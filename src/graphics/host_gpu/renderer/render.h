@@ -11,6 +11,7 @@
 
 #include <array>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -166,6 +167,11 @@ private:
 		PreparedBindings                pixel;
 	};
 
+	// The description of a texture binding, kept for inputs seen before.
+	[[nodiscard]] const TextureDescription&
+	FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
+	                       const ShaderRecompiler::IR::DescriptorValue& value);
+
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -214,6 +220,13 @@ private:
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
+	struct TextureDescriptionEntry {
+		ShaderRecompiler::IR::ImageResource   resource;
+		ShaderRecompiler::IR::DescriptorValue value;
+		TextureDescription                    description;
+	};
+	// Descriptions by input hash; an entry is used only when its inputs compare equal.
+	std::unordered_map<uint64_t, TextureDescriptionEntry> m_texture_descriptions;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

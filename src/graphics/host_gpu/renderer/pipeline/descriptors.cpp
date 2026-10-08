@@ -469,9 +469,11 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+// Everything a texture binding needs before the cache lookup: a function of its inputs only.
+static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                          const ShaderRecompiler::IR::DescriptorValue& value,
+                                          const GraphicContext&                        graphics) {
+	if (resource.atomic64 && !graphics.shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
@@ -480,20 +482,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
-	// Image heap resolves do not follow the draws that sample them: they report no samples.
-	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap) {
-		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
-		const uint8_t base    = descriptor.BaseLevel();
-		counter.finest_level  = std::min(counter.finest_level, base);
-		if (descriptor.MinLod() > base << 8u) {
-			counter.clamped = true;
-		} else {
-			counter.unclamped = true;
-		}
+		TextureDescription result {};
+		result.null = true;
+		return result;
 	}
 
 	const auto address         = descriptor.Base40();
@@ -595,13 +587,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
-	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
-	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
-	if (storage) {
-		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
-	}
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
@@ -615,8 +600,97 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
+	TextureDescription result {};
+	result.desc                = std::move(desc);
+	result.descriptor          = descriptor;
+	result.pixel_format        = pixel_format;
+	result.view_format         = view_format;
+	// Applied after FindImage, whose metadata clears need the attachment-capable format.
+	result.sampled_view_format =
+	    SampledViewFormat(graphics, format, pixel_format, resource.skip_degamma);
+	result.shader_conversion   = shader_conversion;
+	return result;
+}
 
-	auto id = texture_cache.FindImage(desc, shader_conversion);
+static uint64_t TextureDescriptionKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                      const ShaderRecompiler::IR::DescriptorValue& value) {
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto mix  = [&hash](uint64_t word) {
+		hash = (hash ^ word) * 0x100000001b3ull;
+		hash ^= hash >> 32u;
+	};
+	for (uint32_t i = 0; i < value.dwords.size(); i += 2) {
+		mix(value.dwords[i] | (uint64_t {value.dwords[i + 1]} << 32u));
+	}
+	// Every compared field that tells two resources of the same descriptor apart.
+	mix(resource.source | (uint64_t {resource.first_use_pc} << 32u));
+	mix(resource.indirect_root | (uint64_t {resource.shader_swizzle} << 32u));
+	mix(static_cast<uint32_t>(resource.conversion_format) |
+	    (uint64_t {resource.indirect_mapping_offset} << 32u));
+	mix(value.dword_count | (uint64_t {static_cast<uint32_t>(resource.dimension)} << 32u));
+	mix(static_cast<uint32_t>(resource.resource_class) |
+	    (uint64_t {static_cast<uint32_t>(resource.numeric_class)} << 32u));
+	mix(static_cast<uint32_t>(resource.mip_mode) | (uint64_t {resource.mip_count} << 32u));
+	mix(uint64_t {resource.read} | (uint64_t {resource.written} << 8u) |
+	    (uint64_t {resource.atomic} << 16u) | (uint64_t {resource.atomic64} << 24u) |
+	    (uint64_t {resource.depth_compare} << 32u) | (uint64_t {resource.cube} << 40u) |
+	    (uint64_t {resource.r128} << 48u) | (uint64_t {resource.skip_degamma} << 56u));
+	mix(uint64_t {resource.heap});
+	return hash;
+}
+
+const TextureDescription&
+RenderExecutor::FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
+                                       const ShaderRecompiler::IR::DescriptorValue& value) {
+	constexpr size_t MaxTextureDescriptions = 16384;
+	const auto       key                    = TextureDescriptionKey(resource, value);
+	if (const auto found = m_texture_descriptions.find(key);
+	    found != m_texture_descriptions.end() && found->second.value == value &&
+	    found->second.resource == resource) {
+		return found->second.description;
+	}
+	if (m_texture_descriptions.size() >= MaxTextureDescriptions) {
+		m_texture_descriptions.clear();
+	}
+	auto& entry       = m_texture_descriptions[key];
+	entry.resource    = resource;
+	entry.value       = value;
+	entry.description = DescribeTexture(resource, value, m_context.GetGraphics());
+	return entry.description;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	// A copy: the cache lookups below must not depend on the memo's storage.
+	auto  described     = FindTextureDescription(resource, value);
+	auto& desc          = described.desc;
+	auto& texture_cache = m_context.GetTextureCache();
+	if (described.null) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	const bool  storage    = resource.written;
+	const auto& descriptor = described.descriptor;
+	// Image heap resolves do not follow the draws that sample them: they report no samples.
+	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap) {
+		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
+		const uint8_t base    = descriptor.BaseLevel();
+		counter.finest_level  = std::min(counter.finest_level, base);
+		if (descriptor.MinLod() > base << 8u) {
+			counter.clamped = true;
+		} else {
+			counter.unclamped = true;
+		}
+	}
+
+	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+	if (resource.heap && !m_context.IsMapped(desc.info.data.address, desc.info.data.size)) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	if (storage) {
+		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
+	}
+
+	auto id = texture_cache.FindImage(desc, described.shader_conversion);
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
@@ -630,14 +704,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
+		ValidateSampledDepthBinding(resource, descriptor, *image, described.pixel_format,
 		                            desc.info.data.size);
 	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		ValidateStorageColorView(image->info.pixel_format, described.view_format,
+		                         descriptor.DstSelXYZW());
 	} else {
-		// Set after FindImage, whose metadata clears need the attachment-capable format.
-		desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), format, pixel_format,
-		                                          resource.skip_degamma);
+		desc.view_info.format = described.sampled_view_format;
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}
