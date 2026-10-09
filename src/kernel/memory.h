@@ -209,7 +209,9 @@ uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size,
 bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
-bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// access_changed is false when only the write watch changes (Read <-> ReadWrite).
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
+                            bool access_changed = true);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -231,6 +233,7 @@ uint64_t TestDirectMappingCount();
 uint64_t TestFlexibleMappingCount();
 uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
+bool     TestGuestWriteProtectsViews();
 #endif
 
 } // namespace Libs::LibKernel::Memory

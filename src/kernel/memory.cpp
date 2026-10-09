@@ -46,6 +46,17 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if !defined(__APPLE__)
+#include <linux/userfaultfd.h>
+#include <sys/ioctl.h>
+// Values from Linux 5.11 and 5.19, for older kernel headers.
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
+#endif
+#ifndef UFFD_FEATURE_WP_HUGETLBFS_SHMEM
+#define UFFD_FEATURE_WP_HUGETLBFS_SHMEM (1 << 12)
+#endif
+#endif
 #endif
 
 namespace Libs::LibKernel::Memory {
@@ -2994,6 +3005,10 @@ uint64_t TestGuestBackingSize() {
 	return g_guest_address_space->GetBackingSize();
 }
 
+bool TestGuestWriteProtectsViews() {
+	return g_guest_address_space->WriteProtectsViews();
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool TestWindowsBackingViewModes() {
 	constexpr uint64_t size = 0x10000;
@@ -3267,8 +3282,10 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 	return true;
 }
 
-bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                            bool access_changed) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->ProtectTransient(vaddr, size, mode, access_changed);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
