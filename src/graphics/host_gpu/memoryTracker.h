@@ -22,6 +22,8 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	// Queries, uploads and downloads belong to one thread (the GPU thread). They do not wait
+	// for CPU write faults of other threads, which only add CPU-dirty pages.
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
@@ -61,6 +63,9 @@ public:
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (!manager->IsModifiedUnlocked<DirtySource::Gpu>(offset, bytes)) {
+				return;
+			}
 			std::scoped_lock lock(manager->lock);
 			manager->ForEachModifiedRange<DirtySource::Gpu, false>(offset, bytes, func);
 			if constexpr (clear) {
@@ -75,6 +80,10 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			// A written range takes every lock: they stay held until it is marked GPU-dirty.
+			if (!is_written && !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes)) {
+				return;
+			}
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
 			if (!is_written) {
