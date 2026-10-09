@@ -681,10 +681,19 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
-			return true;
+		// Only protection and write-protect faults can be tracking faults.
+		if (info->access_violation_cause != Common::HostException::AccessViolationCause::Other) {
+			const auto cause = info->access_violation_cause ==
+			                           Common::HostException::AccessViolationCause::WriteProtect
+			                       ? Libs::LibKernel::Memory::GpuFaultCause::WriteProtect
+			                       : Libs::LibKernel::Memory::GpuFaultCause::Protection;
+			if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
+			                                            cause)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				return true;
+			}
 		}
+		// Faulting SRT walker loads (unmapped or null pointers too) complete as zero reads.
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);

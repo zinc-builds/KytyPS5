@@ -95,7 +95,8 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	ExceptionInfo info {};
 	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-		info.type = ExceptionType::AccessViolation;
+		info.type                   = ExceptionType::AccessViolation;
+		info.access_violation_cause = AccessViolationCause::Protection;
 		switch (exception_record->ExceptionInformation[0]) {
 			case 0: info.access_violation_type = AccessViolationType::Read; break;
 			case 1: info.access_violation_type = AccessViolationType::Write; break;
@@ -206,6 +207,17 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
 		info.type                   = ExceptionType::AccessViolation;
+#if defined(__APPLE__)
+		info.access_violation_cause = AccessViolationCause::Protection;
+#else
+		// Only access faults on mapped pages (SEGV_ACCERR) and userfaultfd write-protect faults
+		// (BUS_ADRERR with UFFD_FEATURE_SIGBUS) can be tracking faults.
+		if (signal_number == SIGSEGV && signal_info->si_code == SEGV_ACCERR) {
+			info.access_violation_cause = AccessViolationCause::Protection;
+		} else if (signal_number == SIGBUS && signal_info->si_code == BUS_ADRERR) {
+			info.access_violation_cause = AccessViolationCause::WriteProtect;
+		}
+#endif
 		info.access_violation_type  = DecodeAccess(context);
 		info.access_violation_vaddr = reinterpret_cast<uint64_t>(signal_info->si_addr);
 	}
