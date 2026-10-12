@@ -221,7 +221,7 @@ private:
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 	struct TextureDescriptionEntry {
-		ShaderRecompiler::IR::ImageResource   resource;
+		ShaderRecompiler::IR::ImageResource   inputs;
 		ShaderRecompiler::IR::DescriptorValue value;
 		TextureDescription                    description;
 	};
