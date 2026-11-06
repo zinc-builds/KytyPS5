@@ -544,6 +544,39 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+#if defined(__linux__)
+	if (FaultDiag()) {
+		struct Stat {
+			uint64_t calls, uploads, bytes, ranges, written;
+		};
+		static std::unordered_map<uint64_t, Stat> stats;
+		static auto                               last = std::chrono::steady_clock::now();
+		auto& st = stats[CallerOffset(__builtin_return_address(0))];
+		st.calls++;
+		st.written += is_written ? 1 : 0;
+		if (source) {
+			st.uploads++;
+			st.bytes += total_size;
+			st.ranges += copies.size();
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			last = now;
+			for (const auto& [caller, v]: stats) {
+				std::printf("SYNCDIAG caller=0x%llx calls=%llu written=%llu uploads=%llu bytes=%llu "
+				            "ranges=%llu\n",
+				            static_cast<unsigned long long>(caller),
+				            static_cast<unsigned long long>(v.calls),
+				            static_cast<unsigned long long>(v.written),
+				            static_cast<unsigned long long>(v.uploads),
+				            static_cast<unsigned long long>(v.bytes),
+				            static_cast<unsigned long long>(v.ranges));
+			}
+			std::fflush(stdout);
+			stats.clear();
+		}
+	}
+#endif
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();

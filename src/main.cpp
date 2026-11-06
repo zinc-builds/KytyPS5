@@ -1,3 +1,4 @@
+#include "common/hybridAffinity.h"
 #include "common/archive.h"
 #include "common/common.h"
 #include "common/file.h"
@@ -418,6 +419,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+#if defined(__linux__)
+	Common::HybridAffinity::ApplyToProcess();
+#endif
 	InitializeThreads();
 
 	RunOptions options;

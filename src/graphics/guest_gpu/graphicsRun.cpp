@@ -1,4 +1,5 @@
 #if defined(__linux__)
+#include "common/hybridAffinity.h"
 #include <pthread.h>
 #endif
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -394,6 +395,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 #if defined(__linux__)
 	pthread_setname_np(pthread_self(), "KytyGpuCmd");
+	Common::HybridAffinity::ApplyToGpuThread();
 #endif
 	g_gpu_state = gpu;
 
