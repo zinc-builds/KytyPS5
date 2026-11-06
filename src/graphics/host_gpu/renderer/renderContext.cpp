@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/memDiag.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
@@ -87,6 +88,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size) ||
 	    !m_page_manager.IsTrackingFault(fault_vaddr, access)) {
 		return false;
+	}
+	if (MemDiag::Enabled()) {
+		const bool gpu = GuestGpu::IsGpuThread();
+		MemDiag::Add(access == PageFaultAccess::Write
+		                 ? (gpu ? MemDiag::WriteFaultsGpuThread : MemDiag::WriteFaultsOther)
+		                 : (gpu ? MemDiag::ReadFaultsGpuThread : MemDiag::ReadFaultsOther));
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);

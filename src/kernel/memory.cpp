@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -853,7 +854,12 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	// Emulator stores into guest memory (downloads, labels) change bytes without a guest write.
+	// Advance on both sides so no reader pairs the old bytes with the new epoch, or the reverse.
+	Graphics::GuestSyncEpoch::Advance();
+	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	Graphics::GuestSyncEpoch::Advance();
+	return written;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

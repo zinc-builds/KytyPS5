@@ -3,6 +3,8 @@
 #include <pthread.h>
 #endif
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/guestSyncEpoch.h"
+#include "graphics/host_gpu/memDiag.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -286,6 +288,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	MemDiag::NoteLabel();
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -497,6 +500,8 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	GuestSyncEpoch::Advance();
+	MemDiag::NoteSubmit();
 
 	switch (submission.type) {
 		case SubmissionType::Commands:
@@ -630,9 +635,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 
-		if (auto& executor = m_renderer.GetRenderExecutor();
-		    executor.HasAtomicWrites() && !KeepsAtomicWrites(packet_header)) {
-			executor.FlushAtomicWrites(CurrentBuffer());
+		if (!KeepsAtomicWrites(packet_header)) {
+			// The same packets may signal the guest or store into its memory.
+			GuestSyncEpoch::Advance();
+			if (auto& executor = m_renderer.GetRenderExecutor(); executor.HasAtomicWrites()) {
+				executor.FlushAtomicWrites(CurrentBuffer());
+			}
 		}
 
 		if (handler == nullptr) {
@@ -963,6 +971,9 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			std::memcpy(address, value, size);
 		}
 	};
+	if (data_sel != 0) {
+		MemDiag::NoteLabel();
+	}
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
 	switch (data_sel) {
 		case 0: break;

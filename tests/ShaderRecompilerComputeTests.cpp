@@ -20,6 +20,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -4575,6 +4576,33 @@ public:
                   std::memcmp(streamed->Mapped().data() + streamed_offset,
                               stream_values.data(), sizeof(stream_values)) == 0,
               "GPU-readable guest bytes were not streamed without submission");
+      {
+        // The same range in the same command buffer and guest-sync epoch reuses the copy.
+        const auto [again, again_offset] =
+            cache.ObtainBuffer(stream_address, sizeof(stream_values), false);
+        Require(name, "stream copy reuse",
+                again == streamed && again_offset == streamed_offset,
+                "an unchanged stream range was copied again in the same epoch");
+        // Once the guest may have rewritten it, the range is copied afresh.
+        Require(name, "stream source rewrite access",
+                Libs::LibKernel::Memory::KernelMprotect(
+                    reinterpret_cast<void *>(stream_pages), 0x8000, 0x3) == 0,
+                "stream source could not be made CPU-writable");
+        const std::array<uint32_t, 2> rewritten{0x0badf00du, 0x600dcafeu};
+        std::memcpy(reinterpret_cast<void *>(stream_address), rewritten.data(),
+                    sizeof(rewritten));
+        Libs::Graphics::GuestSyncEpoch::Advance();
+        const auto [fresh, fresh_offset] =
+            cache.ObtainBuffer(stream_address, sizeof(rewritten), false);
+        Require(name, "stream copy after guest sync",
+                fresh == streamed && fresh_offset != streamed_offset &&
+                    std::memcmp(fresh->Mapped().data() + fresh_offset,
+                                rewritten.data(), sizeof(rewritten)) == 0,
+                "a stream range was reused across a guest-sync epoch");
+        std::memcpy(reinterpret_cast<void *>(stream_address), stream_values.data(),
+                    sizeof(stream_values));
+        Libs::Graphics::GuestSyncEpoch::Advance();
+      }
       Require(name, "stream source protection restore",
               Libs::LibKernel::Memory::KernelMprotect(
                   reinterpret_cast<void *>(stream_pages), 0x8000, 0x3) == 0,

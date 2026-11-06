@@ -73,6 +73,7 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 |---|---|---|
 | C0 | **Measure (≤ 1 day):** stream-copy bytes and calls per frame (`ObtainBuffer`/`CopySparseMemory`), `PrepareBda` bytes and reprotects, fault rate per thread, and whether the guest's own threads (game main thread, workers) are near 16.7 ms/frame, using Tracy and `perf` on the guest threads | the numbers are in FINDINGS. If the guest threads are over budget, open a Track D. |
 | C1 | **Host-memory import prototype:** `VK_EXT_external_memory_host` to wrap the guest backing memory (or the hot ranges of it) as Vulkan buffers. CPU-written constant and vertex data is then read in place, with no copy. Check NVIDIA's alignment rules, the GPU-side cost of PCIe reads, and coherency with the write tracker. | stream copies < 2% of the draw thread, without a GPU-time regression. Kill it if GPU time rises more than CPU time falls. |
+| C1a | (re-plan from C0) Reuse stream copies of the same range within a guest-sync epoch, command buffer and ring lap; `KYTY_STREAM_VERIFY=1` | 81–90% of copies reused, 0 verify mismatches |
 | C2 | Write-fault storm: stop re-protecting pages the game rewrites every frame (`PrepareBda`, ~280 MB/s). Track them as always-dirty, or snapshot them per frame instead. | kernel fault time < 3% of the draw thread |
 | C3 | Side task: how Astro Bot derives its frame delta (upstream #1931). Does any emulator-side timing make the slowdown worse than the FPS alone explains? Don't fake timing. | written up in FINDINGS |
 
@@ -105,4 +106,4 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 |---|---|---|
 | A | A1 (read-only depth in review) | GPU ~23 ms/frame |
 | B | B0 | — |
-| C | C0 | — |
+| C | C1a merged (stream-copy reuse, +5.7%); next C2 (async write tracking) | C0 in FINDINGS. Guest threads 13–14 ms/frame, ~40% fault handling: no Track D. C1 import deferred: labels are written before the host GPU reads |

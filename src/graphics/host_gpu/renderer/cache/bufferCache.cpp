@@ -7,6 +7,8 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/guestSyncEpoch.h"
+#include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -15,11 +17,15 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
+#include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 #if defined(__linux__)
 #include <atomic>
@@ -116,9 +122,102 @@ void ReportRead(uint64_t vaddr, uint64_t size, bool gpu_thread, double ms, bool 
 } // namespace
 #endif
 
+namespace Libs::Graphics::MemDiag {
+
+void MaybePrint() noexcept {
+	using Clock = std::chrono::steady_clock;
+	static Clock::time_point last = Clock::now();
+	const auto now = Clock::now();
+	if (now - last < std::chrono::seconds(1)) {
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - last).count();
+	last                 = now;
+	uint64_t v[StatCount];
+	for (int i = 0; i < StatCount; i++) {
+		v[i] = g_stats[i].exchange(0, std::memory_order_relaxed);
+	}
+	const auto r = [&](int i) { return static_cast<double>(v[i]) / seconds; };
+	std::printf("MEMDIAG reuse_s=%.0f reuse_old_tick_s=%.0f reuse_old_epoch_s=%.0f "
+	            "verify_failed_s=%.0f ",
+	            r(StreamReuse), r(StreamReuseOldTick), r(StreamReuseOldEpoch),
+	            r(StreamVerifyFailed));
+	std::printf("obtain_s=%.0f written_s=%.0f stream_s=%.0f stream_kb_s=%.0f "
+	            "rep_label_same_s=%.0f rep_label_changed_s=%.0f rep_submit_same_s=%.0f "
+	            "rep_submit_changed_s=%.0f rep_any_same_s=%.0f miss_large_s=%.0f miss_gpu_s=%.0f "
+	            "miss_clean_s=%.0f",
+	            r(ObtainCalls), r(ObtainWritten), r(StreamCalls), r(StreamBytes) / 1024.0,
+	            r(StreamRepeatSame), r(StreamRepeatChanged), r(StreamRepeatSubmitSame),
+	            r(StreamRepeatSubmitChanged), r(StreamRepeatAnySame), r(StreamMissLarge),
+	            r(StreamMissGpu), r(StreamMissClean));
+	static const char* const names[] = {"obtain", "bda", "image"};
+	for (int k = 0; k < static_cast<int>(Sync::Count); k++) {
+		std::printf(" sync_%s_calls_s=%.0f uploads_s=%.0f kb_s=%.0f ranges_s=%.0f", names[k],
+		            r(SyncCalls0 + k), r(SyncUploads0 + k), r(SyncBytes0 + k) / 1024.0,
+		            r(SyncRanges0 + k));
+	}
+	std::printf(" watch_w_pages_s=%.0f unwatch_w_pages_s=%.0f watch_r_pages_s=%.0f "
+	            "unwatch_r_pages_s=%.0f wfault_gpu_s=%.0f wfault_other_s=%.0f rfault_gpu_s=%.0f "
+	            "rfault_other_s=%.0f labels_s=%.0f submits_s=%.0f\n",
+	            r(WatchWritePages), r(UnwatchWritePages), r(WatchReadPages), r(UnwatchReadPages),
+	            r(WriteFaultsGpuThread), r(WriteFaultsOther), r(ReadFaultsGpuThread),
+	            r(ReadFaultsOther), r(LabelEpochs), r(Submits));
+	std::fflush(stdout);
+}
+
+namespace {
+struct StreamSeen {
+	uint64_t label_epoch;
+	uint64_t submit_epoch;
+	uint64_t hash;
+};
+// GPU thread only.
+void NoteStreamCopy(uint64_t vaddr, uint64_t size, const void* bytes) {
+	static std::unordered_map<uint64_t, StreamSeen> seen;
+	if (seen.size() > (1u << 20u)) {
+		seen.clear();
+	}
+	const auto label  = g_label_epoch.load(std::memory_order_relaxed);
+	const auto submit = g_submit_epoch.load(std::memory_order_relaxed);
+	const auto hash   = XXH3_64bits(bytes, size);
+	const auto [it, inserted] =
+	    seen.try_emplace(vaddr ^ (size << 44u), StreamSeen {label, submit, hash});
+	if (!inserted) {
+		const bool same = it->second.hash == hash;
+		if (it->second.label_epoch == label) {
+			Add(same ? StreamRepeatSame : StreamRepeatChanged);
+		}
+		if (it->second.submit_epoch == submit) {
+			Add(same ? StreamRepeatSubmitSame : StreamRepeatSubmitChanged);
+		}
+		if (same) {
+			Add(StreamRepeatAnySame);
+		}
+		it->second = {label, submit, hash};
+	}
+	Add(StreamCalls);
+	Add(StreamBytes, size);
+}
+} // namespace
+
+} // namespace Libs::Graphics::MemDiag
+
 namespace Libs::Graphics {
 
 namespace {
+
+thread_local MemDiag::Sync g_sync_kind = MemDiag::Sync::Obtain;
+
+size_t StreamCopySlot(uint64_t vaddr, uint64_t size) {
+	const uint64_t key = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
+	return static_cast<size_t>(key >> 51u); // 13 bits: STREAM_COPY_SLOTS
+}
+
+// KYTY_STREAM_VERIFY=1: compare every reused stream copy against the guest bytes.
+bool StreamVerifyEnabled() {
+	static const bool on = std::getenv("KYTY_STREAM_VERIFY") != nullptr;
+	return on;
+}
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
@@ -544,6 +643,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (MemDiag::Enabled()) {
+		MemDiag::Add(MemDiag::SyncCalls0, g_sync_kind, 1);
+		if (source) {
+			MemDiag::Add(MemDiag::SyncUploads0, g_sync_kind, 1);
+			MemDiag::Add(MemDiag::SyncBytes0, g_sync_kind, total_size);
+			MemDiag::Add(MemDiag::SyncRanges0, g_sync_kind, copies.size());
+		}
+	}
 #if defined(__linux__)
 	if (FaultDiag()) {
 		struct Stat {
@@ -629,20 +736,79 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return source.first->Handle();
 }
 
+bool BufferCache::VerifyStreamHit(uint64_t vaddr, uint64_t size, uint64_t offset) {
+	static thread_local uint8_t current[CACHING_PAGESIZE];
+	if (!LibKernel::Memory::CopySparseMemory(vaddr, current, size)) {
+		EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+	}
+	// The stream mapping is host-visible; reading it is slow but this is a debug mode.
+	if (std::memcmp(current, m_stream_buffer.Mapped().data() + offset, size) == 0) {
+		return true;
+	}
+	static std::atomic<uint64_t> failures {0};
+	const auto                   n = failures.fetch_add(1, std::memory_order_relaxed);
+	if (n < 64 || (n % 1000) == 0) {
+		std::printf("STREAMVERIFY mismatch n=%llu addr=0x%llx size=%llu epoch=%llu tick=%llu\n",
+		            static_cast<unsigned long long>(n), static_cast<unsigned long long>(vaddr),
+		            static_cast<unsigned long long>(size),
+		            static_cast<unsigned long long>(GuestSyncEpoch::Current()),
+		            static_cast<unsigned long long>(m_scheduler.CurrentTick()));
+		std::fflush(stdout);
+	}
+	MemDiag::Add(MemDiag::StreamVerifyFailed);
+	return false;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
+	if (MemDiag::Enabled()) {
+		MemDiag::MaybePrint();
+		MemDiag::Add(MemDiag::ObtainCalls);
+		if (is_written) {
+			MemDiag::Add(MemDiag::ObtainWritten);
+		} else if (size > CACHING_PAGESIZE) {
+			MemDiag::Add(MemDiag::StreamMissLarge);
+		} else if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+			MemDiag::Add(MemDiag::StreamMissGpu);
+		} else if (!m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+			MemDiag::Add(MemDiag::StreamMissClean);
+		}
+	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		static const bool reuse_disabled = std::getenv("KYTY_NO_STREAM_REUSE") != nullptr;
+		const auto        epoch          = GuestSyncEpoch::Current();
+		const auto        tick           = m_scheduler.CurrentTick();
+		auto&             copy           = (*m_stream_copies)[StreamCopySlot(vaddr, size)];
+		if (!reuse_disabled && copy.vaddr == vaddr && copy.size == size) {
+			if (copy.epoch == epoch && copy.tick == tick && copy.lap == m_stream_buffer.Laps()) {
+				if (!StreamVerifyEnabled() || VerifyStreamHit(vaddr, size, copy.offset)) {
+					MemDiag::Add(MemDiag::StreamReuse);
+					return {&m_stream_buffer, copy.offset};
+				}
+			} else {
+				MemDiag::Add(copy.epoch == epoch ? MemDiag::StreamReuseOldTick
+				                                 : MemDiag::StreamReuseOldEpoch);
+			}
+		}
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+			// Map can wrap the ring, so read the lap after it.
+			copy = {vaddr, size, offset, tick, epoch, m_stream_buffer.Laps()};
+			if (MemDiag::Enabled()) {
+				// Hash a cached copy, not the (possibly write-combined) stream mapping.
+				static thread_local uint8_t snapshot[CACHING_PAGESIZE];
+				(void)LibKernel::Memory::CopySparseMemory(vaddr, snapshot, size);
+				MemDiag::NoteStreamCopy(vaddr, size, snapshot);
 			}
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
@@ -673,7 +839,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
+			g_sync_kind = MemDiag::Sync::Image;
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			g_sync_kind = MemDiag::Sync::Obtain;
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
@@ -876,7 +1044,9 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish) {
+			g_sync_kind = MemDiag::Sync::Bda;
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			g_sync_kind = MemDiag::Sync::Obtain;
 		}
 	}
 }

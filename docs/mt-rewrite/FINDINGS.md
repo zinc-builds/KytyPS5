@@ -34,6 +34,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-06 | `dev` 48b2101a (baseline) | 15.83 / 15.91 | 92.0k / 92.5k | 67.5 (max 68.3)¹ | 13.7¹ |
 | 2026-11-06 | SRT walker reads read-watched pages without faulting | 17.65 / 17.98 | 101.6k / 102.6k | 69.0 (max 99.4) | 14.3 |
 | 2026-11-06 | Atomic-only shader writes share one barrier per batch | 18.92 / 19.18 | 107.6k / 108.4k | 66.2 (max 85.0) | 14.4 |
+| 2026-11-06 | Stream copies reused within a guest-sync epoch (same batch: merge-base 18.67 / 19.32) | 19.88 / 20.28 | 111.6k / 113.4k | 59.9 (max 100.0) | 16.1 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -180,6 +181,100 @@ stream-buffer uploads. Replacing both `shared_mutex`es with per-thread-slot read
 17.36 / 17.67 FPS (no change). The samples moved into `ReadSparseBacking`'s memcpy: the cost is
 copying cold, freshly written guest data, not the lock.
 
+## Guest memory traffic and the guest threads (Track C0, 2026-11-06)
+
+Measured on `dev` 582e4043 with `KYTY_MEM_DIAG=1` and `tools/astro-bench/c0-profile.sh` (per-thread
+`/proc` CPU time, `perf stat --per-thread`, and `perf record` of every thread for 10 s in Sky
+Garden). The diagnostic and perf cost ~10%, so this run did 16–17 FPS. Per frame means ÷16.5.
+
+**GPU thread, guest-memory traffic (per second):**
+
+| What | Rate | Per frame |
+|---|---|---|
+| `ObtainBuffer` calls | 1.13 M | ~68k (~12 per draw) |
+| ↳ clean ranges (tracker check only) | 735k | |
+| ↳ too large for the stream path (> 16 KiB) | 196k | |
+| ↳ written by the shader | 15k | |
+| ↳ **stream copies** of CPU-dirty ranges | 185k, 338 MB | 11k, 20 MB (1.8 KiB mean) |
+| stream copies repeating an exact range already copied since the last guest-visible GPU signal | 151k (81%), **bytes changed: 0** | |
+| stream copies whose bytes equal the previous copy of that range (any time) | 183k (99%) | |
+| `SynchronizeBuffer` from `ObtainBuffer` | 930k calls, 88 uploads, 3.6 MB | |
+| `SynchronizeBuffer` from `PrepareBda` | 1.1k calls, 1.0k uploads, **330 MB** | 20 MB |
+| pages re-write-protected after an upload / unprotected by a fault | 82.6k / 82.8k | ~5k (20 MB) |
+| guest write faults (other threads / GPU thread) | 131k / 0.9k | ~8k |
+| labels (`RELEASE_MEM`, `WRITE_DATA`) / guest submissions | 13k / 316 | 790 / 19 |
+
+So each frame the guest rewrites ~5k pages (20 MB) of data that DMA shaders read through the BDA
+page table. `PrepareBda` uploads them, re-protects them, and the next frame faults on every one
+again (1.6 faults per page). Separately, the stream path copies 20 MB/frame of small CPU-written
+ranges, and 81–90% of those copies repeat a copy made moments earlier with the same bytes.
+
+**Guest threads (CPU time per frame at 16.1 FPS):**
+
+| Thread | ms/frame | What it does |
+|---|---|---|
+| `KytyGpuCmd` | 61.4 | the emulator's draw thread (critical path) |
+| `kyty_emulator` (game main thread) | 14.3 | 55% guest code, 27% kernel, 13% emulator |
+| `FluidCalculation` | 13.5 | 74% kernel: a `sched_yield` spin-wait, not work |
+| 12 × `tbb_thead` (game job workers) | 12.6–13.3 each | 54% guest code, 29% kernel, 15% emulator |
+| `DrawThread` | 7.5 | 43% guest code, 39% kernel |
+
+The tbb workers' kernel time is mostly `native_queued_spin_lock_slowpath` (12% of their time). Their
+emulator time is spinning on tracker locks while handling write faults: the region spinlock in
+`BufferCache::InvalidateMemory` (7.5%) and the page-manager region lock in `IsTrackingFault`
+(4.2%), both held by the GPU thread while it uploads and re-protects. About 40% of the guest
+threads' time is write-fault handling. One guest address takes 13% of tbb time (a hot loop, likely
+a job-system spin-wait). Read faults are negligible (~270/s).
+
+**Verdict on the guest side:** the busiest guest threads use 13–14 ms of CPU per frame, under the
+16.7 ms frame but at the plan's 14 ms budget. About 40% of that is fault handling that C2 removes,
+which would leave ~8 ms. The fault count per frame is fixed (~8k), so at 60 FPS the rate would
+quadruple to ~500k/s and the lock contention would get worse, not better. **No Track D for now:**
+the guest threads fit once the fault storm is gone. Re-measure after C2.
+
+### Host-memory import (C1): feasible, but not safe with how labels work today
+
+- NVIDIA 615 imports a `MAP_SHARED` memfd mapping (the guest backing store's own type) through
+  `VK_EXT_external_memory_host`: `minImportedHostPointerAlignment` is 4 KiB, the importable memory
+  types are host-visible + coherent (one also cached), importing 256 MiB takes 41 ms (it pins the
+  pages), GPU copies from it run at 13–14 GB/s, and GPU writes are visible through a second view of
+  the same pages (probe: `/tmp/trackC-probe/probe.cpp`, kept out of the tree).
+- **The blocker is timing, not the API.** `RELEASE_MEM` and `WRITE_DATA` labels are written when
+  the GPU thread *decodes* the packet, before the host GPU has executed (or even been sent) the
+  preceding draws. The guest takes a label as permission to rewrite the memory those draws read.
+  With copies that is fine, because a copy snapshots the bytes at record time. An in-place read
+  would see the guest's next-frame bytes. Making import safe means deferring every guest-visible
+  GPU signal to host-GPU completion, which also changes how far the guest can run ahead.
+- **Re-plan:** because 81–90% of the copies repeat a range copied moments earlier, reusing copies
+  removes most of the copy cost without that risk (C1a, below). After C1a about 19k copies/s
+  remain (~1.2k per frame). Import is deferred until the label timing changes for another reason.
+
+### Stream-copy reuse (C1a, landed)
+
+`BufferCache::ObtainBuffer` keeps a direct-mapped table (8,192 slots) of recent stream copies keyed
+by exact (address, size). A copy is reused while all of these hold:
+- the `GuestSyncEpoch` hasn't advanced. It advances on every guest submission, on every PM4
+  packet other than register writes, draws and markers (the same set that closes atomic-write
+  batches: labels, waits, DMA, dispatches, events), and on both sides of every emulator store into
+  guest memory (`TryWriteBacking`: downloads, labels);
+- the same command buffer (scheduler tick), so the stream ring's existing watch covers the reuse;
+- the same stream-ring lap, so the bytes haven't been overwritten.
+
+Between two epoch advances the guest has had no GPU signal that the earlier draw finished, so it
+can't legally rewrite the range. `KYTY_STREAM_VERIFY=1` compares every reuse against the guest
+bytes: 0 mismatches over a 30 s Sky Garden run, with 31k reuses/s against 3.4k copies/s (90%
+reused). `KYTY_NO_STREAM_REUSE=1` turns it off. Result: 19.00 → 20.08 FPS (+5.7%, same batch).
+
+### Write tracking without signals (C2 direction)
+
+The kernel (7.3) supports userfaultfd **asynchronous** write protection (`UFFD_FEATURE_WP_ASYNC`)
+on shared-memory views, plus `PAGEMAP_SCAN` to collect written pages and re-protect them in one
+ioctl. Probe on a 1 GiB memfd view: an async write fault costs 0.47 µs, resolved in the kernel
+with no signal and no `siglock`, against several µs plus lock contention for today's SIGBUS. A
+scan of a clean 1 GiB costs 0.15 ms, and 0.27 ms after 5,000 written pages. Writes through
+the backing alias are not reported, as now. This replaces fault-time notification with a scan at
+guest-sync points. The guest-sync contract that makes C1a safe makes that sufficient too.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
@@ -219,4 +314,10 @@ copying cold, freshly written guest data, not the lock.
   (`~/AI/emu/tracy-build` has binaries); export with `tracy-csvexport`. Tracy renames the main
   thread, so match the process by command line (`^\./kyty_emulator --game`), never by name.
 - Thread name `KytyGpuCmd` for the GPU thread (top/perf/taskset).
+- `KYTY_MEM_DIAG=1`: one `MEMDIAG` line per second with `ObtainBuffer` outcomes, stream copies and
+  their repetition, `SynchronizeBuffer` uploads by caller, write-watch changes, faults by thread
+  kind, labels and submissions. `tools/astro-bench/c0-profile.sh <label>` adds per-thread CPU time,
+  `perf stat --per-thread` and a `perf record` of every thread (`/tmp/c0-<label>/`).
+- `KYTY_STREAM_VERIFY=1` checks every reused stream copy against the guest bytes (slow);
+  `KYTY_NO_STREAM_REUSE=1` disables reuse.
 - Env knobs: `KYTY_NO_PIN=1`, `KYTY_AMD_SKIP_RSQRT=1`, `KYTY_NO_SHADER_FASTREAD=1`.
