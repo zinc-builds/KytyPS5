@@ -1,0 +1,127 @@
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 454a91ff..76dd5105 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -1060,7 +1060,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 	}
+ 	const auto vertex_stages = state.VertexStages();
+ 	const bool mesh_active = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
+-	uint32_t   mesh_groups = 0;
++	uint32_t   mesh_groups         = 0;
++	uint32_t   mesh_instance_slice = 0;
+ 	if (mesh_active) {
+ 		const auto& mesh = state.vertex_info[0].mesh;
+ 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
+@@ -1080,10 +1081,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 		}
+ 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+ 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+-		        limits.maxMeshWorkGroupTotalCount) {
++		// Instances beyond the host limits are drawn in slices below.
++		mesh_instance_slice =
++		    std::min(limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount / mesh_groups);
++		if (mesh_groups > limits.maxMeshWorkGroupCount[0] || mesh_instance_slice == 0) {
+ 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+ 			     draw.instance_count);
+ 		}
+@@ -1163,7 +1164,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 			             static_cast<uint32_t>(emit.vertex_offset),
+ 			             index_source.guest_element_size,
+ 			             static_cast<uint32_t>(index_source.address),
+-			             static_cast<uint32_t>(index_source.address >> 32u)};
++			             static_cast<uint32_t>(index_source.address >> 32u),
++			             0};
+ 		} else {
+ 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
+ 		}
+@@ -1209,7 +1211,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
+ 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+ 	if (mesh_active) {
+-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
++		for (uint32_t done = 0; done < draw.instance_count;) {
++			if (done != 0) {
++				vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages,
++				                        PushData::MeshInstanceSliceDword * sizeof(uint32_t),
++				                        sizeof(done), &done);
++			}
++			const auto count = std::min(mesh_instance_slice, draw.instance_count - done);
++			vk_buffer.drawMeshTasksEXT(mesh_groups, count, 1);
++			done += count;
++		}
+ 	} else if (args_buffer.first == nullptr) {
+ 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+ 	} else if (draw.IsIndexed()) {
+diff --git a/src/graphics/shader/recompiler/frontend/translate/Translate.cpp b/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
+index 06bc315f..a7e32110 100644
+--- a/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
++++ b/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
+@@ -1244,12 +1244,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph&
+ 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
+ 			                                                         primitive_count, u32(8)),
+ 			                                                     vertex_count)));
+-			// Instance IDs exclude the start instance, which shaders add from user data.
++			// Instance IDs exclude the start instance, which shaders add from user data. Split
++			// draws push the first instance of each slice.
++			const auto instance =
++			    entry_ir.IAdd(draw(IR::PushData::MeshInstanceSliceDword),
++			                  builtin(IR::StageInputKind::WorkgroupId, 1));
+ 			if (mesh.fast_launch) {
+ 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
+ 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
+-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
+-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
++				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6), instance);
+ 			} else {
+ 				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
+ 				// center in every subgroup; strip winding follows the global primitive.
+@@ -1298,8 +1301,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph&
+ 				     entry_ir.IMul(index_bytes, u32(8))}));
+ 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+ 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
+-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
++				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8), instance);
+ 			}
+ 		} else if (options.stage == ShaderType::Local) {
+ 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+diff --git a/src/graphics/shader/recompiler/ir/ShaderIR.h b/src/graphics/shader/recompiler/ir/ShaderIR.h
+index 034a1797..0ab5e41a 100644
+--- a/src/graphics/shader/recompiler/ir/ShaderIR.h
++++ b/src/graphics/shader/recompiler/ir/ShaderIR.h
+@@ -365,7 +365,10 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
+ 
+ struct PushData {
+ 	static constexpr uint32_t DwordCount = 32;
+-	static constexpr uint32_t MeshDrawDwordCount = 5;
++	// Mesh draws: index count, vertex offset, index size, index address (2), and the first
++	// instance of the current slice when a draw is split to fit the host limits.
++	static constexpr uint32_t MeshDrawDwordCount = 6;
++	static constexpr uint32_t MeshInstanceSliceDword = 5;
+ 	static constexpr uint32_t NoStart    = UINT32_MAX;
+ 	std::array<uint32_t, DwordCount> dwords {};
+ 
+diff --git a/tests/shaderCfgTests.cpp b/tests/shaderCfgTests.cpp
+index 25c2bde7..83a9bfaa 100644
+--- a/tests/shaderCfgTests.cpp
++++ b/tests/shaderCfgTests.cpp
+@@ -11788,7 +11788,7 @@ void TestMeshInputAssembly() {
+     options.input_info.vertex = &input;
+     auto program = Frontend::TranslateProgram(decoded, graph, options);
+     const uint32_t draw[] = {test.count, test.base_vertex, test.width,
+-                             test.address_low, 0x12};
++                             test.address_low, 0x12, 0};
+     Inst *load = nullptr;
+     for (auto &inst : *program.blocks.front()) {
+       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+```
+
+</details>
+
+Credits: #838 by @ew-sudo; the slicing idea from @prompterror's #793; #1211 by @NeySlim; the `main` fixes by @nmzik.
+
+AI use: Claude Code built the branches, wrote the v2 patch, resolved the #1211 conflict and read the overlay numbers with me. I ran the game and checked the outputs myself.
+
