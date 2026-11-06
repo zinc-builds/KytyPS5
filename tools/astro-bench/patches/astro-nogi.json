@@ -1,0 +1,19 @@
+{
+  "id": "PPSA21567",
+  "name": "ASTRO BOT: non RT patch (01.019.000)",
+  "version": "01.019.000",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "Disable GI probes and lighting shaders",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0x70CE313",
+          "off": "0FB682A00700008887E4050000",
+          "on": "B80000000090908887E4050000"
+        }
+      ]
+    }
+  ]
+}
