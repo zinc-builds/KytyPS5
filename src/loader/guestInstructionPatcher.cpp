@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "loader/guestInstructionPatcher.h"
 
 #include "common/assert.h"
@@ -926,7 +927,10 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
-		if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+		// Local tuning knob: KYTY_AMD_SKIP_RSQRT keeps VRSQRTPS on the host's precision, so
+		// --amd-cpu only removes the SSE4a/RDPID/CLWB traps.
+		static const bool skip_rsqrt = std::getenv("KYTY_AMD_SKIP_RSQRT") != nullptr;
+		if (!skip_rsqrt && instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
 		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
 		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&
 		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {

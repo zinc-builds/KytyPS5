@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "graphics/presentation/performanceOverlay.h"
 
 #include "common/debugCounters.h"
@@ -834,6 +835,24 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			shown.low_fps = *percentile > 0.0f ? 1000.0 / *percentile : 0.0;
 		}
 		Refresh(shown, graphics, now, generation);
+		// Local benchmarking aid: one line per refresh on stdout when KYTY_PERF_LOG is set.
+		static const bool perf_log = std::getenv("KYTY_PERF_LOG") != nullptr;
+		if (perf_log && shown.frame_count > 0) {
+			const double fps   = std::max(shown.fps, 1.0);
+			std::string  thrds;
+			for (const auto& thread: shown.host.busiest_threads) {
+				thrds += Fmt(" %s=%.0f%%", thread.name.c_str(), thread.cpu_percent);
+			}
+			std::printf("PERF fps=%.1f frame_ms=%.1f worst_ms=%.1f low1=%.1f draws_frame=%.0f "
+			            "draws_s=%.0f gpu_wait_ms_s=%.0f waits_s=%.0f wt_faults_s=%.0f "
+			            "dispatches_frame=%.0f threads:%s\n",
+			            shown.fps, shown.frame_ms, shown.max_frame_ms, shown.low_fps,
+			            Rate(shown, Counter::Draws) / fps, Rate(shown, Counter::Draws),
+			            Rate(shown, Counter::GpuWaitNs) / 1e6, Rate(shown, Counter::GpuWaits),
+			            Rate(shown, Counter::GpuFaults), Rate(shown, Counter::Dispatches) / fps,
+			            thrds.c_str());
+			std::fflush(stdout);
+		}
 	}
 
 	const float scale = std::clamp(std::min(static_cast<float>(extent.width) / 1920.0f,

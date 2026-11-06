@@ -1,3 +1,6 @@
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
@@ -389,6 +392,9 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+#if defined(__linux__)
+	pthread_setname_np(pthread_self(), "KytyGpuCmd");
+#endif
 	g_gpu_state = gpu;
 
 	for (;;) {
