@@ -1171,8 +1171,10 @@ void CheckDeathCase(const char *name) {
 }
 
 void TestFatalPaths() {
-  for (const char *name : {"gpu-dirty-explicit-cpu", "reentrant-upload",
-                           "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
+  // "reentrant-upload" is not fatal any more: dirty-bit queries read without the tracker region
+  // lock (#1284), and main dropped the explicit upload-callback check (25fb20e5).
+  for (const char *name : {"gpu-dirty-explicit-cpu", "recursive-tracking-lock",
+                           "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
 #if KYTY_BUILD == KYTY_BUILD_DEBUG

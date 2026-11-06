@@ -95,7 +95,7 @@ public:
 	// bits. Other threads only set CPU-dirty bits, under the lock and before their write.
 	template <DirtySource source>
 	[[nodiscard]] bool IsModifiedUnlocked(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto [start, end] = GetPageRange(offset, size);
 		const auto& words       = source == DirtySource::Cpu ? m_cpu_words : m_gpu_words;
 		const auto  first       = start / 64;
 		const auto  last        = (end - 1) / 64;
