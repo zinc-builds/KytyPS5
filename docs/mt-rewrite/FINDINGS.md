@@ -387,6 +387,11 @@ That is ~2 µs of GPU per draw inside passes, high for this GPU. Ruled out as th
 - Redundant pipeline binds: 80% of `vkCmdBindPipeline` re-bind the same pipeline, but skipping
   them (an experiment) left GPU time unchanged.
 - Occlusion queries: none are active in Sky Garden.
+- Avoidable pass breaks: an experiment that resumed the previous pass when the next one used
+  the same attachments found only ~16 of ~175 begins per frame that it could avoid.
+
+The command thread rarely waits for the GPU now: `Scheduler::Wait` under `Process` is ~3.5% of
+its time (Tracy), and comes from servicing guest-thread readbacks (Track C).
 
 Root-only Nsight metrics would separate front-end from shading cost; not available tonight.
 
