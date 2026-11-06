@@ -105,6 +105,6 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 
 | Track | Current step | Notes |
 |---|---|---|
-| A | A1 done (#7, #8); A2 done; A3 measured: transfers end only ~10 passes/frame; A4 done (this PR); next: GPU time inside passes (A5) | GPU ~18–20 ms/frame; indirect-dispatch syncs 0 |
+| A | A1 done (#7, #8); A2 done; A3 measured: transfers end only ~10 passes/frame; A4 done (#10); A5: per-pass GPU timing in the tree; redundant binds, queries and same-target pass breaks ruled out; next: CPU cost of recording (CommitBindings) | GPU ~18.4 ms/frame (11.0 in passes, 4.0 dispatches); indirect-dispatch syncs 0 |
 | B | B1′ (B0 done: B1 dropped; B2 merged, +6.2%) | texture resolve 16.7% → 8.7% of the GPU thread; next: the walk's remainder |
 | C | C1a merged (stream-copy reuse, +5.7%); next C2 (async write tracking) | C0 in FINDINGS. Guest threads 13–14 ms/frame, ~40% fault handling: no Track D. C1 import deferred: labels are written before the host GPU reads |
