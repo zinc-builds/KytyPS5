@@ -19,6 +19,9 @@ is never pushed to and never receives PRs from here.
 
 ## Documents
 
+- `PLAN-60fps.md` — the plan to reach 60 FPS: per-frame budget, three parallel tracks (GPU
+  execution layer, draw state cache, guest memory without copies), owners, milestones, and the
+  shared rules for several agents on one machine. Read it first.
 - `FINDINGS.md` — every measurement so far: what helped, what was ruled out, current profile.
 - `RESEARCH-threaded-draw.md` — design study of the per-draw pipeline: stage purity, ordering
   hazards, candidate designs (pipelined split, prepare/commit split, secondary command buffers,
@@ -27,6 +30,8 @@ is never pushed to and never receives PRs from here.
 
 ## Working rules
 
+- Several agents share this machine: follow the bench-lock rules in `PLAN-60fps.md`
+  (`tools/astro-bench/benchlock.sh`).
 - Measure with `tools/astro-bench` (two runs per configuration, ±0.3 FPS noise) and Tracy; record
   each result in `FINDINGS.md`.
 - Correctness first: Sky Garden must render the same (compare screenshots) and not crash; run the

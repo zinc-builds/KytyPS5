@@ -20,6 +20,10 @@ echo quit > /tmp/vpad.fifo                      # remove the virtual pad when do
 - `garden.sh <label> [flags]` — boot → title → save 1 → Gorilla Nebula → Sky Garden (Dive In is a
   *hold* of Cross) → averages `PERF` lines over `GARDEN_WINDOW` s (45) after `GARDEN_SETTLE` s (25).
   `KEEP_RUNNING=1` leaves the emulator in the level for profiling.
+- `benchlock.sh` — host-wide lock so agents sharing the machine never overlap. `garden.sh`,
+  `run.sh` and `batch.sh` take it exclusively (the emulator inherits it, so `KEEP_RUNNING=1` holds
+  it until the emulator exits); wrap other emulator launches in `benchlock.sh run …` and builds or
+  unit tests in `benchlock.sh build …` (shared). `benchlock.sh status` shows the holder.
 - `batch.sh` — runs `<label> [ENV=VAL…] -- [flags…]` lines back to back.
 - `symbolize.py`, `chains.py` — map perf addresses of this stripped PIE through
   `_Build/linux/kyty_emulator_clang_lld.map` (perf report prints file offsets; vaddr = offset +

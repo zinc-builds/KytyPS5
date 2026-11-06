@@ -4,6 +4,8 @@
 # KYTY_INSTALL: emulator install dir (default: this checkout's _Build/linux/install)
 # KYTY_GAME:    game dump (default: ~/Games/PS5/PPSA21567.zar)
 log=/tmp/bench-$1.log; shift
+. "$(dirname "$0")/benchlock.sh"
+benchlock_acquire x "run.sh $(basename "$log")" || exit 1
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 cd "${KYTY_INSTALL:-$repo/_Build/linux/install}" || exit 1
 export KYTY_PERF_LOG=1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
