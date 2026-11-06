@@ -168,10 +168,93 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 
-// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+// Page-tracker state the walker's load stub reads; see SetSrtWalkerGuestAccess.
+struct WalkerGuestAccess {
+	const void* const* regions      = nullptr;
+	uint64_t           pages_offset = 0;
+	SrtWalkerReader    read         = nullptr;
+};
+WalkerGuestAccess g_walker_access;
+
+// Reads a DWORD of a read-watched page without faulting. Bit 32 set: rax[31:0] holds it.
+uint64_t KYTY_SYSV_ABI WalkerWatchedLoad(uint64_t address) {
+	uint32_t value = 0;
+	const auto read = g_walker_access.read;
+	return read != nullptr && read(address, &value) ? (uint64_t {1} << 32u) | value : 0u;
+}
+
+// Every guest load is `call load` with the address in r10. The stub's load is mov eax, [r10]
+// (41 8b 02), so a fault there completes as a zero read or a tracked read.
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& load) {
 	code.lea(code.r10, code.ptr[address]);
-	code.mov(code.eax, code.dword[code.r10]);
+	code.call(load);
+}
+
+// Loads [r10] into eax and preserves every other register the walker uses (not flags). A load
+// from a page the tracker protects against CPU reads would fault into the exception handler only
+// to be served from the backing view; this reads it from there without the signal.
+void EmitLoadStub(Xbyak::CodeGenerator& c, Xbyak::Label& load) {
+	constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
+	Xbyak::Label raw, watched, done;
+	c.L(load);
+	c.push(c.rcx);
+	c.push(c.r11);
+	c.mov(c.rax, reinterpret_cast<uint64_t>(&g_walker_access));
+	c.mov(c.rcx, c.qword[c.rax + offsetof(WalkerGuestAccess, regions)]);
+	c.test(c.rcx, c.rcx);
+	c.jz(raw, Near);
+	c.mov(c.r11, c.r10);
+	c.shr(c.r11, SrtWalkerTrackedAddressBits);
+	c.jnz(raw, Near);
+	c.mov(c.r11, c.r10);
+	c.shr(c.r11, SrtWalkerRegionBits);
+	c.mov(c.rcx, c.qword[c.rcx + c.r11 * 8]);
+	c.test(c.rcx, c.rcx);
+	c.jz(raw, Near);
+	c.add(c.rcx, c.qword[c.rax + offsetof(WalkerGuestAccess, pages_offset)]);
+	c.mov(c.r11, c.r10);
+	c.shr(c.r11, SrtWalkerPageBits);
+	c.and_(c.r11d, (1u << (SrtWalkerRegionBits - SrtWalkerPageBits)) - 1u);
+	c.test(c.byte[c.rcx + c.r11], SrtWalkerReadWatchedBit);
+	c.jnz(watched, Near);
+	c.L(raw);
+	c.mov(c.eax, c.dword[c.r10]);
+	c.L(done);
+	c.pop(c.r11);
+	c.pop(c.rcx);
+	c.ret();
+	// Call the backing reader with the stack aligned and the walker's caller-saved registers
+	// preserved.
+	c.L(watched);
+	c.push(c.rdx);
+	c.push(c.rsi);
+	c.push(c.rdi);
+	c.push(c.r8);
+	c.push(c.r9);
+	c.push(c.r10);
+	c.push(c.rbp);
+	c.mov(c.rbp, c.rsp);
+	c.and_(c.rsp, -16);
+	c.sub(c.rsp, 32);
+	c.movdqu(c.ptr[c.rsp], c.xmm0);
+	c.movdqu(c.ptr[c.rsp + 16], c.xmm1);
+	c.mov(c.rdi, c.r10);
+	c.mov(c.rax, reinterpret_cast<uint64_t>(&WalkerWatchedLoad));
+	c.call(c.rax);
+	c.movdqu(c.xmm0, c.ptr[c.rsp]);
+	c.movdqu(c.xmm1, c.ptr[c.rsp + 16]);
+	c.mov(c.rsp, c.rbp);
+	c.pop(c.rbp);
+	c.pop(c.r10);
+	c.pop(c.r9);
+	c.pop(c.r8);
+	c.pop(c.rdi);
+	c.pop(c.rsi);
+	c.pop(c.rdx);
+	c.bt(c.rax, 32);
+	c.jnc(raw, Near); // GPU-written bytes: the load faults and synchronizes them
+	c.mov(c.eax, c.eax);
+	c.jmp(done, Near);
 }
 
 class RuntimeValidator {
@@ -442,6 +525,7 @@ private:
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
+	Xbyak::Label                                      m_load;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
@@ -933,7 +1017,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax);
+			LoadGuest(c, c.rax, m_load);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -963,7 +1047,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_load);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1357,6 +1441,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) EmitNode(index);
 	}
+	if (m_captures != 0) EmitLoadStub(c, m_load);
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
@@ -1428,6 +1513,13 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
+}
+
+void SetSrtWalkerGuestAccess(const void* const* regions, uint64_t pages_offset,
+                             SrtWalkerReader read) {
+	g_walker_access.read         = read;
+	g_walker_access.pages_offset = pages_offset;
+	g_walker_access.regions      = regions;
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

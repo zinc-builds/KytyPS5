@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -35,9 +36,14 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 		}
 		return LibKernel::Memory::CopySparseMemory(vaddr, dst, size);
 	});
+	const auto [watch_table, pages_offset] = m_page_manager.ReadWatchTable();
+	ShaderRecompiler::IR::SetSrtWalkerGuestAccess(
+	    watch_table, pages_offset,
+	    [](uint64_t vaddr, uint32_t* value) { return ShaderTryReadGuest(vaddr, value, sizeof(*value)); });
 }
 
 RenderContext::~RenderContext() {
+	ShaderRecompiler::IR::SetSrtWalkerGuestAccess(nullptr, 0, nullptr);
 	ShaderSetGuestReader(nullptr);
 	g_shader_reader_context = nullptr;
 	ShutdownGpu();

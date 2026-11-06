@@ -82,6 +82,19 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
+// Reads a DWORD of guest memory without faulting; false when it must be read in place.
+using SrtWalkerReader = bool (*)(uint64_t address, uint32_t* value);
+// Page-tracker layout the walker's loads check (the page manager asserts it matches).
+constexpr uint32_t SrtWalkerTrackedAddressBits = 44;
+constexpr uint32_t SrtWalkerRegionBits         = 22;
+constexpr uint32_t SrtWalkerPageBits           = 12;
+constexpr uint8_t  SrtWalkerReadWatchedBit     = 0x80;
+// Lets walker loads skip the fault for pages the tracker protects against CPU reads.
+// regions[address >> SrtWalkerRegionBits] is null or points to a region whose byte at
+// pages_offset + page index has SrtWalkerReadWatchedBit set while reads of that page fault;
+// those loads call read first. Set before any walker runs; null regions disables the check.
+void SetSrtWalkerGuestAccess(const void* const* regions, uint64_t pages_offset,
+                             SrtWalkerReader read);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

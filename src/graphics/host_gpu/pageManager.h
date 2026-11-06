@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <memory>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -26,6 +27,10 @@ public:
 	// Whether a fault at vaddr is resolved by page tracking: the page is watched against the
 	// access, or it is not (a watch released since the fault) and the access now succeeds.
 	[[nodiscard]] bool IsTrackingFault(uint64_t vaddr, PageFaultAccess access) const noexcept;
+
+	// The region table and the offset of a region's page-state bytes, for lock-free readers
+	// that test SrtWalkerReadWatchedBit; {nullptr, 0} when the layout does not match.
+	[[nodiscard]] std::pair<const void* const*, uint64_t> ReadWatchTable() const noexcept;
 
 private:
 	struct Impl;

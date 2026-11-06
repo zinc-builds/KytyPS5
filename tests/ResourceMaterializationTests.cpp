@@ -280,6 +280,41 @@ void TestNativeNestedSrtRefresh() {
             snapshot.flattened_srt ==
                 std::vector<uint32_t>{0x1234u, 0x2003u, 0xabcd0000u, 0x5678u},
         "native SRT walk repeated nested pointer reads");
+  {
+    // Loads from pages the tracker marks read-watched use the backing reader, not a fault;
+    // a page it cannot serve still faults into the exception handler.
+    static uint32_t backing_reads = 0;
+    static bool serve_second_table = true;
+    std::array<uint8_t, 1u << (SrtWalkerRegionBits - SrtWalkerPageBits)> pages{};
+    pages[1] = SrtWalkerReadWatchedBit;
+    pages[2] = SrtWalkerReadWatchedBit;
+    const std::array<const void *, 1> regions{pages.data()};
+    SetSrtWalkerGuestAccess(regions.data(), 0, [](uint64_t address, uint32_t *value) {
+      ++backing_reads;
+      switch (address) {
+        case 0x1000u: *value = 0x2003u; return true;
+        case 0x1004u: *value = 0xabcd0000u; return true;
+        case 0x2004u: *value = 0x1234u; break;
+        case 0x2008u: *value = 0x5678u; break;
+        default: return false;
+      }
+      return serve_second_table;
+    });
+    reads = 0;
+    Check(MaterializeResources(plan, {.user_data = fake_user_data}, snapshot, specialization) &&
+              reads == 0 && backing_reads == 4 &&
+              snapshot.flattened_srt ==
+                  std::vector<uint32_t>{0x1234u, 0x2003u, 0xabcd0000u, 0x5678u},
+          "native SRT walk faulted on read-watched pages");
+    serve_second_table = false;
+    backing_reads = 0;
+    Check(MaterializeResources(plan, {.user_data = fake_user_data}, snapshot, specialization) &&
+              reads == 2 && backing_reads == 4 &&
+              snapshot.flattened_srt ==
+                  std::vector<uint32_t>{0x1234u, 0x2003u, 0xabcd0000u, 0x5678u},
+          "native SRT walk did not fall back to a faulting load for unserved watched reads");
+    SetSrtWalkerGuestAccess(nullptr, 0, nullptr);
+  }
   leaf->SetArg(0, root);
   leaf->SetArg(1, Value(0u));
   program.srt_reads.resize(1);

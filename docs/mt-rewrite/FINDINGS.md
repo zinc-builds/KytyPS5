@@ -21,6 +21,21 @@ Run-to-run noise is about ±0.3 FPS; always compare two runs per configuration.
 `dev` = `astro-uffd` = everything above. ~5,800 draws/frame, ~93k draws/s, ~130k write-tracking
 faults/s.
 
+## Progress toward 60 FPS
+
+Target: 60 FPS with stable pacing (16.7 ms frames). Astro Bot's game speed follows its frame
+rate, so anything below 60 plays in slow motion. At ~5.8k draws/frame that means ~350k draws/s
+on the GPU command thread, about 3.7× the starting point. Two `garden.sh` runs per row,
+`--amd-cpu`. `worst_ms` is the mean over 1 s refreshes of the slowest frame (max in brackets),
+and `low1` is the mean 1% low FPS.
+
+| Date | Change | FPS | draws/s | worst_ms | low1 |
+|---|---|---|---|---|---|
+| 2026-11-06 | `dev` 48b2101a (baseline) | 15.83 / 15.91 | 92.0k / 92.5k | 67.5 (max 68.3)¹ | 13.7¹ |
+| 2026-11-06 | SRT walker reads read-watched pages without faulting | 17.65 / 17.98 | 101.6k / 102.6k | 69.0 (max 99.4) | 14.3 |
+
+¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
+
 ## The bottleneck now
 
 The GPU command thread (`GuestGpu::ThreadRun`, OS name `KytyGpuCmd`, Tracy `Thread_Gpu`) is the
@@ -71,15 +86,65 @@ GPU: ~50% busy at 65 W, VRAM 13.8 / 16 GB — not GPU-bound.
   noise), PR #1211 (its useful parts are upstream already), emk530 NoRT/GI-probe game patches
   (no change; GPU-side), cold vs warm pipeline cache (warm it once).
 
+## Profile on `dev` 48b2101a (2026-11-06)
+
+perf with LBR call stacks (`perf record -t <KytyGpuCmd> --call-graph lbr`, 10 s, ~80% on-CPU),
+inclusive share of on-CPU samples:
+
+| Path | Share |
+|---|---|
+| `PipelineCache::GetGraphicsPrograms` (SRT walk + `MaterializeResources` + module match) | 27% |
+| ↳ JIT-compiled SRT walker code itself | ~9% |
+| `ResolveTexture` (`FindTextureDescription`, `FindImage` hash lookups) | 15% |
+| `BufferCache::ObtainBuffer` stream copies (`CopySparseMemory`) | 11-13% |
+| ↳ `pthread_rwlock_unlock`/`rdlock` on the address-space and backing locks | ~7% |
+| NVIDIA driver (`libnvidia-glcore`) | 10% |
+| Kernel page faults + signal delivery (`asm_exc_page_fault`, sigframes) | ~10% |
+| `CommitBindings` | 5.6% |
+| `SynchronizeBuffer` (uploads of CPU-written pages) | 4% |
+
+Tracy (10 s): `DrawIndex` 7.19 s over 803k draws (9.0 µs mean); `DI:GetComputeProgram` 1.48 s
+over 1,680 indirect dispatches. With zones on the sync points, 620 of those dispatches spend
+1.46 s (14.5% of wall time) in `BufferCache::ReadMemory`, 2.4 ms each.
+
+### SRT walker faults (fixed)
+
+The x86 SRT walker read guest memory with plain loads. Pages the buffer cache protects against
+CPU reads (GPU-modified bytes somewhere on the page) faulted on each load. The exception handler
+then served the DWORD from the backing view. That happened ~72k times/s on the GPU thread, about
+0.8 per draw, at ~1.3 µs of kernel entry, signal frame and sigreturn each. The walker's loads now
+call a stub inside its code. The stub checks the page tracker's per-page read-watch bit (a flat
+region table, no locks). Watched pages are read through `ShaderTryReadGuest`. Everything else is
+still a plain load, and the old fault path remains the fallback for GPU-dirty bytes and races.
+Walker backing faults went from ~72k/s to 0, for +12% FPS.
+
+### Indirect-dispatch GPU syncs (open)
+
+The ~1.5 s/10 s of `DI:GetComputeProgram` syncs are **not** the workgroup-count read of the
+dispatch arguments (`EvaluateIndirectCount` never hits GPU-dirty bytes). They are SRT-walker
+loads of two GPU-written DWORDs (`0x57989017c` and `0x57980739c` in this run). A compute pass
+writes them and the next indirect dispatches' SRT walks read them, so the walk must wait for the
+GPU (`HandleFault` → `ReadMemory`). Removing that needs the walk not to depend on GPU-written
+values: bind a superset of descriptors, or resolve the value on the GPU.
+
+### Tooling notes
+
+- `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
+  missing trace data". Off-CPU time came from Tracy zones instead.
+- Keep a copy of `kyty_emulator_clang_lld.map` with each perf capture. A rebuild overwrites it
+  and old captures no longer symbolize.
+- Do not pipe `garden.sh` through `head`. SIGPIPE kills the script before its cleanup and leaves
+  the emulator running.
+- `cmake --install` fails resolving the Qt launcher's image-plugin dependencies (`libheif`,
+  `libjxrglue`). `kyty_emulator` is installed before that step, so benchmarking is unaffected.
+
 ## Remaining costs and candidate directions
 
 1. **Per-draw CPU cost (~10.5 µs × 5.8k draws).** Spread thinly; only structural change helps:
    see `RESEARCH-threaded-draw.md` (pipelined front-end/back-end split, prepare/commit split,
    secondary command buffers, memoized SRT walk).
-2. **Indirect-dispatch sync (~12% of the thread).** `MaterializeResources` reads GPU-written
-   workgroup counts (`runtime.indirect_args_address`) because descriptors are selected per
-   workgroup (`EvaluateIndirectCount`, ResourceMaterialization.cpp). Avoiding it means binding an
-   upper bound of descriptors (selector table maximum) instead of the exact count.
+2. **Indirect-dispatch sync (~14% of wall time).** The SRT walk of a few indirect dispatches
+   reads GPU-written words (see above; not the workgroup counts as first assumed).
 3. **Guest write faults (~130k/s)** — no longer on the critical path after pinning (`tbb_thead`
    ~17% each), but they will be once the GPU thread gets faster.
 

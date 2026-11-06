@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -11,6 +12,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -347,6 +350,23 @@ PageManager::~PageManager() = default;
 
 bool PageManager::IsTrackingFault(uint64_t vaddr, PageFaultAccess access) const noexcept {
 	return m_impl->IsTrackingFault(vaddr, access);
+}
+
+std::pair<const void* const*, uint64_t> PageManager::ReadWatchTable() const noexcept {
+	using namespace ShaderRecompiler::IR;
+	static_assert(ADDRESS_SIZE == uint64_t {1} << SrtWalkerTrackedAddressBits);
+	static_assert(REGION_SIZE == uint64_t {1} << SrtWalkerRegionBits);
+	static_assert(PAGE_SIZE == uint64_t {1} << SrtWalkerPageBits);
+	static_assert(sizeof(std::atomic<Impl::Region*>) == sizeof(void*));
+	Impl::PageState state {};
+	state.access_watchers = 1;
+	uint8_t bits = 0;
+	std::memcpy(&bits, &state, sizeof(bits));
+	if (bits != SrtWalkerReadWatchedBit) {
+		return {nullptr, 0};
+	}
+	return {reinterpret_cast<const void* const*>(m_impl->regions.get()),
+	        offsetof(Impl::Region, pages)};
 }
 
 template <bool track>
