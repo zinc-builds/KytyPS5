@@ -103,6 +103,8 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// Wraps so far: data committed in the current lap stays intact until the next wrap.
+	[[nodiscard]] uint64_t Laps() const noexcept { return m_laps; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -120,6 +122,7 @@ private:
 	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
 	uint64_t              m_offset      = 0;
+	uint64_t              m_laps        = 0;
 	uint64_t              m_mapped_size = 0;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;

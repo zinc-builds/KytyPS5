@@ -2,11 +2,13 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <mutex>
 #include <utility>
 
@@ -177,6 +179,15 @@ private:
 			return;
 		}
 		previous = protection;
+		if (MemDiag::Enabled()) {
+			uint64_t pages = 0;
+			for (size_t word = 0; word < RegionBits::kWordCount; word++) {
+				pages += static_cast<uint64_t>(std::popcount(mask.Word(word)));
+			}
+			MemDiag::Add(is_read ? (track ? MemDiag::WatchReadPages : MemDiag::UnwatchReadPages)
+			                     : (track ? MemDiag::WatchWritePages : MemDiag::UnwatchWritePages),
+			             pages);
+		}
 		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 

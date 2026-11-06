@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -127,6 +128,22 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool VerifyStreamHit(uint64_t vaddr, uint64_t size, uint64_t offset);
+
+	// Stream copies of CPU-written ranges, reused for the same (address, size) while the guest
+	// has had no chance to rewrite them (GuestSyncEpoch), in the same command buffer and stream
+	// lap, so the stream buffer's existing watch still covers the reuse.
+	struct StreamCopy {
+		uint64_t vaddr  = 0;
+		uint64_t size   = 0;
+		uint64_t offset = 0;
+		uint64_t tick   = 0;
+		uint64_t epoch  = 0;
+		uint64_t lap    = 0;
+	};
+	static constexpr size_t STREAM_COPY_SLOTS = 8192;
+	std::unique_ptr<std::array<StreamCopy, STREAM_COPY_SLOTS>> m_stream_copies =
+	    std::make_unique<std::array<StreamCopy, STREAM_COPY_SLOTS>>();
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
