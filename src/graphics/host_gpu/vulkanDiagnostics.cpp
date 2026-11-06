@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #if defined(__linux__)
@@ -118,14 +119,16 @@ void Report() {
 		}                                                                                          \
 	} while (false)
 
-// GPU timer state; used only by the GPU thread through the command scheduler.
+// GPU timer state. Each command scheduler (rendering, presentation) records on its own thread.
 struct GpuTimer {
+	std::mutex                            mutex;
+	std::unordered_map<VkCommandBuffer, uint32_t> active; // recording buffer -> its query pair
 	bool                                  initialized = false;
 	bool                                  enabled     = false;
 	vk::Device                            device;
 	vk::QueryPool                         pool;
 	double                                period = 1.0;
-	uint32_t                              slot = 0, next = 0;
+	uint32_t                              next = 0;
 	std::array<bool, 512>                 pending {};
 	uint64_t                              busy_ns = 0, measured = 0;
 	std::chrono::steady_clock::time_point last;
@@ -229,7 +232,8 @@ void InstallCommandCounters() {
 #undef KYTY_COUNT_COMMAND
 
 void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBuffer buffer) {
-	auto& timer = g_timer;
+	auto&           timer = g_timer;
+	std::lock_guard lock(timer.mutex);
 	if (!timer.initialized) {
 		timer.initialized = true;
 		if (std::getenv("KYTY_GPU_TIME") != nullptr) {
@@ -245,20 +249,25 @@ void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBu
 	if (!timer.enabled) {
 		return;
 	}
-	timer.slot = timer.next;
-	timer.next = (timer.next + 1) % static_cast<uint32_t>(timer.pending.size());
-	Collect(timer.slot);
-	buffer.resetQueryPool(timer.pool, timer.slot * 2, 2);
-	buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timer.pool, timer.slot * 2);
+	const auto slot = timer.next;
+	timer.next      = (timer.next + 1) % static_cast<uint32_t>(timer.pending.size());
+	Collect(slot);
+	timer.active[buffer] = slot;
+	buffer.resetQueryPool(timer.pool, slot * 2, 2);
+	buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timer.pool, slot * 2);
 }
 
 void EndCommandBuffer(vk::CommandBuffer buffer) {
-	auto& timer = g_timer;
-	if (!timer.enabled) {
+	auto&           timer = g_timer;
+	std::lock_guard lock(timer.mutex);
+	const auto      found = timer.active.find(buffer);
+	if (!timer.enabled || found == timer.active.end()) {
 		return;
 	}
-	buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer.pool, timer.slot * 2 + 1);
-	timer.pending[timer.slot] = true;
+	const auto slot = found->second;
+	timer.active.erase(found);
+	buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer.pool, slot * 2 + 1);
+	timer.pending[slot] = true;
 }
 
 } // namespace Libs::Graphics::VulkanDiagnostics
