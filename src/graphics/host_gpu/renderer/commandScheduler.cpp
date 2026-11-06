@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -298,6 +299,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	VulkanDiagnostics::BeginCommandBuffer(
+	    m_graphics.device, m_graphics.physical_device_properties.limits.timestampPeriod,
+	    m_command.m_buffer);
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -305,6 +309,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
+	VulkanDiagnostics::EndCommandBuffer(m_command.m_buffer);
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

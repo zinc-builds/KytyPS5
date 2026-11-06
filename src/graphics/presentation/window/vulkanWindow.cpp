@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -939,6 +940,7 @@ void WindowContext::CreateVulkan() {
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, std::move(device_extensions));
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	VulkanDiagnostics::InstallCommandCounters();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 
