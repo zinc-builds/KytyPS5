@@ -341,6 +341,12 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
+// Reads guest memory for the GPU thread's own shader-input decoding. The renderer installs a
+// reader that avoids GPU-dirty page faults when the bytes were not written by the GPU.
+using ShaderGuestReader = bool (*)(uint64_t vaddr, void* dst, uint64_t size);
+void ShaderSetGuestReader(ShaderGuestReader reader);
+// Reads through the installed reader only; false when the bytes need a GPU synchronization.
+bool ShaderTryReadGuest(uint64_t vaddr, void* dst, uint64_t size);
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 

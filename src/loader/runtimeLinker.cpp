@@ -15,6 +15,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/shader.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -665,6 +666,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
+		}
+		// SRT walker loads that only share a page with GPU-written bytes: read the dword from the
+		// unprotected backing view instead of synchronizing the whole page with the GPU.
+		if (access == GpuAccess::Read) {
+			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+			        info->exception_address)) {
+				uint32_t value = 0;
+				if (Libs::Graphics::ShaderTryReadGuest(info->access_violation_vaddr, &value,
+				                                       sizeof(value))) {
+					Loader::X64InstructionEmulator::CompleteLoad32(info->native_context, length,
+					                                               value);
+					return true;
+				}
+			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);

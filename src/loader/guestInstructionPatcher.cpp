@@ -927,9 +927,10 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
-		// Local tuning knob: KYTY_AMD_SKIP_RSQRT keeps VRSQRTPS on the host's precision, so
-		// --amd-cpu only removes the SSE4a/RDPID/CLWB traps.
-		static const bool skip_rsqrt = std::getenv("KYTY_AMD_SKIP_RSQRT") != nullptr;
+		// Local default: keep VRSQRTPS on the host's precision (as without --amd-cpu) so
+		// --amd-cpu only removes the SSE4a/RDPID/CLWB traps; trapping 1,088 VRSQRTPS sites costs
+		// far more than it buys in Astro Bot. KYTY_AMD_TRAP_RSQRT=1 restores AMD-exact results.
+		static const bool skip_rsqrt = std::getenv("KYTY_AMD_TRAP_RSQRT") == nullptr;
 		if (!skip_rsqrt && instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
 		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
 		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&

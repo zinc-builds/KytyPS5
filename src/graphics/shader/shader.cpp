@@ -1,5 +1,7 @@
 #include "graphics/shader/shader.h"
 
+#include <array>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -156,6 +158,24 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 			info.buffers_num++;
 		}
 		destination.buffer_index = bi;
+	}
+}
+
+static ShaderGuestReader g_guest_reader = nullptr;
+
+void ShaderSetGuestReader(ShaderGuestReader reader) {
+	g_guest_reader = reader;
+}
+
+bool ShaderTryReadGuest(uint64_t vaddr, void* dst, uint64_t size) {
+	return g_guest_reader != nullptr && g_guest_reader(vaddr, dst, size);
+}
+
+// Copies guest memory through the installed reader, or directly when there is none.
+static void ShaderReadGuest(const uint32_t* src, uint32_t* dst, size_t dwords) {
+	const auto vaddr = reinterpret_cast<uint64_t>(src);
+	if (g_guest_reader == nullptr || !g_guest_reader(vaddr, dst, dwords * sizeof(uint32_t))) {
+		std::memcpy(dst, src, dwords * sizeof(uint32_t));
 	}
 }
 
@@ -322,7 +342,25 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
+		// Copy the attribute and V# tables once: reading them in place faults whenever a small
+		// GPU-written buffer shares their page, and each fault waits for the GPU.
+		uint32_t max_semantic = 0;
+		for (const auto& in: metadata.input_semantics) {
+			max_semantic = std::max<uint32_t>(max_semantic, in.semantic);
+		}
+		std::array<uint32_t, 256>                                   attrib_copy {};
+		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4u> buffer_copy {};
+		if (!metadata.input_semantics.empty()) {
+			ShaderReadGuest(attrib, attrib_copy.data(), max_semantic + 1u);
+			uint32_t max_index = 0;
+			for (const auto& in: metadata.input_semantics) {
+				max_index = std::max<uint32_t>(max_index, attrib_copy[in.semantic] & 0x1fu);
+			}
+			EXIT_NOT_IMPLEMENTED(max_index >= ShaderVertexInputInfo::RES_MAX);
+			ShaderReadGuest(buffer, buffer_copy.data(), (max_index + 1u) * 4u);
+		}
+		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib_copy.data(),
+		                           buffer_copy.data());
 		ShaderDetectBuffers(info);
 	}
 	return true;

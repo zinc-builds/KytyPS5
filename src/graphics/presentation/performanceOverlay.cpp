@@ -845,12 +845,12 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			}
 			std::printf("PERF fps=%.1f frame_ms=%.1f worst_ms=%.1f low1=%.1f draws_frame=%.0f "
 			            "draws_s=%.0f gpu_wait_ms_s=%.0f waits_s=%.0f wt_faults_s=%.0f "
-			            "dispatches_frame=%.0f threads:%s\n",
+			            "dispatches_frame=%.0f sigill_s=%.0f threads:%s\n",
 			            shown.fps, shown.frame_ms, shown.max_frame_ms, shown.low_fps,
 			            Rate(shown, Counter::Draws) / fps, Rate(shown, Counter::Draws),
 			            Rate(shown, Counter::GpuWaitNs) / 1e6, Rate(shown, Counter::GpuWaits),
 			            Rate(shown, Counter::GpuFaults), Rate(shown, Counter::Dispatches) / fps,
-			            thrds.c_str());
+			            Rate(shown, Counter::EmulatedInstructions), thrds.c_str());
 			std::fflush(stdout);
 		}
 	}

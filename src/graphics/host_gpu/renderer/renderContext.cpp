@@ -3,11 +3,18 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics {
+
+namespace {
+RenderContext* g_shader_reader_context = nullptr;
+} // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -17,9 +24,21 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	g_shader_reader_context = this;
+	ShaderSetGuestReader([](uint64_t vaddr, void* dst, uint64_t size) -> bool {
+		auto* context = g_shader_reader_context;
+		static const bool disabled = std::getenv("KYTY_NO_SHADER_FASTREAD") != nullptr;
+		if (disabled || context == nullptr || !GuestGpu::IsGpuThread() ||
+		    context->GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+			return false; // read in place: GPU-written bytes must be synchronized first
+		}
+		return LibKernel::Memory::CopySparseMemory(vaddr, dst, size);
+	});
 }
 
 RenderContext::~RenderContext() {
+	ShaderSetGuestReader(nullptr);
+	g_shader_reader_context = nullptr;
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }

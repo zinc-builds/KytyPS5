@@ -21,6 +21,101 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <mutex>
+#include <unordered_map>
+
+// Local diagnostic (KYTY_FAULT_DIAG=1): remember recent GPU-written buffer ranges and their
+// callers, and report which one covered each CPU read that had to download GPU data.
+namespace {
+struct WrittenRange {
+	uint64_t vaddr;
+	uint64_t size;
+	uint64_t caller;
+	uint64_t count;
+};
+std::unordered_map<uint64_t, WrittenRange> g_written_pages; // 4 KiB page -> last writable bind
+std::vector<WrittenRange>                  g_written_big;   // binds over 4 MiB, latest first
+std::mutex                                 g_written_mutex;
+bool FaultDiag() {
+	static const bool on = std::getenv("KYTY_FAULT_DIAG") != nullptr;
+	return on;
+}
+uint64_t CallerOffset(void* ra) {
+	Dl_info info {};
+	return dladdr(ra, &info) != 0 ? reinterpret_cast<uint64_t>(ra) -
+	                                    reinterpret_cast<uint64_t>(info.dli_fbase)
+	                              : reinterpret_cast<uint64_t>(ra);
+}
+void NoteWritten(uint64_t vaddr, uint64_t size, void* ra, void* /*ra2*/) {
+	const uint64_t caller = CallerOffset(ra);
+	std::scoped_lock lock(g_written_mutex);
+	if (size > (4ull << 20u)) {
+		for (auto& r: g_written_big) {
+			if (r.vaddr == vaddr && r.size == size) {
+				r.count++;
+				r.caller = caller;
+				return;
+			}
+		}
+		g_written_big.insert(g_written_big.begin(), {vaddr, size, caller, 1});
+		if (g_written_big.size() > 256) {
+			g_written_big.pop_back();
+		}
+		return;
+	}
+	for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1) >> 12u; page++) {
+		auto& r = g_written_pages[page];
+		r       = {vaddr, size, caller, r.count + 1};
+	}
+}
+void ReportRead(uint64_t vaddr, uint64_t size, bool gpu_thread, double ms, bool downloaded) {
+	static std::atomic<uint64_t> count {0};
+	const auto n = count.fetch_add(1);
+	if (n > 400 && (n % 100) != 0) {
+		return;
+	}
+	WrittenRange hit {};
+	{
+		std::scoped_lock lock(g_written_mutex);
+		if (auto it = g_written_pages.find(vaddr >> 12u); it != g_written_pages.end()) {
+			hit = it->second;
+		} else {
+			for (const auto& r: g_written_big) {
+				if (vaddr >= r.vaddr && vaddr < r.vaddr + r.size) {
+					hit = r;
+					break;
+				}
+			}
+		}
+	}
+	char stack[160] = "";
+	{
+		void* frames[12];
+		const int depth = backtrace(frames, 12);
+		size_t    used  = 0;
+		for (int i = 3; i < depth && used + 20 < sizeof(stack); i++) {
+			used += static_cast<size_t>(std::snprintf(stack + used, sizeof(stack) - used, "%llx,",
+			                                          static_cast<unsigned long long>(CallerOffset(frames[i]))));
+		}
+	}
+	std::printf("FAULTDIAG stack=%s n=%llu read=0x%llx size=%llu gpu_thread=%d dl=%d ms=%.3f written=0x%llx+0x%llx "
+	            "caller=0x%llx binds=%llu\n",
+	            stack, static_cast<unsigned long long>(n), static_cast<unsigned long long>(vaddr),
+	            static_cast<unsigned long long>(size), gpu_thread ? 1 : 0, downloaded ? 1 : 0, ms,
+	            static_cast<unsigned long long>(hit.vaddr), static_cast<unsigned long long>(hit.size),
+	            static_cast<unsigned long long>(hit.caller), static_cast<unsigned long long>(hit.count));
+	std::fflush(stdout);
+}
+} // namespace
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
@@ -296,12 +391,21 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+#if defined(__linux__)
+	const bool diag       = FaultDiag();
+	const bool gpu_thread = GuestGpu::IsGpuThread();
+	const auto diag_start = std::chrono::steady_clock::now();
+	bool       downloaded = false;
+#endif
+	m_scheduler.Context().GetGpu().SendCommandSync([&, this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 		if (IsRegionGpuModified(vaddr, size)) {
+#if defined(__linux__)
+			downloaded = true;
+#endif
 			const auto start =
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
@@ -315,6 +419,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			QueueBdaSync(vaddr, size);
 		}
 	});
+#if defined(__linux__)
+	if (diag) {
+		ReportRead(vaddr, size, gpu_thread,
+		           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+		                                                     diag_start)
+		               .count(),
+		           downloaded);
+	}
+#endif
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -510,6 +623,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+#if defined(__linux__)
+		if (FaultDiag()) {
+			NoteWritten(vaddr, size, __builtin_return_address(0), nullptr);
+		}
+#endif
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
