@@ -168,6 +168,10 @@ struct GpuTimer {
 };
 GpuTimer g_timer;
 
+// The last pipeline bound per recording buffer and bind point (bind_pipeline_repeat).
+std::mutex                                                   g_bind_mutex;
+std::map<std::pair<VkCommandBuffer, int>, VkPipeline> g_last_bind;
+
 // KYTY_GPU_TIME=passes: timestamps around each render pass and dispatch, in a chunk of queries
 // per scheduler command buffer, to split GPU time by kind and find the costliest passes.
 struct PassTimer {
@@ -179,6 +183,7 @@ struct PassTimer {
 		uint32_t draws = 0, width = 0, height = 0, colors = 0;
 	};
 	struct Chunk {
+		bool                 owned   = false; // a recording buffer writes it
 		bool                 pending = false;
 		uint32_t             used    = 0;
 		std::vector<Segment> segments;
@@ -414,10 +419,8 @@ void InstallCommandCounters() {
 			Count(BindPipeline);
 			{
 				// Same pipeline as the last bind on this buffer and bind point.
-				static std::mutex                                                 mutex;
-				static std::map<std::pair<VkCommandBuffer, int>, VkPipeline> last;
-				std::lock_guard lock(mutex);
-				auto& previous = last[{buffer, static_cast<int>(point)}];
+				std::lock_guard lock(g_bind_mutex);
+				auto& previous = g_last_bind[{buffer, static_cast<int>(point)}];
 				if (previous == pipeline) Count(BindPipelineRepeat);
 				previous = pipeline;
 			}
@@ -445,6 +448,11 @@ void InstallCommandCounters() {
 #undef KYTY_COUNT_DISPATCH
 
 void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBuffer buffer) {
+	{
+		std::lock_guard bind_lock(g_bind_mutex);
+		g_last_bind.erase({buffer, static_cast<int>(VK_PIPELINE_BIND_POINT_GRAPHICS)});
+		g_last_bind.erase({buffer, static_cast<int>(VK_PIPELINE_BIND_POINT_COMPUTE)});
+	}
 	auto&           timer = g_timer;
 	std::lock_guard lock(timer.mutex);
 	if (!timer.initialized) {
@@ -467,11 +475,18 @@ void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBu
 		return;
 	}
 	if (g_passes.enabled) {
-		const auto chunk = g_passes.next;
-		g_passes.next    = (g_passes.next + 1) % PassTimer::Chunks;
-		PassCollect(chunk);
-		buffer.resetQueryPool(g_passes.pool, chunk * PassTimer::ChunkQueries, PassTimer::ChunkQueries);
-		g_passes.active[buffer] = chunk;
+		// The next chunk no recording buffer owns; none free: this buffer goes untimed.
+		for (uint32_t tried = 0; tried < PassTimer::Chunks; tried++) {
+			const auto chunk = g_passes.next;
+			g_passes.next    = (g_passes.next + 1) % PassTimer::Chunks;
+			if (g_passes.chunks[chunk].owned) continue;
+			PassCollect(chunk);
+			buffer.resetQueryPool(g_passes.pool, chunk * PassTimer::ChunkQueries,
+			                      PassTimer::ChunkQueries);
+			g_passes.chunks[chunk].owned = true;
+			g_passes.active[buffer]      = chunk;
+			break;
+		}
 	}
 	const auto slot = timer.next;
 	timer.next      = (timer.next + 1) % static_cast<uint32_t>(timer.pending.size());
@@ -491,9 +506,14 @@ void EndCommandBuffer(vk::CommandBuffer buffer) {
 	const auto slot = found->second;
 	timer.active.erase(found);
 	if (const auto pass = g_passes.active.find(buffer); pass != g_passes.active.end()) {
+		// Still inside a render pass (End() closes it after this hook): stamp its end here.
+		if (const auto open = g_passes.open_pass.find(buffer); open != g_passes.open_pass.end()) {
+			g_passes.chunks[pass->second].segments[open->second].end = PassStamp(buffer);
+			g_passes.open_pass.erase(open);
+		}
 		g_passes.chunks[pass->second].pending = true;
+		g_passes.chunks[pass->second].owned   = false;
 		g_passes.active.erase(pass);
-		g_passes.open_pass.erase(buffer);
 	}
 	buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer.pool, slot * 2 + 1);
 	timer.pending[slot] = true;
