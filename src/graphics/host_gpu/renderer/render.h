@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -157,6 +158,12 @@ public:
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
+	// Draws whose only shader buffer writes are atomics to buffers they access no other way
+	// share one write barrier: consecutive ones skip the barriers (and render pass breaks) around
+	// each draw. This records the batch's deferred closing barrier.
+	void FlushAtomicWrites(CommandBuffer& buffer);
+	[[nodiscard]] bool HasAtomicWrites() const { return static_cast<bool>(m_atomic_batch.stages); }
+
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
 	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -209,7 +216,16 @@ private:
 		bool    unclamped    = false;
 	};
 
+	// Guest ranges since the batch's opening barrier: written by its atomics, and accessed in
+	// other ways by draws between them.
+	struct AtomicWriteBatch {
+		vk::PipelineStageFlags stages;
+		RangeSet               atomic;
+		RangeSet               plain;
+	};
+
 	RenderContext&                        m_context;
+	AtomicWriteBatch                      m_atomic_batch;
 	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;

@@ -5370,7 +5370,7 @@ void TestComputeBufferFill() {
 
 void TestDenseBufferTracking() {
   Fixture fixture;
-  std::array<Value, 8> userdata;
+  std::array<Value, 12> userdata;
   for (uint32_t index = 0; index < userdata.size(); index++) {
     userdata[index] = fixture.UserData(index);
   }
@@ -5378,6 +5378,8 @@ void TestDenseBufferTracking() {
       fixture.Buffer({userdata[0], userdata[1], userdata[2], userdata[3]}, 4);
   const auto second =
       fixture.Buffer({userdata[4], userdata[5], userdata[6], userdata[7]}, 28);
+  const auto third =
+      fixture.Buffer({userdata[8], userdata[9], userdata[10], userdata[11]}, 40);
 
   MemoryInfo load_info;
   load_info.kind = ResourceKind::Buffer;
@@ -5406,17 +5408,28 @@ void TestDenseBufferTracking() {
   fixture.Emit(ValueOpcode::LoadBufferU32,
                {second, Value(0u), Value(0u), Value(0u), Value(true)},
                other_flags);
+  // A buffer accessed only by atomics.
+  auto counter_info = atomic_info;
+  counter_info.formatted = false;
+  const auto counter_flags = fixture.AddMemory(counter_info, 40);
+  fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+               {third, Value(0u), Value(0u), Value(1u), Value(0u), Value(true)},
+               counter_flags);
   fixture.PlanAndTrack();
 
-  Check(fixture.program.info.buffers.size() == 2,
+  Check(fixture.program.info.buffers.size() == 3,
         "typed buffer sources were not densely interned");
-  Check(fixture.program.descriptor_sources.size() == 2,
+  Check(fixture.program.descriptor_sources.size() == 3,
         "descriptor source table did not match dense topology");
   const auto &resource = fixture.program.info.buffers[0];
   Check(resource.read && resource.written && resource.atomic &&
             resource.formatted && resource.max_byte_extent == 16 &&
             resource.first_use_pc == 4,
         "buffer access facts were not merged");
+  const auto &counter = fixture.program.info.buffers[2];
+  Check(resource.plain_access && fixture.program.info.buffers[1].plain_access &&
+            counter.atomic && counter.written && !counter.plain_access,
+        "atomic-only buffer access was not distinguished from plain access");
   Check(first.Instruction()->Flags<uint32_t>() == 0 &&
             second.Instruction()->Flags<uint32_t>() == 1,
         "typed handles were not assigned dense indices");

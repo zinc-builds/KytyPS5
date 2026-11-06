@@ -1189,6 +1189,88 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
+	if (shader_write_stages || HasAtomicWrites()) {
+		// Guest ranges of the draw's buffer accesses: atomics to buffers the stage accesses only
+		// atomically, and everything else. Raw address or indirect accesses have no known range.
+		bool                                       known       = true;
+		bool                                       plain_write = false;
+		std::vector<std::pair<uint64_t, uint64_t>> atomic;
+		std::vector<std::pair<uint64_t, uint64_t>> plain;
+		for (const auto* stage: stages) {
+			const auto& program = stage->runtime->module->info;
+			known = known && !program.has_address_writes && !program.info.uses_dma;
+			for (const auto& meta: program.info.buffers) {
+				known = known && meta.indirect_root == ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
+				        meta.indirect_resources.empty();
+				if (meta.descriptor_index == UINT32_MAX ||
+				    meta.descriptor_index >= stage->buffer_sources.size()) {
+					continue;
+				}
+				const auto& source = stage->buffer_sources[meta.descriptor_index];
+				if (source.size == 0) {
+					continue;
+				}
+				if (meta.atomic && !meta.plain_access) {
+					atomic.emplace_back(source.address, source.size);
+				} else {
+					plain.emplace_back(source.address, source.size);
+					plain_write = plain_write || meta.written;
+				}
+			}
+		}
+		if (!mesh_active) {
+			const auto& vs = state.vertex_info[0];
+			for (int i = 0; i < vs.buffers_num; i++) {
+				if (const auto size = VertexBufferDescriptorSize(i, vs); size != 0) {
+					plain.emplace_back(vs.buffers[i].addr, size);
+				}
+			}
+		}
+		if (index_source.address != 0 && index_source.size != 0) {
+			plain.emplace_back(index_source.address,
+			                   index_source.host_data != nullptr
+			                       ? uint64_t {draw.index_count} * index_source.guest_element_size
+			                       : index_source.size);
+		}
+		if (args_buffer.first != nullptr) {
+			plain.emplace_back(emit.indirect.address,
+			                   static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+			                       (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+			                                     : sizeof(vk::DrawIndirectCommand)));
+		}
+		const bool atomic_draw = shader_write_stages && known && !plain_write && !atomic.empty();
+		auto&      batch       = m_atomic_batch;
+		if (HasAtomicWrites()) {
+			// Plain accesses must see the batch's writes; new atomics must follow earlier
+			// plain accesses (the batch skipped their write-after-read barrier).
+			bool conflict = !known || plain_write;
+			for (const auto& [address, size]: plain) {
+				conflict = conflict || batch.atomic.Intersects(address, size);
+			}
+			for (const auto& [address, size]: atomic) {
+				conflict = conflict || (atomic_draw && batch.plain.Intersects(address, size));
+			}
+			if (conflict) {
+				FlushAtomicWrites(buffer);
+			}
+		}
+		if (atomic_draw) {
+			if (!HasAtomicWrites()) {
+				buffer.EndRendering();
+				ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+			}
+			batch.stages |= shader_write_stages;
+			for (const auto& [address, size]: atomic) {
+				batch.atomic.Add(address, size);
+			}
+			shader_write_stages = {};
+		}
+		if (HasAtomicWrites()) {
+			for (const auto& [address, size]: plain) {
+				batch.plain.Add(address, size);
+			}
+		}
+	}
 	if (shader_write_stages) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory.
 		buffer.EndRendering();
@@ -1262,6 +1344,15 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	}
 	const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(ucfg.GetIndexOffset(), vs);
 	return DrawEmitInfo {vertex_offset + first_vertex, instance_offset};
+}
+
+void RenderExecutor::FlushAtomicWrites(CommandBuffer& buffer) {
+	if (!HasAtomicWrites()) {
+		return;
+	}
+	buffer.EndRendering();
+	ShaderWriteBarrier(buffer.Handle(), m_atomic_batch.stages);
+	m_atomic_batch = {};
 }
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {

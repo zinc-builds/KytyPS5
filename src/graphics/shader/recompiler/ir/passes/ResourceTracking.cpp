@@ -4089,6 +4089,7 @@ private:
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
 		resource.atomic          = resource.atomic || atomic;
+		resource.plain_access    = resource.plain_access || !atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
 		                           memory.kind == ResourceKind::ScalarBuffer;
