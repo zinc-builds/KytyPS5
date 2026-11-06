@@ -23,7 +23,8 @@ echo quit > /tmp/vpad.fifo                      # remove the virtual pad when do
 - `batch.sh` — runs `<label> [ENV=VAL…] -- [flags…]` lines back to back.
 - `symbolize.py`, `chains.py` — map perf addresses of this stripped PIE through
   `_Build/linux/kyty_emulator_clang_lld.map` (perf report prints file offsets; vaddr = offset +
-  0x1000; for `perf script` addresses subtract the load base from the r-xp mapping).
+  0x1000; for `perf script` runtime addresses pass the load base = r-xp mapping start − (its file
+  offset + 0x1000), e.g. from `/proc/<pid>/maps` or `perf script --show-mmap-events`).
 - `faultsum.py` — summarise `KYTY_FAULT_DIAG=1` output. `offcpu.py` — off-CPU time from
   `perf record -e sched:sched_switch` (needs root for tracepoints).
 - `patches/` — emk530/issue #745 game patches (NoRT, GI probes) for `--game-patch`; no CPU gain.
