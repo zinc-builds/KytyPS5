@@ -2,6 +2,9 @@
 # Run several garden.sh configurations back to back. Each line of the input:
 #   <label> [ENV=VALUE ...] -- [emulator flags...]
 # Results are appended to /tmp/bench-batch.txt.
+# Holds the exclusive bench lock for the whole batch (see benchlock.sh).
+. "$(dirname "$0")/benchlock.sh"
+benchlock_acquire x "batch.sh" || exit 1
 while read -r line; do
 	[ -z "$line" ] && continue
 	label=${line%% *}; rest=${line#"$label"}

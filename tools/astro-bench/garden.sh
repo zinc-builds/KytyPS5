@@ -5,6 +5,9 @@
 # Result: /tmp/bench-<label>.log and a summary line on stdout.
 label=$1
 shift
+# Exclusive host-wide lock; the emulator inherits it (see benchlock.sh).
+. "$(dirname "$0")/benchlock.sh"
+benchlock_acquire x "garden.sh $label" || exit 1
 log=/tmp/bench-$label.log
 pad() { echo "$*" > /tmp/vpad.fifo; }
 wait_s() { timeout "$1" tail -f /dev/null; }
