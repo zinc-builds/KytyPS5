@@ -8245,7 +8245,7 @@ void TestMeshInputAssembly() {
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
     const uint32_t draw[] = {test.count, test.base_vertex, test.width,
-                             test.address_low, 0x12};
+                             test.address_low, 0x12, 0};
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {

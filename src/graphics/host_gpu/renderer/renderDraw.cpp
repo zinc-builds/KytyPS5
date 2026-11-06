@@ -1047,6 +1047,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto& mesh          = state.vertex_info[0].mesh;
 	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
 	uint32_t    mesh_groups   = 0;
+	uint32_t    mesh_instance_slice = 0;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.indexed || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
@@ -1069,10 +1070,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			return;
 		}
 		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
+		// Instances beyond the host limits are drawn in slices below.
+		mesh_instance_slice = std::min(limits.maxMeshWorkGroupCount[1],
+		                               limits.maxMeshWorkGroupTotalCount / mesh_groups);
+		if (mesh_groups > limits.maxMeshWorkGroupCount[0] || mesh_instance_slice == 0) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
@@ -1200,7 +1201,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		for (uint32_t done = 0; done < draw.instance_count;) {
+			if (done != 0) {
+				vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+				                        PushData::MeshInstanceSliceDword * sizeof(uint32_t),
+				                        sizeof(done), &done);
+			}
+			const auto count = std::min(mesh_instance_slice, draw.instance_count - done);
+			vk_buffer.drawMeshTasksEXT(mesh_groups, count, 1);
+			done += count;
+		}
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	} else if (draw.indexed) {
