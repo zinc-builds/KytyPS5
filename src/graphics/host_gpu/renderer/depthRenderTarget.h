@@ -61,6 +61,19 @@ inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
 	}
 }
 
+// Whether a depth/stencil attachment layout keeps the aspect read-only.
+inline bool DepthReadOnly(vk::ImageLayout layout) {
+	return layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
+}
+
+inline bool StencilReadOnly(vk::ImageLayout layout) {
+	return layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+}
+
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 	const auto writes        = depth.AttachmentWriteAspects();

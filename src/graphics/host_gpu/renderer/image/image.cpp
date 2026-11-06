@@ -120,6 +120,51 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+constexpr vk::AccessFlags2 ReadAccess =
+    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderSampledRead |
+    vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eColorAttachmentRead |
+    vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eInputAttachmentRead |
+    vk::AccessFlagBits2::eTransferRead;
+
+// Accesses that only read.
+static bool OnlyReads(vk::AccessFlags2 access) {
+	return access && !(access & ~ReadAccess);
+}
+
+// Moves one tracked state to the destination. Returns whether that needs a barrier and fills its
+// synchronization and layout fields. A barrier into a read-only access makes earlier writes
+// visible to every read, so later readers of the same layout need none.
+static bool Advance(VulkanImageState& state, vk::ImageLayout destination_layout,
+                    vk::AccessFlags2 destination_access, vk::PipelineStageFlags2 destination_stage,
+                    vk::ImageMemoryBarrier2& barrier) {
+	constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
+	                              vk::AccessFlagBits2::eShaderWrite |
+	                              vk::AccessFlagBits2::eMemoryWrite;
+	const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
+	if (state.layout == destination_layout && state.access_mask == destination_access &&
+	    !repeated_write) {
+		return false;
+	}
+	if (state.layout == destination_layout && state.reads_visible &&
+	    OnlyReads(state.access_mask) && OnlyReads(destination_access)) {
+		// Later writers wait for every reader of the layout.
+		state.pl_stage |= destination_stage;
+		state.access_mask |= destination_access;
+		return false;
+	}
+	const bool reads_visible = OnlyReads(destination_access);
+	barrier.srcStageMask     = state.pl_stage;
+	barrier.srcAccessMask    = state.access_mask;
+	barrier.dstStageMask  = reads_visible ? vk::PipelineStageFlagBits2::eAllCommands : destination_stage;
+	barrier.dstAccessMask = reads_visible ? ReadAccess : destination_access;
+	barrier.oldLayout     = state.layout;
+	barrier.newLayout     = destination_layout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	state = {destination_stage, destination_access, destination_layout, reads_visible};
+	return true;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -150,24 +195,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
 				const auto index = level * info.resources.layers + layer;
 				EXIT_IF(index >= subresource_states.size());
-				auto& subresource_state = subresource_states[index];
-
-				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
-				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
-				const bool     repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
-				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
-					vk::ImageMemoryBarrier2 barrier {};
-					barrier.srcStageMask                    = subresource_state.pl_stage;
-					barrier.srcAccessMask                   = subresource_state.access_mask;
-					barrier.dstStageMask                    = destination_stage;
-					barrier.dstAccessMask                   = destination_access;
-					barrier.oldLayout                       = subresource_state.layout;
-					barrier.newLayout                       = destination_layout;
-					barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-					barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+				vk::ImageMemoryBarrier2 barrier {};
+				if (Advance(subresource_states[index], destination_layout, destination_access,
+				            destination_stage, barrier)) {
 					barrier.image                           = backing.image;
 					barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
 					barrier.subresourceRange.baseMipLevel   = level;
@@ -175,33 +205,28 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
-					subresource_state = {destination_stage, destination_access, destination_layout};
 				}
 			}
 		}
 
-		if (!partial) {
+		if (partial) {
+			state = {destination_stage, destination_access, destination_layout};
+		} else {
+			// Every subresource is now in the destination layout: keep the union of their
+			// readers, so later barriers still wait for all of them.
+			state = {vk::PipelineStageFlags2 {}, vk::AccessFlags2 {}, destination_layout, true};
+			for (const auto& subresource_state: subresource_states) {
+				state.pl_stage |= subresource_state.pl_stage;
+				state.access_mask |= subresource_state.access_mask;
+				state.reads_visible = state.reads_visible && subresource_state.reads_visible;
+			}
 			subresource_states.clear();
 		}
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		vk::ImageMemoryBarrier2 barrier {};
+		if (!Advance(state, destination_layout, destination_access, destination_stage, barrier)) {
 			return {};
 		}
-
-		vk::ImageMemoryBarrier2 barrier {};
-		barrier.srcStageMask                    = state.pl_stage;
-		barrier.srcAccessMask                   = state.access_mask;
-		barrier.dstStageMask                    = destination_stage;
-		barrier.dstAccessMask                   = destination_access;
-		barrier.oldLayout                       = state.layout;
-		barrier.newLayout                       = destination_layout;
-		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 		barrier.image                           = backing.image;
 		barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
 		barrier.subresourceRange.baseMipLevel   = 0;
@@ -214,11 +239,11 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	// Resident heaps sample their images in the read state; only leaving it invalidates them.
 	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
 		    return barrier.oldLayout == ReadLayout() &&
-		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
+		           (barrier.srcAccessMask & vk::AccessFlagBits2::eShaderRead) &&
+		           OnlyReads(barrier.srcAccessMask);
 	    })) {
 		HeapChanged();
 	}
-	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
 

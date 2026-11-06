@@ -35,6 +35,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-06 | SRT walker reads read-watched pages without faulting | 17.65 / 17.98 | 101.6k / 102.6k | 69.0 (max 99.4) | 14.3 |
 | 2026-11-06 | Atomic-only shader writes share one barrier per batch | 18.92 / 19.18 | 107.6k / 108.4k | 66.2 (max 85.0) | 14.4 |
 | 2026-11-06 | Stream copies reused within a guest-sync epoch (same batch: merge-base 18.67 / 19.32) | 19.88 / 20.28 | 111.6k / 113.4k | 59.9 (max 100.0) | 16.1 |
+| 2026-11-06 | Read-only depth attachments; no barrier for read after read (A/B, same batch: ref 18.71 / 18.99) | 18.48 / 18.91 | 105.6k / 107.2k | 67.1 (max 98.7) | 14.7 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -175,6 +176,27 @@ ms/frame, barriers ~2,900 → ~2,000 and render passes ~1,000 → ~500 per frame
 An unsafe experiment that skipped these barriers outright gave the same FPS, so batching loses
 nothing.
 
+**Read-only depth and read-after-read (landed).** `KYTY_VK_COUNT=1` (now in the tree, with
+`KYTY_GPU_TIME=1`) breaks image barriers down by layout pair. The largest pair was
+`DEPTH_STENCIL_READ_ONLY → DEPTH_STENCIL_READ_ONLY` at ~415 per frame: a depth buffer
+alternately sampled and bound as a read-only depth attachment, where only the access mask
+changed. Changes:
+- Attachments in a read-only depth/stencil layout use `STORE_OP_NONE` and read-only access.
+- A barrier into a read-only access makes earlier writes visible to all read types at all
+  stages.
+- `Image::GetBarriers` then skips barriers for further reads in the same layout, merging their
+  stages and accesses so a later writer waits for every reader.
+- Collapsing per-subresource states keeps the union of their readers.
+
+Measured with diagnostics builds, same scene:
+
+| Build | GPU time | Image barriers | Render passes |
+|---|---|---|---|
+| Before | 21.6 ms/frame | ~17.3k/s | ~430/frame |
+| After | 19.8 ms/frame | ~7k/s | ~180/frame |
+
+FPS is unchanged (A/B in one batch), because the command thread still limits.
+
 **Ruled out: a reader-distributed lock for the guest address space and backing store.**
 `pthread_rwlock_rdunlock` showed 8% self time on the GPU thread, under `CopySparseMemory` from
 stream-buffer uploads. Replacing both `shared_mutex`es with per-thread-slot reader counts gave
@@ -275,6 +297,31 @@ scan of a clean 1 GiB costs 0.15 ms, and 0.27 ms after 5,000 written pages. Writ
 the backing alias are not reported, as now. This replaces fault-time notification with a scan at
 guest-sync points. The guest-sync contract that makes C1a safe makes that sufficient too.
 
+### Notes for Tracks B and C (from the Track A agent, 2026-11-06)
+
+Track B (draw state cache):
+- Profile on `dev` 5864233b (perf LBR, GPU thread, on-CPU share). `GetGraphicsPrograms` 24%,
+  of which `MaterializeResources` 16.5% and the JIT walker code ~10%. Walker time is mostly
+  loads of guest tables freshly written by other cores. `ResolveTexture` 17.5%: `FindImage`
+  13.4%, `ExactImageKey` hashing ~6–10%, `FindTextureDescription` 5.4%.
+  `ResolveRenderColorTarget` 6.7%, `ResolveRenderDepthTarget` 2.3%, `CommitBindings` 5.3%, the
+  NVIDIA driver 8.3%.
+- Tracy: `DrawIndex` 7.7 µs mean over ~97k draws/s, about 75% of wall time.
+- `FindImage` already caches exact keys (`m_exact_images` with registration generations). A
+  memo of the result in each `m_texture_descriptions` entry, revalidated with
+  `RegistrationsSince`, would skip the `ExactImageKey` build and hash.
+- Not measured: whether user SGPRs (SRT pointers) repeat frame to frame (B0).
+
+Track C (guest memory):
+- `CopySparseMemory` from `ObtainBuffer`'s stream path (CPU-modified, read-only, ≤ one caching
+  page) is 11–15% of the GPU thread. A lock rewrite didn't help (above). The cost is the memcpy
+  of cold, freshly written guest data into the stream buffer.
+- `pthread_rwlock_*` samples there are cache misses on the lock line plus the copy itself.
+- Write-tracking faults: ~140–150k/s. `PrepareBda` uploads: ~700 `SynchronizeBuffersInRange`
+  calls/s (earlier measurement).
+- Frame delta (#1931): the upstream issue has no technical analysis; replies point to forks and
+  VRAM. Nothing was measured yet.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
@@ -283,6 +330,8 @@ guest-sync points. The guest-sync contract that makes C1a safe makes that suffic
   `SDL_VIDEO_DRIVER=x11`), and on X11 the emulator dies silently right after device creation.
   It is also launched by absolute path, so `^\./kyty_emulator` patterns miss it; match
   `^[^ ]*kyty_emulator --game`.
+- Vulkan synchronization validation was not run: installing `vulkan-validation-layers` needs
+  root, and the prompt went unanswered.
 - GPU metrics need admin (`RmProfilingAdminOnly=1`). They are device-wide, so a root `nsys`
   sampling `sleep N` works while the emulator runs as the user.
 - Keep a copy of `kyty_emulator_clang_lld.map` with each perf capture. A rebuild overwrites it

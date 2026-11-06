@@ -61,7 +61,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	depth.imageLayout = depth_stencil.image_layout;
 	depth.loadOp =
 	    depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	depth.storeOp                       = vk::AttachmentStoreOp::eStore;
+	// An aspect the layout keeps read-only has nothing to store: STORE_OP_NONE keeps the
+	// attachment a read, so sampling it alongside needs no barrier.
+	depth.storeOp = DepthReadOnly(depth_stencil.image_layout) ? vk::AttachmentStoreOp::eNone
+	                                                          : vk::AttachmentStoreOp::eStore;
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
 	vk::RenderingAttachmentInfo stencil {};
@@ -69,7 +72,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.imageLayout = depth_stencil.image_layout;
 	stencil.loadOp =
 	    depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
+	stencil.storeOp = StencilReadOnly(depth_stencil.image_layout) ? vk::AttachmentStoreOp::eNone
+	                                                              : vk::AttachmentStoreOp::eStore;
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
 	vk::RenderingInfo rendering {};
