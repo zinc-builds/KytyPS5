@@ -179,6 +179,35 @@ private:
 	FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
 	                       const ShaderRecompiler::IR::DescriptorValue& value);
 
+	// A stage image slot's last resolve, reused while its descriptor is unchanged and the texture
+	// cache would find the same image.
+	struct TextureResolveMemo {
+		// The resource fields a resolve reads (TextureDescriptionInputs) and the T#.
+		ShaderRecompiler::IR::ImageResource   inputs;
+		ShaderRecompiler::IR::DescriptorValue value;
+		TextureBinding                        binding; // Without mip views.
+		bool                                  reusable = false;
+		bool                                  null     = false;
+		// Otherwise what FindImage returned, for TextureCache::RefindExactImage.
+		ImageId                 found_id;
+		GuestRange              data;
+		uint64_t                generation          = 0;
+		uint32_t                metadata_base_layer = 0;
+		bool                    color_clear         = false;
+		TextureCache::ImageDesc found; // With color_clear.
+	};
+	// ResolveTexture that records in `trace` whether and how its result can be reused.
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            TextureResolveMemo*                          trace);
+	// The memo slots of a stage module's images.
+	[[nodiscard]] std::vector<TextureResolveMemo>& TextureMemoSlots(const ShaderModule& module);
+	// ResolveTexture for image `index` of a stage, through the stage's memo slots.
+	[[nodiscard]] TextureBinding ResolveStageTexture(std::vector<TextureResolveMemo>*         memo,
+	                                                 uint32_t                                 index,
+	                                                 const ShaderRecompiler::IR::ImageResource& resource,
+	                                                 const ShaderRecompiler::IR::DescriptorValue& value);
+
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -243,6 +272,12 @@ private:
 	};
 	// Descriptions by input hash; an entry is used only when its inputs compare equal.
 	std::unordered_map<uint64_t, TextureDescriptionEntry> m_texture_descriptions;
+	// Image slots of each stage module by its id: a program's modules move as it compiles more.
+	std::unordered_map<uint64_t, std::vector<TextureResolveMemo>> m_texture_memo;
+	struct TextureMemoStats {
+		uint64_t lookups = 0, hits = 0, changed = 0, stale = 0, unreusable = 0;
+		uint64_t start_ns = 0;
+	} m_texture_memo_stats;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

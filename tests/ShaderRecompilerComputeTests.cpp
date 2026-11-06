@@ -442,6 +442,23 @@ struct RenderExecutorTestAccess {
     return executor.ResolveTexture(resource, value);
   }
 
+  using TextureMemoSlots = std::vector<RenderExecutor::TextureResolveMemo>;
+  static TextureBinding
+  ResolveStageTexture(RenderExecutor &executor, TextureMemoSlots &slots,
+                      const ShaderRecompiler::IR::ImageResource &resource,
+                      const ShaderRecompiler::IR::DescriptorValue &value) {
+    slots.resize(1);
+    return executor.ResolveStageTexture(&slots, 0, resource, value);
+  }
+  static TextureMemoSlots *TextureMemoSlotsOf(RenderExecutor &executor,
+                                              const ShaderModule &module) {
+    return &executor.TextureMemoSlots(module);
+  }
+  // Marks the slot's binding so that a reuse is visible in its result.
+  static void MarkTextureMemo(TextureMemoSlots &slots) {
+    slots.at(0).binding.layout = vk::ImageLayout::ePreinitialized;
+  }
+
   static std::vector<ShaderRecompiler::IR::ImageResource>
   TextureDescriptionInputs(const RenderExecutor &executor) {
     std::vector<ShaderRecompiler::IR::ImageResource> result;
@@ -6365,6 +6382,61 @@ public:
                   TextureCacheTestAccess::QueryEpoch(texture_cache) == unrelated_epoch,
               "a registration on another page made a lookup search again");
 
+      // A stage image slot reuses its last resolve while the descriptor is the same and no
+      // image was registered or removed on its pages.
+      RenderExecutorTestAccess::TextureMemoSlots slots;
+      const auto Memo = [&](uint64_t address) {
+        return RenderExecutorTestAccess::ResolveStageTexture(executor, slots, resource,
+                                                             Value(address));
+      };
+      const auto Reused = [&](uint64_t address, ImageId expected) {
+        RenderExecutorTestAccess::MarkTextureMemo(slots);
+        const auto binding = Memo(address);
+        return binding.image_id == expected &&
+               binding.layout == vk::ImageLayout::ePreinitialized;
+      };
+      const auto memo_first = Memo(base);
+      Require(name, "memoized resolve",
+              memo_first.image_id == first.image_id &&
+                  memo_first.desc.view_info == first.desc.view_info &&
+                  Reused(base, first.image_id),
+              "a stage slot resolved an unchanged texture again");
+      (void)Resolve(base + moved_offset + 0x8000);
+      Require(name, "memo across unrelated registration", Reused(base, first.image_id),
+              "a registration on another page dropped a stage slot's resolve");
+      const auto memo_newer = TextureCacheTestAccess::InsertImage(texture_cache, first.desc.info);
+      RenderExecutorTestAccess::MarkTextureMemo(slots);
+      const auto after_insert = Memo(base);
+      Require(name, "memo after new registration",
+              after_insert.image_id == memo_newer &&
+                  after_insert.layout != vk::ImageLayout::ePreinitialized,
+              "a stage slot kept its image after a newer one was registered on its pages");
+      TextureCacheTestAccess::DeleteImage(texture_cache, memo_newer);
+      Require(name, "memo after removed registration",
+              Memo(base).image_id == first.image_id && Reused(base, first.image_id),
+              "a stage slot kept an image removed from its pages");
+      // Slots follow the module, not its address: a program's modules move as it grows.
+      {
+        ShaderModule module;
+        module.id = 1;
+        module.info.info.images.resize(1);
+        auto *const first_slots = RenderExecutorTestAccess::TextureMemoSlotsOf(executor, module);
+        first_slots->at(0).reusable = true;
+        module.id = 2;
+        const auto *const second_slots =
+            RenderExecutorTestAccess::TextureMemoSlotsOf(executor, module);
+        Require(name, "memo per module id",
+                second_slots != first_slots && second_slots->size() == 1 &&
+                    !second_slots->at(0).reusable,
+                "a module at a reused address took another module's texture slots");
+      }
+      RenderExecutorTestAccess::MarkTextureMemo(slots);
+      const auto memo_moved = Memo(base + moved_offset);
+      Require(name, "memo with changed descriptor",
+              memo_moved.image_id == moved.image_id &&
+                  memo_moved.layout != vk::ImageLayout::ePreinitialized,
+              "a stage slot reused a resolve for a different descriptor");
+
       // Re-associating a stencil plane re-describes a registered image: a
       // plane read with the old depth's sample count stops matching it.
       constexpr uint64_t stencil_offset = 0x180000;
@@ -6422,10 +6494,14 @@ public:
           TextureCacheTestAccess::InsertImage(texture_cache, bc.info);
       const auto raw_image =
           TextureCacheTestAccess::InsertImage(texture_cache, raw.info);
+      uint64_t bc_generation = 1;
+      auto bc_probe = bc;
       Require(name, "BC alias lookup",
-              texture_cache.FindImage(bc) == bc_image &&
+              texture_cache.FindImage(bc_probe, false, &bc_generation) == bc_image &&
+                  bc_generation == 0 &&
                   TextureCacheTestAccess::Contains(texture_cache, raw_image),
-              "a BC image lookup merged a raw alias without GPU writes");
+              "a BC image lookup merged a raw alias without GPU writes, or offered its "
+              "result for reuse while the alias awaits a merge");
       vk::ClearValue raw_clear{};
       TextureCacheTestAccess::ClearImage(
           texture_cache, scheduler.Current(), raw_image,

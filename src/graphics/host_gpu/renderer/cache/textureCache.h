@@ -52,7 +52,17 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// exact_generation, when given, receives a generation for RefindExactImage when the result
+	// is an exact match FindImage keeps, else 0.
+	[[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_format = false,
+	                                uint64_t* exact_generation = nullptr);
+	// Repeats a FindImage of a description with data range `data` that returned `id` as an exact
+	// match at `generation`, when FindImage would return it again: no image was registered or
+	// unregistered on those pages since. Advances generation and touches the image like FindImage,
+	// including the color-clear step for `found`, the description as FindImage left it (null when
+	// it has no color metadata) and its view's base layer before FindImage.
+	[[nodiscard]] bool RefindExactImage(ImageId id, GuestRange data, const ImageDesc* found,
+	                                    uint32_t metadata_base_layer, uint64_t& generation);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);

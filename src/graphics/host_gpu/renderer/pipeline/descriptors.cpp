@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/drawStateCache.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -30,6 +31,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
@@ -680,11 +684,24 @@ RenderExecutor::FindTextureDescription(const ShaderRecompiler::IR::ImageResource
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	return ResolveTexture(resource, value, nullptr);
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              TextureResolveMemo*                          trace) {
+	if (trace != nullptr) {
+		trace->reusable = false;
+	}
 	// A copy: the cache lookups below must not depend on the memo's storage.
 	auto  described     = FindTextureDescription(resource, value);
 	auto& desc          = described.desc;
 	auto& texture_cache = m_context.GetTextureCache();
 	if (described.null) {
+		if (trace != nullptr) {
+			trace->reusable = true;
+			trace->null     = true;
+		}
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
 	const bool  storage    = resource.written;
@@ -709,7 +726,24 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
 
-	auto id = texture_cache.FindImage(desc, described.shader_conversion);
+	const auto metadata_base_layer = desc.view_info.base_layer;
+	uint64_t   generation          = 0;
+	auto id = texture_cache.FindImage(desc, described.shader_conversion,
+	                                  trace != nullptr ? &generation : nullptr);
+	// Lod statistics count every resolve, so a memo would skip them.
+	if (trace != nullptr && id && generation != 0 && !m_lod_stats) {
+		trace->reusable            = true;
+		trace->null                = false;
+		trace->found_id            = id;
+		trace->data                = desc.info.data;
+		trace->generation          = generation;
+		trace->metadata_base_layer = metadata_base_layer;
+		trace->color_clear         = desc.info.metadata.kind == ImageMetadataKind::Dcc ||
+		                     desc.info.metadata.kind == ImageMetadataKind::Cmask;
+		if (trace->color_clear) {
+			trace->found = desc;
+		}
+	}
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
@@ -734,6 +768,81 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};
+}
+
+std::vector<RenderExecutor::TextureResolveMemo>&
+RenderExecutor::TextureMemoSlots(const ShaderModule& module) {
+	auto& slots = m_texture_memo[module.id];
+	slots.resize(module.info.info.images.size());
+	return slots;
+}
+
+TextureBinding
+RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*             memo,
+                                    uint32_t                                     index,
+                                    const ShaderRecompiler::IR::ImageResource&   resource,
+                                    const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (memo == nullptr) {
+		return ResolveTexture(resource, value);
+	}
+	auto&      slot   = (*memo)[index];
+	auto&      stats  = m_texture_memo_stats;
+	const bool count  = DrawStateCacheStats();
+	const auto inputs = TextureDescriptionInputs(resource);
+	bool       hit    = false;
+	if (!slot.reusable) {
+		if (count) stats.unreusable++;
+	} else if (!(slot.value == value) || !(slot.inputs == inputs)) {
+		if (count) stats.changed++;
+	} else if (slot.null ||
+	           m_context.GetTextureCache().RefindExactImage(
+	               slot.found_id, slot.data, slot.color_clear ? &slot.found : nullptr,
+	               slot.metadata_base_layer, slot.generation)) {
+		hit = true;
+		if (count) stats.hits++;
+	} else if (count) {
+		stats.stale++;
+	}
+	if (count) {
+		stats.lookups++;
+		const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::steady_clock::now().time_since_epoch()).count());
+		if (stats.start_ns == 0) {
+			stats.start_ns = now;
+		} else if (now - stats.start_ns >= 1'000'000'000u) {
+			const auto pct = [&](uint64_t n) { return 100.0 * static_cast<double>(n) / stats.lookups; };
+			std::printf("DTC textures_s=%llu hit=%.1f%% changed=%.1f%% stale=%.1f%% unreusable=%.1f%%\n",
+			            static_cast<unsigned long long>(stats.lookups), pct(stats.hits),
+			            pct(stats.changed), pct(stats.stale), pct(stats.unreusable));
+			std::fflush(stdout);
+			stats = {.start_ns = now};
+		}
+	}
+	if (hit && GetDrawStateCacheMode() != DrawStateCacheMode::Verify) {
+		return slot.binding;
+	}
+	TextureResolveMemo trace;
+	auto               binding = ResolveTexture(resource, value, &trace);
+	if (hit) {
+		const auto& a = slot.binding;
+		const auto& b = binding;
+		if (a.image_id != b.image_id || a.layout != b.layout || a.desc.type != b.desc.type ||
+		    !(a.desc.view_info == b.desc.view_info) || a.desc.info.data != b.desc.info.data ||
+		    a.desc.info.pixel_format != b.desc.info.pixel_format ||
+		    a.desc.info.extent != b.desc.info.extent || a.desc.info.type != b.desc.info.type ||
+		    a.desc.info.metadata.kind != b.desc.info.metadata.kind) {
+			EXIT("KYTY_DTC_VERIFY: texture resolve memo disagrees: image %u vs %u at 0x%016" PRIx64
+			     "\n",
+			     static_cast<uint32_t>(a.image_id.index), static_cast<uint32_t>(b.image_id.index),
+			     b.desc.info.data.address);
+		}
+	}
+	trace.inputs  = inputs;
+	trace.value   = value;
+	trace.binding = binding;
+	trace.binding.mip_views.clear();
+	slot = std::move(trace);
+	return binding;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -799,12 +908,16 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	std::vector<TextureResolveMemo>* memo = nullptr;
+	if (GetDrawStateCacheMode() != DrawStateCacheMode::Off && !program.info.images.empty()) {
+		memo = &TextureMemoSlots(*runtime.module);
+	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (program.info.images[i].heap) {
 			prepared.images[i] = {};
 			continue;
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto binding = ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
