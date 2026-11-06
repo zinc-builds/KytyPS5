@@ -43,9 +43,9 @@ from=$(wc -l < "$log")
 wait_s "${GARDEN_WINDOW:-45}"
 to=$(wc -l < "$log")
 sed -n "${from},${to}p" "$log" | grep '^PERF' |
-	sed -E 's/.*fps=([0-9.]+).*draws_frame=([0-9]+) draws_s=([0-9]+).*wt_faults_s=([0-9]+).*sigill_s=([0-9]+).*/\1 \2 \3 \4 \5/' |
-	awk -v l="$label" '{f+=$1; d+=$2; s+=$3; w+=$4; ill+=$5; n++}
-	     END {printf "%s: fps=%.2f draws/frame=%.0f draws/s=%.0f wt_faults/s=%.0f sigill/s=%.0f (n=%d)\n", l, f/n, d/n, s/n, w/n, ill/n, n}'
+	sed -E 's/.*fps=([0-9.]+).*worst_ms=([0-9.]+) low1=([0-9.]+) draws_frame=([0-9]+) draws_s=([0-9]+).*wt_faults_s=([0-9]+).*sigill_s=([0-9]+).*/\1 \4 \5 \6 \7 \2 \3/' |
+	awk -v l="$label" '{f+=$1; d+=$2; s+=$3; w+=$4; ill+=$5; wm+=$6; if ($6>wx) wx=$6; lo+=$7; n++}
+	     END {printf "%s: fps=%.2f draws/frame=%.0f draws/s=%.0f wt_faults/s=%.0f sigill/s=%.0f worst_ms=%.1f (max %.1f) low1=%.1f (n=%d)\n", l, f/n, d/n, s/n, w/n, ill/n, wm/n, wx, lo/n, n}'
 grep -E '^AMD CPU compatibility' "$log" | head -3
 echo "level start at log line $start" >&2
 [ -n "$KEEP_RUNNING" ] || { pkill -f '^\./kyty_emulator --game'; wait_s 3; pkill -9 -f '^\./kyty_emulator --game'; }
