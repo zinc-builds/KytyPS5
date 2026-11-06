@@ -55,10 +55,11 @@ prepared draw, which a worker thread can produce later.
 
 | Step | What | Done when / kill criterion |
 |---|---|---|
-| B0 | **Measure repetition (≤ 1 day).** Record per-draw fingerprints: shader addresses, the relevant context registers, user SGPRs, and the SRT walk's read-set values. Find the hit rates within a frame and across frames, and the cost of validating a read set compared with walking. | If the cross-frame hit rate is < 50%, or validating costs more than half a walk, re-plan B around a cheaper key (for example, content hashes of the SRT tables) |
-| B1 | Memoize the SRT walk: a per-program LRU keyed on user SGPRs, validated against the read set (`RESEARCH-threaded-draw.md` §5.3). Add `KYTY_DTC_VERIFY=1`, which runs both paths and asserts they are equal. | the walk is < 5% of the thread; verify mode is clean over a full bench |
-| B2 | Memoize texture resolve: T# words → image/view, invalidated by a texture-cache epoch | `ResolveTexture` < 4% |
-| B3 | Whole prepared-draw cache. Preparation becomes side-effect free (no writes to the shared `Program::resources`) and returns an immutable `PreparedDraw`. | ≤ 3 µs/draw |
+| B0 | **Measure repetition** (done, FINDINGS "Draw state cache"). A user-SGPR-keyed walk memo hits 7–8%: buffer descriptors carry per-frame addresses. The module, samplers and images match the program's previous lookup 99%, 99.5% and 91% of the time. | killed B1 as planned |
+| ~~B1~~ | ~~Memoize the SRT walk on user SGPRs, validated against the read set~~. Dropped: keys rarely repeat, and validating a ~50-load read set costs most of a walk. | — |
+| B2 | Memoize texture resolve per stage image slot: same T# words and no image registrations on its pages since → reuse (done, +6.2%) | `ResolveTexture` < 4% (now 8.7%: the misses dominate; next, keep a few descriptors per slot) |
+| B1′ | Make the walk's remainder cheap instead of skipping the walk: reuse the specialization and module when the specialization-relevant descriptor fields match the program's previous lookup (99.7%); memoize `PrepareProgram`'s static vertex input decode (4%). Then the JIT walker itself: cut per-load overhead in its load stub. | `GetGraphicsPrograms` ≤ 12% of the thread |
+| B3 | Whole prepared-draw cache. Preparation becomes side-effect free (no writes to the shared `Program::resources`) and returns an immutable `PreparedDraw`; per-stage samplers, shader data and texture bindings are reused by slot. | ≤ 3 µs/draw |
 | B4 | Prepare misses on a worker thread (prepare/commit split), if misses still matter after B3 | ≤ 2 µs/draw |
 
 ## Track C: guest memory without copies, and the guest side
@@ -105,5 +106,5 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 | Track | Current step | Notes |
 |---|---|---|
 | A | A1 done (#7, #8); A2 done; A3 measured: transfers end only ~10 passes/frame; A4 done (this PR); next: GPU time inside passes (A5) | GPU ~18–20 ms/frame; indirect-dispatch syncs 0 |
-| B | B0 | — |
+| B | B1′ (B0 done: B1 dropped; B2 merged, +6.2%) | texture resolve 16.7% → 8.7% of the GPU thread; next: the walk's remainder |
 | C | C1a merged (stream-copy reuse, +5.7%); next C2 (async write tracking) | C0 in FINDINGS. Guest threads 13–14 ms/frame, ~40% fault handling: no Track D. C1 import deferred: labels are written before the host GPU reads |

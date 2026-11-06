@@ -1302,7 +1302,33 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+bool TextureCache::RefindExactImage(ImageId id, GuestRange data, const ImageDesc* found,
+                                    uint32_t metadata_base_layer, uint64_t& generation) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto*            image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			return false;
+		}
+		if (generation != m_registration_generation) {
+			if (RegistrationsSince(data.address, data.size, generation)) {
+				return false;
+			}
+			generation = m_registration_generation;
+		}
+		image->tick_accessed_last = m_gc_tick;
+		TouchImage(*image);
+	}
+	if (found != nullptr) {
+		MaterializeColorClear(id, *found, metadata_base_layer);
+	}
+	return true;
+}
+
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* exact_generation) {
+	if (exact_generation != nullptr) {
+		*exact_generation = 0;
+	}
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
@@ -1425,11 +1451,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 			return false;
 		};
+		bool kept = known;
 		if (exact_match && !known && !alias_left()) {
 			if (m_exact_images.size() >= MaxExactImages) {
 				m_exact_images.clear();
 			}
 			m_exact_images[key] = {result, m_registration_generation};
+			kept                = true;
+		}
+		if (exact_generation != nullptr) {
+			*exact_generation = kept ? m_registration_generation : 0;
 		}
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {

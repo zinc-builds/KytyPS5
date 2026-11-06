@@ -37,6 +37,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-06 | Stream copies reused within a guest-sync epoch (same batch: merge-base 18.67 / 19.32) | 19.88 / 20.28 | 111.6k / 113.4k | 59.9 (max 100.0) | 16.1 |
 | 2026-11-06 | Read-only depth attachments; no barrier for read after read (A/B, same batch: ref 18.71 / 18.99) | 18.48 / 18.91 | 105.6k / 107.2k | 67.1 (max 98.7) | 14.7 |
 | 2026-11-06 | Indirect dispatches no longer wait for the GPU in their SRT walk (same batch: merge-base 20.06 / 20.16) | 21.94 / 22.17 | 122.1k / 123.3k | 55.3 (max 84.5) | 18.0 |
+| 2026-11-06 | Stage image slots reuse their last texture resolve (Track B2; measured on 582e4043, without the stream-copy row: ref 19.33 / 19.57) | 20.68 / 20.66 | 115.6k / 115.5k | 58.3 (max 83.9) | 16.7 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -389,6 +390,59 @@ That is ~2 µs of GPU per draw inside passes, high for this GPU. Ruled out as th
 
 Root-only Nsight metrics would separate front-end from shading cost; not available tonight.
 
+### Draw state cache, Track B (2026-11-06)
+
+**B0: per-draw state does not repeat; its shape does.** A walk memo keyed on a program's user
+SGPRs (plus shader base and push-data cursor), validated by reloading every guest DWORD the walk
+read, hit only **7–8%** of the ~11k graphics program lookups per frame (VS + PS per draw): 91%
+of keys were new, 1–2% were known with changed memory. The hits were trivial walks (~1.5 loads);
+a typical walk reads ~50 guest DWORDs, and validation has to reload all of them, so it saves
+little even when it hits. A walk costs ~890 ns per lookup (~9.8 ms/frame). Comparing each lookup
+with the previous lookup of the same program (`KYTY_DTC_DIAG`, a local diagnostic):
+
+| Same as the program's previous lookup | Share |
+|---|---|
+| Specialization (selects the module) | 99.7% |
+| Module | 99.2% |
+| Samplers | 99.5% |
+| Images (T#s) | 91% |
+| Buffers (V#s), exact | 21% |
+| Buffers, ignoring base-address bits | 86% |
+| Flattened SRT | 53% |
+| Whole snapshot seen before in this program, exact | 23% |
+
+Buffer descriptors point at per-frame allocations, so walk outputs repeat rarely; images,
+samplers and the selected module repeat almost always. This killed B1 as planned (cross-frame
+hit rate < 50%; see `PLAN-60fps.md` for the re-plan).
+
+**The walk is compute-bound, not load-latency-bound.** Timing one lookup's `FindModule`, then
+`MaterializeResources` and the walk again right away (guest tables now in cache): vertex
+programs (63k lookups/s) 1415 ns cold, 1249 ns warm, 582 ns for the warm walk alone; pixel
+programs (85k/s) 421 / 355 / 173 ns. Warm costs nearly as much as cold, so the walker's code
+(per-node thunk calls and state bytes) and the rest of `MaterializeResources` are the cost, not
+cache misses on freshly written tables. Within `MaterializeResources` the JIT walker is 54%,
+its own code 20%, `WalkedDescriptor` 4%.
+
+**B2: texture resolve memo (merged).** Each stage module keeps, per image slot, its last
+`ResolveTexture` result. A slot is reused when its T# words are unchanged and `TextureCache`
+confirms the image `FindImage` returned as a kept exact match would be returned again: no image
+was registered or unregistered on its pages since (global generation check first, then the page
+stamps). A hit repeats `FindImage`'s side effects (LRU touch, color-clear materialization) and
+skips `FindTextureDescription` and the exact-image hash lookup. Hit rate **89.6%** (9.4% changed
+descriptors, 1% not reusable); `KYTY_DTC_VERIFY=1` resolved every hit again over a full bench
+and found no disagreement. Texture resolve went from 16.7% to 8.7% of the GPU thread (perf,
+10 s), and FPS +6.2%. The misses now cost more than the hits: a slot keeps only one descriptor,
+and programs that alternate between textures miss every time.
+
+| GPU thread, inclusive (perf, 10 s) | `dev` 582e4043 | + B2 |
+|---|---|---|
+| `GetGraphicsPrograms` | 23.7% | 26.4% |
+| ↳ `MaterializeResources` (↳ `WalkSrt` + JIT walker) | 16.5% (11.0%) | 18.5% (12.4%) |
+| Texture resolve (`ResolveTexture` / `ResolveStageTexture`) | 16.7% | 8.7% |
+| ↳ `FindImage` (all callers) | 13.0% | 7.6% |
+| `BufferCache::ObtainBuffer` | 13.2% | 14.0% |
+| NVIDIA driver | 9.4% | 9.6% |
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
@@ -437,3 +491,5 @@ Root-only Nsight metrics would separate front-end from shading cost; not availab
 - `KYTY_STREAM_VERIFY=1` checks every reused stream copy against the guest bytes (slow);
   `KYTY_NO_STREAM_REUSE=1` disables reuse.
 - Env knobs: `KYTY_NO_PIN=1`, `KYTY_AMD_SKIP_RSQRT=1`, `KYTY_NO_SHADER_FASTREAD=1`.
+- Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
+  hit and exits on a disagreement, `KYTY_DTC_STATS=1` prints `DTC` hit-rate lines once per second.
