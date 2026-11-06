@@ -1582,8 +1582,29 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+static bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot& snapshot,
+                                     ResourceSpecialization& specialization);
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	(void)SrtWalkerUnknownGpuWrites::TakeSeen();
+	if (MaterializeResourcesOnce(program, runtime, snapshot, specialization)) {
+		return true;
+	}
+	if (!SrtWalkerUnknownGpuWrites::TakeSeen()) {
+		return false;
+	}
+	// A value the walk left unknown was needed: read it after the GPU writes it.
+	const bool enabled      = SrtWalkerUnknownGpuWrites::Exchange(false);
+	const bool materialized = MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	SrtWalkerUnknownGpuWrites::Exchange(enabled);
+	return materialized;
+}
+
+static bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot& snapshot,
+                                     ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {

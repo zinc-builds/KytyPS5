@@ -82,8 +82,13 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
-// Reads a DWORD of guest memory without faulting; false when it must be read in place.
-using SrtWalkerReader = bool (*)(uint64_t address, uint32_t* value);
+// Reads a DWORD of guest memory without faulting.
+enum class SrtWalkerRead : uint8_t {
+	Ok,
+	GpuWritten, // the bytes hold GPU writes not yet read back: reading them waits for the GPU
+	Failed,     // read in place
+};
+using SrtWalkerReader = SrtWalkerRead (*)(uint64_t address, uint32_t* value);
 // Page-tracker layout the walker's loads check (the page manager asserts it matches).
 constexpr uint32_t SrtWalkerTrackedAddressBits = 44;
 constexpr uint32_t SrtWalkerRegionBits         = 22;
@@ -95,6 +100,24 @@ constexpr uint8_t  SrtWalkerReadWatchedBit     = 0x80;
 // those loads call read first. Set before any walker runs; null regions disables the check.
 void SetSrtWalkerGuestAccess(const void* const* regions, uint64_t pages_offset,
                              SrtWalkerReader read);
+// While set on this thread, walker loads of GPU-written bytes evaluate as unknown instead of
+// waiting for the GPU. Unknown branch conditions keep every successor reachable; a walk that
+// needs such a value fails, and MaterializeResources then repeats it with the wait.
+class SrtWalkerUnknownGpuWrites {
+public:
+	SrtWalkerUnknownGpuWrites();
+	~SrtWalkerUnknownGpuWrites();
+	SrtWalkerUnknownGpuWrites(const SrtWalkerUnknownGpuWrites&)            = delete;
+	SrtWalkerUnknownGpuWrites& operator=(const SrtWalkerUnknownGpuWrites&) = delete;
+
+	// Whether a load on this thread evaluated as unknown since the last call; clears it.
+	static bool TakeSeen();
+	// Turns the mode on or off for this thread; returns whether it was on.
+	static bool Exchange(bool enabled);
+
+private:
+	bool m_previous;
+};
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

@@ -10,6 +10,7 @@
 #include <bit>
 #include <cstring>
 #include <deque>
+#include <utility>
 #include <map>
 #include <unordered_set>
 
@@ -176,26 +177,44 @@ struct WalkerGuestAccess {
 };
 WalkerGuestAccess g_walker_access;
 
-// Reads a DWORD of a read-watched page without faulting. Bit 32 set: rax[31:0] holds it.
+thread_local bool t_unknown_gpu_writes = false;
+thread_local bool t_unknown_gpu_writes_seen = false;
+
+// Reads a DWORD of a read-watched page without faulting. Bit 32 set: rax[31:0] holds it. Bit 33
+// set: the value is unknown (GPU-written bytes while SrtWalkerUnknownGpuWrites is active).
 uint64_t KYTY_SYSV_ABI WalkerWatchedLoad(uint64_t address) {
 	uint32_t value = 0;
 	const auto read = g_walker_access.read;
-	return read != nullptr && read(address, &value) ? (uint64_t {1} << 32u) | value : 0u;
+	if (read == nullptr) return 0;
+	switch (read(address, &value)) {
+		case SrtWalkerRead::Ok: return (uint64_t {1} << 32u) | value;
+		case SrtWalkerRead::GpuWritten:
+			if (t_unknown_gpu_writes) {
+				t_unknown_gpu_writes_seen = true;
+				return uint64_t {1} << 33u;
+			}
+			return 0;
+		case SrtWalkerRead::Failed: return 0;
+	}
+	return 0;
 }
 
-// Every guest load is `call load` with the address in r10. The stub's load is mov eax, [r10]
-// (41 8b 02), so a fault there completes as a zero read or a tracked read.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& load) {
+// Every guest load is `call load` with the address in r10, followed by `jc unknown`. The stub's
+// load is mov eax, [r10] (41 8b 02), so a fault there completes as a zero read or a tracked read.
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& load,
+               const Xbyak::Label& unknown) {
 	code.lea(code.r10, code.ptr[address]);
 	code.call(load);
+	code.jc(unknown, Xbyak::CodeGenerator::T_NEAR);
 }
 
-// Loads [r10] into eax and preserves every other register the walker uses (not flags). A load
+// Loads [r10] into eax with CF clear, or sets CF for an unknown value; preserves every other
+// register the walker uses. A load
 // from a page the tracker protects against CPU reads would fault into the exception handler only
 // to be served from the backing view; this reads it from there without the signal.
 void EmitLoadStub(Xbyak::CodeGenerator& c, Xbyak::Label& load) {
 	constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
-	Xbyak::Label raw, watched, done;
+	Xbyak::Label raw, watched, done, unknown;
 	c.L(load);
 	c.push(c.rcx);
 	c.push(c.r11);
@@ -222,6 +241,12 @@ void EmitLoadStub(Xbyak::CodeGenerator& c, Xbyak::Label& load) {
 	c.L(done);
 	c.pop(c.r11);
 	c.pop(c.rcx);
+	c.clc();
+	c.ret();
+	c.L(unknown);
+	c.pop(c.r11);
+	c.pop(c.rcx);
+	c.stc();
 	c.ret();
 	// Call the backing reader with the stack aligned and the walker's caller-saved registers
 	// preserved.
@@ -251,6 +276,8 @@ void EmitLoadStub(Xbyak::CodeGenerator& c, Xbyak::Label& load) {
 	c.pop(c.rdi);
 	c.pop(c.rsi);
 	c.pop(c.rdx);
+	c.bt(c.rax, 33);
+	c.jc(unknown, Near);
 	c.bt(c.rax, 32);
 	c.jnc(raw, Near); // GPU-written bytes: the load faults and synchronizes them
 	c.mov(c.eax, c.eax);
@@ -1017,7 +1044,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax, m_load);
+			LoadGuest(c, c.rax, m_load, m_ret);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -1047,7 +1074,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_load);
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_load, m_ret);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1520,6 +1547,23 @@ void SetSrtWalkerGuestAccess(const void* const* regions, uint64_t pages_offset,
 	g_walker_access.read         = read;
 	g_walker_access.pages_offset = pages_offset;
 	g_walker_access.regions      = regions;
+}
+
+SrtWalkerUnknownGpuWrites::SrtWalkerUnknownGpuWrites(): m_previous(t_unknown_gpu_writes) {
+	t_unknown_gpu_writes      = true;
+	t_unknown_gpu_writes_seen = false;
+}
+
+SrtWalkerUnknownGpuWrites::~SrtWalkerUnknownGpuWrites() {
+	t_unknown_gpu_writes = m_previous;
+}
+
+bool SrtWalkerUnknownGpuWrites::TakeSeen() {
+	return std::exchange(t_unknown_gpu_writes_seen, false);
+}
+
+bool SrtWalkerUnknownGpuWrites::Exchange(bool enabled) {
+	return std::exchange(t_unknown_gpu_writes, enabled);
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
