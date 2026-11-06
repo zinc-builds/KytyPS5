@@ -137,6 +137,9 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	// The last barrier made earlier writes visible to every read access at every stage, so more
+	// readers of the layout need no barrier.
+	bool                    reads_visible = false;
 };
 
 struct VulkanImage {

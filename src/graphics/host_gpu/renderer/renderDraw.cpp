@@ -524,8 +524,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
-		// The attachment store writes even when guest depth/stencil tests do not.
-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		// The attachment store writes even when guest depth/stencil tests do not, except in a
+		// read-only layout, whose aspects store nothing (STORE_OP_NONE).
+		const bool read_only =
+		    (DepthReadOnly(layout) || !(ImageViewOps::DepthAspectMask(depth.desc.view_info.format) &
+		                                vk::ImageAspectFlagBits::eDepth)) &&
+		    (StencilReadOnly(layout) || !(ImageViewOps::DepthAspectMask(depth.desc.view_info.format) &
+		                                  vk::ImageAspectFlagBits::eStencil));
+		const auto access =
+		    read_only ? vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead}
+		              : vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
