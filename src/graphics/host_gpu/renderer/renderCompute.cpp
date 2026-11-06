@@ -271,6 +271,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
 	m_context.GetCommandScheduler().PopPendingOperations();
+	FlushAtomicWrites(buffer);
 	auto& sh_ctx = buffer.GetShaders();
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
@@ -480,6 +481,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		KYTY_PROFILER_BLOCK("DI:PopPending");
 		m_context.GetCommandScheduler().PopPendingOperations();
 	}
+	FlushAtomicWrites(buffer);
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&

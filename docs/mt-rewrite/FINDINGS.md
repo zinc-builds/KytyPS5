@@ -33,6 +33,7 @@ and `low1` is the mean 1% low FPS.
 |---|---|---|---|---|---|
 | 2026-11-06 | `dev` 48b2101a (baseline) | 15.83 / 15.91 | 92.0k / 92.5k | 67.5 (max 68.3)¹ | 13.7¹ |
 | 2026-11-06 | SRT walker reads read-watched pages without faulting | 17.65 / 17.98 | 101.6k / 102.6k | 69.0 (max 99.4) | 14.3 |
+| 2026-11-06 | Atomic-only shader writes share one barrier per batch | 18.92 / 19.18 | 107.6k / 108.4k | 66.2 (max 85.0) | 14.4 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -127,10 +128,68 @@ writes them and the next indirect dispatches' SRT walks read them, so the walk m
 GPU (`HandleFault` → `ReadMemory`). Removing that needs the walk not to depend on GPU-written
 values: bind a superset of descriptors, or resolve the value on the GPU.
 
+### The GPU is a second bottleneck (2026-11-06)
+
+Measured by bracketing each submitted command buffer with Vulkan timestamps (a local diagnostic
+build), the GPU executes **~610 ms of work per second at 17 FPS, about 35 ms per frame**. That
+alone caps Sky Garden near 28 FPS. Nsight Systems GPU metrics (`pkexec nsys profile
+--gpu-metrics-devices=all`, sampling device-wide while the emulator runs as the user) show the
+time is not shading work:
+
+| Metric (mean over 4 s) | Value |
+|---|---|
+| GR Active | 52% |
+| SMs Active | 24% |
+| SM Issue | 7.5% |
+| DRAM read / write bandwidth | 2.8% / 2.6% |
+
+The GPU is serialized, not saturated. Counting recorded Vulkan commands per call site (a
+diagnostic build wrapping vulkan.hpp's dispatcher) gives, per frame:
+
+| Source | Per frame |
+|---|---|
+| `ShaderWriteHazardBarrier` + `ShaderWriteBarrier` (draws with shader buffer writes; a full `ALL_COMMANDS` drain before, a write barrier after, and both end the render pass) | ~1,340 |
+| `Image::Transit` layout transitions (`CommitBindings`, `AcquireRenderTargets`) | ~900 |
+| `ShaderAccessBarrier` after dispatches | ~220 |
+| `vkCmdBeginRendering` | ~1,000 |
+
+About 560 draws per frame write a shader buffer. Almost all write a single DWORD, atomically, in
+the vertex shader: one of three rotating 128-byte slots. The first indirect-dispatch sync of a
+frame waits ~9 ms because it drains the previous frame's GPU work, so GPU time also stalls the
+command thread.
+
+**Atomic write batches (landed).** The recompiler now records whether a buffer has any plain
+(non-atomic) access (`BufferResource::plain_access`). A draw whose shader buffer writes all go to
+atomic-only buffers joins a batch. The first draw keeps the opening hazard barrier. Later ones
+skip both barriers and the render-pass breaks. The batch's closing `ShaderWriteBarrier` is
+recorded before:
+- any draw whose plain buffer, vertex, index or indirect ranges overlap the batch's atomics;
+- any draw that writes plainly or through raw addresses;
+- an atomic draw whose range overlaps a plain access made during the batch;
+- any dispatch;
+- any PM4 packet other than draws, register writes and markers.
+
+Buffer-cache transfers already open with `ALL_COMMANDS` barriers. Result: GPU time ~35 → ~24.5
+ms/frame, barriers ~2,900 → ~2,000 and render passes ~1,000 → ~500 per frame, and +7.5% FPS.
+An unsafe experiment that skipped these barriers outright gave the same FPS, so batching loses
+nothing.
+
+**Ruled out: a reader-distributed lock for the guest address space and backing store.**
+`pthread_rwlock_rdunlock` showed 8% self time on the GPU thread, under `CopySparseMemory` from
+stream-buffer uploads. Replacing both `shared_mutex`es with per-thread-slot reader counts gave
+17.36 / 17.67 FPS (no change). The samples moved into `ReadSparseBacking`'s memcpy: the cost is
+copying cold, freshly written guest data, not the lock.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
   missing trace data". Off-CPU time came from Tracy zones instead.
+- RenderDoc 1.46 cannot run the emulator. It lacks `VK_KHR_wayland_surface` (use
+  `SDL_VIDEO_DRIVER=x11`), and on X11 the emulator dies silently right after device creation.
+  It is also launched by absolute path, so `^\./kyty_emulator` patterns miss it; match
+  `^[^ ]*kyty_emulator --game`.
+- GPU metrics need admin (`RmProfilingAdminOnly=1`). They are device-wide, so a root `nsys`
+  sampling `sleep N` works while the emulator runs as the user.
 - Keep a copy of `kyty_emulator_clang_lld.map` with each perf capture. A rebuild overwrites it
   and old captures no longer symbolize.
 - Do not pipe `garden.sh` through `head`. SIGPIPE kills the script before its cleanup and leaves
