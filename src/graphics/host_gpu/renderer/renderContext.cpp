@@ -38,9 +38,17 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 		return LibKernel::Memory::CopySparseMemory(vaddr, dst, size);
 	});
 	const auto [watch_table, pages_offset] = m_page_manager.ReadWatchTable();
+	using ShaderRecompiler::IR::SrtWalkerRead;
 	ShaderRecompiler::IR::SetSrtWalkerGuestAccess(
-	    watch_table, pages_offset,
-	    [](uint64_t vaddr, uint32_t* value) { return ShaderTryReadGuest(vaddr, value, sizeof(*value)); });
+	    watch_table, pages_offset, [](uint64_t vaddr, uint32_t* value) {
+		    auto* context = g_shader_reader_context;
+		    if (context != nullptr && GuestGpu::IsGpuThread() &&
+		        context->GetBufferCache().HasGpuDirtyBytes(vaddr, sizeof(*value))) {
+			    return SrtWalkerRead::GpuWritten;
+		    }
+		    return ShaderTryReadGuest(vaddr, value, sizeof(*value)) ? SrtWalkerRead::Ok
+		                                                            : SrtWalkerRead::Failed;
+	    });
 }
 
 RenderContext::~RenderContext() {

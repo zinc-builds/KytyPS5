@@ -13,6 +13,7 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
@@ -618,6 +619,11 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
+	// Call targets must be known: their walk waits for GPU-written bytes.
+	struct Blocking {
+		bool enabled = IR::SrtWalkerUnknownGpuWrites::Exchange(false);
+		~Blocking() { IR::SrtWalkerUnknownGpuWrites::Exchange(enabled); }
+	} blocking;
 	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
 	auto& reads = source.reads;
 	reads.clear();

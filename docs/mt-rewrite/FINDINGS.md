@@ -36,6 +36,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-06 | Atomic-only shader writes share one barrier per batch | 18.92 / 19.18 | 107.6k / 108.4k | 66.2 (max 85.0) | 14.4 |
 | 2026-11-06 | Stream copies reused within a guest-sync epoch (same batch: merge-base 18.67 / 19.32) | 19.88 / 20.28 | 111.6k / 113.4k | 59.9 (max 100.0) | 16.1 |
 | 2026-11-06 | Read-only depth attachments; no barrier for read after read (A/B, same batch: ref 18.71 / 18.99) | 18.48 / 18.91 | 105.6k / 107.2k | 67.1 (max 98.7) | 14.7 |
+| 2026-11-06 | Indirect dispatches no longer wait for the GPU in their SRT walk (same batch: merge-base 20.06 / 20.16) | 21.94 / 22.17 | 122.1k / 123.3k | 55.3 (max 84.5) | 18.0 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -321,6 +322,72 @@ Track C (guest memory):
   calls/s (earlier measurement).
 - Frame delta (#1931): the upstream issue has no technical analysis; replies point to forks and
   VRAM. Nothing was measured yet.
+
+### No CPU-side GPU syncs for indirect dispatches (A4, landed)
+
+The indirect-dispatch syncs (~5k per 45 s window, ~0.95 s per 10 s of the command thread) come
+from two compute shaders, hashes `0xc5ee521b8849cf83` and `0x25cdbea1f5cbfaa6`. They start like
+this (decoded RDNA2):
+
+```
+S_BUFFER_LOAD_DWORD vcc_lo, s8, offset=28   ; element count, written by an earlier GPU pass (≈4)
+V_CMP_LE_U32        vcc_lo, vcc_lo, v0      ; thread id >= count?
+S_MOV_B64           exec_lo, !vcc
+S_CBRANCH_EXECZ     end                     ; the whole body is skipped past the count
+```
+
+The shader reads the count itself, on the GPU (`ReadConstBuffer`, a bound buffer). The CPU-side
+SRT walk only needs it to decide block reachability, and the walker already treats an unknown
+branch condition conservatively (every successor reachable). The fix:
+- During an indirect dispatch's program lookup (`SrtWalkerUnknownGpuWrites`), a walker load of
+  bytes the GPU wrote, and that are not yet read back, evaluates as unknown instead of waiting.
+- If a walk then fails because it needed such a value (for a descriptor or a flattened read),
+  `MaterializeResources` repeats it once with the waiting load.
+
+Same-batch A/B on `dev` fc4c96a2: 20.06 / 20.16 → 21.94 / 22.17 FPS (+9.7%); on `dev` +
+read-only depth earlier, 18.62 / 18.94 → 21.45 / 21.49. Syncs in the level went from ~5k to
+0–1; worst frame ~61 → ~55 ms; 1% low ~15.6 → ~18. Call-target walks (`RefreshShaderSource`)
+keep waiting: a call target must be known.
+
+### A2: remaining barriers and render passes (2026-11-06)
+
+`KYTY_VK_COUNT=sites` on `dev` + read-only depth, per frame:
+
+| Source | Per frame |
+|---|---|
+| Dispatches: `ShaderWriteHazardBarrier` before and `ShaderAccessBarrier` after each (~222 dispatches) | ~445 |
+| `Image::Transit` (`CommitBindings` 176, `AcquireRenderTargets` 151) | ~345 |
+| Buffer uploads, fills, copies (`SynchronizeBuffersInRange` 107, `CpOpDmaData` 91, downloads 25) | ~230 |
+| Draw shader-write barriers left after the atomic batches | ~15 |
+| Render passes | ~174 |
+
+Dropping every dispatch barrier (an unsafe experiment) only moved GPU time from 20.3 to
+19.1 ms/frame. A range-tracking dependency layer for dispatches is not worth its risk now.
+
+What ends render passes (`KYTY_VK_COUNT=sites` with `vkCmdEndRendering`, per frame): ~119 come
+from `Image::Transit` in `AcquireRenderTargets`, i.e. render-target switches; ~16 from
+draw-path barriers; ~11 from dispatches; ~10 from uploads, downloads and fills. **A3 as planned
+(moving transfers to a pre-pass) has little to gain**: transfers end ~10 passes per frame.
+
+Where the GPU time goes (`KYTY_GPU_TIME=passes`, timestamps around each pass and dispatch;
+~18.4 ms busy per frame at 19.8 FPS):
+
+| | Per frame |
+|---|---|
+| Inside render passes (~174 passes, ~5.8k draws) | 11.0 ms |
+| ↳ 1920×1080, 5 color targets (G-buffer), ~9 passes | 4.6 ms |
+| ↳ 1920×1080, 1 color target, ~72 passes | 3.0 ms |
+| ↳ 2048² shadow (depth only), ~5 passes | 0.8 ms |
+| ↳ 1080p depth only, ~13 passes | 0.7 ms |
+| Dispatches (~236) | 4.0 ms |
+| Between them (transfers, barriers, idle) | ~3.4 ms |
+
+That is ~2 µs of GPU per draw inside passes, high for this GPU. Ruled out as the cause:
+- Redundant pipeline binds: 80% of `vkCmdBindPipeline` re-bind the same pipeline, but skipping
+  them (an experiment) left GPU time unchanged.
+- Occlusion queries: none are active in Sky Garden.
+
+Root-only Nsight metrics would separate front-end from shading cost; not available tonight.
 
 ### Tooling notes
 

@@ -104,6 +104,6 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 
 | Track | Current step | Notes |
 |---|---|---|
-| A | A1 (read-only depth in review) | GPU ~23 ms/frame |
+| A | A1 done (#7, #8); A2 done; A3 measured: transfers end only ~10 passes/frame; A4 done (this PR); next: GPU time inside passes (A5) | GPU ~18–20 ms/frame; indirect-dispatch syncs 0 |
 | B | B0 | — |
 | C | C1a merged (stream-copy reuse, +5.7%); next C2 (async write tracking) | C0 in FINDINGS. Guest threads 13–14 ms/frame, ~40% fault handling: no Track D. C1 import deferred: labels are written before the host GPU reads |

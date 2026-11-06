@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -499,6 +500,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetImageHeap().BeginDraw();
 	{
 		KYTY_PROFILER_BLOCK("DI:GetComputeProgram");
+		// An indirect dispatch usually follows the pass that writes its inputs. Values its SRT
+		// walk would wait for the GPU to write only decide reachability here (the shader reads
+		// them itself); materialization waits only when it needs one.
+		const ShaderRecompiler::IR::SrtWalkerUnknownGpuWrites unknown_gpu_writes;
 		if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	}
 	buffer.EndRendering();
