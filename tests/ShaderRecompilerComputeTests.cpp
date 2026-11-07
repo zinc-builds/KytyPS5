@@ -4324,6 +4324,94 @@ public:
             label_clean_stored,
             "a label left a clean cached copy of its page stale");
 
+    // Guest read faults on GPU-written bytes: readers queued together share one
+    // download, and a GPU write queued behind them is downloaded before their
+    // pages lose GPU ownership.
+    {
+      constexpr uintptr_t shared_base = 0x0000000200600000ull;
+      constexpr uint64_t shared_size = 0x10000;
+      constexpr uint64_t shared_address = shared_base + 0x1000;
+      int64_t shared_offset = -1;
+      Require("GpuCommandLane", "shared read allocation",
+              Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                  shared_size, shared_size, 0, &shared_offset) == 0,
+              "shared-read direct-memory allocation failed");
+      void *shared_memory = reinterpret_cast<void *>(shared_base);
+      Require("GpuCommandLane", "shared read mapping",
+              Libs::LibKernel::Memory::KernelMapDirectMemory(
+                  &shared_memory, shared_size, 0x3, 0x10, shared_offset,
+                  shared_size) == 0 &&
+                  shared_memory == reinterpret_cast<void *>(shared_base),
+              "shared-read fixed direct-memory mapping failed");
+      resources.MapMemory(shared_base, shared_size);
+      const auto gpu_write = [&](uint32_t value) {
+        auto dirty =
+            buffer_cache.ObtainBuffer(shared_address, sizeof(value), true, false);
+        Require("GpuCommandLane", "shared read setup", dirty.first != nullptr,
+                "shared-read test could not create a cached Buffer");
+        buffer_cache.FillBuffer(shared_address, sizeof(value), value, false);
+      };
+      for (uint32_t round = 0; round < 32; round++) {
+        const uint32_t value = 0x51ad0000u + round;
+        const bool rewrite = (round & 1u) != 0;
+        const uint32_t expected = rewrite ? value ^ 0xffff0000u : value;
+        gpu.SendCommandSync([&] { gpu_write(value); });
+        std::binary_semaphore lane_entered{0};
+        std::binary_semaphore lane_release{0};
+        gpu.SendCommand([&] {
+          lane_entered.release();
+          lane_release.acquire();
+        });
+        lane_entered.acquire();
+        std::atomic<int> handled{0};
+        std::array<std::jthread, 4> readers;
+        for (auto &reader : readers) {
+          reader = std::jthread([&] {
+            handled += resources.HandleFault(PageFaultAccess::Read,
+                                             shared_address)
+                           ? 1
+                           : 0;
+          });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (rewrite) {
+          gpu.SendCommand([&, expected] { gpu_write(expected); });
+        }
+        lane_release.release();
+        for (auto &reader : readers) {
+          reader.join();
+        }
+        // A rewrite queued after the readers finished leaves the page GPU-owned.
+        (void)resources.HandleFault(PageFaultAccess::Read, shared_address);
+        uint32_t backing = 0;
+        bool gpu_owned = true;
+        bool dirty_bytes = true;
+        gpu.SendCommandSync([&] {
+          gpu_owned = buffer_cache.IsRegionGpuModified(shared_address,
+                                                       sizeof(backing));
+          dirty_bytes =
+              buffer_cache.HasGpuDirtyBytes(shared_address, sizeof(backing));
+        });
+        const bool read_ok = LibKernel::Memory::TryReadBacking(
+            shared_address, &backing, sizeof(backing));
+        Require("GpuCommandLane", "shared read faults",
+                handled.load() == 4 && read_ok && backing == expected &&
+                    !gpu_owned && !dirty_bytes,
+                "concurrent read faults lost a GPU write or left the page "
+                "GPU-owned");
+      }
+      resources.UnmapMemory(shared_base, shared_size);
+      Require("GpuCommandLane", "shared read unmap",
+              Libs::LibKernel::Memory::KernelMunmap(shared_base, shared_size) ==
+                  0,
+              "shared-read direct-memory mapping release failed");
+      Require("GpuCommandLane", "shared read free",
+              Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                  shared_offset, shared_size) == 0,
+              "shared-read direct-memory allocation release failed");
+    }
+
     resources.UnmapMemory(fault_base, fault_size);
     Require("GpuCommandLane", "processor fault unmap",
             Libs::LibKernel::Memory::KernelMunmap(fault_base, fault_size) == 0,
