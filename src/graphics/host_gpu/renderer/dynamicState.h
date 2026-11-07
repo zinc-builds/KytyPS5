@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -24,6 +25,56 @@ struct StencilOps {
 		return fail_op == other.fail_op && pass_op == other.pass_op &&
 		       depth_fail_op == other.depth_fail_op && compare_op == other.compare_op;
 	}
+};
+
+// The graphics pipeline, push constants and set-0 push descriptors recorded last in the current
+// command buffer, so a draw records only what changed. Push constants and push descriptors are
+// reused only while the pipeline layout they were pushed with stays current (a layout belongs to
+// one pipeline); anything else that binds or pushes graphics state must call Reset().
+class GraphicsBindings {
+public:
+	void Reset() {
+		m_pipeline        = nullptr;
+		m_layout          = nullptr;
+		m_constants_known = 0;
+		m_writes_valid    = false;
+	}
+
+	// Something else bound graphics descriptor sets: forget what was pushed.
+	void ForgetLayout() {
+		m_layout          = nullptr;
+		m_constants_known = 0;
+		m_writes_valid    = false;
+	}
+
+	void BindPipeline(vk::CommandBuffer cmdbuf, vk::Pipeline pipeline, vk::PipelineLayout layout);
+	// offset and size in bytes, multiples of 4.
+	void PushConstants(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
+	                   vk::ShaderStageFlags stages, uint32_t offset, uint32_t size,
+	                   const void* data);
+	// Pushes the elements of writes that differ from the last push with this layout.
+	void PushDescriptors(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
+	                     std::span<const vk::WriteDescriptorSet> writes);
+
+private:
+	struct Write {
+		uint32_t           binding = 0;
+		vk::DescriptorType type {};
+		uint32_t           count = 0;
+		uint32_t           first = 0; // index into m_buffers or m_images
+	};
+
+	void UseLayout(vk::PipelineLayout layout);
+
+	vk::Pipeline                          m_pipeline        = nullptr;
+	vk::PipelineLayout                    m_layout          = nullptr;
+	std::array<uint32_t, 32>              m_constants {};
+	uint32_t                              m_constants_known = 0; // bit per dword
+	bool                                  m_writes_valid    = false;
+	std::vector<Write>                    m_writes;
+	std::vector<vk::DescriptorBufferInfo> m_buffers;
+	std::vector<vk::DescriptorImageInfo>  m_images;
+	std::vector<vk::WriteDescriptorSet>   m_pending;
 };
 
 struct DynamicState {
@@ -97,8 +148,13 @@ struct DynamicState {
 	/// Commits the dynamic state to the provided command buffer.
 	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
 
+	GraphicsBindings bindings;
+
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
-	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
+	void Invalidate() {
+		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+		bindings.Reset();
+	}
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());
