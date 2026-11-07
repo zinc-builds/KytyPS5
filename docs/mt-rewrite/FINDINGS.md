@@ -1277,6 +1277,19 @@ backing alias. A per-thread translation cache is validated by a sequence count t
 Result: 38.97 → 39.56 FPS. The scheduler mutex went to Track B with its per-draw locks. The
 `PrepareBda` memcpy (~680 MB/s, two ~8.7 MB ranges a frame) is the largest single item left.
 
+Two attempts on that memcpy (~200 uploads/s of ~3.4 MB, ~41 ms/s of the command thread):
+
+- Copying on a helper thread after the upload is queued is unsound. Labels are stored when the
+  command thread decodes their packet, so the guest may rewrite a buffer before a later copy
+  reads it. With verification, 9% of uploads changed between queueing and the helper's copy.
+  Waiting for the helper at the next packet that can signal the guest
+  (`GuestSyncEpoch::Advance`) puts all the time back: ~40 waits/s totalling ~40 ms/s, because
+  such a packet follows almost every large upload.
+- Splitting the copy over the caller and two helpers, and returning once all of it is copied,
+  keeps the snapshot. The caller's share falls to ~25 ms/s, but the copy is memory-bound
+  (~32 GB/s with three threads, ~17 GB/s alone). FPS: same binary, helpers off 38.99 → on 39.21;
+  against `dev` ab1429f1, 39.93 → 39.87. Not merged (branch `trackB/upload-helper`).
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
