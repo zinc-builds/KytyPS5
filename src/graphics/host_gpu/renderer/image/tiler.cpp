@@ -701,8 +701,9 @@ void TileManager::VerifyDetile(vk::Buffer tiled, uint64_t tiled_offset, Image& i
 	const auto& info     = image.info;
 	const auto  linear   = Detile(tiled, tiled_offset, info);
 	auto        observed = CopyOf(m_graphics, m_scheduler, linear.buffer, linear.offset, linear.size);
-	image.Download(info.BufferCopies(0), observed->Handle(), 0, linear.size);
-	CompareLater(m_graphics, m_scheduler, linear.buffer, linear.offset, observed->Handle(), 0,
+	const auto observed_handle = observed->Handle();
+	image.Download(info.BufferCopies(0), observed_handle, 0, linear.size);
+	CompareLater(m_graphics, m_scheduler, linear.buffer, linear.offset, observed_handle, 0,
 	             linear.size, std::move(observed), info, "detile");
 }
 
@@ -713,17 +714,18 @@ void TileManager::VerifyTile(Image& image, std::span<const vk::BufferImageCopy> 
 	const auto& info            = image.info;
 	const auto  linear_capacity = info.LinearSize(levels);
 	auto reference = CopyOf(m_graphics, m_scheduler, tiled, tiled_offset, tiled_capacity);
+	const auto reference_handle = reference->Handle();
 	{
 		const auto tiling = Prepare(true, tiled_capacity, linear_capacity, info, levels, 0, 0);
-		auto       linear = GetScratchBuffer(linear_capacity, reference->Handle());
+		auto       linear = GetScratchBuffer(linear_capacity, reference_handle);
 		image.Download(regions, linear.buffer, 0, linear.size);
-		Record(linear.buffer, 0, linear_capacity, reference->Handle(), 0, tiled_capacity, tiling,
+		Record(linear.buffer, 0, linear_capacity, reference_handle, 0, tiled_capacity, tiling,
 		       false);
 	}
 	const auto tiling = Prepare(true, tiled_capacity, linear_capacity, info, levels, 0, tiled_offset);
 	RecordImage(tiled, tiled_offset, tiled_capacity, image,
 	            DirectImageFormat(image, levels, false), tiling, false);
-	CompareLater(m_graphics, m_scheduler, tiled, tiled_offset, reference->Handle(), 0,
+	CompareLater(m_graphics, m_scheduler, tiled, tiled_offset, reference_handle, 0,
 	             tiled_capacity, std::move(reference), info, "tile");
 }
 
