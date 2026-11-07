@@ -4,6 +4,7 @@
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
@@ -243,6 +244,8 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				m_program_cache.erase(program);
 				return false;
 			}
+			VulkanDiagnostics::DumpSpirv(ShaderRecompiler::StageName(program->first.stage),
+			                             program->first.hash, module.id, spirv);
 			module.module = CompileSPV(spirv, m_graphics.device);
 			program->second.modules.push_back(std::move(module));
 			break;
