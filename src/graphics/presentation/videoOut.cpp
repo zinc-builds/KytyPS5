@@ -19,6 +19,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
+#include "kernel/timeDiag.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
@@ -530,6 +531,10 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
+	if (video_out->bus == 0) {
+		LibKernel::TimeDiag::NoteFlipSubmit(source == FlipRequestSource::GpuEop, flip_mode,
+		                                    flip_arg, video_out->flip_rate);
+	}
 	return OK;
 }
 
@@ -770,6 +775,9 @@ void VideoOutDriver::Impl::VblankEnd() {
 		if (ctx.opened) {
 			ctx.mutex.Lock();
 			ctx.vblank_status.count++;
+			if (i == 1) {
+				LibKernel::TimeDiag::NoteVblank();
+			}
 			ctx.vblank_status.processTime        = LibKernel::KernelGetProcessTime();
 			ctx.vblank_status.reserved           = LibKernel::KernelReadTsc();
 			ctx.vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
@@ -1139,6 +1147,9 @@ bool FlipQueue::Flip() {
 			continue;
 		}
 		auto& r = *it;
+		if (r.cfg->bus == 0) {
+			LibKernel::TimeDiag::NoteFlipDone(r.cfg->vblank_status.count);
+		}
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1534,6 +1545,8 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
 	PRINT_NAME();
+	LibKernel::TimeDiag::NoteCall(LibKernel::TimeDiag::Source::FlipStatus,
+	                              __builtin_return_address(0));
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1584,6 +1597,8 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 
 KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status) {
 	PRINT_NAME();
+	LibKernel::TimeDiag::NoteCall(LibKernel::TimeDiag::Source::VblankStatus,
+	                              __builtin_return_address(0));
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1664,6 +1679,8 @@ KYTY_SYSV_ABI int VideoOutGetEventCount(const EventQueue::KernelEvent* ev) {
 
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	PRINT_NAME();
+	LibKernel::TimeDiag::NoteCall(LibKernel::TimeDiag::Source::WaitVblank,
+	                              __builtin_return_address(0));
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {

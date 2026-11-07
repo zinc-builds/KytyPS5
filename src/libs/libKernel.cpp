@@ -16,13 +16,14 @@
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
+#include "kernel/timeDiag.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
-#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -1767,6 +1768,7 @@ static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
 	PRINT_NAME();
+	LibKernel::TimeDiag::NoteClock(clock_id, __builtin_return_address(0));
 
 	return POSIX_CALL(LibKernel::KernelClockGettime(clock_id, time));
 }
@@ -1817,6 +1819,70 @@ LIB_DEFINE(InitLibKernelWriteThrottling) {
 
 } // namespace LibKernelWriteThrottling
 
+// Guest entry points of the kernel clocks, so KYTY_TIME_DIAG counts only the game's own calls.
+namespace GuestTime {
+
+namespace TimeDiag = LibKernel::TimeDiag;
+using TimeDiag::Source;
+
+#define KYTY_TIME_NOTE(source) TimeDiag::NoteCall(source, __builtin_return_address(0))
+
+uint64_t KYTY_SYSV_ABI ReadTsc() {
+	KYTY_TIME_NOTE(Source::ReadTsc);
+	return LibKernel::KernelReadTsc();
+}
+
+uint64_t KYTY_SYSV_ABI GetTscFrequency() {
+	KYTY_TIME_NOTE(Source::TscFrequency);
+	return LibKernel::KernelGetTscFrequency();
+}
+
+uint64_t KYTY_SYSV_ABI GetProcessTime() {
+	KYTY_TIME_NOTE(Source::ProcessTime);
+	return LibKernel::KernelGetProcessTime();
+}
+
+uint64_t KYTY_SYSV_ABI GetProcessTimeCounter() {
+	KYTY_TIME_NOTE(Source::ProcessTimeCounter);
+	return LibKernel::KernelGetProcessTimeCounter();
+}
+
+uint64_t KYTY_SYSV_ABI GetProcessTimeCounterFrequency() {
+	KYTY_TIME_NOTE(Source::TscFrequency);
+	return LibKernel::KernelGetProcessTimeCounterFrequency();
+}
+
+int KYTY_SYSV_ABI ClockGettime(LibKernel::KernelClockid clock_id, LibKernel::KernelTimespec* tp) {
+	TimeDiag::NoteClock(clock_id, __builtin_return_address(0));
+	return LibKernel::KernelClockGettime(clock_id, tp);
+}
+
+int KYTY_SYSV_ABI Gettimeofday(LibKernel::KernelTimeval* tp) {
+	KYTY_TIME_NOTE(Source::Gettimeofday);
+	return LibKernel::KernelGettimeofday(tp);
+}
+
+int KYTY_SYSV_ABI Usleep(LibKernel::KernelUseconds microseconds) {
+	TimeDiag::NoteSleep(Source::Usleep, static_cast<uint64_t>(microseconds) * 1000u,
+	                    __builtin_return_address(0));
+	return LibKernel::KernelUsleep(microseconds);
+}
+
+int KYTY_SYSV_ABI Nanosleep(const LibKernel::KernelTimespec* rqtp,
+                            LibKernel::KernelTimespec*       rmtp) {
+	if (rqtp != nullptr && rqtp->tv_sec >= 0 && rqtp->tv_nsec >= 0) {
+		TimeDiag::NoteSleep(Source::Nanosleep,
+		                    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000u +
+		                        static_cast<uint64_t>(rqtp->tv_nsec),
+		                    __builtin_return_address(0));
+	}
+	return LibKernel::KernelNanosleep(rqtp, rmtp);
+}
+
+#undef KYTY_TIME_NOTE
+
+} // namespace GuestTime
+
 namespace Posix {
 
 LIB_VERSION("Posix", 1, "libkernel", 1, 1);
@@ -1829,6 +1895,7 @@ int KYTY_SYSV_ABI getpagesize() {
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
 	PRINT_NAME();
+	LibKernel::TimeDiag::NoteClock(clock_id, __builtin_return_address(0));
 
 	return POSIX_CALL(LibKernel::KernelClockGettime(clock_id, time));
 }
@@ -1846,6 +1913,8 @@ struct KernelTimezone {
 
 int KYTY_SYSV_ABI gettimeofday(LibKernel::KernelTimeval* time, KernelTimezone* timezone) {
 	PRINT_NAME();
+	LibKernel::TimeDiag::NoteCall(LibKernel::TimeDiag::Source::Gettimeofday,
+	                              __builtin_return_address(0));
 
 	if (time != nullptr) {
 		int result = LibKernel::KernelGettimeofday(time);
@@ -1866,6 +1935,12 @@ int KYTY_SYSV_ABI gettimeofday(LibKernel::KernelTimeval* time, KernelTimezone* t
 int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
                             LibKernel::KernelTimespec*       rmtp) {
 	PRINT_NAME();
+	if (rqtp != nullptr && rqtp->tv_sec >= 0 && rqtp->tv_nsec >= 0) {
+		LibKernel::TimeDiag::NoteSleep(LibKernel::TimeDiag::Source::Nanosleep,
+		                               static_cast<uint64_t>(rqtp->tv_sec) * 1000000000u +
+		                                   static_cast<uint64_t>(rqtp->tv_nsec),
+		                               __builtin_return_address(0));
+	}
 
 	return POSIX_CALL(LibKernel::KernelNanosleep(rqtp, rmtp));
 }
@@ -3291,17 +3366,17 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("EjllaAqAPZo", Posix::pthread_condattr_setclock);
 
 	LIB_FUNC("wRYVA5Zolso", LibKernel::KernelClockGetres);
-	LIB_FUNC("QBi7HCK03hw", LibKernel::KernelClockGettime);
-	LIB_FUNC("ejekcaNQNq0", LibKernel::KernelGettimeofday);
+	LIB_FUNC("QBi7HCK03hw", GuestTime::ClockGettime);
+	LIB_FUNC("ejekcaNQNq0", GuestTime::Gettimeofday);
 	LIB_FUNC("kOcnerypnQA", LibKernel::KernelGettimezone);
 	LIB_FUNC("0NTHN1NKONI", LibKernel::KernelConvertLocaltimeToUtc);
 	LIB_FUNC("-o5uEDpN+oY", LibKernel::KernelConvertUtcToLocaltime);
 	LIB_FUNC("n88vx3C5nW8", Posix::gettimeofday);
-	LIB_FUNC("-2IRUCO--PM", LibKernel::KernelReadTsc);
-	LIB_FUNC("1j3S3n-tTW4", LibKernel::KernelGetTscFrequency);
-	LIB_FUNC("4J2sUJmuHZQ", LibKernel::KernelGetProcessTime);
-	LIB_FUNC("BNowx2l588E", LibKernel::KernelGetProcessTimeCounterFrequency);
-	LIB_FUNC("fgxnMeTNUtY", LibKernel::KernelGetProcessTimeCounter);
+	LIB_FUNC("-2IRUCO--PM", GuestTime::ReadTsc);
+	LIB_FUNC("1j3S3n-tTW4", GuestTime::GetTscFrequency);
+	LIB_FUNC("4J2sUJmuHZQ", GuestTime::GetProcessTime);
+	LIB_FUNC("BNowx2l588E", GuestTime::GetProcessTimeCounterFrequency);
+	LIB_FUNC("fgxnMeTNUtY", GuestTime::GetProcessTimeCounter);
 
 	LIB_FUNC("7H0iTOciTLo", Posix::pthread_mutex_lock);
 	LIB_FUNC("2Z+PpY6CaJg", Posix::pthread_mutex_unlock);
@@ -3354,9 +3429,9 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_OBJECT("f7uOxY9mM1U", &LibKernel::g_stack_chk_guard);
 	LIB_OBJECT("djxxOmW6-aw", &LibKernel::g_progname);
 
-	LIB_FUNC("1jfXLRVzisc", LibKernel::KernelUsleep);
-	LIB_FUNC("QcteRwbsnV0", LibKernel::KernelUsleep);
-	LIB_FUNC("QvsZxomvUHs", LibKernel::KernelNanosleep);
+	LIB_FUNC("1jfXLRVzisc", GuestTime::Usleep);
+	LIB_FUNC("QcteRwbsnV0", GuestTime::Usleep);
+	LIB_FUNC("QvsZxomvUHs", GuestTime::Nanosleep);
 	LIB_FUNC("LwG8g3niqwA", LibKernel::KernelDlsym);
 	LIB_FUNC("-ZR+hG7aDHw", LibKernel::KernelSleep);
 	LIB_FUNC("6c3rCVE-fTU", LibKernel::open);

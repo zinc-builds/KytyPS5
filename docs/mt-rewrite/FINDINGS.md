@@ -667,6 +667,45 @@ noise). Texture resolve went from 10.6% to 10.0% of the thread. Not merged.
 - `cmake --install` fails resolving the Qt launcher's image-plugin dependencies (`libheif`,
   `libjxrglue`). `kyty_emulator` is installed before that step, so benchmarking is unaffected.
 
+### Game timing and the real-speed check (C3, 2026-11-07)
+
+There is no PS5 to compare against, so the check for "the game runs at real speed" has to come
+from inside the emulator. `KYTY_TIME_DIAG=1` counts the game's own clock and video-out calls
+(only the guest entry points, not the emulator's internal ones), records their call sites, and
+times every flip that reaches the screen. Sky Garden on `dev` 458607ad, per second:
+
+| | Value |
+|---|---|
+| Flip mode | vsync (`mode1`), flip rate 0 (60 Hz), all flips submitted from the GPU (EOP) |
+| Vblanks | 60/s, steady |
+| Flips on screen | ~23.5/s, each **2 or 3 vblanks** after the previous one (33 or 50 ms; p50 3, p99 3) |
+| `sceKernelGetProcessTimeCounter` | ~65k (≈ 2.8k per frame; ~50k from one site, `eboot+0xd30cec`) |
+| TSC / process-counter frequency queries | ~15.5k |
+| `sceKernelGetProcessTime` | ~630 |
+| `sceKernelReadTsc` | ~230 |
+| Flip status / vblank status / wait-vblank | 0 / ~0 / 0 |
+| `usleep(0)` | **~1.85 M**, all from `eboot+0x114b315` |
+
+What this means:
+- **The game times itself with the process time counter, not with vblank or flip counts.** About
+  55 call sites read a clock exactly once per flip; the first one disassembled (`eboot+0xe07df0`)
+  converts a TSC delta into milliseconds per update stage. How the simulation step is derived and
+  clamped was not traced further, because the check below doesn't depend on it.
+- **The real-speed check is the flip cadence.** On a PS5 this game flips on consecutive vblanks.
+  When every flip that reaches the screen is 1 vblank after the previous one (`flip_vbl` p99 = 1)
+  at 60 flips/s, the game sees exactly the timing it sees on hardware, however it computes its
+  delta. That is the definition of done, alongside the FPS columns.
+- **FPS is quantized by vsync.** A frame shows after 1, 2 or 3 vblanks; "24 FPS" is a mix of
+  30 FPS and 20 FPS frames. Speedups show up as frames moving from 3 vblanks to 2, then from 2
+  to 1: a frame that takes 17 ms still costs two vblanks, so to reach 60 every frame must fit in
+  16.7 ms, not just the average.
+- **`usleep(0)` is a busy spin.** The emulator returns from `usleep(0)` immediately, so the game's
+  worker threads spin there (~10 `tbb_thead`s at ~27% CPU each). Yielding on `usleep(0)` changed
+  nothing (A/B, same batch: 24.41 / 24.22 FPS without, 24.17 / 24.23 with), and the hybrid-CPU
+  pinning already keeps the spinners off the GPU command thread's core.
+
+`dev` 458607ad (everything through #11): 24.20 / 24.41 / 24.22 FPS, worst_ms ~52–54, low1 ~19.
+
 ## Remaining costs and candidate directions
 
 1. **Per-draw CPU cost (~10.5 µs × 5.8k draws).** Spread thinly; only structural change helps:
@@ -689,6 +728,12 @@ noise). Texture resolve went from 10.6% to 10.0% of the thread. Not merged.
   (`~/AI/emu/tracy-build` has binaries); export with `tracy-csvexport`. Tracy renames the main
   thread, so match the process by command line (`^\./kyty_emulator --game`), never by name.
 - Thread name `KytyGpuCmd` for the GPU thread (top/perf/taskset).
+- `KYTY_TIME_DIAG=1` (costs ~1 FPS while on): one `TIMEDIAG` line per second: vblanks, flips on screen with their interval
+  in ms and in vblanks (`flip_vbl`, the real-speed check), flip modes, the game's clock and
+  video-out calls per second with their top call sites (`eboot.bin+0x…`), and the sites read
+  about once per flip (`per_flip:`). `KYTY_TIME_DIAG=dump` also writes the code around every
+  call site to `/tmp/timediag-<offset>.bin` (disassemble with `objdump -D -b binary -mi386:x86-64
+  --adjust-vma=<offset-1024>`).
 - `KYTY_MEM_DIAG=1`: one `MEMDIAG` line per second with `ObtainBuffer` outcomes, stream copies and
   their repetition, `SynchronizeBuffer` uploads by caller, write-watch changes, faults by thread
   kind, labels and submissions. `tools/astro-bench/c0-profile.sh <label>` adds per-thread CPU time,
