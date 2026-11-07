@@ -18088,10 +18088,14 @@ public:
             stencil_write
                 ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
                 : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+        // A read-only depth/stencil layout stores nothing (STORE_OP_NONE), so the attachment
+        // only reads and the sampling reads merge into its state without a barrier.
         const auto expected_access =
-            vk::AccessFlagBits2::eShaderRead |
-            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+            stencil_write ? vk::AccessFlagBits2::eShaderRead |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                          : vk::AccessFlagBits2::eShaderRead |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentRead;
         const auto &vertex_image = shared_bindings.vertex[0].images[0];
         Require(name, "sampled depth and stencil attachment layout",
                 shared_depth.image_id == phased_depth.image_id &&
