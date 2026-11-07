@@ -813,6 +813,40 @@ GPU 14.14 → 13.29 ms/frame, dispatches 3.68 → 3.04, barrier gaps 0.80 → 0.
 (the command thread limits). `KYTY_DISPATCH_CHAIN=0` records every barrier again,
 `=stats` prints `DISPCHAIN` lines.
 
+**Where dispatch time stands after #42 and #45** (`dev` abc268e0, `KYTY_GPU_TIME=draws`, ~34.5
+FPS): GPU 12.93 ms/frame, dispatches 2.79 (248 per frame), barrier gaps 0.54. Chains cut the small
+repeated dispatches most: `d637f68e` 14.1 → 4.5 ms/s, `2a150e06` 8.9 → 3.4 ms/s. Per frame now:
+
+| Module | ms/frame | Notes |
+|---|---|---|
+| `0ec2f135` | 0.53 | 168 registers, 33.8 KB shared (7.5 KB guest LDS), 1 dispatch |
+| emulator tiling/blits (`cs=0`) | 0.3–0.45 | spiky run to run |
+| `abbbd166` | 0.15 | 255 registers |
+| `d637f68e` | 0.13 | 38 dispatches |
+| `c4fbbdb0`, `2a150e06`, `62d38f5b` | ~0.1 each | `2a150e06`: 48 KB guest LDS for one 64-lane wave |
+
+Driver `Shared_Memory_Size` above the guest LDS (`0ec2f135`: +26 KB, `a0cae5af`: 12.6 KB with
+no LDS) comes and goes with codegen changes and looks like register spill space.
+
+**Why the other 46% of dispatches don't chain** (local diagnostic, breaks per second at ~35 FPS):
+the packet before them is `WAIT_REG_MEM_64` (~1.7k) or `EVENT_WRITE` CS_PARTIAL_FLUSH (~1.2k),
+usually after a `RELEASE_MEM` (2.7k); the dispatch itself can't chain (GDS, LDS buffer, ordered
+append: ~0.3k); or something was recorded during its preparation (~70). The waits are the
+game's own ordering, so dispatch serialization is now at the guest's level. Letting a chain run
+through `RELEASE_MEM` (which records nothing here) changed nothing: the wait follows it.
+
+**Ruled out (measured, not landed):**
+- Wave64 halves emitted run by run (all of half 0's lane-local instructions between two cross-half
+  points, then half 1's, instead of interleaved): registers, shared memory and times unchanged;
+  the NVIDIA compiler schedules both halves together anyway.
+- Image reads and writes as EXEC-guarded accesses in masked-select elimination (on top of #42):
+  GPU 12.90 → 12.89 ms/frame.
+- DPP and `V_PERMLANE16` moves shuffling only the caller's half: only 18 of `0ec2f135`'s 230
+  shuffles are DPP (the rest are lane reads across halves); no change.
+- Comparison denormal flushes against constants: only ~120 of `0ec2f135`'s 474 flushes feed
+  comparisons; the rest feed sqrt, division, reciprocal square root and log2, where the
+  guest's flush is needed.
+
 ### Draw state cache, Track B (2026-11-06)
 
 **B0: per-draw state does not repeat; its shape does.** A walk memo keyed on a program's user
