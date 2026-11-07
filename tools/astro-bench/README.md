@@ -21,6 +21,8 @@ without it ~1.7M SIGILL/s drop Sky Garden to ~10 FPS. `run.sh` starts
 copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures the old binary.
 
 - `run.sh` — launches the emulator windowed (1920×1080), muted, DualSense hidden, `KYTY_PERF_LOG=1`.
+  It refuses to start when this checkout's `_Build/linux/kyty_emulator` is newer than the installed
+  one (you built but didn't `cmake --install`); `KYTY_INSTALL=<dir>` runs another install.
 - `garden.sh <label> [flags]` — gets into Sky Garden, then averages `PERF` lines over
   `GARDEN_WINDOW` s (45) after `GARDEN_SETTLE` s (25). `KEEP_RUNNING=1` leaves the emulator in the
   level for profiling. Two routes (`GARDEN_ROUTE`):
@@ -36,6 +38,16 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   it until the emulator exits); wrap other emulator launches in `benchlock.sh run …` and builds or
   unit tests in `benchlock.sh build …` (shared). `benchlock.sh status` shows the holder.
 - `batch.sh` — runs `<label> [ENV=VAL…] -- [flags…]` lines back to back.
+- `refbuild.sh <commit>` — prints the install dir of a Release build of that commit, building it
+  once into `~/.cache/kyty-builds/<sha>/` for every checkout to share. Use it for A/B reference
+  builds instead of building your merge-base yourself, and call it before `batch.sh`, not inside:
+  `ref=$(tools/astro-bench/refbuild.sh "$(git merge-base HEAD origin/dev)")`, then a batch line
+  `ref1 KYTY_INSTALL=$ref -- --amd-cpu`.
+- Builds use **ccache** (`/usr/bin/ccache`, shared cache with `base_dir = /home/tomm` in
+  `~/.config/ccache/ccache.conf`, so worktrees under `$HOME` share entries; a full build drops from
+  ~107 s to ~28 s on hits). A build dir configured before ccache was installed cached
+  `CCACHE_PROGRAM-NOTFOUND`: reconfigure once with `cmake -S . -B _Build/linux
+  -DCCACHE_PROGRAM=/usr/bin/ccache`.
 - `symbolize.py`, `chains.py` — map perf addresses of this stripped PIE through
   `_Build/linux/kyty_emulator_clang_lld.map` (perf report prints file offsets; vaddr = offset +
   0x1000; for `perf script` runtime addresses pass the load base = r-xp mapping start − (its file

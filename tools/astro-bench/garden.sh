@@ -20,7 +20,7 @@ wait_log() { # wait_log <regex> <timeout_s>
 	local end=$((SECONDS + $2))
 	until grep -q -E "$1" "$log" 2>/dev/null; do
 		((SECONDS > end)) && { echo "timeout waiting for: $1" >&2; return 1; }
-		pgrep -f '^\./kyty_emulator --game' >/dev/null || { echo "emulator exited" >&2; return 1; }
+		pgrep -f '^\./kyty_emulator --game' >/dev/null || { echo "emulator exited ($(tail -1 "$log" 2>/dev/null))" >&2; return 1; }
 		wait_s 1
 	done
 	return 0

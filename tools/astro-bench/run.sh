@@ -7,6 +7,11 @@ log=/tmp/bench-$1.log; shift
 . "$(dirname "$0")/benchlock.sh"
 benchlock_acquire x "run.sh $(basename "$log")" || exit 1
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+if [ -z "$KYTY_INSTALL" ] && [ "$repo/_Build/linux/kyty_emulator" -nt "$repo/_Build/linux/install/kyty_emulator" ]; then
+	echo "run.sh: _Build/linux/kyty_emulator is newer than the installed one; run cmake --install first" >&2
+	echo "EXIT STATUS: stale install" > "$log"
+	exit 1
+fi
 cd "${KYTY_INSTALL:-$repo/_Build/linux/install}" || exit 1
 export KYTY_PERF_LOG=1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
 export SDL_GAMECONTROLLER_IGNORE_DEVICES=0x054c/0x0ce6
