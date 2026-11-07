@@ -2,6 +2,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <bit>
 #include <cstdint>
 #include <unordered_map>
@@ -831,11 +833,168 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 	}
 }
 
+// Lane predicates of the lanes a vertex-stage subgroup starts with. Those lanes are the
+// subgroup's lowest ones: the translator already passes the entry ballot's popcount as the NGG
+// vertex count, from which the guest builds EXEC. A predicate whose inputs are only constants,
+// LaneId and that ballot is then constant if it has one value for every prefix-shaped subgroup
+// (1 to 64 active lanes) and every active lane in it; this evaluates exactly that.
+class EntryLanePredicate {
+public:
+	explicit EntryLanePredicate(const Block* entry): m_entry(entry) {}
+
+	// The predicate's value for every active lane of every prefix-shaped subgroup, if it is one.
+	std::optional<bool> Evaluate(const Inst& predicate) {
+		m_nodes = 0;
+		m_cache.clear();
+		if (m_entry == nullptr || !Supported(Value(const_cast<Inst*>(&predicate)))) return {};
+		std::optional<bool> result;
+		for (uint32_t active = 1; active <= 64u; ++active) {
+			for (uint32_t lane = 0; lane < active; ++lane) {
+				m_active = active;
+				m_lane   = lane;
+				m_cache.clear();
+				const auto value = Eval(Value(const_cast<Inst*>(&predicate)));
+				if (!value) return {};
+				if (result && *result != (*value != 0u)) return {};
+				result = *value != 0u;
+			}
+		}
+		return result;
+	}
+
+private:
+	static constexpr uint32_t MaxNodes = 96;
+
+	bool IsEntryBallot(const Inst& inst) const {
+		return inst.GetOpcode() == ValueOpcode::Ballot && inst.Parent() == m_entry &&
+		       IsImmediate(Arg(inst, 0), Type::U1) && Arg(inst, 0).U1();
+	}
+
+	// Every input is a constant, LaneId or a word of the entry ballot; no Phis.
+	bool Supported(Value value) {
+		if (value.IsImmediate()) {
+			const auto type = value.GetType();
+			return type == Type::U1 || type == Type::U32 || type == Type::U64;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || ++m_nodes > MaxNodes) return false;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::LaneId: return true;
+			case ValueOpcode::CompositeExtractU32x4: {
+				const auto* source = Arg(*inst, 0).TryInstruction();
+				return source != nullptr && IsEntryBallot(*source) &&
+				       IsImmediate(Arg(*inst, 1), Type::U32) && Arg(*inst, 1).U32() < 4u;
+			}
+			case ValueOpcode::IAdd32: case ValueOpcode::ISub32: case ValueOpcode::IAdd64:
+			case ValueOpcode::ISub64: case ValueOpcode::BitwiseAnd32: case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32: case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::BitwiseAnd64: case ValueOpcode::BitCount32:
+			case ValueOpcode::ShiftLeftLogical32: case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftLeftLogical64: case ValueOpcode::ShiftRightLogical64:
+			case ValueOpcode::BitFieldUExtract: case ValueOpcode::UMin32: case ValueOpcode::UMax32:
+			case ValueOpcode::ULessThan32: case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::UGreaterThan32: case ValueOpcode::UGreaterThanEqual32:
+			case ValueOpcode::IEqual32: case ValueOpcode::INotEqual32: case ValueOpcode::IEqual64:
+			case ValueOpcode::INotEqual64: case ValueOpcode::SelectU32: case ValueOpcode::SelectU1:
+			case ValueOpcode::LogicalAnd: case ValueOpcode::LogicalOr: case ValueOpcode::LogicalNot:
+			case ValueOpcode::LogicalXor: case ValueOpcode::CompositeConstructU64:
+			case ValueOpcode::CompositeExtractU64:
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+					if (!Supported(Arg(*inst, arg))) return false;
+				}
+				return inst->NumArgs() != 0;
+			default: return false;
+		}
+	}
+
+	// U1 values are 0 or 1. 32-bit shifts by 32 or more are undefined: no value.
+	std::optional<uint64_t> Eval(Value value) {
+		if (value.IsImmediate()) {
+			switch (value.GetType()) {
+				case Type::U1: return value.U1() ? 1u : 0u;
+				case Type::U32: return value.U32();
+				case Type::U64: return value.U64();
+				default: return {};
+			}
+		}
+		const auto* inst = value.TryInstruction();
+		if (const auto found = m_cache.find(inst); found != m_cache.end()) return found->second;
+		const auto result = Compute(*inst);
+		m_cache.emplace(inst, result);
+		return result;
+	}
+
+	std::optional<uint64_t> Compute(const Inst& inst) {
+		const auto op = inst.GetOpcode();
+		if (op == ValueOpcode::LaneId) return m_lane;
+		if (op == ValueOpcode::CompositeExtractU32x4) {
+			const auto word  = Arg(inst, 1).U32();
+			const auto lanes = m_active > 32u * word ? std::min(m_active - 32u * word, 32u) : 0u;
+			return lanes == 32u ? UINT32_MAX : (uint32_t {1} << lanes) - 1u;
+		}
+		std::array<uint64_t, 3> a {};
+		for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+			const auto value = Eval(Arg(inst, arg));
+			if (!value) return {};
+			a[arg] = *value;
+		}
+		const auto u32 = [](uint64_t v) { return static_cast<uint64_t>(static_cast<uint32_t>(v)); };
+		switch (op) {
+			case ValueOpcode::IAdd32: return u32(a[0] + a[1]);
+			case ValueOpcode::ISub32: return u32(a[0] - a[1]);
+			case ValueOpcode::IAdd64: return a[0] + a[1];
+			case ValueOpcode::ISub64: return a[0] - a[1];
+			case ValueOpcode::BitwiseAnd32: case ValueOpcode::BitwiseAnd64: return a[0] & a[1];
+			case ValueOpcode::BitwiseOr32: return a[0] | a[1];
+			case ValueOpcode::BitwiseXor32: return a[0] ^ a[1];
+			case ValueOpcode::BitwiseNot32: return u32(~a[0]);
+			case ValueOpcode::BitCount32: return std::popcount(static_cast<uint32_t>(a[0]));
+			case ValueOpcode::ShiftLeftLogical32:
+				if (a[1] >= 32u) return {};
+				return u32(a[0] << a[1]);
+			case ValueOpcode::ShiftRightLogical32:
+				if (a[1] >= 32u) return {};
+				return a[0] >> a[1];
+			// The emitter masks 64-bit shift amounts to 6 bits; 32-bit ones are native.
+			case ValueOpcode::ShiftLeftLogical64: return a[0] << (a[1] & 63u);
+			case ValueOpcode::ShiftRightLogical64: return a[0] >> (a[1] & 63u);
+			case ValueOpcode::BitFieldUExtract:
+				if (a[1] >= 32u || a[2] > 32u - a[1]) return {};
+				return a[2] == 0u ? 0u : (a[0] >> a[1]) & (UINT32_MAX >> (32u - a[2]));
+			case ValueOpcode::UMin32: return std::min(a[0], a[1]);
+			case ValueOpcode::UMax32: return std::max(a[0], a[1]);
+			case ValueOpcode::ULessThan32: return a[0] < a[1];
+			case ValueOpcode::ULessThanEqual32: return a[0] <= a[1];
+			case ValueOpcode::UGreaterThan32: return a[0] > a[1];
+			case ValueOpcode::UGreaterThanEqual32: return a[0] >= a[1];
+			case ValueOpcode::IEqual32: case ValueOpcode::IEqual64: return a[0] == a[1];
+			case ValueOpcode::INotEqual32: case ValueOpcode::INotEqual64: return a[0] != a[1];
+			case ValueOpcode::SelectU32: case ValueOpcode::SelectU1: return a[0] != 0u ? a[1] : a[2];
+			case ValueOpcode::LogicalAnd: return a[0] & a[1];
+			case ValueOpcode::LogicalOr: return a[0] | a[1];
+			case ValueOpcode::LogicalXor: return a[0] ^ a[1];
+			case ValueOpcode::LogicalNot: return a[0] ^ 1u;
+			case ValueOpcode::CompositeConstructU64: return u32(a[0]) | (u32(a[1]) << 32u);
+			case ValueOpcode::CompositeExtractU64:
+				if (a[1] >= 2u) return {};
+				return u32(a[0] >> (32u * a[1]));
+			default: return {};
+		}
+	}
+
+	const Block*                                       m_entry;
+	uint32_t                                           m_nodes  = 0;
+	uint32_t                                           m_active = 0;
+	uint32_t                                           m_lane   = 0;
+	std::unordered_map<const Inst*, std::optional<uint64_t>> m_cache;
+};
+
 // Full and empty masks have a constant predicate in either wave size. In wave32,
 // ballot projection also survives scalar EXEC operations and loop-carried mask Phis.
 class LaneMaskProjection {
 public:
-	explicit LaneMaskProjection(FoldWorklist& worklist): m_worklist(worklist) {}
+	LaneMaskProjection(FoldWorklist& worklist, const Block* prefix_entry)
+	    : m_worklist(worklist), m_entry_lanes(prefix_entry) {}
 
 	void Fold(Inst& inst, uint32_t wave_size) {
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
@@ -852,6 +1011,10 @@ public:
 		const auto mask = Arg(*shift, 0);
 		if (Immediate(mask, 0u) || Immediate(mask, UINT32_MAX)) {
 			Replace(inst, Value(mask.U32() != 0u));
+			return;
+		}
+		if (const auto value = m_entry_lanes.Evaluate(inst)) {
+			Replace(inst, Value(*value));
 			return;
 		}
 		if (wave_size != 32u) return;
@@ -928,6 +1091,7 @@ private:
 	}
 
 	FoldWorklist& m_worklist;
+	EntryLanePredicate m_entry_lanes;
 	std::unordered_set<const Inst*> m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
 	bool m_grounded = false;
@@ -935,9 +1099,10 @@ private:
 
 } // namespace
 
-void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
+void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size, bool prefix_entry_lanes) {
 	FoldWorklist worklist;
-	LaneMaskProjection mask_projection(worklist);
+	LaneMaskProjection mask_projection(worklist,
+	                                   prefix_entry_lanes && !blocks.empty() ? blocks.front() : nullptr);
 	for (auto* block: blocks)
 		for (auto inst = block->begin(); inst != block->end(); ++inst) worklist.Register(inst);
 	std::vector<Use> users;

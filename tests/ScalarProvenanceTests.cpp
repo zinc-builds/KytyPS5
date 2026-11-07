@@ -820,6 +820,64 @@ void TestCompleteWaveReduction() {
   }
 }
 
+
+// A vertex stage builds EXEC from its NGG vertex count, the entry ballot's popcount. Every
+// launched lane is below it, so the lane's EXEC bit folds to true; lane predicates that change
+// with the number of active lanes, or a ballot outside the entry block, stay dynamic.
+void TestEntryLanePredicateFold() {
+  enum class Case { VertexCount, VertexCountNoPrefix, HalfMask, LaterBallot };
+  for (const auto test : {Case::VertexCount, Case::VertexCountNoPrefix, Case::HalfMask,
+                          Case::LaterBallot}) {
+    Fixture fixture(2);
+    fixture.program.stage = ShaderType::Vertex;
+    fixture.BlockAt().AddBranch(&fixture.BlockAt(1));
+    using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+    fixture.BlockAt().terminator.kind = Terminator::Branch;
+    fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
+    fixture.BlockAt(1).terminator.kind = Terminator::Return;
+    const uint32_t ballot_block = test == Case::LaterBallot ? 1u : 0u;
+    const auto ballot = fixture.Emit(ValueOpcode::Ballot, {Value(true)}, 0, ballot_block);
+    const auto lo = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)}, 0, 1);
+    const auto hi = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)}, 0, 1);
+    // s3 = vertex count | 1 << 28; EXEC = ~0 >> ((0 - s3) & 63), a mask of the low count lanes.
+    const auto count = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::BitCount32, {lo}, 0, 1),
+         fixture.Emit(ValueOpcode::BitCount32, {hi}, 0, 1)}, 0, 1);
+    const auto s3 = fixture.Emit(ValueOpcode::BitwiseOr32, {count, Value(1u << 28u)}, 0, 1);
+    const auto shift = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::ISub32, {Value(0u), s3}, 0, 1), Value(63u)}, 0, 1);
+    const auto mask = fixture.Emit(ValueOpcode::ShiftRightLogical64,
+        {Value(~uint64_t{0}), shift}, 0, 1);
+    auto exec_lo = fixture.Emit(ValueOpcode::CompositeExtractU64, {mask, Value(0u)}, 0, 1);
+    const auto exec_hi = fixture.Emit(ValueOpcode::CompositeExtractU64, {mask, Value(1u)}, 0, 1);
+    if (test == Case::HalfMask) {
+      exec_lo = fixture.Emit(ValueOpcode::BitwiseAnd32, {exec_lo, Value(0xffffu)}, 0, 1);
+    }
+    const auto lane = fixture.Emit(ValueOpcode::LaneId, {}, 0, 1);
+    const auto word = fixture.Emit(ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)}, 0, 1), exec_lo, exec_hi},
+        0, 1);
+    const auto bit = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::BitwiseAnd32,
+             {fixture.Emit(ValueOpcode::ShiftRightLogical32,
+                  {word, fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(31u)}, 0, 1)}, 0, 1),
+              Value(1u)}, 0, 1),
+         Value(0u)}, 0, 1);
+    const auto use = fixture.Emit(ValueOpcode::Reference, {bit}, 0, 1);
+    ValidateProgram(fixture.program);
+    ConstantPropagationPass(fixture.program.blocks, 64, test != Case::VertexCountNoPrefix);
+    const auto folded = use.Instruction()->Arg(0).Resolve();
+    if (test == Case::VertexCount) {
+      Check(folded == Value(true), "the entry vertex count EXEC bit did not fold to true");
+    } else {
+      Check(!folded.IsImmediate(),
+            ("a lane predicate folded without proof, case " +
+             std::to_string(static_cast<unsigned>(test))).c_str());
+    }
+    ValidateProgram(fixture.program);
+  }
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -955,6 +1013,7 @@ int main() {
     TestReadLaneElimination();
     TestCompleteWaveReduction();
     TestOptimizationPipeline();
+    TestEntryLanePredicateFold();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();
