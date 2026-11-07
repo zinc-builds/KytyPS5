@@ -507,6 +507,37 @@ Render-target resolve went from 10.8% to 5.6% of the thread; +3.8% FPS. `RefindE
 now 4.6% of the thread (texture and target hits each lock the texture cache); batching those
 touches per draw is the next small step.
 
+**Ruled out: two ways per texture slot plus one lock per stage (B2c).** Keeping each slot's two
+latest resolves raised texture hits from 89.7% to 93.2%, and consecutive hits of a stage shared one
+texture-cache lock. Four A/B pairs against `dev` 96c2d1c0: 25.00 → 25.15 FPS (+0.6%, inside the
+noise). Texture resolve went from 10.6% to 10.0% of the thread. Not merged.
+
+**Where the GPU thread goes after B2b** (perf, 10 s, `dev` 96c2d1c0, ~25 FPS, ~7.3 µs per draw):
+
+| Path | Share |
+|---|---|
+| `GetGraphicsPrograms` | 30% |
+| ↳ `MaterializeResources` (↳ JIT walker code 12%) | 21% |
+| ↳ `PrepareProgram` (static vertex input decode) | 5% |
+| `PrepareBindings` (↳ texture resolve 10%, ↳ `RefindExactImage` 4%) | 14% |
+| libc `memcpy`/`memset`, self | 14% |
+| ↳ under `CopySparseMemory` (stream copies, Track C) | 3.8% |
+| ↳ under `DrawIndex`, `ExecutePreparedDraw`, `PrepareBindings`, `ResolveStageTexture`, target resolve | ~7% |
+| NVIDIA driver | 11% |
+| `CommitBindings` | 7% |
+
+- **Large per-draw structs.** About 7% of the thread zeroes or copies draw state: each
+  `TextureCache::ImageDesc` is ~1 KB (a 16-entry mip layout). `DrawRenderState` holds nine of
+  them (eight color targets and depth), zeroed every draw although `ResolveRenderColorTarget`
+  rewrites each target it uses. Each texture binding is also copied twice on its way into
+  `PreparedBindings`.
+- **The JIT walker.** Dumping each walker's code and mapping perf samples onto it: 445 walkers,
+  the hot ones 30–80 KB of code for 100–340 SRT reads. The load stub takes 25% of walker time
+  (the guest load itself 9%). The other 75% is spread across the per-node thunks (call, state
+  byte checks, slot stores) with no single hot spot. Halving it needs a different code shape
+  (straight-line evaluation of the reachable value graph instead of memoized thunks), not a
+  local fix.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
