@@ -609,6 +609,23 @@ another binds `0x53ad00000` as a written storage buffer, which marks that image 
 so the next sampling re-creates and detiles it (2× per frame). The copies run at 100–170 GB/s,
 well below VRAM bandwidth: each round-trip is a copy plus a separate tiling dispatch.
 
+**More ceilings (local experiments, same binary, warmed shader stores, `KYTY_GPU_TIME=passes`):**
+
+| Experiment | GPU effect | Status |
+|---|---|---|
+| Wave64 compute run one guest lane per invocation (like vertex/pixel shaders), all compute shaders including unsafe ones | dispatches 3.66 → 3.26 ms/frame; top shader 673 → 522 µs | ceiling −0.4 ms; safe subset smaller; not pursued |
+| Vertex VGPR writes unpredicated (drops every in-region EXEC select; unsafe) | in passes 8.97 → 8.50 ms/frame | ceiling −0.47 ms for a safe `if (exec)` conversion |
+| Fused legacy MAD (above) | −0.4 ms | parked |
+| GPU clocks during the level | 2700 MHz, P2, ~43% busy | not a clock problem |
+
+**Next: single-pass tiling for render-target round-trips (~1.5 ms/frame).** Each of the
+1080p RGBA16F round-trips is a tiling dispatch plus a separate 16.6 MB copy between the image and
+a linear scratch buffer (buffer → image 0.9 ms/frame, image → buffer 0.7 ms/frame, at 100–170
+GB/s). Color images are created mutable-format with storage usage, so the tiler could read and
+write a raw-bit `uint` storage view of the image directly and drop the copies. It needs either
+`shaderStorageImageReadWithoutFormat` (supported by the RTX 4080 Super but not enabled) or
+per-element-size image bindings in the nine tiler shader families.
+
 **Dispatches (`KYTY_GPU_TIME=draws`, grouped by compute module):** 3.65 ms/frame. One shader
 (`0ec2f135`, one dispatch per frame) takes 0.69 ms; then `d637f68e` (40 per frame, 11 µs),
 the emulator's own tiling/blit dispatches (~0.3 ms), `2a150e06` (18 per frame, 15 µs), and a
