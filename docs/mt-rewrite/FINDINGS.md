@@ -583,11 +583,38 @@ folds them when they are constant. GPU 16.97 → 16.13 ms/frame, +2.8% FPS (tabl
   predicated bodies): an unsafe experiment emitting `if (exec)` for vertex shaders changed in-pass
   time by 0.01 ms.
 
-**Measured, not landed: fused legacy MAD.** The games' shaders use `V_MAD_F32`/`V_MAC_F32` (not
+**Measured, not landed: fused legacy MAD.** The game's shaders use `V_MAD_F32`/`V_MAC_F32` (not
 fused on RDNA2), emitted as a multiply and an add with `NoContraction` since d8be245c, which keeps
-the hardware's intermediate rounding. Emitting them as `FMA` cut in-pass time by ~1.7 ms/frame
-in one run (a run with compile stalls; to be re-measured). It changes rounding (one rounding
-instead of two), so it is a precision trade-off, not a free fix.
+the hardware's intermediate rounding. Emitting them as `FMA` (same binary, warmed shader stores,
+2 runs each): GPU 16.19 → 15.75 ms/frame, in passes 8.97 → 8.58; FPS within noise. Not worth
+giving up the hardware-exact rounding (and its unit test) for 0.4 ms. (An earlier run showing
+−1.7 ms had shader-compile stalls in its window.)
+
+**Outside passes (`KYTY_GPU_TIME=passes`, `GPUGAP`/`GPUXFER`, `dev` a456fbcb, per frame at ~27 FPS):**
+
+| | ms/frame |
+|---|---|
+| Transfers | 2.8 |
+| ↳ buffer copies (~96, 11 µs each) | 1.0 |
+| ↳ buffer → image (~9, 96 µs each) | 0.9 |
+| ↳ image → buffer (~4, 167 µs each) | 0.7 |
+| ↳ fills, blits, image copies | 0.2 |
+| Gaps after barriers (~600 per frame) | 0.85 |
+| Clears, command buffer start/end | 0.15 |
+
+The image transfers are round-trips of 1920×1080 RGBA16F render targets that compute passes also
+use as raw memory (`KYTY_TEX_DIAG`, a local trace): one dispatch reads `0x514080000` through a
+texel buffer, so its image is tiled back into buffer memory (2× per frame, 16.6 MB each), and
+another binds `0x53ad00000` as a written storage buffer, which marks that image buffer-modified,
+so the next sampling re-creates and detiles it (2× per frame). The copies run at 100–170 GB/s,
+well below VRAM bandwidth: each round-trip is a copy plus a separate tiling dispatch.
+
+**Dispatches (`KYTY_GPU_TIME=draws`, grouped by compute module):** 3.65 ms/frame. One shader
+(`0ec2f135`, one dispatch per frame) takes 0.69 ms; then `d637f68e` (40 per frame, 11 µs),
+the emulator's own tiling/blit dispatches (~0.3 ms), `2a150e06` (18 per frame, 15 µs), and a
+tail of one-per-frame passes of 90–160 µs. The large ones are wave64 guest code run with two
+guest lanes per host invocation (NVIDIA subgroups are 32 wide): 763 KB and 1.2 MB of SPIR-V,
+with thousands of selects and hundreds of ballots and shuffles.
 
 ### Draw state cache, Track B (2026-11-06)
 
