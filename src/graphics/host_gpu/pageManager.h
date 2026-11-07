@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -27,6 +28,13 @@ public:
 	// Whether a fault at vaddr is resolved by page tracking: the page is watched against the
 	// access, or it is not (a watch released since the fault) and the access now succeeds.
 	[[nodiscard]] bool IsTrackingFault(uint64_t vaddr, PageFaultAccess access) const noexcept;
+
+	// KYTY_ASYNC_WP_VERIFY: takes the pages that lost their last write watcher.
+	static void TakeVerifyUnwatched(std::vector<uint64_t>& pages);
+
+	// Appends the runs of write-watched pages within [begin, end).
+	void AppendWriteWatched(uint64_t begin, uint64_t end,
+	                        std::vector<std::pair<uint64_t, uint64_t>>& runs) const;
 
 	// The region table and the offset of a region's page-state bytes, for lock-free readers
 	// that test SrtWalkerReadWatchedBit; {nullptr, 0} when the layout does not match.

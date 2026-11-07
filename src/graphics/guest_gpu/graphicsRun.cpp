@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <atomic>
 #include <cstdio>
 #include <deque>
@@ -244,6 +245,26 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+namespace {
+// Values the command processor itself stored (RELEASE_MEM / WRITE_DATA labels), so a wait
+// that only orders GPU work need not look for guest writes. Direct-mapped by address.
+struct LabelStore {
+	uint64_t address = 0;
+	uint64_t value   = 0;
+};
+std::array<LabelStore, 1024> g_label_stores {};
+
+void NoteLabelStore(uint64_t address, uint64_t value) {
+	g_label_stores[(address >> 2u) % g_label_stores.size()] = {address, value};
+}
+
+template <typename T>
+bool IsLabelStore(uint64_t address, T value) {
+	const auto& store = g_label_stores[(address >> 2u) % g_label_stores.size()];
+	return store.address == address && static_cast<T>(store.value) == value;
+}
+} // namespace
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
@@ -251,8 +272,15 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	const T value = *addr;
+	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
+		return;
+	}
+	// A value the guest CPU stored may publish data it wrote before; collect those writes.
+	// (A suspended wait resumes through Process, which collects them too.)
+	if (!IsLabelStore(reinterpret_cast<uint64_t>(addr), value)) {
+		m_renderer.CollectAsyncWrites();
 	}
 }
 
@@ -264,10 +292,13 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
+		m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
 	} else if (*counter == 0) {
 		SuspendPm4();
 	} else {
 		(*counter)--;
+		m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
+		m_renderer.CollectAsyncWrites();
 	}
 }
 
@@ -293,8 +324,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
+		NoteLabelStore(reinterpret_cast<uint64_t>(output), src[i]);
 		output += !write_one_address;
 	}
+	m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(dst),
+	                        uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -305,12 +339,17 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.NoteGpuWrite(dst_address, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
 		     " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
+}
+
+void CommandProcessor::NoteGuestWrite(const volatile void* address, uint64_t size) {
+	m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(address), size);
 }
 
 void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset) {
@@ -328,6 +367,9 @@ void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool r
 			    (uint32_t {counter.finest_level} << 24u) | uint32_t {counter.unclamped};
 		}
 		dst[0] = 1;
+	}
+	if (dst != nullptr && size >= 64) {
+		m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(dst), size);
 	}
 	if (reset) {
 		counters = {};
@@ -502,6 +544,8 @@ bool GuestGpu::Process(Submission& submission) {
 	bool complete = true;
 	GuestSyncEpoch::Advance();
 	MemDiag::NoteSubmit();
+	// Writes the guest made before submitting, in asynchronously write-protected ranges.
+	m_renderer.CollectAsyncWrites();
 
 	switch (submission.type) {
 		case SubmissionType::Commands:
@@ -964,11 +1008,19 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// downloads GPU-written bytes under the label before the store.
 	const auto write_label = [this, address](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
+		uint64_t   stored  = 0;
+		std::memcpy(&stored, value, size);
+		NoteLabelStore(vaddr, stored);
+		if (size == sizeof(uint64_t)) {
+			// A 32-bit wait may poll the upper half of a 64-bit label.
+			NoteLabelStore(vaddr + 4, stored >> 32u);
+		}
 		auto&      buffers = m_renderer.GetBufferCache();
 		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
 		    buffers.HasGpuDirtyBytes(vaddr, size) ||
 		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
 			std::memcpy(address, value, size);
+			m_renderer.NoteGpuWrite(vaddr, size);
 		}
 	};
 	if (data_sel != 0) {
@@ -989,6 +1041,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
 			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
+			m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(address),
+			                        uint64_t {gds >> 16u} * sizeof(uint32_t));
 			break;
 		}
 		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
@@ -1073,6 +1127,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
+			m_renderer.NoteGpuWrite(event_address, 16u * 2u * sizeof(uint64_t));
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}

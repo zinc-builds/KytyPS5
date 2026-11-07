@@ -46,6 +46,11 @@ enum Stat : int {
 	WriteFaultsOther,
 	ReadFaultsGpuThread,
 	ReadFaultsOther,
+	AsyncScans,
+	AsyncScanNs,
+	AsyncChunks,            // chunks under async write protection (sampled per scan)
+	AsyncWrittenPages,      // pages the async write scan reported written
+	AsyncInvalidatedPages,  // of those, pages a cache watched (invalidated like a fault)
 	LabelEpochs,
 	Submits,
 	StatCount
@@ -84,6 +89,12 @@ inline void NoteSubmit() noexcept {
 		g_stats[Submits].fetch_add(1, std::memory_order_relaxed);
 	}
 }
+
+// Write-fault addresses, summarized per 2 MiB chunk in the per-second report.
+void NoteWriteFault(uint64_t vaddr) noexcept;
+
+// Extra per-second report (the page manager's watch footprint and scan cost).
+inline void (*g_report_hook)() = nullptr;
 
 // Prints and resets the counters at most once per second (call from the GPU thread).
 void MaybePrint() noexcept;

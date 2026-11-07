@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -146,6 +149,18 @@ enum class GpuFaultCause { Protection, WriteProtect };
 // or the tracker does not account for the fault.
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
                                   GpuFaultCause cause) noexcept;
+// Hot write-tracked ranges use asynchronous write protection: their writes raise no fault
+// the emulator sees. Appends the page runs written there since the last call (GPU thread).
+void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written);
+// The [begin, end) ranges under asynchronous write protection (for KYTY_ASYNC_WP_VERIFY).
+void AsyncGuestRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+// Whether part of the range is under asynchronous write protection, where a store raises no
+// fault: emulator stores there must invalidate the caches themselves (GPU thread).
+[[nodiscard]] bool IsAsyncWriteTracked(uint64_t vaddr, uint64_t size) noexcept;
+// KYTY_ASYNC_WP_VERIFY: takes the ranges the emulator wrote through the backing alias.
+void TakeAliasWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+// KYTY_ASYNC_WP_VERIFY: guest addresses that map the same direct memory as vaddr.
+void FindGuestAliases(uint64_t vaddr, std::vector<uint64_t>& aliases);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

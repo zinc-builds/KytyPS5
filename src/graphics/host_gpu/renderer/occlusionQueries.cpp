@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 
@@ -75,6 +76,8 @@ void OcclusionQueries::PublishDumps() {
 		}
 		WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(dump.address),
 		                   m_samples + dump.uncounted, (dump.address & 8u) == 0);
+		m_scheduler.Context().NoteGpuWrite(dump.address,
+		                                   OCCLUSION_QUERY_DBS * 2u * sizeof(uint64_t));
 	}
 	m_dumps.clear();
 }

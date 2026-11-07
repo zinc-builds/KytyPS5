@@ -7,6 +7,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
+#include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -48,7 +50,10 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #if !defined(__APPLE__)
+#include <linux/fs.h>
 #include <linux/userfaultfd.h>
+// linux/fs.h defines BLOCK_SIZE, which a local constant here also uses.
+#undef BLOCK_SIZE
 #include <sys/ioctl.h>
 // Values from Linux 5.11 and 5.19, for older kernel headers.
 #ifndef UFFD_USER_MODE_ONLY
@@ -943,6 +948,120 @@ static bool GuestAllowsAccess(uint64_t vaddr, Graphics::PageFaultAccess access) 
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+namespace {
+// Promotion of hot 2 MiB chunks to asynchronous write protection. Synchronous write-protect
+// faults count per chunk within a one-second window (high 16 bits: window, low 16: count).
+constexpr uint32_t ASYNC_PROMOTE_FAULTS = 64;
+constexpr size_t   ASYNC_MAX_CHUNKS     = 128;
+std::atomic<uint32_t> g_chunk_faults[GuestBackingStore::ASYNC_CHUNK_COUNT]; // 2 MiB, zero pages
+std::atomic<uint32_t>                    g_fault_window {0};
+std::mutex                               g_promote_mutex;
+std::vector<uint64_t>                    g_promote_pending;
+
+void NoteWriteProtectFault(uint64_t vaddr) noexcept {
+	using Backing    = GuestBackingStore;
+	const auto chunk = vaddr >> Backing::ASYNC_CHUNK_BITS;
+	if (chunk >= Backing::ASYNC_CHUNK_COUNT) {
+		return;
+	}
+	auto&      counter = g_chunk_faults[chunk];
+	const auto window  = g_fault_window.load(std::memory_order_relaxed) & 0xffffu;
+	auto       value   = counter.load(std::memory_order_relaxed);
+	uint32_t   next    = 0;
+	do {
+		next = (value >> 16u) == window ? value + 1 : (window << 16u) | 1u;
+	} while (!counter.compare_exchange_weak(value, next, std::memory_order_relaxed));
+	if ((next & 0xffffu) == ASYNC_PROMOTE_FAULTS) {
+		std::lock_guard lock(g_promote_mutex);
+		g_promote_pending.push_back(chunk);
+	}
+}
+} // namespace
+#endif
+
+void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space == nullptr) {
+		return;
+	}
+	auto& backing = g_guest_address_space->Backing();
+	if (!backing.AsyncWriteProtection()) {
+		return;
+	}
+	static auto window_start = std::chrono::steady_clock::now();
+	if (const auto now = std::chrono::steady_clock::now(); now - window_start >= std::chrono::seconds(1)) {
+		window_start = now;
+		g_fault_window.fetch_add(1, std::memory_order_relaxed);
+	}
+	std::vector<uint64_t> pending;
+	{
+		std::lock_guard lock(g_promote_mutex);
+		pending.swap(g_promote_pending);
+	}
+	for (const auto chunk: pending) {
+		if (backing.AsyncChunkCount() >= ASYNC_MAX_CHUNKS) {
+			break;
+		}
+		if (backing.PromoteChunk(chunk)) {
+			LOGF("\t guest write tracking: asynchronous write protection for 0x%016" PRIx64 "\n",
+			     chunk << GuestBackingStore::ASYNC_CHUNK_BITS);
+		}
+	}
+	if (Graphics::MemDiag::Enabled()) {
+		const auto start = std::chrono::steady_clock::now();
+		backing.ScanAsyncWrites(written);
+		namespace Diag = Graphics::MemDiag;
+		Diag::Add(Diag::AsyncScans);
+		Diag::Add(Diag::AsyncScanNs, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now() - start)
+		                                 .count()));
+		Diag::Add(Diag::AsyncChunks, backing.AsyncChunkCount());
+		return;
+	}
+	backing.ScanAsyncWrites(written);
+#else
+	(void)written;
+#endif
+}
+
+bool IsAsyncWriteTracked(uint64_t vaddr, uint64_t size) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return g_guest_address_space != nullptr && g_guest_address_space->Backing().IsAsync(vaddr, size);
+#else
+	(void)vaddr;
+	(void)size;
+	return false;
+#endif
+}
+
+void FindGuestAliases(uint64_t vaddr, std::vector<uint64_t>& aliases) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space != nullptr) {
+		g_guest_address_space->Backing().FindAliases(vaddr, aliases);
+	}
+#else
+	(void)vaddr;
+	(void)aliases;
+#endif
+}
+
+void TakeAliasWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	std::lock_guard lock(g_alias_write_mutex);
+	ranges.insert(ranges.end(), g_alias_writes.begin(), g_alias_writes.end());
+	g_alias_writes.clear();
+}
+
+void AsyncGuestRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space != nullptr) {
+		g_guest_address_space->Backing().AsyncRanges(ranges);
+	}
+#else
+	(void)ranges;
+#endif
+}
+
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
                     GpuFaultCause cause) noexcept {
 	if (g_gpu_resources == nullptr) {
@@ -958,6 +1077,11 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
 	if (!GuestAllowsAccess(fault_vaddr, access)) {
 		return false;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (cause == GpuFaultCause::WriteProtect) {
+		NoteWriteProtectFault(fault_vaddr);
+	}
+#endif
 	return g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 

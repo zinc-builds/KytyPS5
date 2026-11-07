@@ -497,6 +497,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			dst[16 + slot * 2 + 1] = 15u << 24u;
 		}
 		dst[0] = 1;
+		cp.NoteGuestWrite(dst, buffer_size);
 	}
 
 	return 4;

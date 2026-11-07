@@ -21,6 +21,8 @@
 #include <shared_mutex>
 #include <vector>
 
+#include "kernel/memory.h"
+
 namespace Libs::VideoOut {
 class VideoOutDriver;
 }
@@ -59,6 +61,20 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Applies guest writes to asynchronously write-protected ranges as if they had faulted.
+	// Call where the guest may have published new data: a submission, a satisfied wait.
+	void               CollectAsyncWrites();
+	// The GPU thread stored into guest memory through its mapping (labels, CPU-side DMA).
+	// Where that raises no write fault (asynchronous write protection), invalidate as one would.
+	void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+		VerifyNoteGpuWrite(vaddr, size);
+		if (LibKernel::Memory::IsAsyncWriteTracked(vaddr, size)) {
+			(void)InvalidateMemory(vaddr, size);
+		}
+	}
+	static void VerifyNoteGpuWrite(uint64_t vaddr, uint64_t size);
+	void VerifyAsyncWrites(const std::vector<std::pair<uint64_t, uint64_t>>& written,
+	                       bool before_handling);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
