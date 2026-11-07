@@ -49,6 +49,10 @@ public:
 	          uint32_t levels = 0);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
+	// Detiles straight into the image through a raw-bit storage view, without a linear copy.
+	// Returns false, recording nothing, when the image can't take that path; the caller then
+	// detiles into a buffer and uploads that.
+	[[nodiscard]] bool DetileToImage(vk::Buffer tiled, uint64_t tiled_offset, Image& image);
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
@@ -124,6 +128,16 @@ private:
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling, bool clear_target);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
+	[[nodiscard]] vk::Pipeline GetImagePipeline(uint32_t slot);
+	// The raw-bit view format the image path reads or writes `image` through for `levels`
+	// levels, or eUndefined when it must go through a linear buffer.
+	[[nodiscard]] vk::Format DirectImageFormat(const Image& image, uint32_t levels,
+	                                           bool store) const;
+	void RecordImage(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
+	                 Image& image, vk::Format view_format, const Tiling& tiling, bool store);
+	void VerifyDetile(vk::Buffer tiled, uint64_t tiled_offset, Image& image);
+	void VerifyTile(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
+	                uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels);
 	[[nodiscard]] vk::Pipeline CreatePipeline(std::span<const uint32_t>     code,
 	                                          const vk::SpecializationInfo* specialization) const;
 
@@ -134,6 +148,9 @@ private:
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};
+	std::array<vk::Pipeline, PipelineCount> m_image_pipelines {};
+	bool                                    m_direct_image = true;
+	bool                                    m_verify       = false;
 	vk::Pipeline                            m_d16_to_d24      = nullptr;
 	vk::Pipeline                            m_d16_to_d32      = nullptr;
 	vk::Pipeline                            m_d24_to_d16      = nullptr;

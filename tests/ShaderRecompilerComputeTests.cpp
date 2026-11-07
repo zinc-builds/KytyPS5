@@ -232,6 +232,10 @@ struct ImageTestAccess {
 };
 
 struct TileManagerTestAccess {
+  static vk::Format DirectImageFormat(const TileManager &manager,
+                                      const Image &image, bool store) {
+    return manager.DirectImageFormat(image, 0, store);
+  }
   static uint32_t ConversionRows(uint64_t offset, uint64_t row_stride,
                                  uint64_t active, uint32_t remaining,
                                  uint64_t alignment, uint64_t max_range,
@@ -22517,6 +22521,77 @@ public:
             "partial or repeated transfer changed canonical image metadata");
       }
     }
+    // The image path tiles straight between guest memory and a raw-bit view of
+    // the image. It must give the bytes of the buffer path: detile into a
+    // buffer and upload it, or download the image and tile the download.
+    const auto check_image_path = [&](const std::string &label, ImageInfo info,
+                                      vk::Format format,
+                                      uint64_t storage_size) {
+      info.pixel_format = format;
+      info.data.address = 0x100000000ull;
+      info.pitch = info.mip_layout[0].pitch;
+      const uint64_t linear_size = info.LinearSize();
+      const uint64_t padded_tiled = align_dword(storage_size);
+      const uint64_t padded_linear = align_dword(linear_size);
+      Libs::Graphics::Image image(m_runtime_context, scheduler, info);
+      Require(name, (label + " admitted").c_str(),
+              TileManagerTestAccess::DirectImageFormat(tile_manager, image,
+                                                       true) !=
+                      vk::Format::eUndefined &&
+                  TileManagerTestAccess::DirectImageFormat(tile_manager, image,
+                                                           false) !=
+                      vk::Format::eUndefined,
+              "a plain tiled color image was not admitted to the image path");
+
+      std::vector<uint8_t> tiled(storage_size);
+      fill(&tiled, ++case_index);
+      std::vector<uint8_t> expected;
+      gpu_detile(tiled, &expected, storage_size, linear_size, info);
+      auto input = CreateHostBuffer(name, padded_tiled, AllFlags,
+                                    to_dwords(tiled, padded_tiled));
+      Require(name, (label + " detile").c_str(),
+              tile_manager.DetileToImage(input.buffer, 0, image),
+              "DetileToImage refused an admitted image");
+      auto readback = CreateHostBuffer(
+          name, padded_linear, AllFlags,
+          std::vector<u32>(static_cast<size_t>(padded_linear / sizeof(u32)),
+                           0));
+      image.Download(info.BufferCopies(0), readback.buffer, 0, padded_linear);
+      host_barrier(readback.buffer, padded_linear,
+                   vk::PipelineStageFlagBits::eTransfer,
+                   vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      const auto observed = read_bytes(readback, linear_size);
+      compare((label + " detile into image").c_str(), expected, observed);
+
+      std::vector<uint8_t> expected_tiled;
+      gpu_tile(observed, &expected_tiled, storage_size, linear_size, info);
+      auto output = CreateHostBuffer(
+          name, padded_tiled, AllFlags,
+          std::vector<u32>(static_cast<size_t>(padded_tiled / sizeof(u32)),
+                           0xabababab));
+      tile_manager.TileImage(image, info.BufferCopies(), output.buffer, 0,
+                             padded_tiled);
+      host_barrier(output.buffer, padded_tiled,
+                   vk::PipelineStageFlagBits::eComputeShader,
+                   vk::AccessFlagBits::eShaderWrite);
+      scheduler.Finish();
+      compare((label + " tile from image").c_str(), expected_tiled,
+              read_bytes(output, storage_size));
+      DestroyBuffer(&output);
+      DestroyBuffer(&readback);
+      DestroyBuffer(&input);
+    };
+    const auto image_format = [](u32 bpe) {
+      switch (bpe) {
+      case 1: return vk::Format::eR8Unorm;
+      case 2: return vk::Format::eR16Sfloat;
+      case 4: return vk::Format::eR8G8B8A8Unorm;
+      case 8: return vk::Format::eR16G16B16A16Sfloat;
+      default: return vk::Format::eR32G32B32A32Sfloat;
+      }
+    };
+
     for (const auto family : families) {
       for (u32 bpe = 1; bpe <= family.max_bpe; bpe <<= 1u) {
         TileBlockLayout block{};
@@ -22569,6 +22644,51 @@ public:
           gpu_tile(linear, &gpu_tiled, storage_size, storage_size, info);
           compare(family_label("tile bytes").c_str(), cpu_tiled, gpu_tiled);
         }
+        if (!volume) {
+          check_image_path(family_label("image path"), info,
+                           image_format(bpe), storage_size);
+        }
+      }
+    }
+    {
+      // Array layers, and the color transforms the image path applies itself.
+      struct ImageCase {
+        const char *label;
+        u32 bpe;
+        u32 layers;
+        vk::Format format;
+        Prospero::BufferFormat guest;
+        bool bgra16;
+      };
+      constexpr ImageCase image_cases[] = {
+          {"image path layers", 8, 3, vk::Format::eR16G16B16A16Sfloat,
+           Prospero::BufferFormat::kInvalid, false},
+          {"image path 10_11_11", 4, 2, vk::Format::eB10G11R11UfloatPack32,
+           Prospero::BufferFormat::k10_11_11Float, false},
+          {"image path 2_10_10_10", 4, 1, vk::Format::eA2B10G10R10UnormPack32,
+           Prospero::BufferFormat::k2_10_10_10UNorm, false},
+          {"image path bgra16", 8, 1, vk::Format::eR16G16B16A16Unorm,
+           Prospero::BufferFormat::kInvalid, true},
+      };
+      for (const auto &test : image_cases) {
+        TileBlockLayout block{};
+        Require(name, "image case block",
+                TileGetBlockLayout(TileBlockFamily::RenderTarget64KB, test.bpe,
+                                   block),
+                "render-target block layout is unavailable");
+        const u32 width = block.block_width + 3u;
+        const u32 height = block.block_height * 2u + 1u;
+        const u32 pitch = block.block_width * 2u;
+        const uint64_t slice = uint64_t{2} *
+                               ((height + block.block_height - 1u) /
+                                block.block_height) *
+                               block.block_size;
+        auto info = block_image(block, width, height, test.layers, pitch,
+                                slice * test.layers);
+        info.mip_layout[0].surface_z = 3;
+        info.guest_format = test.guest;
+        info.bgra16 = test.bgra16;
+        check_image_path(test.label, info, test.format, slice * test.layers);
       }
     }
 

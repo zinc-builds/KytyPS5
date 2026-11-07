@@ -276,6 +276,35 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
 endforeach()
+# Tiling families again with the linear side in an image: _image_store detiles into a storage
+# image, _image_load tiles from a sampled image (TILER_IMAGE in gpu_tiler_common.inc).
+set(gpu_tiler_image_families standard256 standard4 standard4_3d standard64 standard64_3d prt
+	prt_3d render_target depth)
+foreach(shader_name IN LISTS gpu_tiler_image_families)
+	foreach(variant IN ITEMS store load)
+		if(variant STREQUAL "store")
+			set(tiler_image 1)
+		else()
+			set(tiler_image 2)
+		endif()
+		set(shader_source "${gpu_tiler_shader_dir}/gpu_tiler_${shader_name}.comp")
+		set(shader_spv "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}_image_${variant}.spv")
+		set(shader_header "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}_image_${variant}_spv.h")
+		string(TOUPPER "GPU_TILER_${shader_name}_IMAGE_${variant}_SPV" shader_symbol)
+		add_custom_command(
+			OUTPUT "${shader_header}"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+			COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+			        -DTILER_IMAGE=${tiler_image} "-I${gpu_tiler_shader_dir}" -o "${shader_spv}"
+			        "${shader_source}"
+			COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
+			        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+			DEPENDS "${shader_source}" ${gpu_tiler_shader_includes}
+			VERBATIM
+		)
+		list(APPEND gpu_tiler_shader_headers "${shader_header}")
+	endforeach()
+endforeach()
 
 set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
 set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")

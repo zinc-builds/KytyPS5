@@ -3,12 +3,30 @@
 
 layout(local_size_x = 64) in;
 
+// TILER_IMAGE selects the linear side: 0 a linear buffer (binding 0 or 1), 1 detile into a
+// raw-bit storage image (binding 4), 2 tile from a raw-bit sampled image (binding 3). The image
+// variants declare only the bindings they use. The image view's format is the unsigned integer
+// format of the element size, so loads and stores move the element's bits unchanged.
+#ifndef TILER_IMAGE
+#define TILER_IMAGE 0
+#endif
+
+#if TILER_IMAGE != 2
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
-layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
 layout(set = 0, binding = 0, std430) readonly buffer Input8 { uint8_t data[]; } input_buffer8;
-layout(set = 0, binding = 1, std430) buffer Output8 { uint8_t data[]; } output_buffer8;
 layout(set = 0, binding = 0, std430) readonly buffer Input16 { uint16_t data[]; } input_buffer16;
+#endif
+#if TILER_IMAGE != 1
+layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
+layout(set = 0, binding = 1, std430) buffer Output8 { uint8_t data[]; } output_buffer8;
 layout(set = 0, binding = 1, std430) buffer Output16 { uint16_t data[]; } output_buffer16;
+#endif
+#if TILER_IMAGE == 1
+layout(set = 0, binding = 4) uniform writeonly uimage2DArray target_image;
+#elif TILER_IMAGE == 2
+#extension GL_EXT_samplerless_texture_functions : require
+layout(set = 0, binding = 3) uniform utexture2DArray source_image;
+#endif
 
 struct Mip {
 	uint src_base;
@@ -33,6 +51,7 @@ layout(set = 0, binding = 2, std140) uniform TilingInfo {
 
 #include "gpu_tiler_color.inc"
 
+#if TILER_IMAGE == 0
 void copy_element(uint src, uint dst) {
 	if ((ELEMENT_BYTES == 4u || ELEMENT_BYTES == 8u) && info.color_transform != 0u) {
 		uvec2 value = uvec2(input_buffer.data[src >> 2], 0u);
@@ -50,6 +69,41 @@ void copy_element(uint src, uint dst) {
 		output_buffer8.data[dst] = input_buffer8.data[src];
 	}
 }
+#endif
+
+#if TILER_IMAGE == 1
+uvec4 load_element(uint src) {
+	uvec4 value = uvec4(0u);
+	if (ELEMENT_BYTES >= 4) {
+		for (uint i = 0; i < ELEMENT_BYTES / 4u; i++) {
+			value[i] = input_buffer.data[(src >> 2) + i];
+		}
+	} else if (ELEMENT_BYTES == 2) {
+		value.x = uint(input_buffer16.data[src >> 1]);
+	} else {
+		value.x = uint(input_buffer8.data[src]);
+	}
+	if ((ELEMENT_BYTES == 4u || ELEMENT_BYTES == 8u) && info.color_transform != 0u) {
+		value.xy = transform_color(value.xy, info.color_transform, true);
+	}
+	return value;
+}
+#elif TILER_IMAGE == 2
+void store_element(uint dst, uvec4 value) {
+	if ((ELEMENT_BYTES == 4u || ELEMENT_BYTES == 8u) && info.color_transform != 0u) {
+		value.xy = transform_color(value.xy, info.color_transform, false);
+	}
+	if (ELEMENT_BYTES >= 4) {
+		for (uint i = 0; i < ELEMENT_BYTES / 4u; i++) {
+			output_buffer.data[(dst >> 2) + i] = value[i];
+		}
+	} else if (ELEMENT_BYTES == 2) {
+		output_buffer16.data[dst >> 1] = uint16_t(value.x);
+	} else {
+		output_buffer8.data[dst] = uint8_t(value.x);
+	}
+}
+#endif
 
 void main() {
 	uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -79,6 +133,11 @@ void main() {
 	uint block_index = block.y * params.blocks_per_row + block.x;
 	uint tiled = block.z * params.tiled_slice_bytes + block_index * BLOCK_BYTES +
 	             block_offset(swizzle);
+#if TILER_IMAGE == 1
+	imageStore(target_image, ivec3(p), load_element(params.src_base + tiled));
+#elif TILER_IMAGE == 2
+	store_element(params.dst_base + tiled, texelFetch(source_image, ivec3(p), 0));
+#else
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
 	if (TILE == 0) {
@@ -86,4 +145,5 @@ void main() {
 	} else {
 		copy_element(params.src_base + linear, params.dst_base + tiled);
 	}
+#endif
 }
