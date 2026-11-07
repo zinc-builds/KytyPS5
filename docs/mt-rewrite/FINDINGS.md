@@ -662,6 +662,21 @@ another binds `0x53ad00000` as a written storage buffer, which marks that image 
 so the next sampling re-creates and detiles it (2× per frame). The copies run at 100–170 GB/s,
 well below VRAM bandwidth: each round-trip is a copy plus a separate tiling dispatch.
 
+**Masked selects (landed).** Inside a guest branch region every VGPR write is
+`Select(exec, value, old)`, so region temporaries keep their old values live and every write is
+predicated. `EliminateMaskedSelects` (vertex and local stages) first folds repeated writes under
+one condition (`Select(c, a, Select(c, b, d))` → `Select(c, a, d)`), then replaces `Select(c, a,
+b)` with `a` when no lane where `c` is false can observe it: every path goes through lane-local
+arithmetic and phis to a select on the same `c` that takes it only where `c` holds, or into a
+buffer/shared access or export whose EXEC argument is `c`. Past a phi on a CFG cycle the masking
+is not trusted (the next iteration may recompute `c`). The top vertex shader goes from 1,848 to
+826 selects and from 227 to 174 KB of SPIR-V; the 4,150-select ones only to ~3,320, because what
+remains are region outputs (merged by phis, or read by an enclosing region). Same binary, same
+batch, `KYTY_MASKED_SELECTS=0` as the reference, two runs each: in passes 8.91 / 8.97 → 8.75 /
+8.81 ms/frame, GPU 14.71 / 14.91 → 14.60 / 14.64; FPS unchanged. That is about a third of the
+−0.47 ms ceiling below; the rest needs the region outputs unpredicated (a per-lane `if (exec)`
+around the region with phis at its end).
+
 **More ceilings (local experiments, same binary, warmed shader stores, `KYTY_GPU_TIME=passes`):**
 
 | Experiment | GPU effect | Status |
@@ -916,5 +931,7 @@ What this means:
   linear buffer and a copy again; `KYTY_TILER_VERIFY=1` also runs that path for every transfer
   the image path takes and compares the bytes on the host (`TILERVERIFY` lines, one per image
   shape, a count every 64 checks; slow).
+- `KYTY_MASKED_SELECTS=0` (Track G): vertex shaders keep every EXEC select. For A/B only, in
+  an install dir of its own: the shader store doesn't record the setting.
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
   hit and exits on a disagreement, `KYTY_DTC_STATS=1` prints `DTC` hit-rate lines once per second.
