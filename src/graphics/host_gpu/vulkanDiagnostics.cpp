@@ -40,6 +40,7 @@ enum Kind {
 	BindPipeline,
 	BindPipelineRepeat,
 	PushDescriptor,
+	PushDescriptorElements,
 	PushConstants,
 	CopyBuffer,
 	CopyImage,
@@ -51,7 +52,7 @@ enum Kind {
 constexpr std::array<const char*, KindCount> KindNames = {
     "barrier",  "barrier2",          "begin_rendering", "end_rendering", "draw",           "draw_indexed",
     "draw_indirect", "draw_mesh",    "dispatch",        "dispatch_indirect", "bind_pipeline", "bind_pipeline_repeat",
-    "push_descriptor", "push_constants", "copy_buffer", "copy_image",     "clear", "begin_query"};
+    "push_descriptor", "push_descriptor_elements", "push_constants", "copy_buffer", "copy_image",     "clear", "begin_query"};
 
 std::array<std::atomic<uint64_t>, KindCount> g_counts {};
 bool                                         g_sites = false;
@@ -427,7 +428,20 @@ void InstallCommandCounters() {
 			original(buffer, point, pipeline);
 		};
 	}
-	KYTY_COUNT_COMMAND(vkCmdPushDescriptorSetKHR, PushDescriptor);
+	if (dispatcher.vkCmdPushDescriptorSetKHR != nullptr) {
+		static PFN_vkCmdPushDescriptorSetKHR original = dispatcher.vkCmdPushDescriptorSetKHR;
+		dispatcher.vkCmdPushDescriptorSetKHR          = [](VkCommandBuffer buffer, VkPipelineBindPoint point,
+                                                      VkPipelineLayout layout, uint32_t set, uint32_t count,
+                                                      const VkWriteDescriptorSet* writes) {
+			Count(PushDescriptor);
+			uint64_t elements = 0;
+			for (uint32_t i = 0; i < count; i++) {
+				elements += writes[i].descriptorCount;
+			}
+			g_counts[PushDescriptorElements].fetch_add(elements, std::memory_order_relaxed);
+			original(buffer, point, layout, set, count, writes);
+		};
+	}
 	KYTY_COUNT_COMMAND(vkCmdPushConstants, PushConstants);
 	KYTY_COUNT_COMMAND(vkCmdCopyBuffer, CopyBuffer);
 	KYTY_COUNT_COMMAND(vkCmdFillBuffer, CopyBuffer);
