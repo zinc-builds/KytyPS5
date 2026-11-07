@@ -9,7 +9,8 @@ shift
 . "$(dirname "$0")/benchlock.sh"
 benchlock_acquire x "garden.sh $label" || exit 1
 log=/tmp/bench-$label.log
-pad() { echo "$*" > /tmp/vpad.fifo; }
+# A FIFO without a reader (vpad.py gone) would block forever while holding the bench lock.
+pad() { timeout 5 bash -c 'echo "$1" > /tmp/vpad.fifo' _ "$*" || { echo "vpad.py is not reading /tmp/vpad.fifo" >&2; exit 1; }; }
 wait_s() { timeout "$1" tail -f /dev/null; }
 wait_log() { # wait_log <regex> <timeout_s>
 	local end=$((SECONDS + $2))
