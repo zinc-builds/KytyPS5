@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <thread>
 
 namespace {
 
@@ -430,7 +431,7 @@ void TestSrtAliasesShareReads() {
   Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value,
         "alias normalization lost read identity");
   struct Reads { uint32_t count = 0; bool dirty = false; } reads;
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+  constexpr SrtMemoryReader read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
         auto &reads = *static_cast<Reads *>(data);
         ++reads.count;
         if (address == 0x1000u) words[0] = 0x1111u;
@@ -438,7 +439,8 @@ void TestSrtAliasesShareReads() {
         else if (address == 0x3000u && !reads.dirty) words[0] = 0x1000u;
         else return false;
         return true;
-      }, &reads);
+      };
+  FakeGuestMemory fake(read_memory, &reads);
   std::vector<uint32_t> flat;
   Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
             reads.count == 3,
@@ -448,6 +450,24 @@ void TestSrtAliasesShareReads() {
   Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0u, 0x2222u, 0u} &&
             reads.count == 3,
         "unreadable pointer did not read as zero");
+  // A walk on the prepare thread uses its own scratch: the command thread's results stay.
+  DescriptorValue before{}, after{};
+  const bool known = WalkedDescriptor(plan, 0, before);
+  const auto command_scratch = plan.srt_scratch;
+  bool prepared_ok = false;
+  std::thread prepare([&] {
+    SetSrtWalkPrepareThread(true);
+    Reads clean;
+    FakeGuestMemory local(read_memory, &clean);
+    std::vector<uint32_t> prepared;
+    prepared_ok = WalkSrt(plan, {}, prepared, nullptr) &&
+                  prepared == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u};
+    SetSrtWalkPrepareThread(false);
+  });
+  prepare.join();
+  Check(prepared_ok && plan.srt_scratch == command_scratch &&
+            WalkedDescriptor(plan, 0, after) == known && (!known || after == before),
+        "a prepare-thread walk failed or changed the command thread's walk results");
 }
 
 void TestUniformVectorDescriptorRead() {

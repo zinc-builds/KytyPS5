@@ -722,10 +722,18 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
-	// GPU-thread scratch for walker results and material keys.
+	// Scratch for walker results and material keys of walks on the command thread.
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// The same for walks on the prepare thread (see SetSrtWalkPrepareThread), made on its first
+	// walk there. Each thread walks a plan only in its own scratch.
+	struct WalkScratch {
+		std::vector<uint64_t>     srt;
+		std::vector<uint32_t>     material_keys;
+		std::vector<SelectorKeys> selector_keys;
+	};
+	mutable std::unique_ptr<WalkScratch> prepare_scratch;
 };
 
 struct Program: ResourcePlan {
