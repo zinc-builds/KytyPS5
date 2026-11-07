@@ -212,6 +212,10 @@ public:
 	void QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	void QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
 	void FinishQueuedDraws(CommandBuffer& buffer) {
+		if (m_queued_count == 0) {
+			return;
+		}
+		m_prepare_stat.drains++;
 		while (m_queued_count != 0) {
 			FinishQueuedDraw(buffer);
 		}
@@ -399,6 +403,7 @@ private:
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
 		uint64_t wait_ns = 0, verified = 0, worker_busy_ns = 0, start_ns = 0;
+		uint64_t drains = 0, waits = 0; // drains: FinishQueuedDraws with draws queued
 	} m_prepare_stat;
 
 	friend class CommandProcessor;

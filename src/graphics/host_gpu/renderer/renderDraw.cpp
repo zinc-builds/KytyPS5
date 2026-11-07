@@ -1798,7 +1798,10 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
 	EXIT_IF(m_queued_count == 0 || queued.sequence != sequence);
 	m_queued_count--;
-	m_prepare_stat.wait_ns += m_prepare_worker->Wait(queued.sequence);
+	if (const auto waited = m_prepare_worker->Wait(queued.sequence); waited != 0) {
+		m_prepare_stat.wait_ns += waited;
+		m_prepare_stat.waits++;
+	}
 	// The draw reads the registers it was queued with.
 	auto& registers   = *buffer.m_registers;
 	auto& user_config = *buffer.m_user_config;
@@ -1823,10 +1826,12 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			const auto draws = static_cast<double>(std::max<uint64_t>(stat.queued, 1));
 			std::printf("PREPARE queued=%" PRIu64 " direct=%" PRIu64 " adopted=%" PRIu64
 			            " failed=%" PRIu64 " hazard=%" PRIu64 " gpu_written=%" PRIu64
-			            " verified=%" PRIu64 " wait_ns_per_draw=%.0f worker_ns_per_draw=%.0f"
+			            " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
+			            " drains=%" PRIu64 ") worker_ns_per_draw=%.0f"
 			            " worker_busy=%.1f%%\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
+			            stat.waits, stat.drains,
 			            static_cast<double>(busy - stat.worker_busy_ns) / draws,
 			            100.0 * static_cast<double>(busy - stat.worker_busy_ns) / span);
 			stat                = {};

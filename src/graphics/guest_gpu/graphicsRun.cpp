@@ -658,15 +658,21 @@ static bool KeepsAtomicWrites(uint32_t packet_header) {
 	}
 }
 
-// Packets that read no guest memory and touch nothing the caches hold, besides direct draws
+// Packets that touch nothing the caches hold and write no guest memory, besides direct draws
 // (which queue themselves, see RenderExecutor::QueueDrawIndex), so a queued draw may wait past
-// them.
+// them. The indirect register writes read guest memory, which a queued draw's shaders could
+// write only racily: the hardware command processor reads these packets long before earlier
+// draws run, so a guest must put a wait or cache operation in between, and those finish the
+// queue. Sky Garden uses them for nearly every draw.
 static bool KeepsQueuedDraw(uint32_t packet_header) {
 	switch ((packet_header >> 8u) & 0xffu) {
 		case Pm4::IT_SET_CONTEXT_REG:
 		case Pm4::IT_SET_SH_REG:
 		case Pm4::IT_SET_UCONFIG_REG:
 		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
 		case Pm4::IT_SET_BASE:
 		case Pm4::IT_INDEX_BASE:
 		case Pm4::IT_INDEX_BUFFER_SIZE:
