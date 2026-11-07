@@ -1,8 +1,12 @@
 #!/bin/bash
-# Benchmark Astro Bot's Sky Garden: boot, load save 1, fly to Sky Garden, dive in, then record
-# KYTY_PERF_LOG lines for a fixed window once the level is running. Needs vpad.py running.
+# Benchmark Astro Bot's Sky Garden: get into the level, then record KYTY_PERF_LOG lines for a
+# fixed window once it is running.
 # Usage: garden.sh <label> [extra kyty_emulator flags...]
 # Result: /tmp/bench-<label>.log and a summary line on stdout.
+# GARDEN_ROUTE=lvl (default): boot straight into the level. The game's own "-lvl <level>" boot
+#   argument is added to /app0/args.txt through KYTY_APP0_OVERLAY (needs an emulator with it).
+# GARDEN_ROUTE=menu: the original route (title, save 1, galaxy map, fly to Sky Garden, dive in)
+#   driven by vpad.py. Numbers from the two routes are not interchangeable; see FINDINGS.md.
 label=$1
 shift
 # Exclusive host-wide lock; the emulator inherits it (see benchlock.sh).
@@ -24,30 +28,52 @@ wait_log() { # wait_log <regex> <timeout_s>
 
 for _ in $(seq 20); do pgrep -f '^\./kyty_emulator --game' >/dev/null || break; wait_s 1; done
 pgrep -f '^\./kyty_emulator --game' >/dev/null && { echo "emulator already running" >&2; exit 1; }
-[ -p /tmp/vpad.fifo ] || { echo "vpad.py not running" >&2; exit 1; }
+route=${GARDEN_ROUTE:-lvl}
+case "$route" in
+lvl)
+	# The game's args.txt plus -lvl. Kept out of the install dir: only this run sees it.
+	overlay=$(mktemp -d /tmp/kyty-app0-XXXXXX) || exit 1
+	printf '%s\r\n' "-package -sequence product -mode product -odxBinary -perfDisplay false -debugDisplay false -debugInput false -lvl aerial_garden" > "$overlay/args.txt"
+	export KYTY_APP0_OVERLAY=$overlay
+	;;
+menu) [ -p /tmp/vpad.fifo ] || { echo "vpad.py not running" >&2; exit 1; } ;;
+*) echo "GARDEN_ROUTE must be lvl or menu" >&2; exit 1 ;;
+esac
 rm -f "$log"
 # On any failure (a timeout below, a signal), stop the emulator: left running, it would keep
 # holding the bench lock. KEEP_RUNNING only applies to a run that reaches the level.
 # Kill only this run's emulator (a child of run.sh): a pattern kill could hit the emulator of
 # whoever takes the lock next.
-cleanup() { pkill -P "$run_pid" -x kyty_emulator; wait_s 3; pkill -9 -P "$run_pid" -x kyty_emulator; }
+cleanup() {
+	[ -n "$overlay" ] && rm -rf "$overlay"
+	[ -n "$run_pid" ] || return
+	pkill -P "$run_pid" -x kyty_emulator; wait_s 3; pkill -9 -P "$run_pid" -x kyty_emulator
+}
 trap 'cleanup' EXIT
 nohup "$(dirname "$0")/run.sh" "$label" "$@" >/dev/null 2>&1 &
 run_pid=$!
 wait_s 5
-wait_log 'Level has started: title_controller_ship' 90 || exit 1
-wait_s 4; pad press a 0.3          # title: press any button
-wait_s 5; pad press a 0.3          # save slot 1
-wait_log 'Level has started: worldmap' 60 || exit 1
-wait_s 6; pad stick L 0 1 2.0      # fly up to the Gorilla Nebula
-wait_s 3; pad press a 0.3          # enter
-wait_s 12; pad stick L 0 1 1.4     # fly up to Sky Garden
-wait_s 3; pad hold a 3.5           # dive in (hold)
-for nudge in 0.6 0.9 0.6; do         # the ship sometimes stops short of the planet
-	wait_log 'StartLevel aerial_garden' 25 2>/dev/null && break
-	pad stick L 0 1 "$nudge"; wait_s 3; pad hold a 4
-done
-wait_log 'StartLevel aerial_garden' 60 || exit 1
+if [ "$route" = lvl ]; then
+	wait_log 'StartLevel aerial_garden|Level has started: title_controller_ship' 90 || exit 1
+	grep -q 'StartLevel aerial_garden' "$log" || {
+		echo "booted to the title: this binary has no KYTY_APP0_OVERLAY (built before 45d400a8): run with GARDEN_ROUTE=menu" >&2
+		exit 1
+	}
+else
+	wait_log 'Level has started: title_controller_ship' 90 || exit 1
+	wait_s 4; pad press a 0.3          # title: press any button
+	wait_s 5; pad press a 0.3          # save slot 1
+	wait_log 'Level has started: worldmap' 60 || exit 1
+	wait_s 6; pad stick L 0 1 2.0      # fly up to the Gorilla Nebula
+	wait_s 3; pad press a 0.3          # enter
+	wait_s 12; pad stick L 0 1 1.4     # fly up to Sky Garden
+	wait_s 3; pad hold a 3.5           # dive in (hold)
+	for nudge in 0.6 0.9 0.6; do         # the ship sometimes stops short of the planet
+		wait_log 'StartLevel aerial_garden' 25 2>/dev/null && break
+		pad stick L 0 1 "$nudge"; wait_s 3; pad hold a 4
+	done
+	wait_log 'StartLevel aerial_garden' 60 || exit 1
+fi
 start=$(wc -l < "$log")
 wait_s "${GARDEN_SETTLE:-25}"       # opening flight / shader warm-up
 from=$(wc -l < "$log")
