@@ -865,10 +865,16 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 	if (operand.kind == Kind::Unknown) {
 		c.jmp(unknown, JumpType(unknown));
 	} else if (operand.kind == Kind::Node) {
-		auto& node = m_nodes[operand.value];
+		// A value is usually referenced again after it is known (a V# word by every read through
+		// it): test its state here and call the thunk only when that is not already known.
+		auto&        node = m_nodes[operand.value];
+		Xbyak::Label known;
+		c.cmp(Byte(node.state), 2);
+		c.je(known, Xbyak::CodeGenerator::T_SHORT);
 		c.call(node.label);
 		c.cmp(Byte(node.state), 2);
 		c.jne(unknown, JumpType(unknown));
+		c.L(known);
 	}
 }
 
