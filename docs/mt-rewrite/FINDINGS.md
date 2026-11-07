@@ -50,6 +50,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Render targets tiled and detiled straight from and into the image (Track G; menu route; same batch: ref `dev` f2848f29 27.97 / 27.36, with `KYTY_GPU_TIME` 26.09 / 27.40; GPU 16.26 → 14.89 ms/frame, transfers 2.71 → 1.34; FPS unchanged, the command thread limits) | 27.63 / 25.85 | 150.1k / 141.1k | 53.0 (max 83.1) | 19.3 |
 | 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
 | 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
+| 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` 84e51e33 29.72; same binary with `KYTY_MASKED_SELECTS=0` in passes 9.09 → 8.91 ms/frame, GPU 14.96 → 14.77; FPS unchanged, the command thread limits) | 29.68 | 155.0k | 45.1 (max 68.5) | 21.3 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -672,8 +673,10 @@ buffer/shared access or export whose EXEC argument is `c`. Past a phi on a CFG c
 is not trusted (the next iteration may recompute `c`). The top vertex shader goes from 1,848 to
 826 selects and from 227 to 174 KB of SPIR-V; the 4,150-select ones only to ~3,320, because what
 remains are region outputs (merged by phis, or read by an enclosing region). Same binary, same
-batch, `KYTY_MASKED_SELECTS=0` as the reference, two runs each: in passes 8.91 / 8.97 → 8.75 /
-8.81 ms/frame, GPU 14.71 / 14.91 → 14.60 / 14.64; FPS unchanged. That is about a third of the
+batch, `KYTY_MASKED_SELECTS=0` as the reference: in passes 8.91 / 8.97 → 8.75 / 8.81 ms/frame
+(time window, two runs each), and 9.09 → 8.91 with the frame-range method (GPU 14.96 → 14.77;
+`dev` 84e51e33 9.11 / 15.12); FPS unchanged. One more frame-range pair against the `dev` build
+showed no difference (9.15 / 9.13), so take it as −0.15 ± 0.05 ms. That is about a third of the
 −0.47 ms ceiling below; the rest needs the region outputs unpredicated (a per-lane `if (exec)`
 around the region with phis at its end).
 
