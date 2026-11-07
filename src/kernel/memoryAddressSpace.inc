@@ -270,6 +270,32 @@ static void LogAliasWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// Odd while a GuestBackingStore writer (map, unmap, zero, backing write) holds its lock, and
+// advanced again when it lets go: a read through a translation taken at an even value, still
+// current after the copy, saw no change. The backing alias stays mapped for the store's lifetime,
+// so a read that races a change only has to be retried.
+static std::atomic<uint64_t> g_translation_seq {0};
+
+struct TranslationWrite {
+	TranslationWrite() noexcept { g_translation_seq.fetch_add(1, std::memory_order_acq_rel); }
+	~TranslationWrite() { g_translation_seq.fetch_add(1, std::memory_order_release); }
+	TranslationWrite(const TranslationWrite&)            = delete;
+	TranslationWrite& operator=(const TranslationWrite&) = delete;
+};
+
+// KYTY_FAST_GUEST_READ=0 always takes the locks; =verify also checks each cached translation
+// against a locked lookup.
+static int FastGuestReadMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_FAST_GUEST_READ");
+		if (value == nullptr) {
+			return 1;
+		}
+		return std::string_view(value) == "0" ? 0 : std::string_view(value) == "verify" ? 2 : 1;
+	}();
+	return mode;
+}
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -364,6 +390,7 @@ public:
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
 		std::lock_guard lock(m_mutex);
+		const TranslationWrite translation_write;
 		// Guest views of the zeroed range change too.
 		g_remap_generation.fetch_add(1, std::memory_order_relaxed);
 		for (const auto& [_, entry]: m_maps) {
@@ -383,6 +410,7 @@ public:
 		LogAliasWrite(vaddr, size);
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		std::lock_guard lock(m_mutex);
+		const TranslationWrite translation_write;
 		const auto*     source = static_cast<const uint8_t*>(data);
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
@@ -419,9 +447,81 @@ public:
 		return true;
 	}
 
+	// Copies [vaddr, vaddr + size) without locks when one backing mapping holds all of it, through
+	// a translation this thread looked up earlier. False: take the locked path.
+	bool TryReadFast(uint64_t vaddr, void* data, uint64_t size) {
+		const int mode = FastGuestReadMode();
+		if (mode == 0 || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			return false; // the test counts reads on the locked path
+		}
+#endif
+		struct Translation {
+			uint64_t       seq   = 1; // odd: empty
+			uint64_t       begin = 0;
+			uint64_t       end   = 0;
+			const uint8_t* host  = nullptr; // backing byte of `begin`
+		};
+		static thread_local std::array<Translation, 4> cache;
+		static thread_local uint32_t                   next = 0;
+		const auto seq = g_translation_seq.load(std::memory_order_acquire);
+		if ((seq & 1u) != 0) {
+			return false;
+		}
+		const Translation* found = nullptr;
+		for (const auto& entry: cache) {
+			if (entry.seq == seq && vaddr >= entry.begin && vaddr + size <= entry.end) {
+				found = &entry;
+				break;
+			}
+		}
+		if (found == nullptr) {
+			std::shared_lock lock(m_mutex);
+			// Writers change the sequence only under the exclusive lock.
+			if (g_translation_seq.load(std::memory_order_relaxed) != seq) {
+				return false;
+			}
+			auto it = m_maps.upper_bound(vaddr);
+			if (it == m_maps.begin()) {
+				return false;
+			}
+			--it;
+			const auto& entry = it->second;
+			if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) {
+				return false;
+			}
+			auto& slot = cache[next++ % cache.size()];
+			slot       = {seq, entry.vaddr, entry.vaddr + entry.size,
+			              m_backing_base + entry.backing_offset};
+			found      = &slot;
+		} else if (mode == 2) {
+			std::shared_lock lock(m_mutex);
+			if (g_translation_seq.load(std::memory_order_relaxed) == seq) {
+				auto it = m_maps.upper_bound(vaddr);
+				EXIT_IF(it == m_maps.begin());
+				--it;
+				const auto& entry = it->second;
+				if (entry.vaddr != found->begin || entry.vaddr + entry.size != found->end ||
+				    m_backing_base + entry.backing_offset != found->host) {
+					EXIT("KYTY_FAST_GUEST_READ=verify: stale translation for 0x%016" PRIx64 "\n",
+					     vaddr);
+				}
+			}
+		}
+		std::memcpy(data, found->host + (vaddr - found->begin), size);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return g_translation_seq.load(std::memory_order_relaxed) == seq;
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
+		}
+		if (TryReadFast(vaddr, data, size)) {
+			return true;
 		}
 
 		std::shared_lock lock(m_mutex);
@@ -495,8 +595,10 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		const TranslationWrite translation_write;
 #else
 		std::lock_guard lock(m_mutex);
+		const TranslationWrite translation_write;
 		if (!MapView(vaddr, size, backing_offset, mode, &write_protected, failure_reason)) {
 			return false;
 		}
@@ -513,6 +615,7 @@ public:
 		std::vector<MapEntry> targets;
 		{
 			std::lock_guard lock(m_mutex);
+			const TranslationWrite translation_write;
 			auto            current = vaddr;
 			while (current < end) {
 				const auto* entry = FindContainingUnlocked(current);
@@ -572,10 +675,12 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
+			const TranslationWrite translation_write;
 			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
 		}
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			std::lock_guard lock(m_mutex);
+			const TranslationWrite translation_write;
 			m_maps.emplace(old.vaddr, old);
 			return false;
 		}
@@ -619,6 +724,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		const TranslationWrite translation_write;
 		RemoveMappingsUnlocked(vaddr, size);
 
 		return true;
@@ -713,6 +819,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		const TranslationWrite translation_write;
 		if (m_async_chunks[chunk].load(std::memory_order_relaxed) != 0) {
 			return false;
 		}
@@ -1274,6 +1381,10 @@ public:
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
+		// One backing mapping holds the range: owned, not private, no gaps.
+		if (data != nullptr && m_backing->TryReadFast(vaddr, data, size)) {
+			return true;
+		}
 		if (data == nullptr || !Owns(vaddr, size)) {
 			return false;
 		}

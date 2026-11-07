@@ -60,6 +60,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Large buffer uploads cross PCIe on the copy engine into a device-local ring; the universal queue copies from there at VRAM speed (Track G4; same batch: ref `dev` abc268e0 35.01; `KYTY_GPU_TIME=1` GPU 13.04 → 12.42 ms/frame; with `=passes` 13.25 → 12.47, transfers 1.35 → 0.58; FPS unchanged, the command thread limits) | 35.28 | 185.0k | 38.3 (max 51.0) | 26.7 |
 | 2026-11-07 | `PrepareBda`'s uploads share one barrier pair (Track G4; same binary, `KYTY_UPLOAD_BATCH=0`: 35.92; `KYTY_GPU_TIME=1` GPU 12.30 → 12.19 ms/frame, barrier gaps 0.53 → 0.45) | 35.84 | 188.7k | 33.5 (max 33.5) | 29.9 |
 | 2026-11-07 | Guest read faults on GPU-written memory no longer stall the command thread: it records and submits the download in PM4 order and moves on, the faulting thread waits (Track B; same batch: ref `dev` c7600e89 36.40 / 36.11; `KYTY_STALL_DIAG` command-thread time in readbacks 9.4–10.2% → 0.8%, of it on the GPU 8.4–9.3% → 0.0%; a single longer frame per run, max 50–83 ms vs 33.8) | 38.99 / 38.90 | 204.3k / 204.8k | 35.6 (max 66.7) / 35.6 (max 50.0) | 27.8 / 28.7 |
+| 2026-11-07 | Guest reads inside one backing mapping copy without locks: a per-thread translation cache checked against a sequence count that backing-store writers make odd (same batch: ref `dev` 75f3eebc 38.97, worst_ms 33.7) | 39.56 | 208.0k | 33.5 (max 33.6) | 29.2 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1257,6 +1258,24 @@ Ruled out:
   only changed runs today, and the recorder needs every write. Building the writes on the
   recorder (69 ns) still needs the same descriptor infos copied, so it is not pursued. Unmerged
   branch `trackB/recorder-descriptors`.
+
+### Where the command thread's library time goes (2026-11-07)
+
+Call stacks of `KytyGpuCmd` on `dev` 4c86dc01 (`perf record -e cpu_core/cycles/u --call-graph lbr
+--user-callchains -t <tid>`; without `--user-callchains`, perf refuses any call graph at
+`perf_event_paranoid=2`). Shares of the thread's cycles:
+
+| Leaf | Share | Callers |
+|---|---|---|
+| memcpy (libc+0x1b1c87) | 6.4% | `PrepareBda` uploads through `AsyncUploader::Upload`'s fill 4.3%, the staging ring 0.3%; `ObtainBuffer` stream copies 1.2%; `PostQueuedDraw`'s register snapshot 0.6% |
+| `pthread_mutex_lock`/`unlock` | 4.0% | `CommandScheduler::PopPendingOperations` per draw 2.3%, `ClampRangeSize` 0.6%, `MakeDepthTargetDesc` 0.2% |
+| `pthread_rwlock_unlock`/`rdlock` | 4.5% | `CopySparseMemory` from `ObtainBuffer` 2.9%, `TryReadBacking` from `MaterializeColorClear` 0.9% |
+
+The guest-memory reader locks are gone: reads inside one backing mapping copy straight from the
+backing alias. A per-thread translation cache is validated by a sequence count that every
+`GuestBackingStore` writer makes odd while it holds its lock (`KYTY_FAST_GUEST_READ=0|verify`).
+Result: 38.97 → 39.56 FPS. The scheduler mutex went to Track B with its per-draw locks. The
+`PrepareBda` memcpy (~680 MB/s, two ~8.7 MB ranges a frame) is the largest single item left.
 
 ### Tooling notes
 
