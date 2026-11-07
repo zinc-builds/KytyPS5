@@ -85,6 +85,12 @@ inline void NoteSubmit() noexcept {
 	}
 }
 
+// Write-fault addresses, summarized per 2 MiB chunk in the per-second report.
+void NoteWriteFault(uint64_t vaddr) noexcept;
+
+// Extra per-second report (the page manager's watch footprint and scan cost).
+inline void (*g_report_hook)() = nullptr;
+
 // Prints and resets the counters at most once per second (call from the GPU thread).
 void MaybePrint() noexcept;
 

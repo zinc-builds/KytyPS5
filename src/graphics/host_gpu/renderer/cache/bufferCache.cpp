@@ -124,6 +124,10 @@ void ReportRead(uint64_t vaddr, uint64_t size, bool gpu_thread, double ms, bool 
 
 namespace Libs::Graphics::MemDiag {
 
+namespace {
+void ReportFaultChunks();
+} // namespace
+
 void MaybePrint() noexcept {
 	using Clock = std::chrono::steady_clock;
 	static Clock::time_point last = Clock::now();
@@ -158,11 +162,56 @@ void MaybePrint() noexcept {
 	}
 	std::printf(" watch_w_pages_s=%.0f unwatch_w_pages_s=%.0f watch_r_pages_s=%.0f "
 	            "unwatch_r_pages_s=%.0f wfault_gpu_s=%.0f wfault_other_s=%.0f rfault_gpu_s=%.0f "
-	            "rfault_other_s=%.0f labels_s=%.0f submits_s=%.0f\n",
+	            "rfault_other_s=%.0f labels_s=%.0f submits_s=%.0f",
 	            r(WatchWritePages), r(UnwatchWritePages), r(WatchReadPages), r(UnwatchReadPages),
 	            r(WriteFaultsGpuThread), r(WriteFaultsOther), r(ReadFaultsGpuThread),
 	            r(ReadFaultsOther), r(LabelEpochs), r(Submits));
+	if (g_report_hook != nullptr) {
+		g_report_hook();
+	}
+	ReportFaultChunks();
+	std::printf("\n");
 	std::fflush(stdout);
+}
+
+namespace {
+std::mutex                             g_fault_mutex;
+std::unordered_map<uint64_t, uint64_t> g_fault_pages;  // 4 KiB page -> faults this second
+std::unordered_map<uint64_t, uint64_t> g_fault_chunks; // 2 MiB chunk -> faults this second
+
+void ReportFaultChunks() {
+	std::unordered_map<uint64_t, uint64_t> pages;
+	std::unordered_map<uint64_t, uint64_t> chunks;
+	{
+		std::scoped_lock lock(g_fault_mutex);
+		pages.swap(g_fault_pages);
+		chunks.swap(g_fault_chunks);
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> sorted(chunks.begin(), chunks.end());
+	std::sort(sorted.begin(), sorted.end(),
+	          [](const auto& a, const auto& b) { return a.second > b.second; });
+	uint64_t total = 0;
+	for (const auto& [chunk, count]: sorted) {
+		total += count;
+	}
+	uint64_t covered = 0;
+	size_t   chunks90 = 0;
+	while (chunks90 < sorted.size() && covered * 10 < total * 9) {
+		covered += sorted[chunks90++].second;
+	}
+	std::printf(" | WFAULTS faults=%llu pages=%zu chunks=%zu chunks_for_90%%=%zu top:",
+	            static_cast<unsigned long long>(total), pages.size(), sorted.size(), chunks90);
+	for (size_t i = 0; i < std::min<size_t>(sorted.size(), 10); i++) {
+		std::printf(" %llx=%llu", static_cast<unsigned long long>(sorted[i].first << 21u),
+		            static_cast<unsigned long long>(sorted[i].second));
+	}
+}
+} // namespace
+
+void NoteWriteFault(uint64_t vaddr) noexcept {
+	std::scoped_lock lock(g_fault_mutex);
+	g_fault_pages[vaddr >> 12u]++;
+	g_fault_chunks[vaddr >> 21u]++;
 }
 
 namespace {

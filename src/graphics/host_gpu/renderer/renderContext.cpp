@@ -98,6 +98,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (MemDiag::Enabled()) {
+		if (access == PageFaultAccess::Write) {
+			MemDiag::NoteWriteFault(fault_vaddr);
+		}
 		const bool gpu = GuestGpu::IsGpuThread();
 		MemDiag::Add(access == PageFaultAccess::Write
 		                 ? (gpu ? MemDiag::WriteFaultsGpuThread : MemDiag::WriteFaultsOther)
