@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/stallDiag.h"
 #include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -274,6 +275,8 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 
 void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdScheduler,
+	                               Common::StallDiag::OnCommandThread());
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(
 	    lock, [this] { return m_priority_operations.empty() && m_priority_active_tick == 0; });
@@ -281,6 +284,8 @@ void CommandScheduler::DrainPriorityOperations() {
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdScheduler,
+	                               Common::StallDiag::OnCommandThread());
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at =
