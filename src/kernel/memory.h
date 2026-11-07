@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -146,6 +149,30 @@ enum class GpuFaultCause { Protection, WriteProtect };
 // or the tracker does not account for the fault.
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
                                   GpuFaultCause cause) noexcept;
+// Hot write-tracked ranges use asynchronous write protection: their writes raise no fault
+// the emulator sees. Appends the page runs written there since the last call (GPU thread).
+// wanted: whether any page of [begin, end) has a write watcher (chunks without are not scanned).
+void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written,
+                             bool (*wanted)(uint64_t begin, uint64_t end) = nullptr);
+// The [begin, end) ranges under asynchronous write protection (for KYTY_ASYNC_WP_VERIFY).
+void AsyncGuestRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+// KYTY_ASYNC_WP_VERIFY: appends the asynchronous pages written since the last collection.
+void PeekAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written);
+// Whether part of the range is under asynchronous write protection, where a store raises no
+// fault: emulator stores there must invalidate the caches themselves (GPU thread).
+[[nodiscard]] bool IsAsyncWriteTracked(uint64_t vaddr, uint64_t size) noexcept;
+// Asks for the chunk holding vaddr to move to asynchronous write protection (next collection).
+void RequestAsyncWriteTracking(uint64_t vaddr) noexcept;
+// One page of an asynchronous chunk: protect it now / whether a guest view stored to it since.
+// ProtectAsyncGuestPage write-protects an asynchronously tracked page now (stores found there
+// go to the next collection) and gives a token; false if the page is not one.
+// AsyncGuestPageUntouched: no guest view has stored to the page since the token was given.
+bool               ProtectAsyncGuestPage(uint64_t page, uint64_t& token);
+[[nodiscard]] bool AsyncGuestPageUntouched(uint64_t page, uint64_t token);
+// Advances on remaps and zeroing: guest bytes that change without a store.
+[[nodiscard]] uint64_t GuestRemapGeneration() noexcept;
+// KYTY_ASYNC_WP_VERIFY: takes the ranges the emulator wrote through the backing alias.
+void TakeAliasWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

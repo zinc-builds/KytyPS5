@@ -6,8 +6,15 @@
 // Relaxed atomics; costs one predictable branch per event when off.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <mutex>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 #include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::MemDiag {
 
@@ -46,6 +53,13 @@ enum Stat : int {
 	WriteFaultsOther,
 	ReadFaultsGpuThread,
 	ReadFaultsOther,
+	WaitCollections,        // satisfied waits that collected asynchronous writes
+	WaitOnCpLabel,          // satisfied waits on the processor's own untouched label (no collection)
+	AsyncScans,
+	AsyncScanNs,
+	AsyncChunks,            // chunks under async write protection (sampled per scan)
+	AsyncWrittenPages,      // pages the async write scan reported written
+	AsyncInvalidatedPages,  // of those, pages a cache watched (invalidated like a fault)
 	LabelEpochs,
 	Submits,
 	StatCount
@@ -90,6 +104,35 @@ void NoteWriteFault(uint64_t vaddr) noexcept;
 
 // Extra per-second report (the page manager's watch footprint and scan cost).
 inline void (*g_report_hook)() = nullptr;
+
+// KYTY_ASYNC_WP_TRACE=<hex page>: print every tracking event that touches one page.
+inline uint64_t TracePage() noexcept {
+	static const uint64_t page = [] {
+		const char* value = std::getenv("KYTY_ASYNC_WP_TRACE");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) & ~uint64_t {0xfff} : 0;
+	}();
+	return page;
+}
+inline bool Traced(uint64_t vaddr, uint64_t size) noexcept {
+	const auto page = TracePage();
+	return page != 0 && vaddr < page + 0x1000 && page < vaddr + size;
+}
+inline void Trace(const char* event, uint64_t vaddr, uint64_t size, uint64_t extra = 0) noexcept {
+	static std::mutex lock;
+	std::scoped_lock  guard(lock);
+	std::printf("WPTRACE %lld tid=%ld %s 0x%llx+0x%llx extra=0x%llx\n",
+	            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                       std::chrono::steady_clock::now().time_since_epoch())
+	                                       .count()),
+#if defined(__linux__)
+	            static_cast<long>(gettid()),
+#else
+	            0L,
+#endif
+	            event, static_cast<unsigned long long>(vaddr),
+	            static_cast<unsigned long long>(size), static_cast<unsigned long long>(extra));
+	std::fflush(stdout);
+}
 
 // Prints and resets the counters at most once per second (call from the GPU thread).
 void MaybePrint() noexcept;
