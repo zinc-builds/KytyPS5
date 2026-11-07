@@ -53,6 +53,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` 84e51e33 29.72; same binary with `KYTY_MASKED_SELECTS=0` in passes 9.09 → 8.91 ms/frame, GPU 14.96 → 14.77; FPS unchanged, the command thread limits) | 29.68 | 155.0k | 45.1 (max 68.5) | 21.3 |
 | 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4; same batch: ref `dev` 84e51e33 29.61; 6.48 → 5.57 µs/draw) | 34.42 | 179.4k | 40.0 (max 51.4) | 24.6 |
 | 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
+| 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch, base `dev` 4d170b12 + the stats diagnostic: 29.34; in passes 9.11 → 8.66 ms/frame, GPU 14.99 → 14.66; FPS unchanged, the command thread limits) | 29.25 | 152.7k | 49.8 (max 50.5) | 20.0 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -682,6 +683,30 @@ showed no difference (9.15 / 9.13), so take it as −0.15 ± 0.05 ms. That is ab
 −0.47 ms ceiling below; the rest needs the region outputs unpredicated (a per-lane `if (exec)`
 around the region with phis at its end).
 
+**Vertex-shader code size (`KYTY_PIPELINE_STATS`).** The driver's own statistics per pipeline,
+joined with `KYTY_GPU_TIME=draws` by module id (Sky Garden, `dev` 4d170b12):
+
+| Module | GPU ms/s | µs/draw | Registers | NVIDIA binary |
+|---|---|---|---|---|
+| VS `28eadb3f` | 18.0 | 6.4 | 96 | 80 KB |
+| MS `74d9612c` | 14.3 | 9.5 | 255 | 500 KB |
+| VS `301b4a23` (also `2054c572`, `d4c03955`: same code) | 13.6 + 11.3 + 9.8 | 10–29 | 219 | 122 KB |
+| MS `dc33907e` | 8.8 | 20.4 | 255 | 729 KB |
+| VS `90036de5` | 7.1 | 1.1 | 221 | 124 KB |
+
+The 219-register family is skinned meshes. It reads a per-lane array kept in VGPRs with
+`V_MOVRELS_B32` (VGPR[base + M0], M0 = 4·bone + row from a loop counter or a vertex attribute).
+The translator writes each read as a chain `Select(M0 == k, v[base + k], …)` over every VGPR
+above the base: 22 reads × 116 candidates in `301b4a23`. Capping the chains at 32 candidates
+(unsafe experiment) gave in passes 9.01 → 8.03 ms/frame and 219 → 168 registers.
+
+**Switch on M0 (landed).** The emitter writes the outermost link of such a chain (eight or more
+links on one selector) as an `OpSwitch` on M0 with a phi; M0 is scalar in the guest, so the switch
+doesn't diverge. In passes 9.11 → 8.66 ms/frame (same batch), the `301b4a23` family 13.8 → 10.2
+ms/s at 213 registers (binary 122 → 149 KB). The rest of the ceiling is register pressure: every
+candidate stays live at each read. Holding the indexed range in a function-local array instead
+would release them, but every other access to those VGPRs would then go through memory.
+
 **More ceilings (local experiments, same binary, warmed shader stores, `KYTY_GPU_TIME=passes`):**
 
 | Experiment | GPU effect | Status |
@@ -1022,6 +1047,9 @@ What this means:
   linear buffer and a copy again; `KYTY_TILER_VERIFY=1` also runs that path for every transfer
   the image path takes and compares the bytes on the host (`TILERVERIFY` lines, one per image
   shape, a count every 64 checks; slow).
+- `KYTY_PIPELINE_STATS=1` (Track G): the driver's statistics for every pipeline it creates
+  (`PIPESTATS kind=… vs=<module id> ps=<module id> exec=… Register_Count=… Binary_Size=…` on
+  NVIDIA), with the module ids `KYTY_GPU_TIME=draws` and `KYTY_SPV_DUMP` use.
 - `KYTY_MASKED_SELECTS=0` (Track G): vertex shaders keep every EXEC select. For A/B only, in
   an install dir of its own: the shader store doesn't record the setting.
 - Threaded draw preparation (Track B4): `KYTY_PREPARE_THREAD=0` draws at once on the command
