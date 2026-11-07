@@ -45,6 +45,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Draws construct only the color attachments and vertex stages they use; texture bindings copied once (Track B1′ step 1; same batch: ref `dev` 05ffc8b5 25.90 / 25.91; 7.06 → 6.71 µs/draw) | 27.40 / 27.55 | 148.8k / 149.1k | 52.6 (max 83.2) | 19.5 |
 | 2026-11-07 | Shader-map lookups cached per thread; vertex tables copied without zeroing (Track B1′ step 3a; 4 pairs, same batch: ref `dev` 07379452 27.37 / 28.27 / 28.10 / 28.04; +0.5% on runs 2–4, 6.60 → 6.56 µs/draw) | 27.96 / 28.41 / 28.23 / 28.22 | 151.6k / 153.0k / 152.1k / 152.1k | 51.5 (max 67.8) | 19.4 |
 | 2026-11-07 | Vertex shaders stop predicating every instruction on an always-set EXEC bit (Track G; same batch: ref `dev` a456fbcb 27.61 / 27.62; GPU 16.97 → 16.13 ms/frame, in passes 9.78 → 8.91) | 28.09 / 28.68 | 152.2k / 154.4k | 50.8 (max 99.9) | 19.8 |
+| 2026-11-07 | Render targets tiled and detiled straight from and into the image (Track G; menu route; same batch: ref `dev` f2848f29 27.97 / 27.36, with `KYTY_GPU_TIME` 26.09 / 27.40; GPU 16.26 → 14.89 ms/frame, transfers 2.71 → 1.34; FPS unchanged, the command thread limits) | 27.63 / 25.85 | 150.1k / 141.1k | 53.0 (max 83.1) | 19.3 |
 | 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
@@ -649,13 +650,30 @@ well below VRAM bandwidth: each round-trip is a copy plus a separate tiling disp
 | Fused legacy MAD (above) | −0.4 ms | parked |
 | GPU clocks during the level | 2700 MHz, P2, ~43% busy | not a clock problem |
 
-**Next: single-pass tiling for render-target round-trips (~1.5 ms/frame).** Each of the
-1080p RGBA16F round-trips is a tiling dispatch plus a separate 16.6 MB copy between the image and
-a linear scratch buffer (buffer → image 0.9 ms/frame, image → buffer 0.7 ms/frame, at 100–170
-GB/s). Color images are created mutable-format with storage usage, so the tiler could read and
-write a raw-bit `uint` storage view of the image directly and drop the copies. It needs either
-`shaderStorageImageReadWithoutFormat` (supported by the RTX 4080 Super but not enabled) or
-per-element-size image bindings in the nine tiler shader families.
+**Single-pass tiling of render targets (landed).** Each 1080p RGBA16F round-trip was a tiling
+dispatch plus a separate 16.6 MB copy between the image and a linear scratch buffer (buffer →
+image 0.85 ms/frame, image → buffer 0.67 ms/frame, plus zero-fills of the scratch). The nine
+tiler families are now also built with the linear side in an image (`TILER_IMAGE` in
+`gpu_tiler_common.inc`): detiling stores into a raw-bit storage view of the image, tiling reads
+a sampled view of the same format with `texelFetch`. The view format is the unsigned integer
+format of the element size (`R8`/`R16`/`R32`/`R32G32`/`R32G32B32A32_UINT`), so neither
+`shaderStorageImageReadWithoutFormat` nor per-size image bindings are needed; write without
+format was already required. It covers single-level, single-sample 2D tiled color images whose
+host texel size equals the element size; mip chains, volumes, block formats and depth keep the
+buffer path. Same batch, `KYTY_GPU_TIME=passes`, two runs each:
+
+| | `dev` f2848f29 | image path |
+|---|---|---|
+| GPU ms/frame | 16.26 / 16.26 | 14.93 / 14.84 |
+| transfers | 2.71 | 1.34 |
+| ↳ buffer → image | 0.85 | 0.10 |
+| ↳ image → buffer | 0.67 | 0.08 |
+| in passes / dispatches | 8.98 / 3.68 | 9.00 / 3.66 |
+
+FPS did not move (27.97 / 27.36 vs 27.63 / 25.85 without the diagnostic): the command thread
+still limits. `KYTY_TILER_VERIFY=1` checked 7.6k transfers over 68 image shapes in Sky Garden
+bit-exact against the buffer path, and the `gpu_tiler` suite checks both directions for every
+2D family and element size, array layers and the three color transforms.
 
 **Dispatches (`KYTY_GPU_TIME=draws`, grouped by compute module):** 3.65 ms/frame. One shader
 (`0ec2f135`, one dispatch per frame) takes 0.69 ms; then `d637f68e` (40 per frame, 11 µs),
@@ -873,5 +891,9 @@ What this means:
 - `KYTY_STREAM_VERIFY=1` checks every reused stream copy against the guest bytes (slow);
   `KYTY_NO_STREAM_REUSE=1` disables reuse.
 - Env knobs: `KYTY_NO_PIN=1`, `KYTY_AMD_SKIP_RSQRT=1`, `KYTY_NO_SHADER_FASTREAD=1`.
+- Tiler image path (Track G): `KYTY_TILER_DIRECT=0` tiles and detiles render targets through a
+  linear buffer and a copy again; `KYTY_TILER_VERIFY=1` also runs that path for every transfer
+  the image path takes and compares the bytes on the host (`TILERVERIFY` lines, one per image
+  shape, a count every 64 checks; slow).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
   hit and exits on a disagreement, `KYTY_DTC_STATS=1` prints `DTC` hit-rate lines once per second.
