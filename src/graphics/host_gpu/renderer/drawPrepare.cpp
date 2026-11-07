@@ -6,6 +6,8 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <chrono>
+#include <deque>
+#include <mutex>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -20,6 +22,18 @@ namespace {
 thread_local bool    t_worker = false;
 thread_local Log*    t_log    = nullptr;
 std::atomic<uint64_t> g_hazard_generation {0};
+
+struct StoredRange {
+	uint64_t sequence;
+	uint64_t begin;
+	uint64_t end;
+};
+// Enough for every store between a draw's post and its adoption at any realistic rate.
+constexpr size_t           StoredHistory = 4096;
+std::mutex                 g_stored_mutex;
+std::deque<StoredRange>    g_stored;
+uint64_t                   g_stored_last = 0; // under g_stored_mutex
+std::atomic<uint64_t>      g_stored_sequence {0};
 
 uint64_t NowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -46,6 +60,37 @@ void NoteHazard() noexcept {
 
 uint64_t HazardGeneration() noexcept {
 	return g_hazard_generation.load(std::memory_order_relaxed);
+}
+
+void NoteStoredRange(uint64_t vaddr, uint64_t size) {
+	std::scoped_lock lock(g_stored_mutex);
+	g_stored.push_back({++g_stored_last, vaddr, vaddr + size});
+	if (g_stored.size() > StoredHistory) {
+		g_stored.pop_front();
+	}
+	g_stored_sequence.store(g_stored_last, std::memory_order_seq_cst);
+}
+
+uint64_t StoredSequence() noexcept {
+	return g_stored_sequence.load(std::memory_order_seq_cst);
+}
+
+bool StoredSince(uint64_t sequence, const std::vector<std::pair<uint64_t, uint64_t>>& reads) {
+	if (StoredSequence() == sequence) {
+		return false;
+	}
+	std::scoped_lock lock(g_stored_mutex);
+	if (g_stored.empty() || g_stored.front().sequence > sequence + 1) {
+		return true;
+	}
+	for (auto it = g_stored.rbegin(); it != g_stored.rend() && it->sequence > sequence; ++it) {
+		for (const auto& [address, size]: reads) {
+			if (address < it->end && it->begin < address + size) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 Worker::Worker(Run run, void* context): m_run(run), m_context(context), m_thread([this] { Loop(); }) {}

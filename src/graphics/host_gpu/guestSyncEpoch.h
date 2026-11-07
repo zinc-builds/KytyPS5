@@ -12,13 +12,26 @@ namespace Libs::Graphics::GuestSyncEpoch {
 // (downloads, label stores through the backing). Between two advances the guest has seen no
 // sign that the GPU consumed earlier work, so the bytes that work reads cannot change.
 inline std::atomic<uint64_t> g_epoch {1};
+// The same without emulator stores whose ranges DrawPrepare records (AdvanceRanged): queued
+// draws check those by range instead.
+inline std::atomic<uint64_t> g_unranged_epoch {1};
 
 inline void Advance() noexcept {
+	g_unranged_epoch.fetch_add(1, std::memory_order_acq_rel);
+	g_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// For a store whose range the caller also records with DrawPrepare::NoteStoredRange.
+inline void AdvanceRanged() noexcept {
 	g_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 [[nodiscard]] inline uint64_t Current() noexcept {
 	return g_epoch.load(std::memory_order_acquire);
+}
+
+[[nodiscard]] inline uint64_t CurrentUnranged() noexcept {
+	return g_unranged_epoch.load(std::memory_order_acquire);
 }
 
 } // namespace Libs::Graphics::GuestSyncEpoch

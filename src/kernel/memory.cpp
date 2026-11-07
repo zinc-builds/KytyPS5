@@ -858,12 +858,14 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
-bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged) {
 	// Emulator stores into guest memory (downloads, labels) change bytes without a guest write.
 	// Advance on both sides so no reader pairs the old bytes with the new epoch, or the reverse.
-	Graphics::GuestSyncEpoch::Advance();
+	const auto advance = ranged ? Graphics::GuestSyncEpoch::AdvanceRanged
+	                            : Graphics::GuestSyncEpoch::Advance;
+	advance();
 	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
-	Graphics::GuestSyncEpoch::Advance();
+	advance();
 	return written;
 }
 
@@ -908,8 +910,8 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
-void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
-	if (!TryWriteBacking(vaddr, data, size)) {
+void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged) noexcept {
+	if (!TryWriteBacking(vaddr, data, size, ranged)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);

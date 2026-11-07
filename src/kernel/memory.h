@@ -133,7 +133,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
-bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// `ranged`: the caller records the range with DrawPrepare::NoteStoredRange around the store.
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged = false);
 // One aligned 4- or 8-byte store through the backing (a label: never written twice).
 bool                   TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
@@ -141,7 +142,7 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged = false) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 // Protection: the host page protection forbids the access. WriteProtect: a bus error that
