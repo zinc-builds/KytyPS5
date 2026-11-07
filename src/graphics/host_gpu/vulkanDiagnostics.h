@@ -22,6 +22,11 @@
 // KYTY_GPU_TIME=draws also stamps the end of each draw ("GPUDRAW ..."): GPU time between a draw's
 // stamp and the previous one in its pass, grouped by vertex (or mesh) module and by pixel module.
 //
+// KYTY_PIPELINE_STATS=1: enables VK_KHR_pipeline_executable_properties and prints the driver's
+// statistics for every pipeline it creates ("PIPESTATS kind=... vs=<module id> ps=<module id>
+// exec=<name> <statistic>=<value> ...": binary size, registers and the like on NVIDIA), with the
+// module ids KYTY_GPU_TIME=draws and KYTY_SPV_DUMP use.
+//
 // KYTY_SPV_DUMP=<dir>: writes each graphics or compute module's SPIR-V as
 // <dir>/<stage>_<guest hash>_<module id>.spv when it is compiled or loaded from the shader store.
 namespace Libs::Graphics::VulkanDiagnostics {
@@ -41,6 +46,12 @@ void DrawStamp(vk::CommandBuffer buffer, uint64_t vs_id, uint64_t ps_id, uint64_
 
 // KYTY_GPU_TIME=draws: the compute module of the next dispatch recorded into the buffer.
 void TagDispatch(vk::CommandBuffer buffer, uint64_t module_id);
+
+// KYTY_PIPELINE_STATS is set (read once).
+bool PipelineStatsRequested();
+// Prints a pipeline's executable statistics; it was created with eCaptureStatisticsKHR.
+void ReportPipelineStatistics(vk::Device device, vk::Pipeline pipeline, const char* kind,
+                              uint64_t vs_id, uint64_t ps_id);
 
 void DumpSpirv(const char* stage, uint64_t hash, uint64_t id, std::span<const uint32_t> spirv);
 

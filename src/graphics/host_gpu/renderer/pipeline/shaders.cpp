@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
@@ -353,9 +354,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = pipeline.pipeline_layout;
 
+	if (graphics.pipeline_stats_enabled) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (graphics.pipeline_stats_enabled) {
+		VulkanDiagnostics::ReportPipelineStatistics(graphics.device, pipeline.pipeline,
+		                                            mesh ? "mesh" : "graphics", vertex.id,
+		                                            pixel != nullptr ? pixel->id : 0u);
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -389,9 +398,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
+	if (graphics.pipeline_stats_enabled) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (graphics.pipeline_stats_enabled) {
+		VulkanDiagnostics::ReportPipelineStatistics(graphics.device, pipeline.pipeline, "compute",
+		                                            module.id, 0u);
+	}
 }
 
 } // namespace Libs::Graphics

@@ -54,7 +54,8 @@ EMIT_NATIVE(BitFieldInsert, OpBitFieldInsert, U32, uint32_t, uint32_t, uint32_t,
 EMIT_NATIVE(BitFieldUExtract, OpBitFieldUExtract, U32, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(BitFieldSExtract, OpBitFieldSExtract, U32, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(SelectU1, OpSelect, U1, uint32_t, uint32_t, uint32_t)
-EMIT_NATIVE(SelectU32, OpSelect, U32, uint32_t, uint32_t, uint32_t)
+// Long chains Select(m == k, v_k, ...) on one selector m (indexed VGPR reads) become an OpSwitch.
+uint32_t EmitSelectU32(ValueEmitContext& ctx, const IR::Inst& inst);
 EMIT_NATIVE(SelectF32, OpSelect, F32, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(SelectF64, OpSelect, F64, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(IAdd32, OpIAdd, U32, uint32_t, uint32_t)
