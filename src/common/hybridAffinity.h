@@ -15,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace Common::HybridAffinity {
 
@@ -102,10 +103,13 @@ inline Plan& GetPlan() {
 			}
 		}
 		result.prepare_cpu = prepare;
+		// KYTY_RESERVE_CPUS=<list>: also keep the emulator off these (for a thread pinned there).
+		const char* reserve_env = std::getenv("KYTY_RESERVE_CPUS");
+		const auto  reserved    = reserve_env != nullptr ? ParseCpuList(reserve_env) : std::set<int> {};
 		CPU_ZERO(&result.process);
 		for (const int cpu: performance) {
 			if (siblings.count(cpu) == 0 && cpu != gpu && cpu != prepare &&
-			    CPU_ISSET(cpu, &allowed)) {
+			    reserved.count(cpu) == 0 && CPU_ISSET(cpu, &allowed)) {
 				CPU_SET(cpu, &result.process);
 			}
 		}
@@ -149,6 +153,57 @@ inline void ApplyToPrepareThread() {
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	CPU_SET(cpu, &set);
+	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
+// Call from a thread the game created, once it has its name. The game's threads run on the
+// efficiency cores (all but the recording thread's): since write faults stopped raising signals
+// they are light, and leaving the performance cores to the emulator's threads, the game's main
+// thread and its render thread gained 3%. Threads whose name starts with one of
+// KYTY_GUEST_PCORE_NAMES=<name,...> (default DrawThread) stay on the emulator's cores.
+// KYTY_GUEST_THREAD_CPUS=<list> picks other CPUs, =none keeps every game thread with the emulator.
+inline void ApplyToGuestThread(const std::string& name) {
+	static const std::set<int> cpus = [] {
+		if (!GetPlan().active) {
+			return std::set<int> {};
+		}
+		if (const char* value = std::getenv("KYTY_GUEST_THREAD_CPUS"); value != nullptr) {
+			return std::string(value) == "none" ? std::set<int> {} : ParseCpuList(value);
+		}
+		auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
+		// Not the recording thread's CPU (see ApplyToRecorderThread).
+		const int recorder = EnvCpu("KYTY_RECORDER_CPU");
+		if (recorder >= 0) {
+			efficiency.erase(recorder);
+		} else if (!efficiency.empty()) {
+			efficiency.erase(std::prev(efficiency.end()));
+		}
+		return efficiency;
+	}();
+	if (cpus.empty()) {
+		return;
+	}
+	static const std::vector<std::string> keep = [] {
+		const char*              value = std::getenv("KYTY_GUEST_PCORE_NAMES");
+		std::stringstream        stream(value != nullptr ? value : "DrawThread");
+		std::vector<std::string> names;
+		for (std::string prefix; std::getline(stream, prefix, ',');) {
+			if (!prefix.empty()) {
+				names.push_back(prefix);
+			}
+		}
+		return names;
+	}();
+	for (const auto& prefix: keep) {
+		if (name.rfind(prefix, 0) == 0) {
+			return;
+		}
+	}
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	for (const int cpu: cpus) {
+		CPU_SET(cpu, &set);
+	}
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 

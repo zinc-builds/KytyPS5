@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "common/hybridAffinity.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -3219,6 +3220,9 @@ static void* RunThread(void* arg) {
 		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
 #endif
 	}
+#if defined(__linux__)
+	Common::HybridAffinity::ApplyToGuestThread(thread->name);
+#endif
 #endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64

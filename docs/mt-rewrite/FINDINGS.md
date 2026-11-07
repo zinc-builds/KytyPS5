@@ -56,6 +56,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 204abd61 34.46; in passes 8.90 → 8.43 ms/frame, GPU 14.79 → 14.38; against `dev` 4d170b12 earlier: in passes 8.93 → 8.53) | 34.80 | 181.7k | 40.9 (max 65.5) | 25.0 |
 | 2026-11-07 | Compute and pixel shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` ae6d8c77 35.09; GPU 14.34 → 13.86 ms/frame, dispatches 3.68 → 3.39, in passes 8.42 → 8.23; FPS unchanged, the command thread limits) | 35.21 | 184.1k | 40.0 (max 66.6) | 26.1 |
 | 2026-11-07 | Consecutive dispatches the guest lets overlap share their barriers (Track G3; same batch: ref `dev` ae6d8c77 34.81; with `KYTY_GPU_TIME=passes`, GPU 14.14 → 13.29 ms/frame, dispatches 3.68 → 3.04, barrier gaps 0.80 → 0.54) | 35.19 | 183.4k | 38.5 (max 50.6) | 27.4 |
+| 2026-11-07 | Game-created threads on the efficiency cores, the game's render thread and the emulator on the performance cores (same batch: ref `dev` e5ef1e84 35.03 / 35.27, worst_ms 39.0 / 38.5) | 36.02 / 36.45 | 188.8k / 191.7k | 33.5 (max 33.5) | 28.7 / 29.9 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1057,6 +1058,28 @@ Ruled out: skipping `PopPendingOperations`' lock when no operation is ready (an 
 the queue's front tick). Its 73 ns per call measured under TSC marks did not show up in FPS
 (same batch, without the external load: `dev` 204abd61 34.99 / 34.84, with the change 34.26).
 
+### Core layout after C2 and B4 (2026-11-07)
+
+The rule "guest threads on performance cores" dates from when they spent ~40% of their time in
+write-fault signals. Since C2 they are light, and the efficiency cores 12–18 sat idle. Same
+binary, layouts set through `KYTY_GUEST_THREAD_CPUS`, `KYTY_GUEST_PCORE_NAMES`,
+`KYTY_RESERVE_CPUS` and `KYTY_RECORDER_CPU`; FPS per run:
+
+| Layout | FPS | worst_ms | low1 |
+|---|---|---|---|
+| (a) all game threads on the performance cores (before) | 35.20 / 35.07 / 35.46 | 39–40 | 24.8–27.4 |
+| (b0) game-created threads on efficiency cores 12–18 | 35.77 / 35.68 / 35.45 | 33.5–34.5 | 28.2–29.9 |
+| (d0) as b0, but `DrawThread` (the game's render thread) stays on the performance cores | 36.38 / 36.35 | 33.5 (max 33.9) | 29.9 |
+| (b) as d0 plus the recorder on performance CPU 6, taken from the emulator | 36.20 / 36.62 / 36.45 | 33.5–34.5 | 27.8–29.8 |
+| (c) as b0 plus the recorder on CPU 9 (the prepare worker's SMT sibling) | 35.26 | 33.5 | 28.7 |
+
+d0 is now the default: threads the game creates run on the efficiency cores except the
+recorder's, and those named in `KYTY_GUEST_PCORE_NAMES` (default `DrawThread`) stay with the
+emulator. The game's main thread is the process's main thread and is unaffected. Same batch
+against `dev` e5ef1e84: 35.03 / 35.27 → **36.02 / 36.45 FPS (+3.1%)**, worst frame 38.8 →
+33.5 ms (no frame over two vblanks), 1% low 25.3 → 29.3. Moving the recorder to a
+performance core costs nothing (b), so a performance core is free for it if it gets more work.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
@@ -1166,6 +1189,10 @@ What this means:
   NVIDIA), with the module ids `KYTY_GPU_TIME=draws` and `KYTY_SPV_DUMP` use.
 - `KYTY_MASKED_SELECTS=0` (Track G): vertex shaders keep every EXEC select. For A/B only, in
   an install dir of its own: the shader store doesn't record the setting.
+- Core layout: `KYTY_GUEST_THREAD_CPUS=<list>|none` (where the game's threads run, default the
+  efficiency cores but the recorder's), `KYTY_GUEST_PCORE_NAMES=<name,...>` (game threads kept
+  on the performance cores, default `DrawThread`), `KYTY_RESERVE_CPUS=<list>` (performance CPUs
+  the emulator leaves free, e.g. for `KYTY_RECORDER_CPU`).
 - Threaded draw preparation (Track B4): `KYTY_PREPARE_THREAD=0` draws at once on the command
   thread, `KYTY_PREPARE_DEPTH=<n>` queues up to n draws (default 4), `KYTY_PREPARE_CPU=<n>` pins
   the worker elsewhere, `KYTY_PREPARE_VERIFY=1` looks every adopted draw up again and exits on a
