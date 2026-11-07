@@ -53,7 +53,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same binary, same batch, `KYTY_MASKED_SELECTS=0`: 29.53; in passes 9.14 → 8.93 ms/frame, GPU 15.14 → 14.77; FPS unchanged, the command thread limits. Re-measured after an external load overlapped the first runs) | 29.31 | 153.0k | 48.9 (max 65.4) | 20.1 |
 | 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4; same batch: ref `dev` 84e51e33 29.61; 6.48 → 5.57 µs/draw) | 34.42 | 179.4k | 40.0 (max 51.4) | 24.6 |
 | 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
-| 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 4d170b12 29.31; in passes 8.93 → 8.53 ms/frame, GPU 14.77 → 14.38; FPS unchanged, the command thread limits) | 29.53 | 154.2k | 51.5 (max 68.2) | 20.0 |
+| 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 204abd61 34.46; in passes 8.90 → 8.43 ms/frame, GPU 14.79 → 14.38; against `dev` 4d170b12 earlier: in passes 8.93 → 8.53) | 34.80 | 181.7k | 40.9 (max 65.5) | 25.0 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -702,7 +702,7 @@ above the base: 22 reads × 116 candidates in `301b4a23`. Capping the chains at 
 
 **Switch on M0 (landed).** The emitter writes the outermost link of such a chain (eight or more
 links on one selector) as an `OpSwitch` on M0 with a phi; M0 is scalar in the guest, so the switch
-doesn't diverge. In passes 8.93 → 8.53 ms/frame against `dev` 4d170b12 (same batch), the
+doesn't diverge. In passes 8.90 → 8.43 ms/frame against `dev` 204abd61 (same batch), the
 `301b4a23` family 13.8 → 10.2 ms/s at 213 registers (binary 122 → 149 KB). The rest of the ceiling is register pressure: every
 candidate stays live at each read. Holding the indexed range in a function-local array instead
 would release them, but every other access to those VGPRs would then go through memory.
