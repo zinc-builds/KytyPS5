@@ -600,6 +600,11 @@ struct RenderExecutorTestAccess {
     executor.ResolveRenderColorTarget(buffer, color, slot);
   }
 
+  // Marks a color target slot's memo so that a reuse is visible in its result.
+  static void MarkColorTargetMemo(RenderExecutor &executor, uint32_t slot) {
+    executor.m_color_target_memo.at(slot).result.guest_array_layer = 0xbad;
+  }
+
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
     executor.BindRenderTarget(id);
   }
@@ -11402,6 +11407,31 @@ public:
                   rendering.num_layers == 1 &&
                   rendering.num_color_attachments == 1,
               "color attachment lost its dimensions or padded guest layout");
+
+      if (&target == &cases[0]) {
+        // Unchanged registers reuse the slot's resolve until an image is registered on its
+        // pages.
+        RenderExecutorTestAccess::MarkColorTargetMemo(executor, 0);
+        RenderColorInfo repeated{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           repeated, 0);
+        const auto newer = TextureCacheTestAccess::InsertImage(texture_cache, color.desc.info);
+        RenderExecutorTestAccess::MarkColorTargetMemo(executor, 0);
+        RenderColorInfo after_insert{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           after_insert, 0);
+        TextureCacheTestAccess::DeleteImage(texture_cache, newer);
+        RenderColorInfo after_delete{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           after_delete, 0);
+        Require(name, "color target memo",
+                repeated.image_id == color.image_id && repeated.guest_array_layer == 0xbad &&
+                    after_insert.image_id == newer && after_insert.guest_array_layer == 0 &&
+                    after_delete.image_id == color.image_id &&
+                    after_delete.guest_array_layer == 0,
+                "a color target slot reused a resolve across an image registration on its "
+                "pages, or resolved unchanged registers again");
+      }
 
       if (width == 1 && height == 1) {
         Require(name, "single-texel tiled layout",

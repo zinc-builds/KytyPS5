@@ -811,11 +811,16 @@ RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*            
 			stats.start_ns = now;
 		} else if (now - stats.start_ns >= 1'000'000'000u) {
 			const auto pct = [&](uint64_t n) { return 100.0 * static_cast<double>(n) / stats.lookups; };
-			std::printf("DTC textures_s=%llu hit=%.1f%% changed=%.1f%% stale=%.1f%% unreusable=%.1f%%\n",
+			auto& targets = m_color_target_stats;
+			std::printf("DTC textures_s=%llu hit=%.1f%% changed=%.1f%% stale=%.1f%% unreusable=%.1f%% "
+			            "color_targets_s=%llu hit=%.1f%%\n",
 			            static_cast<unsigned long long>(stats.lookups), pct(stats.hits),
-			            pct(stats.changed), pct(stats.stale), pct(stats.unreusable));
+			            pct(stats.changed), pct(stats.stale), pct(stats.unreusable),
+			            static_cast<unsigned long long>(targets.lookups),
+			            targets.lookups ? 100.0 * static_cast<double>(targets.hits) / targets.lookups : 0.0);
 			std::fflush(stdout);
-			stats = {.start_ns = now};
+			stats   = {.start_ns = now};
+			targets = {};
 		}
 	}
 	if (hit && GetDrawStateCacheMode() != DrawStateCacheMode::Verify) {

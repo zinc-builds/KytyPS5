@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -274,10 +275,33 @@ private:
 	std::unordered_map<uint64_t, TextureDescriptionEntry> m_texture_descriptions;
 	// Image slots of each stage module by its id: a program's modules move as it compiles more.
 	std::unordered_map<uint64_t, std::vector<TextureResolveMemo>> m_texture_memo;
+	// A color target slot's last resolve, reused while its registers are unchanged and the
+	// texture cache would find the same image.
+	struct ColorTargetMemo {
+		HW::RenderTarget rt {};
+		uint32_t         mask                = 0;
+		bool             ignore_target_mask  = false;
+		bool             exact_format        = false;
+		uint64_t         generation          = 0; // 0: not reusable.
+		uint32_t         metadata_base_layer = 0;
+		RenderColorInfo  result;
+	};
+	std::array<ColorTargetMemo, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_memo {};
+	// The depth target's last description and image, kept like ColorTargetMemo.
+	struct DepthTargetMemo {
+		HW::DepthRenderTarget   z {};
+		uint64_t                generation          = 0; // 0: not reusable.
+		uint32_t                metadata_base_layer = 0;
+		TextureCache::ImageDesc desc;
+		ImageId                 image_id;
+	} m_depth_target_memo;
 	struct TextureMemoStats {
 		uint64_t lookups = 0, hits = 0, changed = 0, stale = 0, unreusable = 0;
 		uint64_t start_ns = 0;
 	} m_texture_memo_stats;
+	struct {
+		uint64_t lookups = 0, hits = 0;
+	} m_color_target_stats;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
