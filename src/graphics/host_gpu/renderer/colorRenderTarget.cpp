@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/drawStateCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -53,6 +55,33 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	r             = {};
 	r.target_slot = rt_slot;
+
+	auto* memo = GetDrawStateCacheMode() != DrawStateCacheMode::Off &&
+	                     rt_slot < m_color_target_memo.size()
+	                 ? &m_color_target_memo[rt_slot]
+	                 : nullptr;
+	bool hit = false;
+	if (memo != nullptr && memo->generation != 0 && memo->mask == mask &&
+	    memo->ignore_target_mask == ignore_target_mask && memo->exact_format == exact_format &&
+	    std::memcmp(&memo->rt, &rt, sizeof(rt)) == 0) {
+		const auto& found      = memo->result.desc;
+		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
+		                         found.info.metadata.kind == ImageMetadataKind::Cmask;
+		hit = m_context.GetTextureCache().RefindExactImage(
+		    memo->result.image_id, found.info.data, color_clear ? &found : nullptr,
+		    memo->metadata_base_layer, memo->generation);
+		if (DrawStateCacheStats()) {
+			m_color_target_stats.lookups++;
+			m_color_target_stats.hits += hit ? 1 : 0;
+		}
+		if (hit && GetDrawStateCacheMode() != DrawStateCacheMode::Verify) {
+			r = memo->result;
+			BindRenderTarget(r.image_id);
+			return;
+		}
+	} else if (memo != nullptr && DrawStateCacheStats()) {
+		m_color_target_stats.lookups++;
+	}
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
@@ -257,9 +286,31 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = mip;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	const auto metadata_base_layer = r.desc.view_info.base_layer;
+	uint64_t   generation          = 0;
+	r.image_id = texture_cache.FindImage(r.desc, exact_format, memo != nullptr ? &generation : nullptr);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	if (memo == nullptr) {
+		return;
+	}
+	if (hit && (r.image_id != memo->result.image_id ||
+	            !(r.desc.view_info == memo->result.desc.view_info) ||
+	            r.desc.info.data != memo->result.desc.info.data ||
+	            r.guest_mip_level != memo->result.guest_mip_level ||
+	            r.guest_array_layer != memo->result.guest_array_layer)) {
+		EXIT("KYTY_DTC_VERIFY: color target memo disagrees: slot %u image %u vs %u\n", rt_slot,
+		     memo->result.image_id.index, r.image_id.index);
+	}
+	memo->generation = r.image_id ? generation : 0;
+	if (memo->generation != 0) {
+		std::memcpy(&memo->rt, &rt, sizeof(rt)); // With padding: compared as bytes.
+		memo->mask                = mask;
+		memo->ignore_target_mask  = ignore_target_mask;
+		memo->exact_format        = exact_format;
+		memo->metadata_base_layer = metadata_base_layer;
+		memo->result              = r;
+	}
 }
 
 } // namespace Libs::Graphics

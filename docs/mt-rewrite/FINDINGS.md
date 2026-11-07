@@ -38,6 +38,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-06 | Read-only depth attachments; no barrier for read after read (A/B, same batch: ref 18.71 / 18.99) | 18.48 / 18.91 | 105.6k / 107.2k | 67.1 (max 98.7) | 14.7 |
 | 2026-11-06 | Indirect dispatches no longer wait for the GPU in their SRT walk (same batch: merge-base 20.06 / 20.16) | 21.94 / 22.17 | 122.1k / 123.3k | 55.3 (max 84.5) | 18.0 |
 | 2026-11-06 | Stage image slots reuse their last texture resolve (Track B2; measured on 582e4043, without the stream-copy row: ref 19.33 / 19.57) | 20.68 / 20.66 | 115.6k / 115.5k | 58.3 (max 83.9) | 16.7 |
+| 2026-11-07 | Color and depth target slots reuse their last resolve (Track B2b; same batch: ref `dev` 277a708e 24.24 / 24.24) | 24.95 / 25.36 | 136.8k / 139.0k | 53.0 (max 82.2) | 19.2 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -447,6 +448,17 @@ and programs that alternate between textures miss every time.
 | ↳ `FindImage` (all callers) | 13.0% | 7.6% |
 | `BufferCache::ObtainBuffer` | 13.2% | 14.0% |
 | NVIDIA driver | 9.4% | 9.6% |
+
+**B2b: render-target resolve memo (merged).** `ResolveRenderColorTarget` and
+`ResolveRenderDepthTarget` rebuilt each target's description (tiling layout, `UpdateSize`) and
+searched the texture cache every draw: 10.8% of the GPU thread on `dev` 277a708e, though the
+`CB_COLOR*`/`DB_*` registers rarely change within a pass. Each color slot and the depth target
+now keep their last resolve, keyed by the raw register bytes (plus the target mask and flags for
+color), reused when `RefindExactImage` confirms the image. Depth and stencil test state is still
+derived from the other registers each draw. 99.7% of color target resolves hit, verify clean.
+Render-target resolve went from 10.8% to 5.6% of the thread; +3.8% FPS. `RefindExactImage` is
+now 4.6% of the thread (texture and target hits each lock the texture cache); batching those
+touches per draw is the next small step.
 
 ### Tooling notes
 

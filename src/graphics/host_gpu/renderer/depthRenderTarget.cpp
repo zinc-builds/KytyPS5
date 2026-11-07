@@ -14,11 +14,13 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/drawStateCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -309,7 +311,20 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	auto&      memo = m_depth_target_memo;
+	const auto mode = GetDrawStateCacheMode();
+	bool       hit  = false;
+	if (mode != DrawStateCacheMode::Off && memo.generation != 0 &&
+	    std::memcmp(&memo.z, &z, sizeof(z)) == 0) {
+		const bool color_clear = memo.desc.info.metadata.kind == ImageMetadataKind::Dcc ||
+		                         memo.desc.info.metadata.kind == ImageMetadataKind::Cmask;
+		hit = m_context.GetTextureCache().RefindExactImage(
+		    memo.image_id, memo.desc.info.data, color_clear ? &memo.desc : nullptr,
+		    memo.metadata_base_layer, memo.generation);
+	}
+	if (!hit || mode == DrawStateCacheMode::Verify) {
+		r.desc = MakeDepthTargetDesc(buffer, z);
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -346,9 +361,33 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	if (hit && mode != DrawStateCacheMode::Verify) {
+		r.desc     = memo.desc;
+		r.image_id = memo.image_id;
+		BindRenderTarget(r.image_id);
+		return;
+	}
+	auto&      cache               = m_context.GetTextureCache();
+	const auto metadata_base_layer = r.desc.view_info.base_layer;
+	uint64_t   generation          = 0;
+	r.image_id = cache.FindImage(r.desc, false, mode != DrawStateCacheMode::Off ? &generation : nullptr);
 	BindRenderTarget(r.image_id);
+	if (mode == DrawStateCacheMode::Off) {
+		return;
+	}
+	if (hit && (r.image_id != memo.image_id || !(r.desc.view_info == memo.desc.view_info) ||
+	            r.desc.info.data != memo.desc.info.data ||
+	            r.desc.info.stencil != memo.desc.info.stencil)) {
+		EXIT("KYTY_DTC_VERIFY: depth target memo disagrees: image %u vs %u\n",
+		     memo.image_id.index, r.image_id.index);
+	}
+	memo.generation = r.image_id ? generation : 0;
+	if (memo.generation != 0) {
+		std::memcpy(&memo.z, &z, sizeof(z)); // With padding: compared as bytes.
+		memo.metadata_base_layer = metadata_base_layer;
+		memo.desc                = r.desc;
+		memo.image_id            = r.image_id;
+	}
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
