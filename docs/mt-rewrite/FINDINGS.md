@@ -921,6 +921,32 @@ recorded in between. Same binary, `KYTY_UPLOAD_BATCH=0` as the reference: `KYTY_
 12.30 → 12.19 ms/frame; `=passes` barrier gaps 0.53 → 0.45 ms/frame (447 → 387 gaps),
 transfer → transfer gaps 4.4 → 1.5 ms/s; FPS unchanged.
 
+**Skinned vertex shaders' indexed reads (measured, not landed).** The 213-register family
+(`301b4a23`, `2054c572`, `d4c03955`: one guest program, hash `663ef8a1a281b3fc`) has 22
+`V_MOVRELS_B32` reads with base `v0`–`v3`. The guest keeps three 4-dword entries in `v0`–`v11` and
+walks them in loops: `M0 = 4 · s98` (and `+ 4`), where `s98` counts iterations and each lane stays
+in the loop while `s98 < v69`, a per-vertex count. In Sky Garden `M0` stays below 16, but nothing
+in the program bounds it from above: a vertex with a larger `v69` reads `v12`, `v13`, … on the
+hardware. The translator conservatively offers every VGPR from the base up to the limit (116
+candidates). Capping them at 16 (an unsafe experiment, separate shader stores, same binary):
+
+| | 116 candidates | 16 candidates (unsafe) |
+|---|---|---|
+| GPU (`KYTY_GPU_TIME=1`) | 12.24 ms/frame | 11.67 |
+| in passes (`=passes`) | 8.46 | 7.63 |
+| registers (`KYTY_PIPELINE_STATS`) | 213 | 168 |
+
+The cap has no correctness proof: it changes results for vertices whose count exceeds three.
+Exact options, none measured:
+- Every `M0` here is a multiple of 4 (shifted counters, and first-lane reads of shifted values in
+  the later loops), so each read could drop the candidates outside `base + 4k` (29 instead of 116).
+  The reads use all four bases `v0`–`v3` close together, so between them every register stays a
+  candidate; this may not shorten any live range.
+- A local array: every definition of a high register that reaches a read also stores to it, and
+  the reads load from it. Its register count and local-memory cost are unknown.
+Parked like the fused MAD; whether a bound on the per-vertex count may be assumed is a project
+decision. The cap is one line in `V_MOVRELS_B32` (`KYTY_MOVRELS_CAP`, local only).
+
 ### Draw state cache, Track B (2026-11-06)
 
 **B0: per-draw state does not repeat; its shape does.** A walk memo keyed on a program's user
