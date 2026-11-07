@@ -50,10 +50,10 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Render targets tiled and detiled straight from and into the image (Track G; menu route; same batch: ref `dev` f2848f29 27.97 / 27.36, with `KYTY_GPU_TIME` 26.09 / 27.40; GPU 16.26 → 14.89 ms/frame, transfers 2.71 → 1.34; FPS unchanged, the command thread limits) | 27.63 / 25.85 | 150.1k / 141.1k | 53.0 (max 83.1) | 19.3 |
 | 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
 | 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
-| 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` 84e51e33 29.72; same binary with `KYTY_MASKED_SELECTS=0` in passes 9.09 → 8.91 ms/frame, GPU 14.96 → 14.77; FPS unchanged, the command thread limits) | 29.68 | 155.0k | 45.1 (max 68.5) | 21.3 |
+| 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same binary, same batch, `KYTY_MASKED_SELECTS=0`: 29.53; in passes 9.14 → 8.93 ms/frame, GPU 15.14 → 14.77; FPS unchanged, the command thread limits. Re-measured after an external load overlapped the first runs) | 29.31 | 153.0k | 48.9 (max 65.4) | 20.1 |
 | 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4; same batch: ref `dev` 84e51e33 29.61; 6.48 → 5.57 µs/draw) | 34.42 | 179.4k | 40.0 (max 51.4) | 24.6 |
 | 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
-| 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch, base `dev` 4d170b12 + the stats diagnostic: 29.34; in passes 9.11 → 8.66 ms/frame, GPU 14.99 → 14.66; FPS unchanged, the command thread limits) | 29.25 | 152.7k | 49.8 (max 50.5) | 20.0 |
+| 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 4d170b12 29.31; in passes 8.93 → 8.53 ms/frame, GPU 14.77 → 14.38; FPS unchanged, the command thread limits) | 29.53 | 154.2k | 51.5 (max 68.2) | 20.0 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -677,9 +677,9 @@ is not trusted (the next iteration may recompute `c`). The top vertex shader goe
 826 selects and from 227 to 174 KB of SPIR-V; the 4,150-select ones only to ~3,320, because what
 remains are region outputs (merged by phis, or read by an enclosing region). Same binary, same
 batch, `KYTY_MASKED_SELECTS=0` as the reference: in passes 8.91 / 8.97 → 8.75 / 8.81 ms/frame
-(time window, two runs each), and 9.09 → 8.91 with the frame-range method (GPU 14.96 → 14.77;
-`dev` 84e51e33 9.11 / 15.12); FPS unchanged. One more frame-range pair against the `dev` build
-showed no difference (9.15 / 9.13), so take it as −0.15 ± 0.05 ms. That is about a third of the
+(time window, two runs each), and 9.14 → 8.93 with the frame-range method in a batch free of
+outside load (GPU 15.14 → 14.77); FPS unchanged. An earlier pair against the `dev` build showed
+no difference (9.15 / 9.13) and ran while an external build loaded the machine. That is about a third of the
 −0.47 ms ceiling below; the rest needs the region outputs unpredicated (a per-lane `if (exec)`
 around the region with phis at its end).
 
@@ -702,8 +702,8 @@ above the base: 22 reads × 116 candidates in `301b4a23`. Capping the chains at 
 
 **Switch on M0 (landed).** The emitter writes the outermost link of such a chain (eight or more
 links on one selector) as an `OpSwitch` on M0 with a phi; M0 is scalar in the guest, so the switch
-doesn't diverge. In passes 9.11 → 8.66 ms/frame (same batch), the `301b4a23` family 13.8 → 10.2
-ms/s at 213 registers (binary 122 → 149 KB). The rest of the ceiling is register pressure: every
+doesn't diverge. In passes 8.93 → 8.53 ms/frame against `dev` 4d170b12 (same batch), the
+`301b4a23` family 13.8 → 10.2 ms/s at 213 registers (binary 122 → 149 KB). The rest of the ceiling is register pressure: every
 candidate stays live at each read. Holding the indexed range in a function-local array instead
 would release them, but every other access to those VGPRs would then go through memory.
 
