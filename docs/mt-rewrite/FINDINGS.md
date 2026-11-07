@@ -998,6 +998,23 @@ The other ~1.7 µs per draw is outside the draw commit: PM4 parsing and register
 dispatches (~234 per frame at ~11 µs each, mostly `PrepareBda` and `SynchronizeBuffer`, about
 0.5 µs per draw), labels and guest-thread commands.
 
+**The buffer side of the commit** (`dev` 34fd87d1, ~34 FPS; same TSC marks, ns per draw, and
+`KYTY_MEM_DIAG=1` per second):
+- Buffer acquisition takes ~730 ns per draw: storage buffers and per-draw uploads
+  (`RebindBuffers`: `ObtainBuffer` per buffer, the flattened SRT and shader data) 297, the
+  index buffer 250, vertex buffers 182; `FindBuffers` adds 127. That is ~11.5 `ObtainBuffer`
+  calls per draw (1.95M/s): 1.27M/s are clean ranges (a tracker check and a
+  `SynchronizeBuffer` that uploads nothing), 348k/s are larger than the stream path, 244k/s
+  reuse a stream copy, 62k/s make one (215 MB/s).
+- `PrepareBda` (dispatches and DMA draws) takes 43 ms per second of the command thread
+  (4.3%), in ~6.2k calls; single calls reach 1.2–2 ms. It uploads ~600 MB/s, ~150k pages
+  over 28.6k distinct pages, so each hot page about 5 times a second. 83% of its time is the
+  copy from guest pages into the staging buffer, already at ~18 GB/s.
+- Ruled out for `PrepareBda`: skipping pages whose bytes did not change since their last
+  upload (only 5.6% did not), and splitting the copy across threads (at ~18 GB/s it is near
+  the memory bandwidth; at best ~1%). Only not copying would remove it: reading those pages in
+  place (C1 host import), which still waits on labels being written at host-GPU completion.
+
 Ruled out: skipping `PopPendingOperations`' lock when no operation is ready (an atomic copy of
 the queue's front tick). Its 73 ns per call measured under TSC marks did not show up in FPS
 (same batch, without the external load: `dev` 204abd61 34.99 / 34.84, with the change 34.26).
