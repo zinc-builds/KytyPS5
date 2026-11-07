@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #if defined(__linux__)
 #include <execinfo.h>
 extern "C" char __ehdr_start; // NOLINT: the ELF header, so offsets match the lld map
@@ -739,6 +741,61 @@ void TagDispatch(vk::CommandBuffer buffer, uint64_t module_id) {
 	if (!g_passes.draws_enabled) return;
 	std::lock_guard lock(g_timer.mutex);
 	g_passes.next_dispatch_module[buffer] = module_id;
+}
+
+bool PipelineStatsRequested() {
+	static const bool requested = std::getenv("KYTY_PIPELINE_STATS") != nullptr;
+	return requested;
+}
+
+void ReportPipelineStatistics(vk::Device device, vk::Pipeline pipeline, const char* kind,
+                              uint64_t vs_id, uint64_t ps_id) {
+	const vk::PipelineInfoKHR info {.pipeline = pipeline};
+	uint32_t                  count = 0;
+	if (device.getPipelineExecutablePropertiesKHR(&info, &count, nullptr) != vk::Result::eSuccess) {
+		return;
+	}
+	std::vector<vk::PipelineExecutablePropertiesKHR> executables(count);
+	if (device.getPipelineExecutablePropertiesKHR(&info, &count, executables.data()) !=
+	    vk::Result::eSuccess) {
+		return;
+	}
+	std::string line;
+	for (uint32_t index = 0; index < count; index++) {
+		const vk::PipelineExecutableInfoKHR executable {.pipeline = pipeline, .executableIndex = index};
+		uint32_t                            stats = 0;
+		if (device.getPipelineExecutableStatisticsKHR(&executable, &stats, nullptr) !=
+		    vk::Result::eSuccess) {
+			continue;
+		}
+		std::vector<vk::PipelineExecutableStatisticKHR> values(stats);
+		if (device.getPipelineExecutableStatisticsKHR(&executable, &stats, values.data()) !=
+		    vk::Result::eSuccess) {
+			continue;
+		}
+		line = fmt::format("PIPESTATS kind={} vs={:016x} ps={:016x} exec=\"{}\"", kind, vs_id,
+		                   ps_id, executables[index].name.data());
+		for (const auto& value: values) {
+			std::string name = value.name.data();
+			std::replace(name.begin(), name.end(), ' ', '_');
+			switch (value.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					line += fmt::format(" {}={}", name, value.value.b32 != 0u);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+					line += fmt::format(" {}={}", name, value.value.i64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					line += fmt::format(" {}={}", name, value.value.u64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+					line += fmt::format(" {}={:.2f}", name, value.value.f64);
+					break;
+			}
+		}
+		std::printf("%s\n", line.c_str());
+	}
+	std::fflush(stdout);
 }
 
 void DumpSpirv(const char* stage, uint64_t hash, uint64_t id, std::span<const uint32_t> spirv) {
