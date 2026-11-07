@@ -204,10 +204,10 @@ uint64_t KYTY_SYSV_ABI WalkerWatchedLoad(uint64_t address) {
 // Every guest load is `call load` with the address in r10, followed by `jc unknown`. The stub's
 // load is mov eax, [r10] (41 8b 02), so a fault there completes as a zero read or a tracked read.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& load,
-               const Xbyak::Label& unknown) {
+               const Xbyak::Label& unknown, Xbyak::CodeGenerator::LabelType type) {
 	code.lea(code.r10, code.ptr[address]);
 	code.call(load);
-	code.jc(unknown, Xbyak::CodeGenerator::T_NEAR);
+	code.jc(unknown, type);
 }
 
 // Loads [r10] into eax with CF clear, or sets CF for an unknown value; preserves every other
@@ -481,7 +481,9 @@ private:
 // state byte (0 unevaluated, 1 unknown or in progress, 2 known, 3 a control Phi holding its first
 // value) and a qword slot; a reference is `call thunk; cmp state, 2`. Operands that are unknown,
 // constant or plain user data are folded at emission. Registers: rdi user data, rsi flat buffer,
-// rdx scratch, r8 capture cursor.
+// rdx scratch, r8 capture cursor, rbx the reach and state bytes (so most take a one-byte
+// displacement). Each thunk is preceded by a `ret` that its unknown exits jump back to, mostly
+// with a short jump.
 class WalkerCompiler {
 public:
 	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
@@ -537,6 +539,16 @@ private:
 	void Layout();
 	void Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip);
 	void Zero(uint32_t offset, uint32_t size);
+	// A reach or state byte, through rbx.
+	Xbyak::Address Byte(uint32_t offset) const {
+		auto& c = m_code;
+		return offset >= m_byte_base ? c.byte[c.rbx + (offset - m_byte_base)]
+		                             : c.byte[c.rbx - (m_byte_base - offset)];
+	}
+	// A jump to the running thunk's `ret` is backward, so it can be short.
+	Xbyak::CodeGenerator::LabelType JumpType(const Xbyak::Label& target) const {
+		return &target == m_unknown ? Xbyak::CodeGenerator::T_AUTO : Near;
+	}
 	void Branch(const Operand& operand, const Xbyak::Label& unknown);
 	void Load(const Xbyak::Reg64& reg, const Operand& operand);
 	void Fetch(const Operand& operand, const Xbyak::Label& unknown);
@@ -553,9 +565,10 @@ private:
 	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
-	Xbyak::Label                                      m_ret;
+	// The running thunk's preceding `ret`: an unknown operand returns through it.
+	const Xbyak::Label*                               m_unknown = nullptr;
 	Xbyak::Label                                      m_load;
-	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
+	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_byte_base = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
 
@@ -811,6 +824,7 @@ void WalkerCompiler::Layout() {
 		if (Thunk(index)) m_nodes[index].state = offset++;
 	}
 	m_states_end = offset;
+	m_byte_base  = m_reach + 128u;
 	// Captured addresses come last; EmitRead counts them.
 	m_plan.srt_captures = (offset + 7u) & ~7u;
 }
@@ -849,12 +863,12 @@ void WalkerCompiler::Zero(uint32_t offset, uint32_t size) {
 void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown) {
 	auto& c = m_code;
 	if (operand.kind == Kind::Unknown) {
-		c.jmp(unknown, Near);
+		c.jmp(unknown, JumpType(unknown));
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
 		c.call(node.label);
-		c.cmp(c.byte[c.rdx + node.state], 2);
-		c.jne(unknown, Near);
+		c.cmp(Byte(node.state), 2);
+		c.jne(unknown, JumpType(unknown));
 	}
 }
 
@@ -887,7 +901,7 @@ void WalkerCompiler::Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Op
 void WalkerCompiler::Store(const Node& node) {
 	auto& c = m_code;
 	c.mov(c.qword[c.rdx + node.slot], c.rax);
-	c.mov(c.byte[c.rdx + node.state], 2);
+	c.mov(Byte(node.state), 2);
 	c.ret();
 }
 
@@ -895,13 +909,17 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 	auto&       c    = m_code;
 	auto&       node = m_nodes[index];
 	const auto& args = node.args;
+	Xbyak::Label unknown;
+	c.L(unknown);
+	c.ret();
+	m_unknown = &unknown;
 	c.L(node.label);
-	c.cmp(c.byte[c.rdx + node.state], 0);
-	c.jne(m_ret, Near);
-	c.mov(c.byte[c.rdx + node.state], 1);
+	c.cmp(Byte(node.state), 0);
+	c.jne(unknown);
+	c.mov(Byte(node.state), 1);
 	if (node.result != Operand {Kind::Node, index}) {
 		// A cycle referenced this value before it folded to another operand.
-		Fetch(node.result, m_ret);
+		Fetch(node.result, *m_unknown);
 		Store(node);
 		return;
 	}
@@ -910,16 +928,16 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 			// Only predecessors reached by this walk contribute, and they must agree. The state is 3
 			// once one of them has stored the value; callers read it like 1, as unknown.
 			const auto& blocks = m_plan.control_phi_predecessors.at(node.inst);
-			const auto  state  = c.byte[c.rdx + node.state];
+			const auto  state  = Byte(node.state);
 			for (size_t i = 0; i < args.size(); ++i) {
 				Xbyak::Label next, first;
-				c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
+				c.cmp(Byte(m_reach + blocks[i]), 0);
 				c.je(next, Near);
-				Fetch(args[i], m_ret);
+				Fetch(args[i], *m_unknown);
 				c.cmp(state, 1);
 				c.je(first, Near);
 				c.cmp(c.rax, c.qword[c.rdx + node.slot]);
-				c.jne(m_ret, Near);
+				c.jne(*m_unknown);
 				c.jmp(next, Near);
 				c.L(first);
 				c.mov(c.qword[c.rdx + node.slot], c.rax);
@@ -927,7 +945,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 				c.L(next);
 			}
 			c.cmp(state, 3);
-			c.jne(m_ret, Near);
+			c.jne(*m_unknown);
 			c.mov(state, 2);
 			c.ret();
 			return;
@@ -939,13 +957,13 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: {
 			Xbyak::Label other;
-			Fetch(args[0], m_ret);
+			Fetch(args[0], *m_unknown);
 			c.test(c.rax, c.rax);
 			c.jz(other, Near);
-			Fetch(args[1], m_ret);
+			Fetch(args[1], *m_unknown);
 			Store(node);
 			c.L(other);
-			Fetch(args[2], m_ret);
+			Fetch(args[2], *m_unknown);
 			Store(node);
 			return;
 		}
@@ -953,10 +971,10 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		case ValueOpcode::ULessThanEqual32: {
 			const bool less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
 			Xbyak::Label bound_zero;
-			Fetch(args[0], m_ret);
+			Fetch(args[0], *m_unknown);
 			c.test(c.eax, c.eax);
 			c.jz(bound_zero, Near);
-			Branch(args[1], m_ret);
+			Branch(args[1], *m_unknown);
 			Load(c.rax, args[0]);
 			Load(c.rcx, args[1]);
 			// ULT tests other < bound, ULE bound <= other.
@@ -984,7 +1002,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 				Load(c.rax, args[0]);
 				c.test(c.rax, c.rax);
 				decide();
-				Fetch(args[1], m_ret);
+				Fetch(args[1], *m_unknown);
 				c.test(c.rax, c.rax);
 				Set(&Xbyak::CodeGenerator::setne);
 				Store(node);
@@ -999,9 +1017,9 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 					decide();
 				}
 				c.L(refine);
-				Fetch(args[2], m_ret);
+				Fetch(args[2], *m_unknown);
 				c.test(c.rax, c.rax);
-				c.jnz(m_ret, Near);
+				c.jnz(*m_unknown);
 			}
 			c.L(decided);
 			c.mov(c.eax, uint32_t {!conjunction});
@@ -1021,14 +1039,14 @@ void WalkerCompiler::EmitRead(const Node& node) {
 	auto args = std::span(node.args);
 	Xbyak::Label zero;
 	if (vector) {
-		Fetch(args[0], m_ret);
+		Fetch(args[0], *m_unknown);
 		c.test(c.rax, c.rax);
 		c.jz(zero, Near);
 		args = args.subspan(1);
-		if (args.empty()) c.jmp(m_ret, Near);
+		if (args.empty()) c.jmp(*m_unknown);
 	}
 	if (!args.empty()) {
-		for (const auto& arg: args) Branch(arg, m_ret);
+		for (const auto& arg: args) Branch(arg, *m_unknown);
 		const auto immediate =
 		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
 		    ~int64_t {3};
@@ -1045,18 +1063,18 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.rax, c.ptr[c.rax + c.r9 + static_cast<size_t>(immediate)]);
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
-			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax, m_load, m_ret);
+			c.jnz(*m_unknown);
+			LoadGuest(c, c.rax, m_load, *m_unknown, JumpType(*m_unknown));
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
 			if (vector) {
 				// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
 				c.test(c.r11d, 1u << 15u);
-				c.jnz(m_ret, Near);
+				c.jnz(*m_unknown);
 				Load(c.rcx, args[4]);
 				c.test(c.ecx, (1u << 23u) | 0xf0000000u);
-				c.jnz(m_ret, Near);
+				c.jnz(*m_unknown);
 				c.test(c.r11d, 0x3fffu);
 				c.jz(zero, Near);
 				c.test(c.ecx, 0x7fu << 12u);
@@ -1076,7 +1094,8 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_load, m_ret);
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_load, *m_unknown,
+			          JumpType(*m_unknown));
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1091,7 +1110,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 void WalkerCompiler::EmitStrict(const Node& node) {
 	auto&       c    = m_code;
 	const auto& inst = *node.inst;
-	for (const auto& arg: node.args) Branch(arg, m_ret);
+	for (const auto& arg: node.args) Branch(arg, *m_unknown);
 	const std::array regs {c.rax, c.rcx, c.r9, c.r11};
 	for (size_t i = 0; i < node.args.size() && i < regs.size(); ++i) Load(regs[i], node.args[i]);
 	// Field ops require offset + width <= 32. Leaves (1 << width) - 1 in r11, the offset in
@@ -1099,7 +1118,7 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 	const auto field = [&](const Xbyak::Reg32& offset, const Xbyak::Reg32& width) {
 		c.lea(c.r10, c.ptr[offset.cvt64() + width.cvt64()]);
 		c.cmp(c.r10, 32);
-		c.ja(m_ret, Near);
+		c.ja(*m_unknown);
 		c.mov(c.r10, c.rcx);
 		c.mov(c.ecx, width);
 		c.mov(c.r11d, 1);
@@ -1189,11 +1208,11 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::FPRecipIFlag32:
 			// Normal positive powers of two have exact normal reciprocals in every FP mode.
 			c.test(c.eax, 0x807fffffu);
-			c.jnz(m_ret, Near);
+			c.jnz(*m_unknown);
 			c.shr(c.eax, 23);
-			c.jz(m_ret, Near);
+			c.jz(*m_unknown);
 			c.cmp(c.eax, 254);
-			c.jae(m_ret, Near);
+			c.jae(*m_unknown);
 			c.neg(c.eax);
 			c.add(c.eax, 254);
 			c.shl(c.eax, 23);
@@ -1332,11 +1351,13 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
+	c.push(c.rbx);
+	c.lea(c.rbx, c.ptr[c.rdx + m_byte_base]);
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
 	Zero(m_reach, m_states_end - m_reach);
 	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
 	if (!resources) {
-		for (uint32_t block = 0; block < blocks.size(); ++block) c.mov(c.byte[c.rdx + m_reach + block], 1);
+		for (uint32_t block = 0; block < blocks.size(); ++block) c.mov(Byte(m_reach + block), 1);
 	} else if (!blocks.empty()) {
 		// Reachability grows monotonically. A newly reached predecessor of an evaluated
 		// control Phi restarts the walk with fresh values; a retreating edge resumes at its target.
@@ -1347,17 +1368,17 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			for (const auto block: m_plan.control_phi_predecessors.at(node.inst)) rechecks[block].push_back(node.state);
 		}
 		std::vector<Xbyak::Label> starts(blocks.size());
-		c.mov(c.byte[c.rdx + m_reach], 1);
+		c.mov(Byte(m_reach), 1);
 		c.L(pass);
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			Xbyak::Label next;
 			const auto mark = [&](uint32_t target) {
 				Xbyak::Label reached;
-				c.cmp(c.byte[c.rdx + m_reach + target], 0);
+				c.cmp(Byte(m_reach + target), 0);
 				c.jne(reached, Near);
-				c.mov(c.byte[c.rdx + m_reach + target], 1);
+				c.mov(Byte(m_reach + target), 1);
 				for (const auto state: rechecks[target]) {
-					c.cmp(c.byte[c.rdx + state], 0);
+					c.cmp(Byte(state), 0);
 					c.jne(reset, Near);
 				}
 				if (target <= block) c.jmp(starts[target], Near);
@@ -1366,7 +1387,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			const auto& successors = blocks[block].successors;
 			const auto  condition  = conditions[block];
 			c.L(starts[block]);
-			c.cmp(c.byte[c.rdx + m_reach + block], 0);
+			c.cmp(Byte(m_reach + block), 0);
 			c.je(next, Near);
 			if (condition.kind == Kind::Constant) {
 				mark(successors[condition.value != 0u ? 0 : 1]);
@@ -1404,7 +1425,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			if (blocks[block].srt_reads.empty()) continue;
 			Xbyak::Label skip;
-			c.cmp(c.byte[c.rdx + m_reach + block], 0);
+			c.cmp(Byte(m_reach + block), 0);
 			c.je(skip, Near);
 			for (const auto slot: blocks[block].srt_reads) flat(slot);
 			c.L(skip);
@@ -1418,9 +1439,9 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 				const auto& list = image ? blocks[block].images : blocks[block].sources;
 				if (std::ranges::find(list, id) == list.end()) continue;
 				if (listed) {
-					c.or_(c.al, c.byte[c.rdx + m_reach + block]);
+					c.or_(c.al, Byte(m_reach + block));
 				} else {
-					c.mov(c.al, c.byte[c.rdx + m_reach + block]);
+					c.mov(c.al, Byte(m_reach + block));
 				}
 				listed = true;
 			}
@@ -1456,10 +1477,11 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		c.L(skip);
 	}
 	c.mov(c.rax, c.r8);
-	c.L(m_ret);
+	c.pop(c.rbx);
 	c.ret();
 	c.L(fail);
 	c.xor_(c.eax, c.eax);
+	c.pop(c.rbx);
 	c.ret();
 	if (resources && !blocks.empty()) {
 		c.L(reset);
