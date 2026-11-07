@@ -8,12 +8,14 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+// Sets for layouts too large to push. Sky Garden writes ~800 per frame; pools a quarter this size
+// filled every ~300 sets, and each refill cost a chain of failed allocations and a pool reset.
+constexpr uint32_t   DescriptorHeapCount = 4096;
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 4096},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 8192},
 };
 
 } // namespace

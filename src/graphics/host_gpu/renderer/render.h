@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/deferredRecorder.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -103,7 +104,41 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
+	// For recording directly: first waits until the recording thread has recorded everything
+	// queued with Record().
+	[[nodiscard]] vk::CommandBuffer Handle() const noexcept {
+		if (m_recorder != nullptr) {
+			m_recorder->Drain();
+		}
+		return m_buffer;
+	}
+	// Records f(vk::CommandBuffer) on the recording thread, in order with everything else, or now
+	// if this buffer has none. Queued commands start recording at Publish().
+	template <typename F>
+	void Record(F&& f) const {
+		if (m_recorder != nullptr) {
+			m_recorder->Record(m_buffer, std::forward<F>(f));
+		} else {
+			f(m_buffer);
+		}
+	}
+	// Records f(vk::CommandBuffer, data) where fill(data) writes `size` bytes now.
+	template <typename Fill, typename F>
+	void Record(size_t size, Fill&& fill, F&& f) const {
+		if (m_recorder != nullptr) {
+			m_recorder->Record(m_buffer, size, std::forward<Fill>(fill), std::forward<F>(f));
+		} else {
+			thread_local std::vector<std::byte> data;
+			data.resize(size);
+			fill(data.data());
+			f(m_buffer, data.data());
+		}
+	}
+	void Publish() const {
+		if (m_recorder != nullptr) {
+			m_recorder->Publish();
+		}
+	}
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -124,6 +159,7 @@ private:
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer = nullptr;
+	DeferredRecorder*   m_recorder = nullptr; // the render scheduler's recording thread
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;

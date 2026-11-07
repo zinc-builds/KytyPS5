@@ -247,8 +247,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	return barriers;
 }
 
-void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+static vk::PipelineStageFlags2 TransitStages(vk::AccessFlags2 destination_access) {
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -260,8 +259,13 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
-	const auto barriers =
-	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	return destination_stage;
+}
+
+void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	const auto barriers = GetBarriers(destination_layout, destination_access,
+	                                  TransitStages(destination_access), range);
 	if (barriers.empty()) {
 		return;
 	}
@@ -270,6 +274,20 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
 	command_buffer.pipelineBarrier2(dependency);
+}
+
+void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+                    std::optional<ImageSubresourceRange> range) {
+	const auto barriers = GetBarriers(destination_layout, destination_access,
+	                                  TransitStages(destination_access), range);
+	if (barriers.empty()) {
+		return;
+	}
+	m_scheduler.EndRendering();
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
+	dependency.pImageMemoryBarriers    = barriers.data();
+	m_scheduler.Current().Handle().pipelineBarrier2(dependency);
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

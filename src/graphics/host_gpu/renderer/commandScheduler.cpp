@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -75,10 +77,20 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
+static bool RecordThreadEnabled() {
+	const char* value = std::getenv("KYTY_RECORD_THREAD");
+	return value == nullptr || value[0] != '0';
+}
+
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool record_thread)
+    : m_recorder(record_thread && RecordThreadEnabled() ? std::make_unique<DeferredRecorder>()
+                                                        : nullptr),
+      m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	m_command.m_recorder = m_recorder.get();
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -174,7 +186,15 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// Every draw comes here; reading the GPU tick at most every 20 us is enough to retire work.
+	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+	if (now - m_last_refresh.load(std::memory_order_relaxed) >=
+	    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+	        std::chrono::microseconds(20))
+	        .count()) {
+		m_last_refresh.store(now, std::memory_order_relaxed);
+		m_master.Refresh();
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -309,6 +329,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
+	// The command pool and buffer are the recording thread's until it is done.
+	(void)m_command.Handle();
 	VulkanDiagnostics::EndCommandBuffer(m_command.m_buffer);
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
