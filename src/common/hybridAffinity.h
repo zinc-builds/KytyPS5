@@ -164,15 +164,19 @@ inline void ApplyToPrepareThread() {
 // KYTY_GUEST_THREAD_CPUS=<list> picks other CPUs, =none keeps every game thread with the emulator.
 inline void ApplyToGuestThread(const std::string& name) {
 	static const std::set<int> cpus = [] {
-		if (const char* value = std::getenv("KYTY_GUEST_THREAD_CPUS"); value != nullptr) {
-			return std::string(value) == "none" ? std::set<int> {} : ParseCpuList(value);
-		}
 		if (!GetPlan().active) {
 			return std::set<int> {};
 		}
+		if (const char* value = std::getenv("KYTY_GUEST_THREAD_CPUS"); value != nullptr) {
+			return std::string(value) == "none" ? std::set<int> {} : ParseCpuList(value);
+		}
 		auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
-		if (efficiency.size() >= 2) {
-			efficiency.erase(std::prev(efficiency.end())); // the recording thread's
+		// Not the recording thread's CPU (see ApplyToRecorderThread).
+		const int recorder = EnvCpu("KYTY_RECORDER_CPU");
+		if (recorder >= 0) {
+			efficiency.erase(recorder);
+		} else if (!efficiency.empty()) {
+			efficiency.erase(std::prev(efficiency.end()));
 		}
 		return efficiency;
 	}();
