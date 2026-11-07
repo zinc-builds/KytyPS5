@@ -706,8 +706,7 @@ static bool KeepsDispatchChain(uint32_t packet_header) {
 		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
 		case Pm4::IT_SET_BASE:
 		case Pm4::IT_INDIRECT_BUFFER:
-		case Pm4::IT_DISPATCH_DIRECT:
-		case Pm4::IT_DISPATCH_INDIRECT: return true;
+		case Pm4::IT_DISPATCH_DIRECT: return true;
 		case Pm4::IT_NOP: {
 			const auto r = KYTY_PM4_R(packet_header);
 			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
@@ -801,7 +800,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		// Only dispatches from the packet loop chain: it ends chains at synchronizing packets.
-		m_in_dispatch_packet = opcode == Pm4::IT_DISPATCH_DIRECT || opcode == Pm4::IT_DISPATCH_INDIRECT;
+		m_in_dispatch_packet = opcode == Pm4::IT_DISPATCH_DIRECT;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		m_in_dispatch_packet = false;

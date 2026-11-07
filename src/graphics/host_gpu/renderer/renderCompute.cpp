@@ -287,13 +287,15 @@ static int DispatchChainSetting() {
 // the guest, consecutive dispatches overlap unless a packet between them waits (a partial flush,
 // a cache operation, a label wait, ...); the command processor ends a chain at any such packet
 // (EndDispatchChain). Dispatches that use emulator-owned memory shared between dispatches (the
-// LDS utility buffer, GDS) or the ordered-append path keep their barriers.
+// LDS utility buffer, GDS, the BDA fault bitmap, which shaders update without atomics) or the
+// ordered-append path keep their barriers.
 bool RenderExecutor::ChainsDispatch(const ShaderComputeInputInfo& input_info,
                                     const PreparedBindings& bindings, uint32_t mode) {
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const auto&        program = input_info.stage.module->info;
 	return DispatchChainSetting() != 0 && bindings.shared_memory.buffer == nullptr &&
-	       bindings.gds.buffer == nullptr && !program.info.uses_gds && !input_info.lds_storage &&
+	       bindings.gds.buffer == nullptr && !program.info.uses_gds && !program.info.uses_dma &&
+	       !input_info.lds_storage &&
 	       (mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) == 0;
 }
 
