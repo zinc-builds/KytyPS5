@@ -448,7 +448,9 @@ struct RenderExecutorTestAccess {
                       const ShaderRecompiler::IR::ImageResource &resource,
                       const ShaderRecompiler::IR::DescriptorValue &value) {
     slots.resize(1);
-    return executor.ResolveStageTexture(&slots, 0, resource, value);
+    TextureBinding binding;
+    executor.ResolveStageTexture(&slots, 0, resource, value, binding);
+    return binding;
   }
   static TextureMemoSlots *TextureMemoSlotsOf(RenderExecutor &executor,
                                               const ShaderModule &module) {

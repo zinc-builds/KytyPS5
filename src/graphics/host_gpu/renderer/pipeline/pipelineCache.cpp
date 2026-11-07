@@ -678,9 +678,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	     db.shader_execute_on_noop || sh.AlphaToMask());
 	state.ps_active = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	state.vertex_stage_count = tess_active ? 3u : 1u;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
-		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		vertex_params = PrepareTessellationPrograms(vertex_regs, context,
+		                                            std::span<ShaderVertexInputInfo, 3> {vertex_info.data(), 3});
 		// Reflection decodes both programs; the key also covers the VGT fields in tess.
 		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
 		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
@@ -692,8 +694,8 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			                                              vertex_params[1].code, layout->second);
 			StoreLayout(layout->first, layout->second);
 		}
-		for (auto& stage: vertex_info) {
-			stage.tess = layout->second;
+		for (uint32_t i = 0; i < 3; i++) {
+			vertex_info[i].tess = layout->second;
 		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
@@ -885,7 +887,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state) {
-	const auto* colors        = state.color_info;
+	const auto* colors        = state.color_info.data();
 	const auto& depth         = state.depth_info;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
