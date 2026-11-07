@@ -1051,8 +1051,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
+	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+		return *m_last_graphics_pipeline;
+	}
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
+	m_last_graphics_key      = key;
+	m_last_graphics_pipeline = &pipeline;
 	if (!inserted) {
 		return pipeline;
 	}

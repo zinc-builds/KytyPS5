@@ -263,6 +263,11 @@ private:
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
+	// The last graphics lookup: most draws repeat it, and comparing the key is cheaper than
+	// hashing it. Map nodes keep their address, and entries are only erased before the first
+	// lookup (warm-up) and in the destructor.
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
