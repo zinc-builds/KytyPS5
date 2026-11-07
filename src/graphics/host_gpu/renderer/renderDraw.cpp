@@ -849,6 +849,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
+	// Each resolve constructs its color_info entry; the logs and the sample count read entry 0.
+	if (state.mrt_mask == 0) {
+		state.color_info.Construct(0);
+	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
@@ -860,7 +864,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
-	const auto colors       = std::span {state.color_info, state.color_count};
+	const auto colors       = std::span {state.color_info.data(), state.color_count};
 	const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
 	                                                    : state.color_info[0].desc.info.samples;
 	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
@@ -1131,7 +1135,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	PrepareGraphicsBindings(stages, std::span {state.color_info.data(), state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1149,7 +1153,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
+	    AcquireRenderTargets(buffer, state.color_info.data(), state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {

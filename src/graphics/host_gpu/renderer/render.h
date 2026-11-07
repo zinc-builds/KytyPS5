@@ -239,11 +239,11 @@ private:
 	                                            TextureResolveMemo*                          trace);
 	// The memo slots of a stage module's images.
 	[[nodiscard]] std::vector<TextureResolveMemo>& TextureMemoSlots(const ShaderModule& module);
-	// ResolveTexture for image `index` of a stage, through the stage's memo slots.
-	[[nodiscard]] TextureBinding ResolveStageTexture(std::vector<TextureResolveMemo>*         memo,
-	                                                 uint32_t                                 index,
-	                                                 const ShaderRecompiler::IR::ImageResource& resource,
-	                                                 const ShaderRecompiler::IR::DescriptorValue& value);
+	// ResolveTexture for image `index` of a stage, through the stage's memo slots, into `out`.
+	// out keeps its mip view storage, emptied.
+	void ResolveStageTexture(std::vector<TextureResolveMemo>*             memo, uint32_t index,
+	                         const ShaderRecompiler::IR::ImageResource&   resource,
+	                         const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& out);
 
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);

@@ -19,6 +19,7 @@
 #include <atomic>
 #include <bit>
 #include <cstring>
+#include <memory>
 
 namespace Libs::Graphics {
 
@@ -53,9 +54,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		mask = 0x0f;
 	}
 
-	r             = {};
-	r.target_slot = rt_slot;
-
 	auto* memo = GetDrawStateCacheMode() != DrawStateCacheMode::Off &&
 	                     rt_slot < m_color_target_memo.size()
 	                 ? &m_color_target_memo[rt_slot]
@@ -75,13 +73,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			m_color_target_stats.hits += hit ? 1 : 0;
 		}
 		if (hit && GetDrawStateCacheMode() != DrawStateCacheMode::Verify) {
-			r = memo->result;
+			// r may be unconstructed (DrawRenderState::color_info).
+			std::construct_at(&r, memo->result);
 			BindRenderTarget(r.image_id);
 			return;
 		}
 	} else if (memo != nullptr && DrawStateCacheStats()) {
 		m_color_target_stats.lookups++;
 	}
+	std::construct_at(&r);
+	r.target_slot = rt_slot;
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {

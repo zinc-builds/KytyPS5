@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -26,6 +27,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -128,24 +130,59 @@ struct ShaderModule {
 	bool                                         mesh_task = false;
 };
 
+// N trivially copyable elements, left unconstructed until Construct: value-initializing a draw
+// state's eight color attachments and three vertex stages wrote ~16 KB for every draw.
+template <typename T, size_t N>
+class UninitializedArray {
+	static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>);
+
+public:
+	UninitializedArray() {} // NOLINT(modernize-use-equals-default): leaves the elements unset.
+	UninitializedArray(std::initializer_list<T> init) {
+		EXIT_IF(init.size() > N);
+		size_t i = 0;
+		for (const auto& value: init) {
+			Construct(i++, value);
+		}
+	}
+
+	// Replaces element i, constructed or not.
+	template <typename... Args>
+	T& Construct(size_t i, Args&&... args) {
+		return *std::construct_at(&m_items[i], std::forward<Args>(args)...);
+	}
+	[[nodiscard]] T&       operator[](size_t i) { return m_items[i]; }
+	[[nodiscard]] const T& operator[](size_t i) const { return m_items[i]; }
+	[[nodiscard]] T*       data() { return m_items; }
+	[[nodiscard]] const T* data() const { return m_items; }
+
+private:
+	union {
+		T m_items[N];
+	};
+};
+
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
 struct DrawRenderState {
-	RenderDepthInfo                      depth_info;
-	RenderColorInfo                      color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t                             color_count                              = 0;
+	RenderDepthInfo depth_info;
+	// Constructed up to the slots PrepareDrawRenderState resolves, and always element 0.
+	UninitializedArray<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> color_info;
+	uint32_t                                                          color_count = 0;
 	// Color targets the pixel program writes.
-	uint32_t                             mrt_mask                                 = 0;
-	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
-	bool                                 primitive_restart_enable                 = false;
-	bool                                 ps_active                                = false;
-	std::array<ShaderVertexInputInfo, 3> vertex_info;
-	ShaderPixelInputInfo                 ps_input_info;
+	uint32_t              mrt_mask                 = 0;
+	vk::PrimitiveTopology topology                 = vk::PrimitiveTopology::ePointList;
+	bool                  primitive_restart_enable = false;
+	bool                  ps_active                = false;
+	// The first vertex_stage_count are constructed: LS, HS and ES with tessellation, else VS.
+	UninitializedArray<ShaderVertexInputInfo, 3> vertex_info;
+	uint32_t                                     vertex_stage_count = 1;
+	ShaderPixelInputInfo                         ps_input_info;
 	// Input: the user-data slots a GPU-read indirect draw patches.
-	ShaderIndirectOffsets                indirect_offsets;
-	bool                                 indirect_draw = false;
+	ShaderIndirectOffsets indirect_offsets;
+	bool                  indirect_draw = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
-		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
+		return {vertex_info.data(), vertex_stage_count};
 	}
 };
 

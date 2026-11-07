@@ -778,13 +778,23 @@ RenderExecutor::TextureMemoSlots(const ShaderModule& module) {
 	return slots;
 }
 
-TextureBinding
-RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*             memo,
-                                    uint32_t                                     index,
-                                    const ShaderRecompiler::IR::ImageResource&   resource,
-                                    const ShaderRecompiler::IR::DescriptorValue& value) {
+// Assigns `from` but its mip views to `out`, emptying out's mip views and keeping their storage.
+static void AssignWithoutMipViews(TextureBinding& out, const TextureBinding& from) {
+	out.image_id   = from.image_id;
+	out.image_view = from.image_view;
+	out.desc       = from.desc;
+	out.layout     = from.layout;
+	out.mip_views.clear();
+}
+
+void RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*             memo,
+                                         uint32_t                                     index,
+                                         const ShaderRecompiler::IR::ImageResource&   resource,
+                                         const ShaderRecompiler::IR::DescriptorValue& value,
+                                         TextureBinding&                              out) {
 	if (memo == nullptr) {
-		return ResolveTexture(resource, value);
+		AssignWithoutMipViews(out, ResolveTexture(resource, value));
+		return;
 	}
 	auto&      slot   = (*memo)[index];
 	auto&      stats  = m_texture_memo_stats;
@@ -825,7 +835,8 @@ RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*            
 		}
 	}
 	if (hit && GetDrawStateCacheMode() != DrawStateCacheMode::Verify) {
-		return slot.binding;
+		AssignWithoutMipViews(out, slot.binding);
+		return;
 	}
 	TextureResolveMemo trace;
 	auto               binding = ResolveTexture(resource, value, &trace);
@@ -843,12 +854,11 @@ RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*            
 			     b.desc.info.data.address);
 		}
 	}
-	trace.inputs  = inputs;
-	trace.value   = value;
-	trace.binding = binding;
-	trace.binding.mip_views.clear();
+	trace.inputs = inputs;
+	trace.value  = value;
+	AssignWithoutMipViews(trace.binding, binding);
 	slot = std::move(trace);
-	return binding;
+	AssignWithoutMipViews(out, binding);
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -923,11 +933,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			prepared.images[i] = {};
 			continue;
 		}
-		auto binding = ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i]);
+		auto& binding = prepared.images[i];
+		ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i], binding);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
