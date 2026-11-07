@@ -943,6 +943,35 @@ cut walker instructions by 12% but not its cycles (10.1% → 10.4%), because loa
 not merged. Since B4 the walker runs on the prepare worker, which is half idle, so walker
 speedups now buy worker headroom (for example on a smaller core), not FPS.
 
+**Where the command thread's time goes after B4** (`dev` 204abd61, ~34 FPS, 5.6 µs per draw;
+TSC marks around each phase of a queued draw's commit, a local diagnostic, ns per draw):
+
+| Phase | ns |
+|---|---|
+| texture bindings (`PrepareBindings`: stage texture resolve, memo validation, samplers, views) | 900 |
+| buffer bindings (`PrepareGraphicsBindings`: `FindBuffers`, BDA, rebinds) | 625 |
+| render targets (color and depth resolve, memo hits) | 445 |
+| vertex and index buffers (`ObtainBuffer`) | 420 |
+| record (vertex/index commit, pushes, dynamic state, atomic batches, pass begin, draw) | 300 |
+| `CommitBindings` | 295 |
+| waiting for the worker | ~200 |
+| `AcquireRenderTargets` | 195 |
+| `PopPendingOperations` (clock read, timeline refresh every 20 µs, lock, retired operations) | 185 |
+| adopting the worker's lookup | 95 |
+| pipeline lookup | 65 |
+| everything else in the commit (checks, index setup, register rebinding, tail) | ~200 |
+| register copy at queue time | 35 |
+| **commit total** | **~3,950** |
+
+The other ~1.7 µs per draw is outside the draw commit: PM4 parsing and register writes
+(Sky Garden loads register blocks with `SET_*_REG_INDIRECT` for nearly every draw),
+dispatches (~234 per frame at ~11 µs each, mostly `PrepareBda` and `SynchronizeBuffer`, about
+0.5 µs per draw), labels and guest-thread commands.
+
+Ruled out: skipping `PopPendingOperations`' lock when no operation is ready (an atomic copy of
+the queue's front tick). Its 73 ns per call measured under TSC marks did not show up in FPS
+(same batch: 35.03 → 34.89).
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
