@@ -40,12 +40,7 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
-void CommandBuffer::BeginRendering(const RenderState& state) const {
-	if (m_rendering && m_render_state == state) {
-		return;
-	}
-	EndRendering();
-
+static void RecordBeginRendering(vk::CommandBuffer buffer, const RenderState& state) {
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
 		const auto& attachment = state.color_attachments[i];
@@ -83,7 +78,21 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	buffer.beginRendering(rendering);
+}
+
+void CommandBuffer::BeginRendering(const RenderState& state) const {
+	if (m_rendering && m_render_state == state) {
+		return;
+	}
+	// Queued like the draw that follows: the pass switch needs no wait for the recording thread.
+	const bool end = m_rendering;
+	Record([end, state](vk::CommandBuffer buffer) {
+		if (end) {
+			buffer.endRendering();
+		}
+		RecordBeginRendering(buffer, state);
+	});
 	m_render_state = state;
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state.depth_stencil_attachment.depth_clear   = false;

@@ -58,6 +58,10 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	// Into the scheduler's current command buffer, taken only if a barrier is needed: a draw that
+	// needs none does not wait for the recording thread.
+	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+	             std::optional<ImageSubresourceRange> range);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

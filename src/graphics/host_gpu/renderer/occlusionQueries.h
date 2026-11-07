@@ -37,6 +37,8 @@ public:
 
 	[[nodiscard]] bool Enabled() const { return m_pool != nullptr; }
 
+	// Whether draws count samples now (Begin records a query).
+	[[nodiscard]] bool Counting() const { return m_open != 0; }
 	// In the draw's rendering: the query that counts its samples, or -1.
 	[[nodiscard]] int32_t Begin(vk::CommandBuffer command) {
 		return m_open == 0 ? -1 : BeginQuery(command);

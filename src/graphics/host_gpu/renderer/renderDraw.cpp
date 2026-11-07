@@ -469,8 +469,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
 		image.Transit(layout, image.binding.attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		                                     view.layer_count});
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
@@ -540,8 +539,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto& view                = depth.desc.view_info;
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		                                     view.layer_count});
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -914,20 +912,37 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(const CommandBuffer&         buffer,
                                 const PreparedVertexBuffers& prepared) {
 	if (prepared.count != 0) {
 		// Guest descriptor bounds must survive allocation merging in the cache.
-		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
-		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
+		const auto count = prepared.count;
+		buffer.Record(
+		    count * (sizeof(vk::Buffer) + 2 * sizeof(vk::DeviceSize)),
+		    [&](std::byte* data) {
+			    std::memcpy(data, prepared.buffers.data(), count * sizeof(vk::Buffer));
+			    data += count * sizeof(vk::Buffer);
+			    std::memcpy(data, prepared.offsets.data(), count * sizeof(vk::DeviceSize));
+			    data += count * sizeof(vk::DeviceSize);
+			    std::memcpy(data, prepared.sizes.data(), count * sizeof(vk::DeviceSize));
+		    },
+		    [count](vk::CommandBuffer cb, const std::byte* data) {
+			    const auto* buffers = reinterpret_cast<const vk::Buffer*>(data);
+			    const auto* offsets =
+			        reinterpret_cast<const vk::DeviceSize*>(data + count * sizeof(vk::Buffer));
+			    cb.bindVertexBuffers2(0, count, buffers, offsets, offsets + count, nullptr);
+		    });
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(const CommandBuffer& buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
-	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+	buffer.Record([handle = prepared.buffer, offset = prepared.offset,
+	               type = prepared.type](vk::CommandBuffer cb) {
+		cb.bindIndexBuffer(handle, offset, type);
+	});
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -949,7 +964,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandBuffer& buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -963,23 +978,33 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
 			if (draw.indexed) {
-				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
-				                      emit.first_instance);
+				buffer.Record([count = draw.index_count, instances = draw.instance_count,
+				               vertex = emit.vertex_offset,
+				               first = emit.first_instance](vk::CommandBuffer cb) {
+					cb.drawIndexed(count, instances, 0, vertex, first);
+				});
 			} else {
-				vk_buffer.draw(draw.index_count, draw.instance_count,
-				               static_cast<uint32_t>(emit.vertex_offset), emit.first_instance);
+				buffer.Record([count = draw.index_count, instances = draw.instance_count,
+				               vertex = static_cast<uint32_t>(emit.vertex_offset),
+				               first = emit.first_instance](vk::CommandBuffer cb) {
+					cb.draw(count, instances, vertex, first);
+				});
 			}
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			for (uint32_t i = 0; i < draw.index_count; i += 4) {
 				if (draw.indexed) {
-					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
-					                      emit.first_instance);
+					buffer.Record([instances = draw.instance_count, i, vertex = emit.vertex_offset,
+					               first = emit.first_instance](vk::CommandBuffer cb) {
+						cb.drawIndexed(4, instances, i, vertex, first);
+					});
 				} else {
-					vk_buffer.draw(4, draw.instance_count,
-					               i + static_cast<uint32_t>(emit.vertex_offset),
-					               emit.first_instance);
+					buffer.Record([instances = draw.instance_count,
+					               vertex = i + static_cast<uint32_t>(emit.vertex_offset),
+					               first = emit.first_instance](vk::CommandBuffer cb) {
+						cb.draw(4, instances, vertex, first);
+					});
 				}
 			}
 			break;
@@ -1146,16 +1171,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
-	// memory.
-	auto vk_buffer = buffer.Handle();
-	if (!mesh_active) {
-		CommitVertexBuffers(vk_buffer, vertex_bindings);
-	}
+	// memory. CommitBindings records layout transitions directly; the draw's own commands after
+	// them are queued for the recording thread (CommandBuffer::Record), so anything recorded
+	// directly below must take a fresh buffer.Handle().
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	auto& bound         = dynamic_state.bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (!mesh_active) {
-		CommitIndexBuffer(vk_buffer, index_binding);
+		CommitVertexBuffers(buffer, vertex_bindings);
+		CommitIndexBuffer(buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
 	const auto draw_dwords =
@@ -1174,11 +1198,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
-		bound.PushConstants(vk_buffer, pipeline.pipeline_layout, pipeline.push_stages, 0,
+		bound.PushConstants(buffer, pipeline.pipeline_layout, pipeline.push_stages, 0,
 		                    draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
-		bound.PushConstants(vk_buffer, pipeline.pipeline_layout, pipeline.push_stages,
+		bound.PushConstants(buffer, pipeline.pipeline_layout, pipeline.push_stages,
 		                    PushData::UserClipPlaneDword * sizeof(uint32_t),
 		                    std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                    buffer.GetRegisters().GetUserClipPlanes().data());
@@ -1187,7 +1211,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
-	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	dynamic_state.Commit(m_context.GetGraphics(), buffer);
 
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
@@ -1266,7 +1290,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		if (atomic_draw) {
 			if (!HasAtomicWrites()) {
 				buffer.EndRendering();
-				ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+				ShaderWriteHazardBarrier(buffer.Handle(), shader_write_stages);
 			}
 			batch.stages |= shader_write_stages;
 			for (const auto& [address, size]: atomic) {
@@ -1283,41 +1307,53 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (shader_write_stages) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory.
 		buffer.EndRendering();
-		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+		ShaderWriteHazardBarrier(buffer.Handle(), shader_write_stages);
 	}
 	buffer.BeginRendering(rendering);
-	bound.BindPipeline(vk_buffer, pipeline.pipeline, pipeline.pipeline_layout);
+	bound.BindPipeline(buffer, pipeline.pipeline, pipeline.pipeline_layout);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
-	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	const int32_t occlusion_query =
+	    occlusion_queries.Counting() ? occlusion_queries.Begin(buffer.Handle()) : -1;
 	if (mesh_task) {
-		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+		buffer.Record([count = emit.indirect.count](vk::CommandBuffer cb) {
+			cb.drawMeshTasksEXT(count, 1, 1);
+		});
 	} else if (mesh_active) {
 		for (uint32_t done = 0; done < draw.instance_count;) {
 			if (done != 0) {
-				bound.PushConstants(vk_buffer, pipeline.pipeline_layout, pipeline.push_stages,
+				bound.PushConstants(buffer, pipeline.pipeline_layout, pipeline.push_stages,
 				                    PushData::MeshInstanceSliceDword * sizeof(uint32_t),
 				                    sizeof(done), &done);
 			}
 			const auto count = std::min(mesh_instance_slice, draw.instance_count - done);
-			vk_buffer.drawMeshTasksEXT(mesh_groups, count, 1);
+			buffer.Record([mesh_groups, count](vk::CommandBuffer cb) {
+				cb.drawMeshTasksEXT(mesh_groups, count, 1);
+			});
 			done += count;
 		}
 	} else if (args_buffer.first == nullptr) {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
-	} else if (draw.indexed) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
+		EmitDrawPrimitives(ucfg, buffer, draw, emit);
 	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
+		buffer.Record([indexed = draw.indexed, handle = args_buffer.first->Handle(),
+		               offset = args_buffer.second, count = emit.indirect.count,
+		               stride = emit.indirect.stride](vk::CommandBuffer cb) {
+			if (indexed) {
+				cb.drawIndexedIndirect(handle, offset, count, stride);
+			} else {
+				cb.drawIndirect(handle, offset, count, stride);
+			}
+		});
 	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
+	if (occlusion_query >= 0) {
+		occlusion_queries.End(buffer.Handle(), occlusion_query);
+	}
+	buffer.Publish();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (shader_write_stages) {
 		buffer.EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		ShaderWriteBarrier(buffer.Handle(), shader_write_stages);
 	}
 }
 

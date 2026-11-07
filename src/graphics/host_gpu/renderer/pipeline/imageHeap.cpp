@@ -580,14 +580,14 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			const auto& view_info = element.binding.desc.view_info;
 			image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead,
 			               ImageSubresourceRange {view_info.base_level, view_info.level_count,
-			                                      view_info.base_layer, view_info.layer_count},
-			               buffer.Handle());
+			                                      view_info.base_layer, view_info.layer_count});
 			return true;
 		});
 	}
 	m_active.clear();
-	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
-	                                   nullptr);
+	buffer.Record([bind_point, layout, set = m_set](vk::CommandBuffer cb) {
+		cb.bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &set, 0, nullptr);
+	});
 }
 
 void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {

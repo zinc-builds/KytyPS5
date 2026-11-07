@@ -109,6 +109,27 @@ inline void ApplyToGpuThread() {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
+// Call from the GPU recording thread: an efficiency core of its own, which the emulator leaves
+// free. KYTY_RECORDER_CPU=<n> picks another CPU.
+inline void ApplyToRecorderThread() {
+	int cpu = -1;
+	if (const char* value = std::getenv("KYTY_RECORDER_CPU"); value != nullptr) {
+		cpu = std::atoi(value);
+	} else if (GetPlan().active) {
+		const auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
+		if (!efficiency.empty()) {
+			cpu = *efficiency.rbegin();
+		}
+	}
+	if (cpu < 0) {
+		return;
+	}
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
 } // namespace Common::HybridAffinity
 #endif
 

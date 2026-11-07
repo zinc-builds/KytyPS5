@@ -7,7 +7,9 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -17,7 +19,9 @@ namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	// record_thread: draws record their final commands on a second thread (KYTY_RECORD_THREAD=0
+	// turns it off).
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool record_thread = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -85,6 +89,7 @@ private:
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
+	std::unique_ptr<DeferredRecorder> m_recorder;
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
@@ -97,6 +102,7 @@ private:
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
+	std::atomic<int64_t>         m_last_refresh {0}; // steady_clock ticks of the last tick read
 	OperationState               m_operation_state      = OperationState::Open;
 };
 

@@ -1116,7 +1116,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto                           vk_buffer              = buffer.Handle();
 	size_t                         image_descriptor_count = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
@@ -1147,7 +1146,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			buffer.EndRendering();
 			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
 			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));
-			vk_buffer.pipelineBarrier(
+			buffer.Handle().pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
 			        vk::PipelineStageFlagBits::eComputeShader,
@@ -1178,19 +1177,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
 				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
-				              {}, vk_buffer);
+				              {});
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
 				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+				              vk::AccessFlagBits2::eShaderRead | storage_access, {});
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range, vk_buffer);
+				              range);
 			} else {
-				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range);
 			}
 			binding.layout = image.backing.state.layout;
 		}
@@ -1272,26 +1271,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
-	// Graphics draws record only the push constants and descriptors that changed.
+	// Graphics draws record only the push constants and descriptors that changed, queued for the
+	// recording thread. Direct recording takes a fresh buffer.Handle(), which waits for the queue.
 	const bool graphics = pipeline_bind_point == vk::PipelineBindPoint::eGraphics;
 	auto&      bound    = m_context.GetCommandScheduler().GetDynamicState().bindings;
 	if (has_push_data) {
 		if (graphics) {
-			bound.PushConstants(vk_buffer, pipeline.pipeline_layout, pipeline.push_stages, 0,
+			bound.PushConstants(buffer, pipeline.pipeline_layout, pipeline.push_stages, 0,
 			                    sizeof(push_data), push_data.dwords.data());
 		} else {
-			vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
+			buffer.Handle().pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 			                        sizeof(push_data), push_data.dwords.data());
 		}
 	}
 
 	if (!m_descriptor_writes.empty()) {
 		if (pipeline.uses_push_descriptors && graphics) {
-			bound.PushDescriptors(vk_buffer, pipeline.pipeline_layout, m_descriptor_writes);
+			bound.PushDescriptors(buffer, pipeline.pipeline_layout, m_descriptor_writes);
 		} else if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
+			buffer.Handle().pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+			                                     static_cast<uint32_t>(m_descriptor_writes.size()),
+			                                     m_descriptor_writes.data());
 		} else {
 			if (graphics) {
 				bound.ForgetLayout();
@@ -1300,11 +1300,28 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
+			const auto device = m_context.GetGraphics().device;
+			if (graphics) {
+				// The fresh set is the recording thread's to write, after the pushes above.
+				const auto writes = std::span<const vk::WriteDescriptorSet> {m_descriptor_writes};
+				buffer.Record(
+				    DescriptorWritesSize(writes),
+				    [writes](std::byte* data) { CopyDescriptorWrites(writes, data); },
+				    [device, layout = pipeline.pipeline_layout, set,
+				     count = static_cast<uint32_t>(writes.size())](vk::CommandBuffer   cb,
+				                                                   const std::byte* data) {
+					    device.updateDescriptorSets(
+					        count, reinterpret_cast<const vk::WriteDescriptorSet*>(data), 0,
+					        nullptr);
+					    cb.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 0, 1, &set,
+					                          0, nullptr);
+				    });
+			} else {
+				device.updateDescriptorSets(static_cast<uint32_t>(m_descriptor_writes.size()),
+				                            m_descriptor_writes.data(), 0, nullptr);
+				buffer.Handle().bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+				                                   0, 1, &set, 0, nullptr);
+			}
 		}
 	}
 }

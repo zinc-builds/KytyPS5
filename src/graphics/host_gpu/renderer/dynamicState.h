@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -14,6 +15,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+class CommandBuffer;
 
 struct StencilOps {
 	vk::StencilOp fail_op {};
@@ -26,6 +28,11 @@ struct StencilOps {
 		       depth_fail_op == other.depth_fail_op && compare_op == other.compare_op;
 	}
 };
+
+// Bytes CopyDescriptorWrites needs for writes and the descriptors they point to.
+size_t DescriptorWritesSize(std::span<const vk::WriteDescriptorSet> writes);
+// Copies writes and their buffer or image descriptors to data, pointing the copies at the copies.
+void CopyDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes, std::byte* data);
 
 // The graphics pipeline, push constants and set-0 push descriptors recorded last in the current
 // command buffer, so a draw records only what changed. Push constants and push descriptors are
@@ -47,13 +54,14 @@ public:
 		m_writes_valid    = false;
 	}
 
-	void BindPipeline(vk::CommandBuffer cmdbuf, vk::Pipeline pipeline, vk::PipelineLayout layout);
+	void BindPipeline(const CommandBuffer& buffer, vk::Pipeline pipeline,
+	                  vk::PipelineLayout layout);
 	// offset and size in bytes, multiples of 4.
-	void PushConstants(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
+	void PushConstants(const CommandBuffer& buffer, vk::PipelineLayout layout,
 	                   vk::ShaderStageFlags stages, uint32_t offset, uint32_t size,
 	                   const void* data);
 	// Pushes the elements of writes that differ from the last push with this layout.
-	void PushDescriptors(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
+	void PushDescriptors(const CommandBuffer& buffer, vk::PipelineLayout layout,
 	                     std::span<const vk::WriteDescriptorSet> writes);
 
 private:
@@ -145,8 +153,8 @@ struct DynamicState {
 	float                line_width {};
 	vk::ImageAspectFlags feedback_loop_aspects {};
 
-	/// Commits the dynamic state to the provided command buffer.
-	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
+	/// Records the changed dynamic state into the command buffer.
+	void Commit(const GraphicContext& graphics, const CommandBuffer& buffer);
 
 	GraphicsBindings bindings;
 
