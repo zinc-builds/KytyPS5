@@ -52,6 +52,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
 | 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` 84e51e33 29.72; same binary with `KYTY_MASKED_SELECTS=0` in passes 9.09 → 8.91 ms/frame, GPU 14.96 → 14.77; FPS unchanged, the command thread limits) | 29.68 | 155.0k | 45.1 (max 68.5) | 21.3 |
 | 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4; same batch: ref `dev` 84e51e33 29.61; 6.48 → 5.57 µs/draw) | 34.42 | 179.4k | 40.0 (max 51.4) | 24.6 |
+| 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -903,6 +904,19 @@ cache hash lookups ~2.5%, `FindView` 1.2%), libc `memcpy` and friends ~12% (stre
 per-draw structs), `ObtainBuffer`/`FindBuffer`/`SynchronizeBuffer`/`FindBuffers`/`RebindBuffers`
 ~6.6%, `pthread_rwlock_*` ~4% (the guest address-space lock in `CopySparseMemory`),
 `CommitBindings` 2.1%, the NVIDIA driver 2.2% (pushes and binds not deferred to the recorder).
+**Correction: the walker is bound by executed instructions, not by instruction fetch** (B1′,
+measured on 84e51e33). A denser encoding cut its L1i misses by 24% (115M → 88M per 8 s). It used
+short jumps to a `ret` placed before each thunk, and reach and state bytes through rbx with
+one-byte offsets. Its cycles did not move (12.8% → 13.4% of the thread) and FPS was noise
+(29.29–29.58 vs 29.16–29.56). The walker runs at IPC ≈ 1.9 and retires about 4,500 instructions
+per draw. Most values are shared and referenced again once known: every read through a V#
+references its words. So each reference now tests the value's state byte and calls its thunk
+only when the value is not known yet. That cut walker cycles from 12.8% to 10.2% of the thread,
+for +2.5% / +3.2% FPS. The L1i-miss share was large but cheap: the misses were served from L2,
+overlapped with other work. Checking the page tracker inline at each load instead of in a stub
+cut walker instructions by 12% but not its cycles (10.1% → 10.4%), because loads wait on memory;
+not merged. Since B4 the walker runs on the prepare worker, which is half idle, so walker
+speedups now buy worker headroom (for example on a smaller core), not FPS.
 
 ### Tooling notes
 
