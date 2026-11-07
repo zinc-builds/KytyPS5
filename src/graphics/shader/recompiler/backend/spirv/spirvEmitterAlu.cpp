@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <algorithm>
 #include <array>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -317,6 +319,99 @@ uint32_t EmitFPCos(EmitterState& state, uint32_t arg0) {
 	auto source = EmitTrigCycleF32(state, arg0, false);
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
+}
+
+
+namespace {
+
+// Select(IEqual32(selector, key), value, next): one link of an indexed-read chain.
+bool IsIndexLink(const IR::Inst& inst, IR::Value& selector, uint32_t& key) {
+	if (inst.GetOpcode() != IR::ValueOpcode::SelectU32) return false;
+	const auto* condition = inst.Arg(0).Resolve().TryInstruction();
+	if (condition == nullptr || condition->GetOpcode() != IR::ValueOpcode::IEqual32) return false;
+	const auto lhs = condition->Arg(0).Resolve();
+	const auto rhs = condition->Arg(1).Resolve();
+	if (lhs.IsImmediate() || !rhs.IsImmediate() || rhs.GetType() != IR::Type::U32) return false;
+	selector = lhs;
+	key      = rhs.U32();
+	return true;
+}
+
+} // namespace
+
+uint32_t EmitSelectU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	const auto plain = [&] {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, ctx.Def(inst.Arg(0)),
+		                          ctx.Def(inst.Arg(1)), ctx.Def(inst.Arg(2)));
+		return result;
+	};
+	// V_MOVRELS reads VGPR[base + M0] as a chain of selects over every VGPR above the base, so
+	// each read costs one select per candidate. A switch on M0 (uniform in the guest wave) costs
+	// one branch. Only the outermost link of a chain switches; inner links stay plain selects
+	// that nothing else reads.
+	constexpr size_t MinCases = 8;
+	IR::Value        selector;
+	uint32_t         key = 0;
+	if (!IsIndexLink(inst, selector, key)) return plain();
+	for (const auto& use: inst.Uses()) {
+		IR::Value outer_selector;
+		uint32_t  outer_key = 0;
+		if (use.operand == 2 && IsIndexLink(*use.user, outer_selector, outer_key) &&
+		    outer_selector == selector) {
+			return plain();
+		}
+	}
+	// Outer links override inner ones with the same key.
+	std::vector<std::pair<uint32_t, IR::Value>> cases;
+	const IR::Inst*                             link = &inst;
+	IR::Value                                   fallback;
+	for (;;) {
+		IR::Value link_selector;
+		uint32_t  link_key = 0;
+		if (!IsIndexLink(*link, link_selector, link_key) || link_selector != selector) break;
+		if (std::ranges::none_of(cases, [&](const auto& item) { return item.first == link_key; })) {
+			cases.emplace_back(link_key, link->Arg(1));
+		}
+		fallback = link->Arg(2);
+		const auto* next = fallback.Resolve().TryInstruction();
+		if (next == nullptr) break;
+		link = next;
+	}
+	if (cases.size() < MinCases) return plain();
+
+	const auto selector_id   = ctx.Def(selector);
+	const auto fallback_id   = ctx.Def(fallback);
+	std::vector<uint32_t> values;
+	values.reserve(cases.size());
+	for (const auto& [case_key, value]: cases) values.push_back(ctx.Def(value));
+	const auto merge_label   = state.builder.AllocateId();
+	const auto default_label = state.builder.AllocateId();
+	std::vector<uint32_t> labels(cases.size());
+	std::vector<uint32_t> words {spv::OpSwitch, selector_id, default_label};
+	for (size_t index = 0; index < cases.size(); index++) {
+		labels[index] = state.builder.AllocateId();
+		words.push_back(cases[index].first);
+		words.push_back(labels[index]);
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(words);
+	const auto            result = state.builder.AllocateId();
+	std::vector<uint32_t> phi {spv::OpPhi, TypeU32(state), result};
+	for (size_t index = 0; index < cases.size(); index++) {
+		EmitLabel(state, labels[index]);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		phi.push_back(values[index]);
+		phi.push_back(labels[index]);
+	}
+	EmitLabel(state, default_label);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	phi.push_back(fallback_id);
+	phi.push_back(default_label);
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(phi);
+	return result;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

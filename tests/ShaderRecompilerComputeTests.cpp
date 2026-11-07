@@ -31100,17 +31100,48 @@ TestCase Vop1MoveRelSource() {
   AppendVMovLiteral(&code, 12, 0x11111111u);
   AppendVMovLiteral(&code, 13, 0x22222222u);
   AppendVMovLiteral(&code, 14, 0x33333333u);
-  code.push_back(EncodeSMovB32(124, InlineU32(2)));
-  code.push_back(0x7e6e870cu);
+  // M0 comes from the buffer, so the read cannot constant-fold.
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 124, Vgpr(0))); // v_readfirstlane_b32 m0, v0
+  code.push_back(0x7e6e870cu);                    // v_movrels_b32 v55, v12
   AppendStoreVgpr(&code, 55, 0);
   AppendEnd(&code);
 
-  return {"Vop1MoveRelSource",
-          code,
-          {},
-          {0x33333333u},
-          {O::V_MOV_B32, O::S_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+  TestCase test{"Vop1MoveRelSource",
+                code,
+                {2u},
+                {0x33333333u},
+                {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                 O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  // Every VGPR above the base is a candidate: the read is a switch on M0.
+  test.required_spirv = {"OpSwitch"};
+  return test;
+}
+
+// M0 = 0 reads the base register itself: the switch's default.
+TestCase Vop1MoveRelSourceBase() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 12, 0x11111111u);
+  AppendVMovLiteral(&code, 13, 0x22222222u);
+  AppendVMovLiteral(&code, 14, 0x33333333u);
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 124, Vgpr(0))); // v_readfirstlane_b32 m0, v0
+  code.push_back(0x7e6e870cu);                    // v_movrels_b32 v55, v12
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  TestCase test{"Vop1MoveRelSourceBase",
+                code,
+                {0u},
+                {0x11111111u},
+                {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                 O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.required_spirv = {"OpSwitch"};
+  return test;
 }
 
 TestCase Vop1MoveRelDestination() {
@@ -48525,6 +48556,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  AddCase(Vop1MoveRelSourceBase);
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
