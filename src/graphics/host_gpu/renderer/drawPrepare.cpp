@@ -57,12 +57,19 @@ Worker::~Worker() {
 	m_thread.join();
 }
 
-uint64_t Worker::Post() {
-	const auto sequence = ++m_posted_local;
-	m_posted.store(sequence, std::memory_order_seq_cst);
+void Worker::Wake() {
 	if (m_sleeping.load(std::memory_order_seq_cst)) {
 		m_sleeping.store(false, std::memory_order_seq_cst);
 		m_sleeping.notify_one();
+	}
+}
+
+uint64_t Worker::Post() {
+	// No fence: a worker that goes to sleep without seeing this post is woken by Wait.
+	const auto sequence = ++m_posted_local;
+	m_posted.store(sequence, std::memory_order_release);
+	if (m_sleeping.load(std::memory_order_relaxed)) {
+		Wake();
 	}
 	return sequence;
 }
@@ -72,7 +79,11 @@ uint64_t Worker::Wait(uint64_t sequence) {
 		return 0;
 	}
 	const auto start = NowNs();
+	Wake();
 	for (uint32_t spins = 0; m_done.load(std::memory_order_acquire) < sequence; spins++) {
+		if ((spins & 1023u) == 1023u) {
+			Wake();
+		}
 		if (spins < 16384) {
 			KYTY_PREPARE_PAUSE();
 		} else {

@@ -83,6 +83,8 @@ public:
 
 private:
 	void Loop();
+	// Wakes the worker if it sleeps.
+	void Wake();
 
 	Run   m_run;
 	void* m_context;
