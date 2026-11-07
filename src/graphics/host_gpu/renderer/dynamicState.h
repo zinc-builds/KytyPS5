@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -34,36 +35,22 @@ size_t DescriptorWritesSize(std::span<const vk::WriteDescriptorSet> writes);
 // Copies writes and their buffer or image descriptors to data, pointing the copies at the copies.
 void CopyDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes, std::byte* data);
 
-// The graphics pipeline, push constants and set-0 push descriptors recorded last in the current
-// command buffer, so a draw records only what changed. Push constants and push descriptors are
-// reused only while the pipeline layout they were pushed with stays current (a layout belongs to
-// one pipeline); anything else that binds or pushes graphics state must call Reset().
-class GraphicsBindings {
+// Push constants and set-0 push descriptors recorded last in the current command buffer, kept by
+// the thread that records (the recording thread, or the GPU command thread without one). A push
+// reuses them only while the pipeline layout and the command thread's epoch stay the same.
+class RecordedBindings {
 public:
-	void Reset() {
-		m_pipeline        = nullptr;
-		m_layout          = nullptr;
-		m_constants_known = 0;
-		m_writes_valid    = false;
-	}
-
-	// Something else bound graphics descriptor sets: forget what was pushed.
-	void ForgetLayout() {
-		m_layout          = nullptr;
-		m_constants_known = 0;
-		m_writes_valid    = false;
-	}
-
-	[[nodiscard]] vk::Pipeline BoundPipeline() const { return m_pipeline; }
-	void BindPipeline(const CommandBuffer& buffer, vk::Pipeline pipeline,
-	                  vk::PipelineLayout layout);
-	// offset and size in bytes, multiples of 4.
-	void PushConstants(const CommandBuffer& buffer, vk::PipelineLayout layout,
-	                   vk::ShaderStageFlags stages, uint32_t offset, uint32_t size,
-	                   const void* data);
-	// Pushes the elements of writes that differ from the last push with this layout.
-	void PushDescriptors(const CommandBuffer& buffer, vk::PipelineLayout layout,
-	                     std::span<const vk::WriteDescriptorSet> writes);
+	// A pipeline with this layout was bound.
+	void Use(uint64_t epoch, vk::PipelineLayout layout);
+	// The dwords of [offset, offset + size) that differ from the last push, as {offset, size} in
+	// bytes; size 0 if none.
+	[[nodiscard]] std::pair<uint32_t, uint32_t> PlanConstants(uint64_t epoch, vk::PipelineLayout layout,
+	                                                          uint32_t offset, uint32_t size,
+	                                                          const std::byte* data);
+	// The runs of writes' elements that differ from the last push; valid until the next call.
+	[[nodiscard]] std::span<const vk::WriteDescriptorSet>
+	PlanDescriptors(uint64_t epoch, vk::PipelineLayout layout,
+	                std::span<const vk::WriteDescriptorSet> writes);
 
 private:
 	struct Write {
@@ -73,9 +60,7 @@ private:
 		uint32_t           first = 0; // index into m_buffers or m_images
 	};
 
-	void UseLayout(vk::PipelineLayout layout);
-
-	vk::Pipeline                          m_pipeline        = nullptr;
+	uint64_t                              m_epoch           = ~uint64_t {0};
 	vk::PipelineLayout                    m_layout          = nullptr;
 	std::array<uint32_t, 32>              m_constants {};
 	uint32_t                              m_constants_known = 0; // bit per dword
@@ -84,6 +69,40 @@ private:
 	std::vector<vk::DescriptorBufferInfo> m_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_images;
 	std::vector<vk::WriteDescriptorSet>   m_pending;
+};
+
+// The graphics pipeline recorded last in the current command buffer, so a draw records only what
+// changed. Push constants and push descriptors are compared on the thread that records them
+// (RecordedBindings): this side only advances an epoch that voids them. Anything else that binds
+// or pushes graphics state must call Reset() or ForgetLayout().
+class GraphicsBindings {
+public:
+	void Reset() {
+		m_pipeline = nullptr;
+		m_epoch++;
+	}
+
+	// Something else bound graphics descriptor sets: forget what was pushed.
+	void ForgetLayout() { m_epoch++; }
+
+	[[nodiscard]] vk::Pipeline BoundPipeline() const { return m_pipeline; }
+	void BindPipeline(const CommandBuffer& buffer, vk::Pipeline pipeline,
+	                  vk::PipelineLayout layout);
+	// Queue pushes for the recording thread, which records the parts that differ from what it
+	// pushed last with this layout. offset and size in bytes, multiples of 4.
+	void PushConstants(const CommandBuffer& buffer, vk::PipelineLayout layout,
+	                   vk::ShaderStageFlags stages, uint32_t offset, uint32_t size,
+	                   const void* data);
+	void PushDescriptors(const CommandBuffer& buffer, vk::PipelineLayout layout,
+	                     std::span<const vk::WriteDescriptorSet> writes);
+
+private:
+	vk::Pipeline     m_pipeline = nullptr;
+	uint64_t         m_epoch    = 0;
+	// The recording side's state. Only the thread that records touches it.
+	RecordedBindings m_recorded;
+	// KYTY_BIND_VERIFY=1: the same comparison made here, checked against the recording side's.
+	RecordedBindings m_verify;
 };
 
 struct DynamicState {

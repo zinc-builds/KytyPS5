@@ -1279,8 +1279,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
-	// Graphics draws record only the push constants and descriptors that changed, queued for the
-	// recording thread. Direct recording takes a fresh buffer.Handle(), which waits for the queue.
+	// Graphics draws queue their push constants and descriptors for the recording thread, which
+	// records only what changed (GraphicsBindings). Direct recording takes a fresh
+	// buffer.Handle(), which waits for the queue.
 	const bool graphics = pipeline_bind_point == vk::PipelineBindPoint::eGraphics;
 	auto&      bound    = m_context.GetCommandScheduler().GetDynamicState().bindings;
 	if (has_push_data) {

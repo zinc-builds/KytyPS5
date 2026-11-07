@@ -3,6 +3,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -27,14 +29,6 @@ static bool SameDescriptor(const vk::DescriptorBufferInfo& a, const vk::Descript
 
 static bool SameDescriptor(const vk::DescriptorImageInfo& a, const vk::DescriptorImageInfo& b) {
 	return a.sampler == b.sampler && a.imageView == b.imageView && a.imageLayout == b.imageLayout;
-}
-
-void GraphicsBindings::UseLayout(vk::PipelineLayout layout) {
-	if (layout != m_layout) {
-		m_layout          = layout;
-		m_constants_known = 0;
-		m_writes_valid    = false;
-	}
 }
 
 static size_t DescriptorBytes(const vk::WriteDescriptorSet& write) {
@@ -68,44 +62,35 @@ void CopyDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes, std::b
 	}
 }
 
-// Records vkCmdPushDescriptorSetKHR with copies of the writes and their descriptors.
-static void RecordPushDescriptors(const CommandBuffer& buffer, vk::PipelineLayout layout,
-                                  std::span<const vk::WriteDescriptorSet> writes) {
-	const auto count = static_cast<uint32_t>(writes.size());
-	buffer.Record(
-	    DescriptorWritesSize(writes),
-	    [writes](std::byte* data) { CopyDescriptorWrites(writes, data); },
-	    [layout, count](vk::CommandBuffer cb, const std::byte* data) {
-		    cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0, count,
-		                            reinterpret_cast<const vk::WriteDescriptorSet*>(data));
-	    });
+// KYTY_BIND_VERIFY=1: the command thread makes the same comparisons as the recording thread and
+// sends its result along; the recording thread exits on a difference.
+static bool BindVerifyEnabled() {
+	static const bool enabled = std::getenv("KYTY_BIND_VERIFY") != nullptr;
+	return enabled;
 }
 
-void GraphicsBindings::BindPipeline(const CommandBuffer& buffer, vk::Pipeline pipeline,
-                                    vk::PipelineLayout layout) {
-	if (pipeline == m_pipeline && BindDedupeEnabled()) {
-		return;
+void RecordedBindings::Use(uint64_t epoch, vk::PipelineLayout layout) {
+	if (epoch != m_epoch || layout != m_layout) {
+		m_epoch           = epoch;
+		m_layout          = layout;
+		m_constants_known = 0;
+		m_writes_valid    = false;
 	}
-	buffer.Record([pipeline](vk::CommandBuffer cb) {
-		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-	});
-	m_pipeline = pipeline;
-	UseLayout(layout);
 }
 
-void GraphicsBindings::PushConstants(const CommandBuffer& buffer, vk::PipelineLayout layout,
-                                     vk::ShaderStageFlags stages, uint32_t offset, uint32_t size,
-                                     const void* data) {
+std::pair<uint32_t, uint32_t> RecordedBindings::PlanConstants(uint64_t epoch,
+                                                              vk::PipelineLayout layout,
+                                                              uint32_t offset, uint32_t size,
+                                                              const std::byte* data) {
 	const uint32_t first = offset / 4u;
 	const uint32_t count = size / 4u;
 	EXIT_IF((offset | size) % 4u != 0 || count == 0 || first + count > m_constants.size());
-	UseLayout(layout);
-	const auto* bytes   = static_cast<const uint8_t*>(data);
-	uint32_t    changed = UINT32_MAX;
-	uint32_t    last    = 0;
+	Use(epoch, layout);
+	uint32_t changed = UINT32_MAX;
+	uint32_t last    = 0;
 	for (uint32_t i = 0; i < count; i++) {
 		uint32_t value = 0;
-		std::memcpy(&value, bytes + i * 4u, sizeof(value));
+		std::memcpy(&value, data + i * 4u, sizeof(value));
 		const uint32_t dword = first + i;
 		if ((m_constants_known & (1u << dword)) == 0 || m_constants[dword] != value) {
 			m_constants[dword] = value;
@@ -115,23 +100,18 @@ void GraphicsBindings::PushConstants(const CommandBuffer& buffer, vk::PipelineLa
 	}
 	m_constants_known |= (count == 32u ? ~0u : ((1u << count) - 1u)) << first;
 	if (!BindDedupeEnabled()) {
-		changed = 0;
-		last    = count - 1;
-	} else if (changed == UINT32_MAX) {
-		return;
+		return {offset, size};
 	}
-	const uint32_t push_offset = (first + changed) * 4u;
-	const uint32_t push_size   = (last - changed + 1u) * 4u;
-	buffer.Record(
-	    push_size, [&](std::byte* out) { std::memcpy(out, bytes + changed * 4u, push_size); },
-	    [layout, stages, push_offset, push_size](vk::CommandBuffer cb, const std::byte* values) {
-		    cb.pushConstants(layout, stages, push_offset, push_size, values);
-	    });
+	if (changed == UINT32_MAX) {
+		return {0, 0};
+	}
+	return {(first + changed) * 4u, (last - changed + 1u) * 4u};
 }
 
-void GraphicsBindings::PushDescriptors(const CommandBuffer& buffer, vk::PipelineLayout layout,
-                                       std::span<const vk::WriteDescriptorSet> writes) {
-	UseLayout(layout);
+std::span<const vk::WriteDescriptorSet>
+RecordedBindings::PlanDescriptors(uint64_t epoch, vk::PipelineLayout layout,
+                                  std::span<const vk::WriteDescriptorSet> writes) {
+	Use(epoch, layout);
 	bool same = m_writes_valid && m_writes.size() == writes.size() && BindDedupeEnabled();
 	for (size_t i = 0; same && i < writes.size(); i++) {
 		const auto& write = writes[i];
@@ -157,20 +137,19 @@ void GraphicsBindings::PushDescriptors(const CommandBuffer& buffer, vk::Pipeline
 			}
 		}
 		m_writes_valid = true;
-		RecordPushDescriptors(buffer, layout, writes);
-		return;
+		return writes;
 	}
-	// Push runs of changed array elements; the others keep their pushed values.
+	// Runs of changed array elements; the others keep their pushed values.
 	m_pending.clear();
 	for (size_t i = 0; i < writes.size(); i++) {
 		const auto& write  = writes[i];
 		const auto& record = m_writes[i];
 		const bool  buffer = IsBufferDescriptor(write.descriptorType);
 		const auto  changed = [&](uint32_t element) {
-            return buffer ? !SameDescriptor(m_buffers[record.first + element],
-			                                 write.pBufferInfo[element])
-			               : !SameDescriptor(m_images[record.first + element],
-			                                 write.pImageInfo[element]);
+			return buffer ? !SameDescriptor(m_buffers[record.first + element],
+			                                write.pBufferInfo[element])
+			              : !SameDescriptor(m_images[record.first + element],
+			                                write.pImageInfo[element]);
 		};
 		for (uint32_t element = 0; element < write.descriptorCount;) {
 			if (!changed(element)) {
@@ -196,9 +175,117 @@ void GraphicsBindings::PushDescriptors(const CommandBuffer& buffer, vk::Pipeline
 			m_pending.push_back(run);
 		}
 	}
-	if (!m_pending.empty()) {
-		RecordPushDescriptors(buffer, layout, m_pending);
+	return m_pending;
+}
+
+void GraphicsBindings::BindPipeline(const CommandBuffer& buffer, vk::Pipeline pipeline,
+                                    vk::PipelineLayout layout) {
+	if (pipeline == m_pipeline && BindDedupeEnabled()) {
+		return;
 	}
+	if (BindVerifyEnabled()) {
+		m_verify.Use(m_epoch, layout);
+	}
+	buffer.Record([pipeline, state = &m_recorded, epoch = m_epoch, layout](vk::CommandBuffer cb) {
+		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+		state->Use(epoch, layout);
+	});
+	m_pipeline = pipeline;
+}
+
+namespace {
+// What the command thread's comparison decided (KYTY_BIND_VERIFY), sent with a push.
+struct VerifyRun {
+	uint32_t binding;
+	uint32_t first;
+	uint32_t count;
+	uint32_t pad;
+};
+} // namespace
+
+void GraphicsBindings::PushConstants(const CommandBuffer& buffer, vk::PipelineLayout layout,
+                                     vk::ShaderStageFlags stages, uint32_t offset, uint32_t size,
+                                     const void* data) {
+	EXIT_IF((offset | size) % 4u != 0 || size == 0 || offset + size > 32u * 4u);
+	std::pair<uint32_t, uint32_t> expected {UINT32_MAX, 0};
+	if (BindVerifyEnabled()) {
+		expected = m_verify.PlanConstants(m_epoch, layout, offset, size,
+		                                  static_cast<const std::byte*>(data));
+	}
+	buffer.Record(
+	    size, [&](std::byte* out) { std::memcpy(out, data, size); },
+	    [state = &m_recorded, epoch = m_epoch, layout, stages, offset, size,
+	     expected](vk::CommandBuffer cb, const std::byte* values) {
+		    const auto [push_offset, push_size] =
+		        state->PlanConstants(epoch, layout, offset, size, values);
+		    if (expected.first != UINT32_MAX &&
+		        (expected.first != push_offset || expected.second != push_size)) {
+			    EXIT("KYTY_BIND_VERIFY: push constants differ: command thread %u+%u, recorder %u+%u\n",
+			         expected.first, expected.second, push_offset, push_size);
+		    }
+		    if (push_size != 0) {
+			    cb.pushConstants(layout, stages, push_offset, push_size,
+			                     values + (push_offset - offset));
+		    }
+	    });
+}
+
+void GraphicsBindings::PushDescriptors(const CommandBuffer& buffer, vk::PipelineLayout layout,
+                                       std::span<const vk::WriteDescriptorSet> writes) {
+	thread_local std::vector<VerifyRun> expected;
+	expected.clear();
+	const bool verify = BindVerifyEnabled();
+	if (verify) {
+		for (const auto& run: m_verify.PlanDescriptors(m_epoch, layout, writes)) {
+			expected.push_back({run.dstBinding, run.dstArrayElement, run.descriptorCount, 0});
+		}
+	}
+	const size_t writes_size = DescriptorWritesSize(writes);
+	const size_t verify_size = verify ? (expected.size() + 1) * sizeof(VerifyRun) : 0;
+	const auto   count       = static_cast<uint32_t>(writes.size());
+	buffer.Record(
+	    writes_size + verify_size,
+	    [&](std::byte* data) {
+		    CopyDescriptorWrites(writes, data);
+		    if (verify) {
+			    const VerifyRun header {static_cast<uint32_t>(expected.size()), 0, 0, 0};
+			    std::memcpy(data + writes_size, &header, sizeof(header));
+			    std::memcpy(data + writes_size + sizeof(header), expected.data(),
+			                expected.size() * sizeof(VerifyRun));
+		    }
+	    },
+	    [state = &m_recorded, epoch = m_epoch, layout, count, writes_size,
+	     verify](vk::CommandBuffer cb, const std::byte* data) {
+		    const std::span<const vk::WriteDescriptorSet> copies {
+		        reinterpret_cast<const vk::WriteDescriptorSet*>(data), count};
+		    const auto runs = state->PlanDescriptors(epoch, layout, copies);
+		    if (verify) {
+			    VerifyRun header {};
+			    std::memcpy(&header, data + writes_size, sizeof(header));
+			    bool same = header.binding == runs.size();
+			    for (size_t i = 0; same && i < runs.size(); i++) {
+				    VerifyRun run {};
+				    std::memcpy(&run, data + writes_size + (i + 1) * sizeof(VerifyRun), sizeof(run));
+				    same = run.binding == runs[i].dstBinding && run.first == runs[i].dstArrayElement &&
+				           run.count == runs[i].descriptorCount;
+			    }
+			    if (!same) {
+				    EXIT("KYTY_BIND_VERIFY: push descriptors differ: command thread %u runs, "
+				         "recorder %zu runs\n",
+				         header.binding, runs.size());
+			    }
+			    static std::atomic<uint64_t> verified {0};
+			    if ((verified.fetch_add(1, std::memory_order_relaxed) % 1000000u) == 999999u) {
+				    std::printf("KYTY_BIND_VERIFY: %llu pushes match\n",
+				                static_cast<unsigned long long>(verified.load()));
+				    std::fflush(stdout);
+			    }
+		    }
+		    if (!runs.empty()) {
+			    cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0,
+			                            static_cast<uint32_t>(runs.size()), runs.data());
+		    }
+	    });
 }
 
 // Each setter is queued with copies of its values (CommandBuffer::Record).
