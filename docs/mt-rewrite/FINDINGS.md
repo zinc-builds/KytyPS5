@@ -44,6 +44,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Hot write-tracked chunks use asynchronous write protection (same binary, async off: 25.24 / 25.37; guest main thread 15.0 → 11.3 ms/frame) | 25.88 / 25.85 | 141.6k / 141.4k | 52.7 (max 83.4) | 19.5 |
 | 2026-11-07 | Draws construct only the color attachments and vertex stages they use; texture bindings copied once (Track B1′ step 1; same batch: ref `dev` 05ffc8b5 25.90 / 25.91; 7.06 → 6.71 µs/draw) | 27.40 / 27.55 | 148.8k / 149.1k | 52.6 (max 83.2) | 19.5 |
 | 2026-11-07 | Shader-map lookups cached per thread; vertex tables copied without zeroing (Track B1′ step 3a; 4 pairs, same batch: ref `dev` 07379452 27.37 / 28.27 / 28.10 / 28.04; +0.5% on runs 2–4, 6.60 → 6.56 µs/draw) | 27.96 / 28.41 / 28.23 / 28.22 | 151.6k / 153.0k / 152.1k / 152.1k | 51.5 (max 67.8) | 19.4 |
+| 2026-11-07 | Vertex shaders stop predicating every instruction on an always-set EXEC bit (Track G; same batch: ref `dev` a456fbcb 27.61 / 27.62; GPU 16.97 → 16.13 ms/frame, in passes 9.78 → 8.91) | 28.09 / 28.68 | 152.2k / 154.4k | 50.8 (max 99.9) | 19.8 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -550,6 +551,43 @@ sets with failed allocations; 19.6k non-push sets/s), and the GPU tick is read a
 
 **Dispatches cost ~11 µs each on the command thread** (~236/frame, 6.5%), almost all in
 `PrepareBda` and `SynchronizeBuffer` (Track C).
+
+### Vertex shading cost, Track G (2026-11-07)
+
+`KYTY_GPU_TIME=draws` (timestamp after every draw, grouped by vertex and pixel module) on `dev`
+2d24ba32: 17.3 ms/frame of GPU time, 9.9 in passes, 3.8 in dispatches, 3.6 between. No shader
+dominates: the costliest vertex shader is 8% of in-pass time, the costliest pixel shader 11%.
+Per-draw times are far above what the ALU work explains (a 2,450-index draw of the top vertex
+shader takes 6.4 µs; switching pipelines costs ~5×), so draws are latency-bound: the time of one
+warp through a long shader, plus instruction-cache warm-up after a switch.
+
+The shaders are long. `KYTY_PIPELINE_STATS` (local experiment, `VK_KHR_pipeline_executable_properties`):
+
+| Module | Guest code | SPIR-V | NVIDIA binary | Registers |
+|---|---|---|---|---|
+| top VS (`28eadb3f`) | 12.5 KB | 227 KB | 92 KB | 111 |
+| VS `2054c572` | 14.4 KB | 353 KB | 131 KB | 220 |
+| VS `0c4216ab` (12k draws/s) | 3.3 KB | 60 KB | 36 KB | 238 |
+| MS `dc33907e` (GS on mesh, two guest lanes per invocation) | 15.8 KB | 599 KB | 729 KB | 255 |
+
+**EXEC fold (landed).** A guest NGG vertex shader builds EXEC from the vertex count the
+translator passes in s3, the popcount of the entry `Ballot(true)`, and every VGPR write is a
+`Select` on the lane's EXEC bit. The host compiler couldn't prove that bit is set, so whole
+vertex shaders ran predicated (1,845 `OpSelect` in the top one). The translator already assumes a
+vertex subgroup's invocations are its lowest lanes (that makes the popcount a vertex count);
+constant propagation now evaluates such lane predicates for every prefix-shaped subgroup and
+folds them when they are constant. GPU 16.97 → 16.13 ms/frame, +2.8% FPS (table above).
+
+**Ruled out:**
+- Branching per lane in the remaining data-dependent EXEC regions (`if (subgroupAny(exec))` with
+  predicated bodies): an unsafe experiment emitting `if (exec)` for vertex shaders changed in-pass
+  time by 0.01 ms.
+
+**Measured, not landed: fused legacy MAD.** The games' shaders use `V_MAD_F32`/`V_MAC_F32` (not
+fused on RDNA2), emitted as a multiply and an add with `NoContraction` since d8be245c, which keeps
+the hardware's intermediate rounding. Emitting them as `FMA` cut in-pass time by ~1.7 ms/frame
+in one run (a run with compile stalls; to be re-measured). It changes rounding (one rounding
+instead of two), so it is a precision trade-off, not a free fix.
 
 ### Draw state cache, Track B (2026-11-06)
 
