@@ -280,14 +280,15 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                                 uint32_t push_data_cursor) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+                                                 uint32_t push_data_cursor,
+                                                 StageResources& resources) {
+	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources.snapshot,
+	                                                    resources.specialization));
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 		        push_data_cursor, layout.ShaderDataDwords()) ||
-		    candidate.specialization != specialization) {
+		    candidate.specialization != resources.specialization) {
 			continue;
 		}
 		if constexpr (HasCalls) {
@@ -301,21 +302,22 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
                                            ShaderRecompiler::CompileOptions  options,
                                            ShaderRecompiler::TranslateResult translated,
-                                           uint32_t                          push_data_cursor) {
+                                           uint32_t                          push_data_cursor,
+                                           const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
 	const auto profile = SpirvProfile(m_graphics);
 	options.profile    = &profile;
-	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-	                                               program.specialization, push_data_cursor);
+	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
+	                                               push_data_cursor);
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
 	const auto function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            info.bindings.push_data_start_dword, program.specialization);
+	                            info.bindings.push_data_start_dword, specialization);
 	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
@@ -326,7 +328,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .id             = id,
 	    .module         = CompileSPV(result.spirv, m_graphics.device),
 	    .info           = std::move(info),
-	    .specialization = program.specialization,
+	    .specialization = specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
 	m_compiled[static_cast<size_t>(key.stage)]++;
@@ -357,7 +359,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
-                                              uint32_t& push_data_cursor) {
+                                              uint32_t& push_data_cursor, StageResources& resources) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -386,13 +388,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
-	m_lookup_key.stage           = options.stage;
-	m_lookup_key.hash            = params.hash;
-	m_lookup_key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	auto entry = m_program_cache.find(m_lookup_key);
+	// Per thread, so lookups need no shared scratch; it keeps its capacity between lookups.
+	thread_local ProgramKey lookup_key;
+	lookup_key.stage           = options.stage;
+	lookup_key.hash            = params.hash;
+	lookup_key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input_info, lookup_key.static_state);
+	auto entry = m_program_cache.find(lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
-		input_info.stage = {.module = &module, .resources = &entry->second.resources};
+		input_info.stage = {.module = &module, .resources = &resources.snapshot};
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
 	};
@@ -403,9 +407,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
+			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, resources);
 		} else {
-			module = cached.FindModule<false>(runtime, push_data_cursor);
+			module = cached.FindModule<false>(runtime, push_data_cursor, resources);
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -424,7 +428,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
 			                 params.hash, source.unsupported_call_pc);
-			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+			m_program_cache.emplace(lookup_key, Program {.skip_dispatch = true});
 			return nullptr;
 		}
 	}
@@ -445,21 +449,22 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto retained = !source.calls.empty()
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
 		                    : nullptr;
-		entry = m_program_cache.emplace(m_lookup_key, Program {
+		entry = m_program_cache.emplace(lookup_key, Program {
 		    .call_source   = std::move(retained),
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
 		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-		    program.resource_plan, runtime, program.resources, program.specialization));
+		    program.resource_plan, runtime, resources.snapshot, resources.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+		if (const auto* module =
+		        entry->second.FindModule<true>(runtime, push_data_cursor, resources)) {
 			return bind(*module);
 		}
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data_cursor));
+	                          push_data_cursor, resources.specialization));
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -853,7 +858,8 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+		const auto& pixel_module =
+		    *GetProgram(pixel_params, pixel_info, push_data_cursor, m_graphics_resources[3]);
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -863,7 +869,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, m_graphics_resources[i]);
 	}
 }
 
@@ -874,7 +880,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
-	return GetProgram(params, input_info, push_data_cursor);
+	return GetProgram(params, input_info, push_data_cursor, m_compute_resources);
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,

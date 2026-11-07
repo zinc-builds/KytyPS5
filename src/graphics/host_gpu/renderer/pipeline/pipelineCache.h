@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -207,19 +208,25 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
+	// What one lookup materializes for a stage. Lookups write it, not the shared Program, so a
+	// stage's resources belong to the draw or dispatch that looked it up.
+	struct StageResources {
+		ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+	};
+
 	struct Program {
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
-		bool                                         skip_dispatch = false;
+		ShaderRecompiler::IR::ResourcePlan              resource_plan;
+		// A deque, so a module stays where it is while the program compiles more.
+		std::deque<ShaderModule>                        modules;
+		bool                                            skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		                         uint32_t push_data_cursor, StageResources& resources);
 	};
 
 	struct ProgramKey {
@@ -247,7 +254,10 @@ private:
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
-	ProgramKey                             m_lookup_key;
+	// Graphics stages indexed like GraphicsPipelineKey::stage_ids, and the dispatch's stage. A
+	// stage's resources stay valid until the next lookup of that stage kind.
+	std::array<StageResources, 4>          m_graphics_resources;
+	StageResources                         m_compute_resources;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -260,11 +270,12 @@ private:
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	                               uint32_t& push_data_cursor, StageResources& resources);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
-	                            uint32_t                          push_data_cursor);
+	                            uint32_t                          push_data_cursor,
+	                            const ShaderRecompiler::IR::ResourceSpecialization& specialization);
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();
