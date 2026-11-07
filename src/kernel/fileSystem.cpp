@@ -19,6 +19,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -363,6 +364,29 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
+// KYTY_APP0_OVERLAY=<dir>: files in <dir> replace the game's /app0 files of the same relative
+// path (e.g. a launch args.txt for benchmarks). Off unless set; only existing regular files.
+static std::filesystem::path App0OverlayFile(const std::filesystem::path& rel_path) {
+	static const char* overlay = [] {
+		const char* dir = std::getenv("KYTY_APP0_OVERLAY");
+		if (dir != nullptr && *dir != '\0') {
+			::printf("FileSystem: /app0 overlay %s\n", dir);
+			return dir;
+		}
+		return static_cast<const char*>(nullptr);
+	}();
+	if (overlay == nullptr || rel_path.empty()) {
+		return {};
+	}
+	std::error_code ec;
+	auto            path = std::filesystem::path(overlay) / rel_path;
+	if (!std::filesystem::is_regular_file(path, ec)) {
+		return {};
+	}
+	::printf("FileSystem: /app0/%s from overlay\n", rel_path.generic_string().c_str());
+	return path;
+}
+
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
@@ -381,6 +405,11 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		if (p.point == "/app0/") {
+			if (auto shadow = App0OverlayFile(native_rel_path); !shadow.empty()) {
+				return shadow;
+			}
+		}
 		if (Common::IsArchivePath(p.dir)) {
 			return p.dir / native_rel_path;
 		}
