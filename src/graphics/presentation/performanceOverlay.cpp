@@ -71,6 +71,7 @@ struct FrameWindow {
 	size_t                           next         = 0;
 	size_t                           count        = 0;
 	uint32_t                         flips        = 0;
+	uint64_t                         total_flips  = 0; // since start, for frame-indexed bench windows
 	float                            max_ms       = 0.0f;
 	uint32_t                         guest_width  = 0;
 	uint32_t                         guest_height = 0;
@@ -106,6 +107,7 @@ struct FrameWindow {
 		flip_totals = totals;
 		last_flip   = now;
 		flips++;
+		total_flips++;
 	}
 
 	size_t RecentHitches(Clock::time_point now) const {
@@ -797,9 +799,13 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	}
 	if (shown.sample_time == Clock::time_point {} || now - shown.sample_time >= REFRESH_INTERVAL ||
 	    details != shown_details) {
+		uint64_t total_flips = 0;   // flips so far, and the time of the last one, for the perf log
+		double   last_flip_s = 0.0; // steady-clock seconds
 		{
 			std::scoped_lock lock(g_frame_mutex);
 			auto&            frames = g_frames;
+			total_flips             = frames.total_flips;
+			last_flip_s = std::chrono::duration<double>(frames.last_flip.time_since_epoch()).count();
 			shown.history_count     = frames.count;
 			for (size_t i = 0; i < frames.count; i++) {
 				shown.history[i] =
@@ -845,12 +851,13 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			}
 			std::printf("PERF fps=%.1f frame_ms=%.1f worst_ms=%.1f low1=%.1f draws_frame=%.0f "
 			            "draws_s=%.0f gpu_wait_ms_s=%.0f waits_s=%.0f wt_faults_s=%.0f "
-			            "dispatches_frame=%.0f sigill_s=%.0f threads:%s\n",
+			            "dispatches_frame=%.0f sigill_s=%.0f frames=%llu t=%.4f threads:%s\n",
 			            shown.fps, shown.frame_ms, shown.max_frame_ms, shown.low_fps,
 			            Rate(shown, Counter::Draws) / fps, Rate(shown, Counter::Draws),
 			            Rate(shown, Counter::GpuWaitNs) / 1e6, Rate(shown, Counter::GpuWaits),
 			            Rate(shown, Counter::GpuFaults), Rate(shown, Counter::Dispatches) / fps,
-			            Rate(shown, Counter::EmulatedInstructions), thrds.c_str());
+			            Rate(shown, Counter::EmulatedInstructions),
+			            static_cast<unsigned long long>(total_flips), last_flip_s, thrds.c_str());
 			std::fflush(stdout);
 		}
 	}

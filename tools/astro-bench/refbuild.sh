@@ -15,11 +15,17 @@ root=${KYTY_BUILDS:-$HOME/.cache/kyty-builds}
 dst=$root/$sha
 done_marker=$dst/.complete
 [ -f "$done_marker" ] && { echo "$dst/install"; exit 0; }
+# Building inside an exclusive hold would disturb that benchmark, and could deadlock with a caller
+# waiting on this commit's lock while it waits for the benchmark.
+[ "$KYTY_BENCH_LOCKED" = x ] && { echo "refbuild: $sha is not built yet; call refbuild.sh before batch.sh" >&2; exit 1; }
 
 mkdir -p "$root"
 exec 7>"$root/$sha.lock"
 flock 7 # one builder per commit; later callers wait and reuse its result
 [ -f "$done_marker" ] && { echo "$dst/install"; exit 0; }
+# The whole preparation (worktree, submodules, configure, build) is build work: shared bench lock.
+. "$repo/tools/astro-bench/benchlock.sh"
+benchlock_acquire s "refbuild.sh $sha" >&2 || exit 1
 
 src=$root/$sha.src
 rm -rf "$src" "$dst"
@@ -32,7 +38,7 @@ git -C "$src" submodule update --init --recursive -q >&2
 
 cmake -S "$src" -B "$src/_Build/linux" -G Ninja -DCMAKE_BUILD_TYPE=Release \
 	-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >&2
-"$repo/tools/astro-bench/benchlock.sh" build cmake --build "$src/_Build/linux" --target kyty_emulator -j 8 >&2
+cmake --build "$src/_Build/linux" --target kyty_emulator -j 8 >&2
 # The install's last step (the Qt launcher's plugin dependencies) fails; kyty_emulator is in by then.
 cmake --install "$src/_Build/linux" --prefix "$dst/install" >&2 || true
 [ -x "$dst/install/kyty_emulator" ] || { echo "refbuild: install of $sha failed" >&2; exit 1; }

@@ -3,13 +3,27 @@
 #   <label> [ENV=VALUE ...] -- [emulator flags...]
 # Results are appended to /tmp/bench-batch.txt.
 # Holds the exclusive bench lock for the whole batch (see benchlock.sh).
+# The first measured run of a batch tends to be slow (cold file cache and clocks), so the batch
+# starts with a short, unreported warm-up run of its first line. BATCH_WARMUP=0 skips it.
 . "$(dirname "$0")/benchlock.sh"
 benchlock_acquire x "batch.sh" || exit 1
-while read -r line; do
-	[ -z "$line" ] && continue
+run_line() { # run_line <line> [extra env]: runs one configuration, prints garden.sh's summary line
+	local line=$1 label rest envs flags
 	label=${line%% *}; rest=${line#"$label"}
 	envs=${rest%%--*}; flags=${rest#*--}; [ "$flags" = "$rest" ] && flags=""
+	label=$label$3
 	# shellcheck disable=SC2086
-	env $envs bash "$(dirname "$0")/garden.sh" "$label" $flags > "/tmp/garden-$label.out" 2>&1; head -1 "/tmp/garden-$label.out" >> /tmp/bench-batch.txt
+	env $envs $2 bash "$(dirname "$0")/garden.sh" "$label" $flags > "/tmp/garden-$label.out" 2>&1
+	head -1 "/tmp/garden-$label.out"
 	sleep 3
+}
+mapfile -t lines
+first=
+for line in "${lines[@]}"; do [ -n "$line" ] && { first=$line; break; }; done
+if [ -n "$first" ] && [ "${BATCH_WARMUP:-1}" != 0 ]; then
+	run_line "$first" "GARDEN_FRAMES=0-150" "-warmup" > /dev/null
+fi
+for line in "${lines[@]}"; do
+	[ -z "$line" ] && continue
+	run_line "$line" >> /tmp/bench-batch.txt
 done

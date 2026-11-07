@@ -75,14 +75,43 @@ else
 	wait_log 'StartLevel aerial_garden' 60 || exit 1
 fi
 start=$(wc -l < "$log")
-wait_s "${GARDEN_SETTLE:-25}"       # opening flight / shader warm-up
-from=$(wc -l < "$log")
-wait_s "${GARDEN_WINDOW:-45}"
-to=$(wc -l < "$log")
-sed -n "${from},${to}p" "$log" | grep '^PERF' |
-	sed -E 's/.*fps=([0-9.]+).*worst_ms=([0-9.]+) low1=([0-9.]+) draws_frame=([0-9]+) draws_s=([0-9]+).*wt_faults_s=([0-9]+).*sigill_s=([0-9]+).*/\1 \4 \5 \6 \7 \2 \3/' |
-	awk -v l="$label" '{f+=$1; d+=$2; s+=$3; w+=$4; ill+=$5; wm+=$6; if ($6>wx) wx=$6; lo+=$7; n++}
-	     END {printf "%s: fps=%.2f draws/frame=%.0f draws/s=%.0f wt_faults/s=%.0f sigill/s=%.0f worst_ms=%.1f (max %.1f) low1=%.1f (n=%d)\n", l, f/n, d/n, s/n, w/n, ill/n, wm/n, wx, lo/n, n}'
+summary='{f+=$1; d+=$2; s+=$3; w+=$4; ill+=$5; wm+=$6; if ($6>wx) wx=$6; lo+=$7; n++}
+	END {if (fw != "") f = fw * n; printf "%s: fps=%.2f draws/frame=%.0f draws/s=%.0f wt_faults/s=%.0f sigill/s=%.0f worst_ms=%.1f (max %.1f) low1=%.1f (n=%d)%s\n", l, f/n, d/n, s/n, w/n, ill/n, wm/n, wx, lo/n, n, note}'
+fields() { sed -E 's/.*fps=([0-9.]+).*worst_ms=([0-9.]+) low1=([0-9.]+) draws_frame=([0-9]+) draws_s=([0-9]+).*wt_faults_s=([0-9]+).*sigill_s=([0-9]+).*/\1 \4 \5 \6 \7 \2 \3/'; }
+perf_since_start() { tail -n +"$start" "$log" | grep '^PERF'; }
+last_frames() { perf_since_start | grep -o 'frames=[0-9]*' | tail -1 | cut -d= -f2; }
+# Frame window (default): the game is frame-locked and the scripted opening flight is the same in
+# every run, so game frames [F0, F1) after level start always show the same scene, whatever the
+# build's speed. fps = frames / seconds between the PERF lines at F0 and F1. Needs a binary whose
+# PERF lines carry frames= and t=; older ones fall back to the time window.
+for _ in $(seq 10); do [ -n "$(last_frames)" ] && break; wait_s 1; done
+base=$(perf_since_start | grep -m1 -o 'frames=[0-9]*' | cut -d= -f2)
+window=${GARDEN_FRAMES:-1000-1600}
+if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
+	f0=$((base + ${window%-*})) f1=$((base + ${window#*-}))
+	end=$((SECONDS + ${window#*-} / 5 + 30)) # even at 5 FPS
+	until [ "$(last_frames)" -ge "$f1" ] 2>/dev/null; do
+		((SECONDS > end)) && { echo "timeout waiting for frame $f1" >&2; exit 1; }
+		pgrep -f '^\./kyty_emulator --game' >/dev/null || { echo "emulator exited ($(tail -1 "$log"))" >&2; exit 1; }
+		wait_s 1
+	done
+	perf_since_start | awk -v f0="$f0" -v f1="$f1" '
+		{ match($0, /frames=[0-9]+/); fr = substr($0, RSTART + 7, RLENGTH - 7) + 0
+		  match($0, / t=[0-9.]+/); t = substr($0, RSTART + 3, RLENGTH - 3) + 0 }
+		fr >= f0 && a == "" { a = fr; ta = t; inwin = 1 }
+		inwin { print }
+		fr >= f1 { printf "FRAMEFPS %.4f\n", (fr - a) / (t - ta); exit }' > "/tmp/garden-$label.window"
+	fw=$(grep -m1 '^FRAMEFPS' "/tmp/garden-$label.window" | cut -d' ' -f2)
+	grep '^PERF' "/tmp/garden-$label.window" | fields |
+		awk -v l="$label" -v fw="$fw" -v note=" frames=$window" "$summary"
+else
+	wait_s "${GARDEN_SETTLE:-25}"       # opening flight / shader warm-up
+	from=$(wc -l < "$log")
+	wait_s "${GARDEN_WINDOW:-45}"
+	to=$(wc -l < "$log")
+	sed -n "${from},${to}p" "$log" | grep '^PERF' | fields |
+		awk -v l="$label" -v fw="" -v note=" time window" "$summary"
+fi
 grep -E '^AMD CPU compatibility' "$log" | head -3
 echo "level start at log line $start" >&2
 if [ -n "$KEEP_RUNNING" ]; then trap - EXIT; fi

@@ -7,7 +7,10 @@ log=/tmp/bench-$1.log; shift
 . "$(dirname "$0")/benchlock.sh"
 benchlock_acquire x "run.sh $(basename "$log")" || exit 1
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-if [ -z "$KYTY_INSTALL" ] && [ "$repo/_Build/linux/kyty_emulator" -nt "$repo/_Build/linux/install/kyty_emulator" ]; then
+# Whole seconds: cmake --install copies the build's mtime but drops the fraction.
+built=$(stat -c %Y "$repo/_Build/linux/kyty_emulator" 2>/dev/null || echo 0)
+installed=$(stat -c %Y "$repo/_Build/linux/install/kyty_emulator" 2>/dev/null || echo 0)
+if [ -z "$KYTY_INSTALL" ] && [ "$built" -gt "$installed" ]; then
 	echo "run.sh: _Build/linux/kyty_emulator is newer than the installed one; run cmake --install first" >&2
 	echo "EXIT STATUS: stale install" > "$log"
 	exit 1
