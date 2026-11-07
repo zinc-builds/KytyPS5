@@ -985,6 +985,11 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		     image.backing.samples != 1)) {
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
+		if (m_tiler.DetileToImage(source.Handle(), source_offset, destination)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes,
+			                           info.LinearSize());
+			return;
+		}
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
 		const auto copies = info.BufferCopies(linear.offset);
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
