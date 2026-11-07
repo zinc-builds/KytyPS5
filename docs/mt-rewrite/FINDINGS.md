@@ -41,6 +41,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Color and depth target slots reuse their last resolve (Track B2b; same batch: ref `dev` 277a708e 24.24 / 24.24) | 24.95 / 25.36 | 136.8k / 139.0k | 53.0 (max 82.2) | 19.2 |
 | 2026-11-07 | Draws re-record only a changed pipeline, push constants and push descriptors (Track A; same batch: ref `dev` 9af34700 24.78 / 24.87) | 24.90 / 25.38 | 136.7k / 139.1k | 52.5 (max 82.6) | 19.1 |
 | 2026-11-07 | Draws record their Vulkan commands on a second thread (Track A; same batch: ref `dev` 7f737011 24.99 / 25.19) | 25.50 / 25.55 | 139.8k / 139.9k | 52.9 (max 68.7) | 19.2 |
+| 2026-11-07 | Hot write-tracked chunks use asynchronous write protection (same binary, async off: 25.24 / 25.37; guest main thread 15.0 → 11.3 ms/frame) | 25.88 / 25.85 | 141.6k / 141.4k | 52.7 (max 83.4) | 19.5 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -292,7 +293,7 @@ can't legally rewrite the range. `KYTY_STREAM_VERIFY=1` compares every reuse aga
 bytes: 0 mismatches over a 30 s Sky Garden run, with 31k reuses/s against 3.4k copies/s (90%
 reused). `KYTY_NO_STREAM_REUSE=1` turns it off. Result: 19.00 → 20.08 FPS (+5.7%, same batch).
 
-### Write tracking without signals (C2, prototype not merged)
+### Write tracking without signals (C2)
 
 The kernel (7.3) supports userfaultfd **asynchronous** write protection (`UFFD_FEATURE_WP_ASYNC`)
 on shared-memory views, plus `PAGEMAP_SCAN` to collect written pages and re-protect them in one
@@ -307,42 +308,73 @@ scan of a clean 1 GiB costs 0.15 ms, and 0.27 ms after 5,000 written pages.
   over all of it costs ~1.5 ms, so scanning everything at each submission (19 per frame) is
   out. Only the hot chunks can be scanned.
 
-**Prototype** (branch `trackc/c2-async-wp-prototype`):
+**Design:**
 - A chunk with ≥ 64 SIGBUS write faults in one second moves to a second userfaultfd with
-  `WP_ASYNC`.
-- At each submission start, and at each satisfied wait, `PAGEMAP_SCAN` with `WP_MATCHING`
-  collects the written pages and re-protects them. Waits on a value the command processor stored
-  itself (a label) are skipped.
-- Written pages that a cache still watches are invalidated, as a fault would do.
-- 26 chunks were promoted; a scan takes ~32 µs, ~250 scans/s.
-- The first version also scanned at every satisfied `WAIT_REG_MEM`. That took 17% of the GPU
-  thread and cost 21% FPS.
+  `WP_ASYNC`. A chunk the command processor stores a label into is promoted too (see below).
+- At each submission start `PAGEMAP_SCAN` with `WP_MATCHING` collects the written pages of the
+  async chunks and re-protects them. Written pages that a cache still watches are invalidated,
+  as a fault would do. Chunks with no write-watched page are skipped (a page that gains a
+  watcher is protected then, so earlier stores need no report).
+- A satisfied `WAIT_REG_MEM`, memory semaphore or valid `REWIND` may publish guest data, so it
+  requests a collection, run before the next packet that reads guest data (register writes,
+  waits and markers in between don't).
+- Unless the wait is provably on the command processor's own label. `RELEASE_MEM` and
+  `WRITE_DATA` into an async page re-protect that page (one-page `PAGEMAP_SCAN`), then store
+  through the backing alias with one scalar store (the guest may reuse a label at once), which
+  leaves no written mark, and record (address, value, page token). Pages whose bytes another
+  guest view also maps get no proof: a store through the alias would not mark this view. A wait whose value matches, whose page token is still current and whose page shows no
+  store since (a one-page scan without `WP_MATCHING`) skips the collection: the value is the
+  processor's own, so the guest published nothing by it.
+- The page token advances whenever a page's written state is cleared outside a collection (the
+  label store's re-protect, a new write watcher, the end of a read watch), since that would hide
+  a guest store from the "written since?" check; those writes are kept for the next collection
+  (a new watcher's range can span pages already watched). Remaps and zeroing void all labels.
+- Inside async chunks a page stays write-protected after its last watcher leaves.
+- Earlier versions: scanning at every satisfied wait took 17% of the GPU thread (−21% FPS);
+  skipping waits on any value the processor had stored was unsound (the guest can store the
+  same value); collecting whenever a label store found its page written cost ~63 scans per
+  frame (−2%), because the guest resets labels before reuse.
 
-| Same binary, 2 runs each | async off (`KYTY_NO_ASYNC_WP=1`) | async on |
+**Result on `dev` 71d59e85** (same binary, `KYTY_NO_ASYNC_WP=1` as the reference, one batch):
+
+| 2 runs each | async off | async on |
 |---|---|---|
-| FPS | 20.22 / 20.64 | 20.25 / 20.15 |
-| SIGBUS write faults/s | ~159k | ~500 |
-| Game main thread, ms of CPU per frame | 12.2 | 9.7 |
-| Each `tbb_thead` worker, ms per frame | 11.3 | 8.7 |
-| GPU thread, ms per frame | 41.9 | 42.6 |
+| FPS | 25.24 / 25.37 | 25.88 / 25.85 |
+| SIGBUS write faults/s | ~196k | ~410 |
+| Whole process, CPU (10 s profile, review-round-1 build) | 688% | 565% |
+| Game main thread, ms of CPU per frame | 15.0 | 11.3 |
+| Each `tbb_thead` worker, ms per frame | 13.6 | 9.8 |
+| GPU thread, ms per frame | 42.5 | 44.4 |
 
-**Why it is not merged:** correctness is unproven, and the gain today is off the critical path.
-- The verifier (`KYTY_ASYNC_WP_VERIFY=1`) snapshots the watched pages of async chunks and
-  compares them at the next scan. It reports pages that changed with no report, ~0.13% of
-  checks.
-- A dry run (`KYTY_ASYNC_WP_DRYRUN=1`) keeps the chunks on the faulting path. It reports more
-  of them (179k against 79k), so the verifier has a false-positive class that isn't identified
-  yet. It can neither clear nor convict the async path.
-- The prototype found and closed two real holes:
-  - The GPU thread's own CPU stores into guest memory (labels, `WRITE_DATA`, CPU-side DMA
-    fills and copies, occlusion results, LOD stats, GDS reads, memory semaphores) raise no fault
-    in async ranges, so each must invalidate explicitly (`NoteGpuWrite`, 9 call sites).
-  - Lifting the read protection of a GPU-dirty page re-applies the write protection. That erases
-    the written state of an earlier guest store, so a scan has to run first.
-- Next for C2: a verifier for the invariant that matters, that a clean page's cached device copy
-  equals guest memory (read back sampled cached-buffer ranges at scan points). Then re-measure.
-  Worth it once the draw thread approaches 16 ms. Today the guest threads finish their frame
-  before the GPU thread does.
+~100 chunks are async (label promotion added ~75); a collection scan takes ~40 µs, ~280 per
+second. ~3,000 satisfied waits/s are proven label waits and skip collection; ~50/s collect.
+The GPU thread pays ~2 ms/frame more (scans, label stores), but with the draw recorder on its
+own thread (#18) the freed cores are worth more: on `dev` 838723bc, before #18, the same design
+was FPS-neutral (25.07 vs 25.04).
+
+**Correctness.** Asynchronous protection moves the moment a write is noticed from the store to
+the next collection, so these had to hold. The verifier found the first two:
+- The GPU thread's own CPU stores into guest memory (labels, `WRITE_DATA`, CPU-side DMA fills
+  and copies, occlusion results, LOD stats, GDS reads, memory semaphores) raise no fault in an
+  async range. Each one invalidates explicitly (`RenderContext::NoteGpuWrite`).
+- Lifting the read protection of a GPU-dirty page re-applies the write protection, which would
+  erase the written state of an earlier guest store. The range is scanned first, and its writes
+  are handed to the next collection.
+- Collections happen wherever the guest may have published data: each submission, and each
+  satisfied wait, memory semaphore or `REWIND` except a wait proven to be on the processor's
+  own label (above). Review found the earlier "any stored value" skip unsound.
+
+`KYTY_ASYNC_WP_VERIFY=1` snapshots the write-watched pages of async ranges after a collection.
+It compares them at the next one and flags any page whose bytes changed without being reported
+written, invalidated, unwatched, remapped or stored through the backing alias. It reads the
+pages before taking those logs, so a store racing the check can't be misreported.
+`KYTY_ASYNC_WP_DRYRUN=1` runs the same bookkeeping with the chunks left on the faulting path.
+That is the control: 0 lost writes in 323M page checks. With async on, in Sky Garden: 0 in 67.5M.
+`KYTY_ASYNC_WP_TRACE=<page>` prints every tracking event of one page.
+
+Earlier verifier reports (~0.1% "lost writes", even in the dry run) were the verifier's own
+race. It took its logs, then a guest thread faulted, logged and wrote the page, and only then
+did the compare read it.
 
 **The other signal source on guest threads:** the `siglock` contention in the C0 profile is
 shared. Write-fault SIGBUS is ~3% of tbb time. SIGILL from the 1,088 VRSQRTPS sites the

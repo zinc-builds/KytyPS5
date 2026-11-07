@@ -98,6 +98,26 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 } // namespace
 
+namespace {
+// KYTY_ASYNC_WP_VERIFY: pages whose last write watcher left; their bytes may change legitimately.
+const bool                 g_verify_unwatch = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+std::mutex                 g_unwatch_mutex;
+std::vector<uint64_t>      g_unwatched;
+
+void NoteVerifyUnwatch(uint64_t page) {
+	if (g_verify_unwatch) {
+		std::lock_guard lock(g_unwatch_mutex);
+		g_unwatched.push_back(page);
+	}
+}
+} // namespace
+
+void PageManager::TakeVerifyUnwatched(std::vector<uint64_t>& pages) {
+	std::lock_guard lock(g_unwatch_mutex);
+	pages.insert(pages.end(), g_unwatched.begin(), g_unwatched.end());
+	g_unwatched.clear();
+}
+
 struct PageManager::Impl {
 	struct PageState {
 		uint8_t write_watchers  : 7 = 0;
@@ -152,6 +172,7 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		std::atomic<uint32_t>               write_watched_pages {0}; // changed under lock
 	};
 
 	Impl() {
@@ -263,6 +284,17 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if (!is_read && watcher_edge) {
+				region.write_watched_pages.fetch_add(track ? 1u : ~0u, std::memory_order_relaxed);
+			}
+			if (!track && !is_read && new_count == 0) {
+				NoteVerifyUnwatch(address);
+			}
+			if (update && MemDiag::Traced(address, PAGE_SIZE)) {
+				MemDiag::Trace(is_read ? (track ? "watch-access" : "unwatch-access")
+				                       : (track ? "watch-write" : "unwatch-write"),
+				               address, PAGE_SIZE, new_count);
+			}
 			if (watcher_edge && old_perms != new_perms) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
@@ -448,6 +480,42 @@ PageManager::~PageManager() {
 		g_diag_impl            = nullptr;
 	}
 #endif
+}
+
+bool PageManager::HasWriteWatched(uint64_t begin, uint64_t end) const noexcept {
+	end = std::min(end, ADDRESS_SIZE);
+	for (auto address = Common::AlignDown(begin, REGION_SIZE); address < end; address += REGION_SIZE) {
+		const auto* region = m_impl->FindRegion(address);
+		if (region != nullptr && region->write_watched_pages.load(std::memory_order_relaxed) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void PageManager::AppendWriteWatched(uint64_t begin, uint64_t end,
+                                     std::vector<std::pair<uint64_t, uint64_t>>& runs) const {
+	begin = Common::AlignDown(begin, PAGE_SIZE);
+	end   = Common::AlignUp(end, PAGE_SIZE);
+	for (auto address = begin; address < end;) {
+		const auto region_end = std::min(end, Common::AlignDown(address, REGION_SIZE) + REGION_SIZE);
+		auto*      region     = m_impl->FindRegion(address);
+		if (region == nullptr) {
+			address = region_end;
+			continue;
+		}
+		SpinGuard lock(region->lock);
+		for (; address < region_end; address += PAGE_SIZE) {
+			if (region->pages[(address % REGION_SIZE) / PAGE_SIZE].write_watchers == 0) {
+				continue;
+			}
+			if (!runs.empty() && runs.back().second == address) {
+				runs.back().second += PAGE_SIZE;
+			} else {
+				runs.emplace_back(address, address + PAGE_SIZE);
+			}
+		}
+	}
 }
 
 bool PageManager::IsTrackingFault(uint64_t vaddr, PageFaultAccess access) const noexcept {

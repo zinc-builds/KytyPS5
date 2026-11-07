@@ -91,12 +91,108 @@ public:
 		}
 		m_fd = fd;
 		LOGF("\t guest write tracking: userfaultfd write protection\n");
+#if defined(UFFD_FEATURE_WP_ASYNC) && defined(PAGEMAP_SCAN)
+		// Hot ranges move to a second context whose write faults the kernel resolves itself
+		// (no signal); their written pages are collected with PAGEMAP_SCAN instead.
+		if (std::getenv("KYTY_NO_ASYNC_WP") != nullptr) {
+			return;
+		}
+		const int async_fd = static_cast<int>(
+		    syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+		const int pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+		uffdio_api async_api {};
+		async_api.api      = UFFD_API;
+		async_api.features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED |
+		                     UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
+		if (async_fd >= 0 && pagemap >= 0 && ioctl(async_fd, UFFDIO_API, &async_api) == 0 &&
+		    (async_api.features & UFFD_FEATURE_WP_ASYNC) != 0) {
+			m_async_fd = async_fd;
+			m_pagemap  = pagemap;
+			LOGF("\t guest write tracking: asynchronous write protection for hot ranges\n");
+		} else {
+			if (async_fd >= 0) {
+				close(async_fd);
+			}
+			if (pagemap >= 0) {
+				close(pagemap);
+			}
+		}
+#endif
 	}
 
 	~GuestWriteProtection() {
 		if (m_fd >= 0) {
 			close(m_fd);
 		}
+		if (m_async_fd >= 0) {
+			close(m_async_fd);
+		}
+		if (m_pagemap >= 0) {
+			close(m_pagemap);
+		}
+	}
+
+	[[nodiscard]] bool AsyncEnabled() const { return m_async_fd >= 0; }
+
+	// Moves a registered range to the asynchronous context. Its pages lose their protection
+	// and read as written until the next Scan re-protects them.
+	[[nodiscard]] bool MakeAsync(uint64_t vaddr, uint64_t size) const {
+		uffdio_range range {vaddr, size};
+		if (ioctl(m_fd, UFFDIO_UNREGISTER, &range) != 0) {
+			EXIT("guest write tracking: unregistering 0x%016" PRIx64 "+0x%" PRIx64 " failed: %d\n",
+			     vaddr, size, errno);
+		}
+		uffdio_register reg {};
+		reg.range = {vaddr, size};
+		reg.mode  = UFFDIO_REGISTER_MODE_WP;
+		if (ioctl(m_async_fd, UFFDIO_REGISTER, &reg) == 0 &&
+		    (reg.ioctls & (uint64_t {1} << _UFFDIO_WRITEPROTECT)) != 0) {
+			return true;
+		}
+		// Unregistering dropped the range's write protection, which nothing here can restore.
+		EXIT("guest write tracking: moving 0x%016" PRIx64 "+0x%" PRIx64
+		     " to asynchronous write protection failed: %d\n",
+		     vaddr, size, errno);
+	}
+
+	// Calls found(begin, end) for each run of pages written since they were last protected and,
+	// with protect, write-protects them again in the same step. With protect, ranges outside the
+	// asynchronous context are skipped by the kernel.
+	template <typename Found>
+	void Scan(uint64_t vaddr, uint64_t size, Found&& found, bool protect = true) const {
+#if defined(PAGEMAP_SCAN)
+		std::array<page_region, 512> regions {};
+		auto                         start = vaddr;
+		const auto                   end   = vaddr + size;
+		while (start < end) {
+			pm_scan_arg arg {};
+			arg.size          = sizeof(arg);
+			arg.flags         = protect ? PM_SCAN_WP_MATCHING : 0;
+			arg.start         = start;
+			arg.end           = end;
+			arg.vec           = reinterpret_cast<uint64_t>(regions.data());
+			arg.vec_len       = regions.size();
+			arg.category_mask = PAGE_IS_WRITTEN;
+			arg.return_mask   = PAGE_IS_WRITTEN;
+			const auto count  = ioctl(m_pagemap, PAGEMAP_SCAN, &arg);
+			EXIT_IF(count < 0);
+			for (long i = 0; i < count; i++) {
+				if (Graphics::MemDiag::Traced(regions[i].start, regions[i].end - regions[i].start)) {
+					Graphics::MemDiag::Trace("scan-written", regions[i].start, regions[i].end - regions[i].start);
+				}
+				found(regions[i].start, regions[i].end);
+			}
+			// walk_end is where the kernel stopped: the end, or a full output vector.
+			if (arg.walk_end <= start) {
+				break;
+			}
+			start = arg.walk_end;
+		}
+#else
+		(void)vaddr;
+		(void)size;
+		(void)found;
+#endif
 	}
 
 	KYTY_CLASS_NO_COPY(GuestWriteProtection);
@@ -133,20 +229,46 @@ public:
 		return registered;
 	}
 
-	[[nodiscard]] bool Protect(uint64_t vaddr, uint64_t size, bool write_protect) const {
+	[[nodiscard]] bool Protect(uint64_t vaddr, uint64_t size, bool write_protect,
+	                           bool async = false) const {
+		if (Graphics::MemDiag::Traced(vaddr, size)) {
+			Graphics::MemDiag::Trace(write_protect ? "uffd-wp" : "uffd-unwp", vaddr, size, async ? 1 : 0);
+		}
 		const auto          page  = static_cast<uint64_t>(getpagesize());
 		const auto          start = vaddr & ~(page - 1);
 		uffdio_writeprotect range {};
 		range.range.start = start;
 		range.range.len   = ((vaddr + size + page - 1) & ~(page - 1)) - start;
 		range.mode        = write_protect ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
-		return ioctl(m_fd, UFFDIO_WRITEPROTECT, &range) == 0;
+		return ioctl(async ? m_async_fd : m_fd, UFFDIO_WRITEPROTECT, &range) == 0;
 	}
 
 private:
-	int m_fd = -1;
+	int m_fd       = -1;
+	int m_async_fd = -1;
+	int m_pagemap  = -1;
 };
 #endif
+
+// KYTY_ASYNC_WP_VERIFY: stores through the backing alias change guest bytes without a write
+// fault in any mode; the verifier skips them.
+static bool                                       g_log_alias_writes = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+static std::mutex                                 g_alias_write_mutex;
+static std::vector<std::pair<uint64_t, uint64_t>> g_alias_writes;
+
+// Advances whenever guest bytes change without a store through a guest view or the backing
+// (remaps, zeroing): RenderContext::IsCpLabel's proof does not cover those.
+static std::atomic<uint64_t> g_remap_generation {0};
+
+static void LogAliasWrite(uint64_t vaddr, uint64_t size) {
+	if (Graphics::MemDiag::Traced(vaddr, size)) {
+		Graphics::MemDiag::Trace("alias-write-or-remap", vaddr, size);
+	}
+	if (g_log_alias_writes) {
+		std::lock_guard lock(g_alias_write_mutex);
+		g_alias_writes.emplace_back(vaddr, vaddr + size);
+	}
+}
 
 class GuestBackingStore {
 public:
@@ -242,6 +364,15 @@ public:
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
 		std::lock_guard lock(m_mutex);
+		// Guest views of the zeroed range change too.
+		g_remap_generation.fetch_add(1, std::memory_order_relaxed);
+		for (const auto& [_, entry]: m_maps) {
+			const auto begin = std::max(backing_offset, entry.backing_offset);
+			const auto end   = std::min(backing_offset + size, entry.backing_offset + entry.size);
+			if (begin < end) {
+				LogAliasWrite(entry.vaddr + (begin - entry.backing_offset), end - begin);
+			}
+		}
 		std::memset(m_backing_base + backing_offset, 0, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
@@ -249,6 +380,7 @@ public:
 	}
 
 	void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		LogAliasWrite(vaddr, size);
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		std::lock_guard lock(m_mutex);
 		const auto*     source = static_cast<const uint8_t*>(data);
@@ -259,6 +391,32 @@ public:
 			                source + (start - vaddr), bytes);
 		    },
 		    [](uint64_t, uint64_t) {});
+	}
+
+	// One aligned 4- or 8-byte store (a label: the guest may see it and reuse the label at
+	// once, so the bytes must not be written twice as memcpy may).
+	bool StoreLabel(uint64_t vaddr, uint64_t value, uint64_t size) {
+		if ((size != 4 && size != 8) || (vaddr & (size - 1)) != 0) {
+			return false;
+		}
+		LogAliasWrite(vaddr, size);
+		std::shared_lock lock(m_mutex);
+		auto             it = m_maps.upper_bound(vaddr);
+		if (it == m_maps.begin()) {
+			return false;
+		}
+		--it;
+		const auto& entry = it->second;
+		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) {
+			return false;
+		}
+		auto* target = m_backing_base + (entry.backing_offset + vaddr - entry.vaddr);
+		if (size == 4) {
+			*reinterpret_cast<volatile uint32_t*>(target) = static_cast<uint32_t>(value);
+		} else {
+			*reinterpret_cast<volatile uint64_t*>(target) = value;
+		}
+		return true;
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -328,6 +486,9 @@ public:
 
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
+		// A remap changes the bytes behind the addresses without a store.
+		g_remap_generation.fetch_add(1, std::memory_order_relaxed);
+		LogAliasWrite(vaddr, size);
 		bool write_protected = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (!ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason)) {
@@ -342,6 +503,8 @@ public:
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
 		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode, write_protected});
+		// Again once the view is in: a new alias voids labels proven against the old views.
+		g_remap_generation.fetch_add(1, std::memory_order_relaxed);
 		return true;
 	}
 
@@ -393,6 +556,8 @@ public:
 	}
 
 	bool UnmapOne(uint64_t vaddr, uint64_t size) {
+		g_remap_generation.fetch_add(1, std::memory_order_relaxed);
+		LogAliasWrite(vaddr, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
 			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
@@ -487,8 +652,12 @@ public:
 					return VirtualMemory::Protect(start, bytes, mode);
 				}
 				// Write-protect before the view becomes writable, so no write lands unwatched.
-				return m_write_protection.Protect(start, bytes,
-				                                  mode == VirtualMemory::Mode::Read) &&
+				if (access_changed && mode == VirtualMemory::Mode::Read) {
+					// Re-protecting would erase the written state of earlier stores to these
+					// still-watched pages; hand them to the next scan first.
+					KeepAsyncWritesUnlocked(start, bytes);
+				}
+				return ProtectWritesUnlocked(start, bytes, mode == VirtualMemory::Mode::Read) &&
 				       (!access_changed ||
 				        VirtualMemory::Protect(start, bytes, VirtualMemory::Mode::ReadWrite));
 			};
@@ -512,6 +681,184 @@ public:
 #endif
 		return VirtualMemory::Protect(vaddr, size, mode);
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	static constexpr uint64_t ASYNC_CHUNK_BITS  = 21; // 2 MiB
+	static constexpr uint64_t ASYNC_CHUNK_SIZE  = uint64_t {1} << ASYNC_CHUNK_BITS;
+	static constexpr uint64_t ASYNC_CHUNK_LIMIT = uint64_t {1} << 40u; // lower guest range
+	static constexpr size_t   ASYNC_CHUNK_COUNT = ASYNC_CHUNK_LIMIT >> ASYNC_CHUNK_BITS;
+
+	[[nodiscard]] bool AsyncWriteProtection() const { return m_write_protection.AsyncEnabled(); }
+
+	// Lock-free: flags only change on the GPU thread, which is the only caller.
+	[[nodiscard]] bool IsAsync(uint64_t vaddr, uint64_t size) const noexcept {
+		if (m_async_count.load(std::memory_order_relaxed) == 0 || size == 0) {
+			return false;
+		}
+		const auto last = (vaddr + size - 1) >> ASYNC_CHUNK_BITS;
+		for (auto chunk = vaddr >> ASYNC_CHUNK_BITS; chunk <= last && chunk < ASYNC_CHUNK_COUNT;
+		     chunk++) {
+			if (m_async_chunks[chunk].load(std::memory_order_relaxed) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Moves the write-protected views of a 2 MiB chunk to asynchronous write protection. The
+	// next ScanAsyncWrites reports all of its pages as written, which covers writes that land
+	// while the chunk changes context.
+	bool PromoteChunk(uint64_t chunk) {
+		if (!m_write_protection.AsyncEnabled() || chunk >= ASYNC_CHUNK_COUNT) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		if (m_async_chunks[chunk].load(std::memory_order_relaxed) != 0) {
+			return false;
+		}
+		const auto begin = chunk << ASYNC_CHUNK_BITS;
+		const auto end   = begin + ASYNC_CHUNK_SIZE;
+		bool       moved = false;
+		// KYTY_ASYNC_WP_DRYRUN: track the chunk as if asynchronous but keep its views synchronous
+		// (to check KYTY_ASYNC_WP_VERIFY itself against the faulting path).
+		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		ForEachSparseRange(
+		    m_maps, begin, ASYNC_CHUNK_SIZE,
+		    [&](const MapEntry& entry, uint64_t start, uint64_t bytes) {
+			    if (entry.write_protected) {
+				    moved = dry_run || m_write_protection.MakeAsync(start, bytes) || moved;
+			    }
+		    },
+		    [](uint64_t, uint64_t) {});
+		(void)end;
+		if (!moved) {
+			return false;
+		}
+		// Published under the unique lock: protections and new views route by this flag.
+		m_async_chunks[chunk].store(1, std::memory_order_relaxed);
+		m_async_count.fetch_add(1, std::memory_order_relaxed);
+		m_async_list.insert(std::upper_bound(m_async_list.begin(), m_async_list.end(), chunk),
+		                    chunk);
+		return true;
+	}
+
+	// Whether one page lies in a write-protected view of an asynchronous chunk (so its guest
+	// stores leave a mark PAGEMAP_SCAN reports).
+	[[nodiscard]] bool AsyncPageTrackedUnlocked(uint64_t page) const {
+		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		if (dry_run || !IsAsync(page, 0x1000)) {
+			return false;
+		}
+		bool tracked = true;
+		ForEachSparseRange(
+		    m_maps, page, 0x1000,
+		    [&](const MapEntry& entry, uint64_t, uint64_t) { tracked = tracked && entry.write_protected; },
+		    [&](uint64_t, uint64_t) { tracked = false; });
+		return tracked;
+	}
+
+	// Write-protects one asynchronously tracked page now (false if it is not one) and returns
+	// a token for AsyncPageUntouched. Stores found on it go to the next ScanAsyncWrites.
+	bool ProtectAsyncPage(uint64_t page, uint64_t& token) {
+		std::shared_lock lock(m_mutex);
+		if (!AsyncPageTrackedUnlocked(page)) {
+			return false;
+		}
+		std::lock_guard kept_lock(m_kept_mutex);
+		// A store through another guest view of the same bytes leaves this view's page clean,
+		// so no proof for aliased pages. (A later alias advances the remap generation.)
+		const auto generation = g_remap_generation.load(std::memory_order_relaxed);
+		auto&      alias      = m_alias_memo[(page >> 12u) % m_alias_memo.size()];
+		if (alias.page != page || alias.generation != generation) {
+			alias = {page, generation, AliasedUnlocked(page)};
+		}
+		if (alias.aliased) {
+			return false;
+		}
+		m_write_protection.Scan(page, 0x1000, [&](uint64_t begin, uint64_t end) {
+			HideWritesLocked(begin, end, true);
+		});
+		token = PageTokenLocked(page);
+		return true;
+	}
+
+	// Whether no guest view has stored to the page since ProtectAsyncPage gave the token.
+	[[nodiscard]] bool AsyncPageUntouched(uint64_t page, uint64_t token) {
+		std::shared_lock lock(m_mutex);
+		if (!AsyncPageTrackedUnlocked(page)) {
+			return false;
+		}
+		// Held across both checks: a re-protection between them would hide a store.
+		std::lock_guard kept_lock(m_kept_mutex);
+		const auto&     slot = m_page_seq[(page >> 12u) % m_page_seq.size()];
+		if (slot.page != page || slot.seq != token || token <= m_seq_floor) {
+			return false;
+		}
+		bool written = false;
+		m_write_protection.Scan(page, 0x1000, [&](uint64_t, uint64_t) { written = true; }, false);
+		return !written;
+	}
+
+	// KYTY_ASYNC_WP_VERIFY: pages written since the last ScanAsyncWrites, without consuming them.
+	void PeekAsyncWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
+		std::shared_lock lock(m_mutex);
+		for (const auto chunk: m_async_list) {
+			m_write_protection.Scan(
+			    chunk << ASYNC_CHUNK_BITS, ASYNC_CHUNK_SIZE,
+			    [&](uint64_t begin, uint64_t end) { written.emplace_back(begin, end); }, false);
+		}
+	}
+
+	void AsyncRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+		std::shared_lock lock(m_mutex);
+		for (const auto chunk: m_async_list) {
+			ranges.emplace_back(chunk << ASYNC_CHUNK_BITS, (chunk + 1) << ASYNC_CHUNK_BITS);
+		}
+	}
+
+	[[nodiscard]] size_t AsyncChunkCount() {
+		std::shared_lock lock(m_mutex);
+		return m_async_list.size();
+	}
+
+	// Appends the page runs of asynchronous chunks written since the last scan, and
+	// re-protects them. The caller handles them after the lock is released. Chunks the filter
+	// rejects (nothing there needs its writes) are left as they are: a page that gains a write
+	// watcher is write-protected then, so stores before that need no report.
+	void ScanAsyncWrites(std::vector<std::pair<uint64_t, uint64_t>>& written,
+	                     bool (*wanted)(uint64_t begin, uint64_t end) = nullptr) {
+		std::shared_lock lock(m_mutex);
+		{
+			std::lock_guard kept_lock(m_kept_mutex);
+			written.insert(written.end(), m_kept_writes.begin(), m_kept_writes.end());
+			m_kept_writes.clear();
+		}
+		const auto want = [&](uint64_t chunk) {
+			return wanted == nullptr ||
+			       wanted(chunk << ASYNC_CHUNK_BITS, (chunk + 1) << ASYNC_CHUNK_BITS);
+		};
+		for (size_t i = 0; i < m_async_list.size();) {
+			auto first = m_async_list[i];
+			if (!want(first)) {
+				i++;
+				continue;
+			}
+			auto last = first;
+			while (++i < m_async_list.size() && m_async_list[i] == last + 1 && want(last + 1)) {
+				last++;
+			}
+			m_write_protection.Scan(first << ASYNC_CHUNK_BITS,
+			                        (last - first + 1) << ASYNC_CHUNK_BITS,
+			                        [&](uint64_t begin, uint64_t end) {
+				                        if (!written.empty() && written.back().second == begin) {
+					                        written.back().second = end;
+				                        } else {
+					                        written.emplace_back(begin, end);
+				                        }
+			                        });
+		}
+	}
+#endif
 
 	bool Contains(uint64_t vaddr, uint64_t size) {
 		std::shared_lock lock(m_mutex);
@@ -538,6 +885,109 @@ private:
 		// Registered for userfaultfd write protection; watches on other views use mprotect.
 		bool write_protected = false;
 	};
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	template <typename Func>
+	void ForEachAsyncChunk(uint64_t vaddr, uint64_t size, Func&& func) const {
+		if (m_async_list.empty()) {
+			return;
+		}
+		const auto end = vaddr + size;
+		for (auto start = vaddr; start < end;) {
+			const auto chunk = start >> ASYNC_CHUNK_BITS;
+			const auto stop  = std::min(end, (chunk + 1) << ASYNC_CHUNK_BITS);
+			if (chunk < ASYNC_CHUNK_COUNT && m_async_chunks[chunk].load(std::memory_order_relaxed) != 0) {
+				func(start, stop - start);
+			}
+			start = stop;
+		}
+	}
+
+	// Under m_kept_mutex: [begin, end) was written and is write-protected again; report keeps it
+	// for the next ScanAsyncWrites.
+	void HideWritesLocked(uint64_t begin, uint64_t end, bool report) const {
+		if (report) {
+			m_kept_writes.emplace_back(begin, end);
+		}
+		if (end - begin > 64 * 0x1000) {
+			m_seq_floor = ++m_seq;
+			return;
+		}
+		for (auto page = begin; page < end; page += 0x1000) {
+			m_page_seq[(page >> 12u) % m_page_seq.size()] = {page, ++m_seq};
+		}
+	}
+
+	// Whether another view maps the bytes behind this page (under m_mutex).
+	[[nodiscard]] bool AliasedUnlocked(uint64_t page) const {
+		auto it = m_maps.upper_bound(page);
+		if (it == m_maps.begin()) {
+			return true;
+		}
+		--it;
+		const auto& self = it->second;
+		if (page < self.vaddr || page + 0x1000 > self.vaddr + self.size) {
+			return true;
+		}
+		const auto offset = self.backing_offset + (page - self.vaddr);
+		for (const auto& [_, entry]: m_maps) {
+			if (&entry != &self && entry.backing_offset < offset + 0x1000 &&
+			    offset < entry.backing_offset + entry.size) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Under m_kept_mutex: the page's current token.
+	uint64_t PageTokenLocked(uint64_t page) const {
+		auto& slot = m_page_seq[(page >> 12u) % m_page_seq.size()];
+		if (slot.page != page || slot.seq <= m_seq_floor) {
+			slot = {page, ++m_seq};
+		}
+		return slot.seq;
+	}
+
+	void KeepAsyncWritesUnlocked(uint64_t vaddr, uint64_t size) const {
+		ForEachAsyncChunk(vaddr, size, [&](uint64_t start, uint64_t bytes) {
+			std::lock_guard lock(m_kept_mutex);
+			m_write_protection.Scan(start, bytes, [&](uint64_t begin, uint64_t end) {
+				HideWritesLocked(begin, end, true);
+			});
+		});
+	}
+
+	// uffd write protection of a registered view range, split by context.
+	bool ProtectWritesUnlocked(uint64_t vaddr, uint64_t size, bool write_protect) const {
+		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		if (m_async_list.empty() || dry_run) {
+			return m_write_protection.Protect(vaddr, size, write_protect);
+		}
+		const auto end = vaddr + size;
+		for (auto start = vaddr; start < end;) {
+			const auto chunk = start >> ASYNC_CHUNK_BITS;
+			const auto stop  = std::min(end, (chunk + 1) << ASYNC_CHUNK_BITS);
+			const bool async = chunk < ASYNC_CHUNK_COUNT &&
+			                   m_async_chunks[chunk].load(std::memory_order_relaxed) != 0;
+			// In an asynchronous chunk a page stays write-protected after its last watcher leaves:
+			// a store there costs no signal, and the protection keeps "not written since" provable
+			// (RenderContext::IsCpLabel).
+			if (async && write_protect) {
+				// Re-protecting would erase written state: the range can include pages already
+				// watched (the page manager batches across them), so their stores are kept for
+				// the next collection, and page tokens advance.
+				std::lock_guard kept_lock(m_kept_mutex);
+				m_write_protection.Scan(start, stop - start, [&](uint64_t begin, uint64_t end) {
+					HideWritesLocked(begin, end, true);
+				});
+			} else if (!async && !m_write_protection.Protect(start, stop - start, write_protect, async)) {
+				return false;
+			}
+			start = stop;
+		}
+		return true;
+	}
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	void RemoveMappingsUnlocked(uint64_t vaddr, uint64_t size) {
@@ -666,6 +1116,15 @@ private:
 		}
 #if !defined(__APPLE__)
 		*write_protected = m_write_protection.Enabled() && m_write_protection.Register(vaddr, size);
+		if (*write_protected) {
+			static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+			ForEachAsyncChunk(vaddr, size, [&](uint64_t start, uint64_t bytes) {
+				// MakeAsync succeeds or stops the emulator: a failed move would lose protection.
+				if (!dry_run) {
+					(void)m_write_protection.MakeAsync(start, bytes);
+				}
+			});
+		}
 #else
 		*write_protected = false;
 #endif
@@ -682,6 +1141,30 @@ private:
 	int m_fd = -1;
 #if !defined(__APPLE__)
 	GuestWriteProtection m_write_protection;
+	// Chunks under asynchronous write protection; written under the unique lock.
+	std::unique_ptr<std::atomic<uint8_t>[]> m_async_chunks =
+	    std::make_unique<std::atomic<uint8_t>[]>(ASYNC_CHUNK_COUNT);
+	std::vector<uint64_t> m_async_list;
+	std::atomic<size_t>   m_async_count {0};
+	// Writes found before a re-protection, reported by the next ScanAsyncWrites.
+	mutable std::mutex                                 m_kept_mutex;
+	mutable std::vector<std::pair<uint64_t, uint64_t>> m_kept_writes;
+	// Per-page sequence numbers (by hash, under m_kept_mutex) that advance whenever a page's
+	// written state is cleared outside ScanAsyncWrites: such a re-protection hides a store from
+	// a later "written since?" check, so it voids the page's tokens (AsyncPageUntouched).
+	struct PageSeq {
+		uint64_t page = 0;
+		uint64_t seq  = 0;
+	};
+	mutable std::array<PageSeq, 4096> m_page_seq {};
+	mutable uint64_t                  m_seq       = 0;
+	mutable uint64_t                  m_seq_floor = 0; // tokens at or below are void
+	struct AliasMemo {
+		uint64_t page       = 0;
+		uint64_t generation = 0;
+		bool     aliased    = true;
+	};
+	std::array<AliasMemo, 1024> m_alias_memo {}; // under m_kept_mutex
 #endif
 #endif
 
@@ -777,6 +1260,14 @@ public:
 		return true;
 	}
 
+	bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->StoreLabel(vaddr, value, size);
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
@@ -813,6 +1304,10 @@ public:
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	[[nodiscard]] GuestBackingStore& Backing() { return *m_backing; }
+#endif
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);

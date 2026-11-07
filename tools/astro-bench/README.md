@@ -8,13 +8,17 @@ Requirements: Linux, `python-evdev`, write access to `/dev/uinput` (uaccess), th
 the Gorilla Nebula (copy one with `setup-install.sh`).
 
 ```bash
-python3 -I tools/astro-bench/vpad.py &          # virtual X360 pad on /tmp/vpad.fifo (leave running)
+[ -p /tmp/vpad.fifo ] || python3 -I tools/astro-bench/vpad.py &  # virtual X360 pad (shared, leave running)
 tools/astro-bench/setup-install.sh              # once per build dir: save data + warm shader cache
 tools/astro-bench/garden.sh mylabel --amd-cpu   # one run → "mylabel: fps=… draws/frame=… …"
 printf '%s\n' "a1 -- --amd-cpu" "b1 KYTY_NO_PIN=1 -- --amd-cpu" | tools/astro-bench/batch.sh
 cat /tmp/bench-batch.txt                        # batch results (logs: /tmp/bench-<label>.log)
-echo quit > /tmp/vpad.fifo                      # remove the virtual pad when done
 ```
+
+The pad is shared by every agent on the machine: don't send it `quit`. Always pass `--amd-cpu`;
+without it ~1.7M SIGILL/s drop Sky Garden to ~10 FPS. `run.sh` starts
+`_Build/linux/install/kyty_emulator`, not the freshly linked one: after each build, install or
+copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures the old binary.
 
 - `run.sh` — launches the emulator windowed (1920×1080), muted, DualSense hidden, `KYTY_PERF_LOG=1`.
 - `garden.sh <label> [flags]` — boot → title → save 1 → Gorilla Nebula → Sky Garden (Dive In is a

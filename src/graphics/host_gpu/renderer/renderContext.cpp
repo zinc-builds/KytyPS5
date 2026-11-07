@@ -11,12 +11,20 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstring>
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
 namespace {
 RenderContext* g_shader_reader_context = nullptr;
+void           NoteVerifyInvalidated(uint64_t vaddr, uint64_t size);
 } // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
@@ -106,7 +114,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		                 ? (gpu ? MemDiag::WriteFaultsGpuThread : MemDiag::WriteFaultsOther)
 		                 : (gpu ? MemDiag::ReadFaultsGpuThread : MemDiag::ReadFaultsOther));
 	}
+	if (MemDiag::Traced(fault_vaddr, 1)) {
+		MemDiag::Trace(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr, 1);
+	}
 	if (access == PageFaultAccess::Write) {
+		NoteVerifyInvalidated(fault_vaddr & ~(TRACKER_PAGE_SIZE - 1), TRACKER_PAGE_SIZE);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
@@ -116,10 +128,30 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+namespace {
+// KYTY_ASYNC_WP_VERIFY: ranges invalidated between two scans; their snapshots are void.
+std::mutex                                 g_verify_mutex;
+std::unordered_map<uint64_t, uint64_t>     g_verify_gpu_writes;   // page -> count, all time
+std::unordered_map<uint64_t, uint64_t>     g_verify_alias_writes; // page -> count, all time
+std::vector<std::pair<uint64_t, uint64_t>> g_verify_invalidated;
+
+void NoteVerifyInvalidated(uint64_t vaddr, uint64_t size) {
+	if (MemDiag::Traced(vaddr, size)) {
+		MemDiag::Trace("invalidate", vaddr, size);
+	}
+	static const bool verify = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+	if (verify) {
+		std::lock_guard lock(g_verify_mutex);
+		g_verify_invalidated.emplace_back(vaddr, vaddr + size);
+	}
+}
+} // namespace
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	NoteVerifyInvalidated(vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_image_heap.InvalidateMemory(vaddr, size);
@@ -170,6 +202,198 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+// KYTY_ASYNC_WP_VERIFY=1: every write-watched page of an asynchronous range must keep its
+// bytes until a scan reports it written. Every 8th scan snapshots those pages after handling
+// the scan; the next scan compares them before handling its own reports. Stores through the
+// backing alias (downloads, zeroing) change bytes without a fault in any mode and are skipped.
+void RenderContext::VerifyNoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (MemDiag::Traced(vaddr, size)) {
+		MemDiag::Trace("gpu-thread-store", vaddr, size);
+	}
+	static const bool enabled = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+	if (enabled && size != 0) {
+		for (auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < vaddr + size; page += TRACKER_PAGE_SIZE) {
+			g_verify_gpu_writes[page]++;
+		}
+	}
+}
+
+void RenderContext::VerifyAsyncWrites(const std::vector<std::pair<uint64_t, uint64_t>>& written,
+                                      bool before_handling) {
+	static const bool enabled = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static std::unordered_map<uint64_t, uint64_t> snapshots;
+	static uint64_t                               scans   = 0;
+	static uint64_t                               checked = 0;
+	static uint64_t                               lost    = 0;
+	const auto inside = [](const std::vector<std::pair<uint64_t, uint64_t>>& runs, uint64_t page) {
+		return std::any_of(runs.begin(), runs.end(), [&](const auto& run) {
+			return page + TRACKER_PAGE_SIZE > run.first && page < run.second;
+		});
+	};
+	static std::array<uint8_t, TRACKER_PAGE_SIZE> bytes;
+	// Read the pages before taking the logs: a store that changed the bytes read here was
+	// logged (fault, invalidation, alias store) or marked written before the read.
+	std::vector<std::pair<uint64_t, uint64_t>> changed; // page, current hash
+	if (before_handling) {
+		for (const auto& [page, hash]: snapshots) {
+			if (LibKernel::Memory::TryReadBacking(page, bytes.data(), bytes.size())) {
+				checked++;
+				const auto now = XXH3_64bits(bytes.data(), bytes.size());
+				if (MemDiag::Traced(page, TRACKER_PAGE_SIZE)) {
+					MemDiag::Trace("compare", page, TRACKER_PAGE_SIZE, now);
+				}
+				if (now != hash) {
+					changed.emplace_back(page, now);
+				}
+			}
+		}
+		snapshots.clear();
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> alias;
+	LibKernel::Memory::TakeAliasWrites(alias);
+	for (const auto& [begin, end]: alias) {
+		for (auto page = begin & ~(TRACKER_PAGE_SIZE - 1); page < end; page += TRACKER_PAGE_SIZE) {
+			g_verify_alias_writes[page]++;
+		}
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> invalidated;
+	{
+		std::lock_guard lock(g_verify_mutex);
+		invalidated.swap(g_verify_invalidated);
+	}
+	std::vector<uint64_t> unwatched_pages;
+	PageManager::TakeVerifyUnwatched(unwatched_pages);
+	for (const auto page: unwatched_pages) {
+		invalidated.emplace_back(page, page + TRACKER_PAGE_SIZE);
+	}
+	if (before_handling) {
+		std::vector<std::pair<uint64_t, uint64_t>> late;
+		if (!changed.empty()) {
+			LibKernel::Memory::PeekAsyncGuestWrites(late);
+		}
+		for (const auto& [page, now]: changed) {
+			if (inside(written, page) || inside(alias, page) || inside(invalidated, page) ||
+			    inside(late, page)) {
+				continue;
+			}
+			if (lost++ < 64) {
+				std::vector<std::pair<uint64_t, uint64_t>> still;
+				m_page_manager.AppendWriteWatched(page, page + TRACKER_PAGE_SIZE, still);
+				std::printf("ASYNCWPVERIFY lost write: page=0x%llx async=%d mapped=%d watched=%d "
+				            "gpu_writes=%llu alias_writes=%llu\n",
+				            static_cast<unsigned long long>(page),
+				            LibKernel::Memory::IsAsyncWriteTracked(page, TRACKER_PAGE_SIZE) ? 1 : 0,
+				            IsMapped(page, TRACKER_PAGE_SIZE) ? 1 : 0, still.empty() ? 0 : 1,
+				            static_cast<unsigned long long>(g_verify_gpu_writes[page]),
+				            static_cast<unsigned long long>(g_verify_alias_writes[page]));
+			}
+		}
+		return;
+	}
+	if ((scans++ % 8) != 0) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> watched;
+	LibKernel::Memory::AsyncGuestRanges(ranges);
+	for (const auto& [begin, end]: ranges) {
+		m_page_manager.AppendWriteWatched(begin, end, watched);
+	}
+	for (const auto& [begin, end]: watched) {
+		for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			if (LibKernel::Memory::TryReadBacking(page, bytes.data(), bytes.size())) {
+				snapshots[page] = XXH3_64bits(bytes.data(), bytes.size());
+				if (MemDiag::Traced(page, TRACKER_PAGE_SIZE)) {
+					MemDiag::Trace("snapshot", page, TRACKER_PAGE_SIZE, snapshots[page]);
+				}
+			}
+		}
+	}
+	static auto last = std::chrono::steady_clock::now();
+	if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(1)) {
+		last = std::chrono::steady_clock::now();
+		std::printf("ASYNCWPVERIFY checked=%llu lost=%llu watched_pages=%zu\n",
+		            static_cast<unsigned long long>(checked), static_cast<unsigned long long>(lost),
+		            snapshots.size());
+		std::fflush(stdout);
+	}
+}
+
+void RenderContext::CollectAsyncWrites() {
+	m_async_collect_requested = false;
+	static std::vector<std::pair<uint64_t, uint64_t>> written;
+	static std::vector<std::pair<uint64_t, uint64_t>> watched;
+	written.clear();
+	// Chunks without write watchers need no scan (their writes invalidate nothing).
+	static const PageManager* pages = nullptr;
+	pages = &m_page_manager;
+	LibKernel::Memory::CollectAsyncGuestWrites(written, [](uint64_t begin, uint64_t end) {
+		return pages->HasWriteWatched(begin, end);
+	});
+	if (written.empty()) {
+		VerifyAsyncWrites(written, true);
+		VerifyAsyncWrites(written, false);
+		return;
+	}
+	KYTY_PROFILER_BLOCK("CollectAsyncWrites");
+	watched.clear();
+	for (const auto& [begin, end]: written) {
+		m_page_manager.AppendWriteWatched(begin, end, watched);
+	}
+	MemDiag::Add(MemDiag::AsyncWrittenPages, [&] {
+		uint64_t pages = 0;
+		for (const auto& [begin, end]: written) {
+			pages += (end - begin) / TRACKER_PAGE_SIZE;
+		}
+		return pages;
+	}());
+	VerifyAsyncWrites(written, true);
+	for (const auto& [begin, end]: watched) {
+		// The same work as a write fault on each page (HandleFault).
+		MemDiag::Add(MemDiag::AsyncInvalidatedPages, (end - begin) / TRACKER_PAGE_SIZE);
+		if (IsMapped(begin, end - begin)) {
+			(void)InvalidateMemory(begin, end - begin);
+			continue;
+		}
+		for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			(void)InvalidateMemory(page, TRACKER_PAGE_SIZE);
+		}
+	}
+	VerifyAsyncWrites(written, false);
+}
+
+bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size,
+                                 bool invalidate) {
+	const auto page = vaddr & ~uint64_t {0xfff};
+	if (size == 0 || size > sizeof(uint64_t) || ((vaddr + size - 1) & ~uint64_t {0xfff}) != page) {
+		return false;
+	}
+	// Read first: a remap after this read voids the label.
+	const auto generation = LibKernel::Memory::GuestRemapGeneration();
+	uint64_t   token      = 0;
+	if (!LibKernel::Memory::ProtectAsyncGuestPage(page, token)) {
+		LibKernel::Memory::RequestAsyncWriteTracking(vaddr);
+		return false;
+	}
+	uint64_t stored = 0;
+	std::memcpy(&stored, value, size);
+	if (!LibKernel::Memory::TryStoreLabelBacking(vaddr, stored, size)) {
+		return false;
+	}
+	if (invalidate) {
+		(void)InvalidateMemory(vaddr, size);
+	}
+	m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()] = {vaddr, stored, size, generation, token};
+	if (size == sizeof(uint64_t)) {
+		m_cp_labels[((vaddr + 4) >> 2u) % m_cp_labels.size()] = {vaddr + 4, stored >> 32u, 4,
+		                                                           generation, token};
+	}
+	return true;
 }
 
 void RenderContext::PrepareBda() {

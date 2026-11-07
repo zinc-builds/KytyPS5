@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <execinfo.h>
 #include <mutex>
 #include <unordered_map>
@@ -128,6 +129,7 @@ namespace {
 void ReportFaultChunks();
 } // namespace
 
+
 void MaybePrint() noexcept {
 	using Clock = std::chrono::steady_clock;
 	static Clock::time_point last = Clock::now();
@@ -166,6 +168,13 @@ void MaybePrint() noexcept {
 	            r(WatchWritePages), r(UnwatchWritePages), r(WatchReadPages), r(UnwatchReadPages),
 	            r(WriteFaultsGpuThread), r(WriteFaultsOther), r(ReadFaultsGpuThread),
 	            r(ReadFaultsOther), r(LabelEpochs), r(Submits));
+	std::printf(" wait_collections_s=%.0f wait_on_cp_label_s=%.0f", r(WaitCollections),
+	            r(WaitOnCpLabel));
+	std::printf(" async_written_pages_s=%.0f async_invalidated_pages_s=%.0f async_scans_s=%.0f "
+	            "async_scan_us=%.1f async_chunks=%.0f",
+	            r(AsyncWrittenPages), r(AsyncInvalidatedPages), r(AsyncScans),
+	            v[AsyncScans] != 0 ? static_cast<double>(v[AsyncScanNs]) / 1000.0 / static_cast<double>(v[AsyncScans]) : 0.0,
+	            v[AsyncScans] != 0 ? static_cast<double>(v[AsyncChunks]) / static_cast<double>(v[AsyncScans]) : 0.0);
 	if (g_report_hook != nullptr) {
 		g_report_hook();
 	}
@@ -926,6 +935,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		m_scheduler.Context().NoteGpuWrite(vaddr, size);
 		return;
 	}
 
@@ -951,6 +961,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		m_scheduler.Context().NoteGpuWrite(dst_vaddr, size);
 		return;
 	}
 
