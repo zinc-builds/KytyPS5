@@ -45,8 +45,39 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Draws construct only the color attachments and vertex stages they use; texture bindings copied once (Track B1′ step 1; same batch: ref `dev` 05ffc8b5 25.90 / 25.91; 7.06 → 6.71 µs/draw) | 27.40 / 27.55 | 148.8k / 149.1k | 52.6 (max 83.2) | 19.5 |
 | 2026-11-07 | Shader-map lookups cached per thread; vertex tables copied without zeroing (Track B1′ step 3a; 4 pairs, same batch: ref `dev` 07379452 27.37 / 28.27 / 28.10 / 28.04; +0.5% on runs 2–4, 6.60 → 6.56 µs/draw) | 27.96 / 28.41 / 28.23 / 28.22 | 151.6k / 153.0k / 152.1k / 152.1k | 51.5 (max 67.8) | 19.4 |
 | 2026-11-07 | Vertex shaders stop predicating every instruction on an always-set EXEC bit (Track G; same batch: ref `dev` a456fbcb 27.61 / 27.62; GPU 16.97 → 16.13 ms/frame, in passes 9.78 → 8.91) | 28.09 / 28.68 | 152.2k / 154.4k | 50.8 (max 99.9) | 19.8 |
+| 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
+
+## Benchmark route (2026-11-07)
+
+`garden.sh` used to drive the menus with the virtual pad: boot, title, save slot 1, galaxy map,
+Gorilla Nebula, fly to Sky Garden, dive in. That took ~55 s to `StartLevel aerial_garden`
+(boot → title ~7 s, title → galaxy map 14 s, galaxy-map flight 31 s) and sometimes needed nudges.
+
+The dump is a developer build (`debuginfo.txt`: Asobi autobuild 2026-05-07). At boot the game
+reads its arguments from `/app0/args.txt`:
+`-package -sequence product -mode product -odxBinary -perfDisplay false -debugDisplay false -debugInput false`.
+`ProductNextSequence` also takes `-lvl <level>`, which sets the next level and enters state 7
+(level start), skipping the title and galaxy map. It also takes `-worldmap`, `-title`,
+`-skipIntro`, `-showLogo`, `-finalStage` and `-intent <x>`. Registered sequences: `product`
+(ProductNextSequence), `drs` (DebugLaunchSequence), `main` (GameMain), `demo` (ASOBI HAPTICS DEMO).
+
+`KYTY_APP0_OVERLAY=<dir>` makes files in `<dir>` replace `/app0` files of the same path.
+`garden.sh` writes a temporary `args.txt` with `-lvl aerial_garden` added. The level starts
+~14 s after launch, and a whole run takes ~90 s instead of ~133 s. It needs no vpad or save.
+
+Same binary, same batch, two runs each (warm-up run first):
+
+| Route | FPS | draws/frame | worst_ms | low1 |
+|---|---|---|---|---|
+| `lvl` | 27.89 / 28.24 | 5447 / 5454 | 50.1 / 52.0 | 19.9 / 19.0 |
+| `menu` | 27.36 / 27.94 | 5472 / 5429 | 50.8 / 50.9 | 19.7 / 19.5 |
+
+The scene is the same (draws/frame match, same opening flight). `lvl` reads 0.4 FPS higher on
+average, which is about the run-to-run spread (0.35 and 0.58 within each route) but above the
+±0.3 bar. So the progress table marks the route change, and A/B pairs must use one route.
+`GARDEN_ROUTE=menu` keeps the old route.
 
 ## The bottleneck now
 
