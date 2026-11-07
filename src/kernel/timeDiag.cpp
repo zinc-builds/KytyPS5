@@ -42,8 +42,10 @@ struct State {
 	std::mutex mutex;
 	// (source, caller) -> calls since the last report.
 	std::unordered_map<uint64_t, uint64_t> callers;
-	std::unordered_map<int, uint64_t>      flip_modes; // (mode << 8 | rate) -> count
-	int64_t                                last_flip_arg = 0;
+	// Call site -> "module+offset", resolved once by the calling guest thread (see RecordCaller).
+	std::unordered_map<uint64_t, std::string> sites;
+	std::unordered_map<int, uint64_t>         flip_modes; // (mode << 8 | rate) -> count
+	int64_t                                   last_flip_arg = 0;
 	// Flips that reached the screen since the last report: wall interval and vblank interval.
 	std::vector<double>   flip_ms;
 	std::vector<uint64_t> flip_vblanks;
@@ -51,20 +53,15 @@ struct State {
 	uint64_t              last_flip_vblank = 0;
 };
 
+// Process lifetime: the detached reporter may still run during static destruction.
 State& GetState() {
-	static State state;
-	return state;
+	static auto* state = new State;
+	return *state;
 }
 
 uint64_t CallerKey(Source source, const void* caller) {
 	return (reinterpret_cast<uint64_t>(caller) & 0x00ff'ffff'ffff'ffffull) |
 	       (static_cast<uint64_t>(source) << 56u);
-}
-
-void RecordCaller(Source source, const void* caller) {
-	auto&            s = GetState();
-	std::scoped_lock lock(s.mutex);
-	s.callers[CallerKey(source, caller)]++;
 }
 
 std::string DescribeAddress(uint64_t addr) {
@@ -81,7 +78,7 @@ std::string DescribeAddress(uint64_t addr) {
 	return buf;
 }
 
-// KYTY_TIME_DIAG=dump: writes the guest code around a call site once, to
+// KYTY_TIME_DIAG=dump: writes the guest code around a call site to
 // /tmp/timediag-<module offset>.bin (1 KiB before the return address and 1 KiB after), for
 // offline disassembly.
 void DumpCode(uint64_t addr) {
@@ -89,11 +86,9 @@ void DumpCode(uint64_t addr) {
 		const char* mode = std::getenv("KYTY_TIME_DIAG");
 		return mode != nullptr && std::string_view(mode) == "dump";
 	}();
-	static std::unordered_map<uint64_t, bool> dumped;
-	if (!enabled || dumped[addr]) {
+	if (!enabled) {
 		return;
 	}
-	dumped[addr]  = true;
 	auto* linker  = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	auto* program = linker->FindProgramByAddr(addr);
 	if (program == nullptr || addr - program->base_vaddr < 1024 ||
@@ -108,6 +103,25 @@ void DumpCode(uint64_t addr) {
 	}
 }
 
+// The first call from a site resolves it, on the calling guest thread: the caller's module is
+// executing, so it can't be unloaded while FindProgramByAddr's result and its code are used.
+void RecordCaller(Source source, const void* caller) {
+	auto&      s     = GetState();
+	const auto addr  = reinterpret_cast<uint64_t>(caller);
+	bool       known = false;
+	{
+		std::scoped_lock lock(s.mutex);
+		s.callers[CallerKey(source, caller)]++;
+		known = s.sites.contains(addr);
+	}
+	if (!known) {
+		auto name = DescribeAddress(addr);
+		DumpCode(addr);
+		std::scoped_lock lock(s.mutex);
+		s.sites.try_emplace(addr, std::move(name));
+	}
+}
+
 template <typename T>
 T Percentile(std::vector<T> v, int pct) {
 	if (v.empty()) {
@@ -116,6 +130,15 @@ T Percentile(std::vector<T> v, int pct) {
 	const auto at = v.begin() + static_cast<ptrdiff_t>((v.size() - 1) * pct / 100);
 	std::nth_element(v.begin(), at, v.end());
 	return *at;
+}
+
+std::string SiteName(const std::unordered_map<uint64_t, std::string>& sites, uint64_t addr) {
+	if (auto it = sites.find(addr); it != sites.end()) {
+		return it->second;
+	}
+	char buf[32];
+	std::snprintf(buf, sizeof(buf), "0x%" PRIx64, addr);
+	return buf;
 }
 
 void Report(double seconds) {
@@ -138,6 +161,7 @@ void Report(double seconds) {
 	const auto flips_gpu = s.flips_gpu.exchange(0, std::memory_order_relaxed);
 
 	std::vector<std::pair<uint64_t, uint64_t>> callers;
+	std::unordered_map<uint64_t, std::string>  sites;
 	std::unordered_map<int, uint64_t>          modes;
 	std::vector<double>                        flip_ms;
 	std::vector<uint64_t>                      flip_vblanks;
@@ -146,6 +170,7 @@ void Report(double seconds) {
 		std::scoped_lock lock(s.mutex);
 		callers.assign(s.callers.begin(), s.callers.end());
 		s.callers.clear();
+		sites = s.sites;
 		modes.swap(s.flip_modes);
 		flip_ms.swap(s.flip_ms);
 		flip_vblanks.swap(s.flip_vblanks);
@@ -195,7 +220,7 @@ void Report(double seconds) {
 	for (size_t i = 0; i < std::min<size_t>(callers.size(), 8); i++) {
 		const auto [key, count] = callers[i];
 		line += " " + std::string(SOURCE_NAMES[key >> 56u]) + "@" +
-		        DescribeAddress(key & 0x00ff'ffff'ffff'ffffull) + "=" +
+		        SiteName(sites, key & 0x00ff'ffff'ffff'ffffull) + "=" +
 		        std::to_string(static_cast<uint64_t>(static_cast<double>(count) / seconds));
 	}
 	// Sites read about once or a few times per flip: the candidates for the game's frame delta.
@@ -208,8 +233,7 @@ void Report(double seconds) {
 				char buf[24];
 				std::snprintf(buf, sizeof(buf), "=%.2f", per_flip);
 				line += " " + std::string(SOURCE_NAMES[key >> 56u]) + "@" +
-				        DescribeAddress(key & 0x00ff'ffff'ffff'ffffull) + buf;
-				DumpCode(key & 0x00ff'ffff'ffff'ffffull);
+				        SiteName(sites, key & 0x00ff'ffff'ffff'ffffull) + buf;
 			}
 		}
 	}

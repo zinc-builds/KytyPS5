@@ -731,8 +731,8 @@ What this means:
 - `KYTY_TIME_DIAG=1`: one `TIMEDIAG` line per second: vblanks, flips on screen with their interval
   in ms and in vblanks (`flip_vbl`, the real-speed check), flip modes, the game's clock and
   video-out calls per second with their top call sites (`eboot.bin+0x…`), and the sites read
-  about once per flip (`per_flip:`). `KYTY_TIME_DIAG=dump` also writes the code around those
-  sites to `/tmp/timediag-<offset>.bin` (disassemble with `objdump -D -b binary -mi386:x86-64
+  about once per flip (`per_flip:`). `KYTY_TIME_DIAG=dump` also writes the code around every
+  call site to `/tmp/timediag-<offset>.bin` (disassemble with `objdump -D -b binary -mi386:x86-64
   --adjust-vma=<offset-1024>`).
 - `KYTY_MEM_DIAG=1`: one `MEMDIAG` line per second with `ObtainBuffer` outcomes, stream copies and
   their repetition, `SynchronizeBuffer` uploads by caller, write-watch changes, faults by thread
