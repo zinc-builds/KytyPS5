@@ -20,6 +20,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -46,11 +47,13 @@ struct ShaderMapData: ShaderMappedData {
 
 struct ShaderMapEntry {
 	ShaderMapData data;
-	uint64_t      hash;
+	uint64_t      hash = 0;
 };
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Bumped under g_shader_map_mutex whenever a shader is mapped.
+static std::atomic<uint64_t> g_shader_map_generation {0};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -89,14 +92,30 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {mapped, hash};
+	g_shader_map_generation.fetch_add(1, std::memory_order_release);
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
+	// Every draw looks up its few shaders again. A thread reuses its recent lookups, without the
+	// lock, while no shader was mapped since.
+	struct Cached {
+		uint64_t       addr       = 0;
+		uint64_t       generation = UINT64_MAX;
+		ShaderMapEntry entry;
+	};
+	thread_local std::array<Cached, 8> cache;
+	auto& cached = cache[((addr >> 8u) ^ (addr >> 12u)) & 7u];
+	if (cached.addr == addr &&
+	    cached.generation == g_shader_map_generation.load(std::memory_order_acquire)) {
+		return cached.entry;
+	}
+
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		cached = {addr, g_shader_map_generation.load(std::memory_order_relaxed), iter->second};
 		return iter->second;
 	}
 
@@ -349,8 +368,9 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		for (const auto& in: metadata.input_semantics) {
 			max_semantic = std::max<uint32_t>(max_semantic, in.semantic);
 		}
-		std::array<uint32_t, 256>                                   attrib_copy {};
-		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4u> buffer_copy {};
+		// Only the entries read below are read from the guest, and only those are used.
+		std::array<uint32_t, 256>                                   attrib_copy;
+		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4u> buffer_copy;
 		if (!metadata.input_semantics.empty()) {
 			ShaderReadGuest(attrib, attrib_copy.data(), max_semantic + 1u);
 			uint32_t max_index = 0;
