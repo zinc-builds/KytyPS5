@@ -43,6 +43,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Draws record their Vulkan commands on a second thread (Track A; same batch: ref `dev` 7f737011 24.99 / 25.19) | 25.50 / 25.55 | 139.8k / 139.9k | 52.9 (max 68.7) | 19.2 |
 | 2026-11-07 | Hot write-tracked chunks use asynchronous write protection (same binary, async off: 25.24 / 25.37; guest main thread 15.0 → 11.3 ms/frame) | 25.88 / 25.85 | 141.6k / 141.4k | 52.7 (max 83.4) | 19.5 |
 | 2026-11-07 | Draws construct only the color attachments and vertex stages they use; texture bindings copied once (Track B1′ step 1; same batch: ref `dev` 05ffc8b5 25.90 / 25.91; 7.06 → 6.71 µs/draw) | 27.40 / 27.55 | 148.8k / 149.1k | 52.6 (max 83.2) | 19.5 |
+| 2026-11-07 | Shader-map lookups cached per thread; vertex tables copied without zeroing (Track B1′ step 3a; 4 pairs, same batch: ref `dev` 07379452 27.37 / 28.27 / 28.10 / 28.04; +0.5% on runs 2–4, 6.60 → 6.56 µs/draw) | 27.96 / 28.41 / 28.23 / 28.22 | 151.6k / 153.0k / 152.1k / 152.1k | 51.5 (max 67.8) | 19.4 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -644,6 +645,23 @@ noise). Texture resolve went from 10.6% to 10.0% of the thread. Not merged.
   byte checks, slot stores) with no single hot spot. Halving it needs a different code shape
   (straight-line evaluation of the reachable value graph instead of memoized thunks), not a
   local fix.
+
+**The walker is front-end bound, not thunk-bound** (B1′ step 2, measured on #25). Thunk
+mechanics take about half of the walker's samples: the state-byte `cmp` 15%, `ret` 13%, `jne`
+12% and `call` 11%. A first cut emitted every value with a single reference inline, keeping
+thunks only for shared values, Phis and control values. A side-by-side check against the
+thunk-only walker over 17.8M walks found no difference. But it inlined little: walker code went
+from 7.48 to 7.26 MB and call sites from 63k to 58k, because most values are shared (a
+buffer's V# words feed every read through it). Same-batch A/B: 27.17 / 27.65 → 27.31 / 27.73
+FPS, which is noise, and walker self time went from 11.8% to 11.5%. Not merged.
+
+Hardware events show why. The thread is 34% retiring, 29% front-end bound (fetch latency 13%),
+33% back-end bound (memory 24%) and 4% bad speculation. JIT walker code is 13% of the thread's
+cycles but 35% of its L1i misses, and 4% of its L2 data misses. So the walker mostly waits on
+instruction fetch: 446 walkers, 30–80 KB each and 7.2 MB in all, against a 2 MB L2. The guest
+data it reads mostly hits. What would help is less walker code per walk, for example
+computing a buffer's base and size once per V# instead of per read, or a denser thunk
+encoding. Removing calls alone does not help.
 
 ### Tooling notes
 
