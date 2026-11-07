@@ -176,7 +176,7 @@ std::map<std::pair<VkCommandBuffer, int>, VkPipeline> g_last_bind;
 // KYTY_GPU_TIME=passes: timestamps around each render pass and dispatch, in a chunk of queries
 // per scheduler command buffer, to split GPU time by kind and find the costliest passes.
 struct PassTimer {
-	static constexpr uint32_t ChunkQueries = 4096;
+	static constexpr uint32_t ChunkQueries = 16384;
 	static constexpr uint32_t Chunks       = 64;
 	struct Segment {
 		uint32_t begin = 0, end = 0; // query indices
@@ -188,8 +188,23 @@ struct PassTimer {
 		bool                 pending = false;
 		uint32_t             used    = 0;
 		std::vector<Segment> segments;
+		struct Draw {
+			int32_t  segment = -1;
+			uint32_t query   = UINT32_MAX;
+			uint64_t vs = 0, ps = 0, vertices = 0;
+			bool     changed = false;
+		};
+		std::vector<Draw> draws;
+	};
+	struct DrawTotal {
+		double   ns = 0;
+		uint64_t n = 0, vertices = 0, changed = 0;
+		double   changed_ns = 0;
 	};
 	bool                                          enabled = false;
+	bool                                          draws_enabled = false;
+	std::unordered_map<uint64_t, DrawTotal>       by_vs, by_ps;
+	DrawTotal                                     draw_total;
 	vk::QueryPool                                 pool;
 	std::array<Chunk, Chunks>                     chunks;
 	uint32_t                                      next = 0;
@@ -224,6 +239,31 @@ void PassCollect(uint32_t index) {
 		                                       stamps.data(), sizeof(uint64_t),
 		                                       vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
 			const auto base = index * PassTimer::ChunkQueries;
+			// Each draw gets the time from the previous stamp in its pass (or the pass begin).
+			int32_t  segment_index = -1;
+			uint64_t previous      = 0;
+			for (const auto& draw: chunk.draws) {
+				if (draw.segment < 0 || draw.query == UINT32_MAX) continue;
+				const auto& segment = chunk.segments[draw.segment];
+				if (segment.begin == UINT32_MAX) continue;
+				if (draw.segment != segment_index) {
+					segment_index = draw.segment;
+					previous      = stamps[segment.begin - base];
+				}
+				const auto stamp = stamps[draw.query - base];
+				if (stamp < previous) continue;
+				const double ns = static_cast<double>(stamp - previous) * g_timer.period;
+				previous        = stamp;
+				for (auto* total: {&g_passes.by_vs[draw.vs], &g_passes.by_ps[draw.ps], &g_passes.draw_total}) {
+					total->ns += ns;
+					total->n++;
+					total->vertices += draw.vertices;
+					if (draw.changed) {
+						total->changed++;
+						total->changed_ns += ns;
+					}
+				}
+			}
 			for (const auto& segment: chunk.segments) {
 				if (segment.end == UINT32_MAX || segment.begin == UINT32_MAX) continue;
 				const auto b = stamps[segment.begin - base], e = stamps[segment.end - base];
@@ -245,6 +285,25 @@ void PassCollect(uint32_t index) {
 	}
 	chunk.used = 0;
 	chunk.segments.clear();
+	chunk.draws.clear();
+}
+
+void PrintDrawTotals(const char* what, std::unordered_map<uint64_t, PassTimer::DrawTotal>& totals,
+                     double s, size_t limit) {
+	std::vector<std::pair<uint64_t, PassTimer::DrawTotal>> top(totals.begin(), totals.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+	for (size_t i = 0; i < top.size() && i < limit; i++) {
+		const auto& [id, t] = top[i];
+		std::printf("GPUDRAW %s=%016llx ms_s=%.3f draws_s=%.0f us=%.2f verts=%.0f ns_vert=%.2f "
+		            "switch=%.0f%% switch_us=%.2f\n",
+		            what, static_cast<unsigned long long>(id), t.ns / 1e6 / s, t.n / s,
+		            t.ns / 1e3 / static_cast<double>(t.n),
+		            static_cast<double>(t.vertices) / static_cast<double>(t.n),
+		            t.vertices != 0 ? t.ns / static_cast<double>(t.vertices) : 0.0,
+		            100.0 * static_cast<double>(t.changed) / static_cast<double>(t.n),
+		            t.changed != 0 ? t.changed_ns / 1e3 / static_cast<double>(t.changed) : 0.0);
+	}
+	totals.clear();
 }
 
 // Adds a finished command buffer's GPU time; skips one whose results are not ready, since it
@@ -283,6 +342,17 @@ void Collect(uint32_t slot) {
 				const auto& [w, h, c, n] = top[i].second;
 				std::printf("GPUPASS shape=%ux%u colors=%u ms_s=%.2f passes_s=%.0f\n", w, h, c,
 				            top[i].first / 1e6 / s, n / s);
+			}
+			if (g_passes.draws_enabled) {
+				const auto& t = g_passes.draw_total;
+				std::printf("GPUDRAW total ms_s=%.2f draws_s=%.0f verts_s=%.0f switch_ms_s=%.2f "
+				            "switches_s=%.0f vs_modules=%zu ps_modules=%zu\n",
+				            t.ns / 1e6 / s, t.n / s, static_cast<double>(t.vertices) / s,
+				            t.changed_ns / 1e6 / s, t.changed / s, g_passes.by_vs.size(),
+				            g_passes.by_ps.size());
+				g_passes.draw_total = {};
+				PrintDrawTotals("vs", g_passes.by_vs, s, 25);
+				PrintDrawTotals("ps", g_passes.by_ps, s, 15);
 			}
 			g_passes.pass_ns = g_passes.dispatch_ns = 0;
 			g_passes.passes = g_passes.dispatches = g_passes.pass_draws = 0;
@@ -331,6 +401,15 @@ void PassDraw(VkCommandBuffer buffer) {
 	g_passes.chunks[found->second].segments[open->second].draws++;
 }
 
+void PassDrawStamp(VkCommandBuffer buffer, uint64_t vs, uint64_t ps, uint64_t vertices, bool changed) {
+	std::lock_guard lock(g_timer.mutex);
+	const auto found = g_passes.active.find(buffer);
+	const auto open  = g_passes.open_pass.find(buffer);
+	if (found == g_passes.active.end() || open == g_passes.open_pass.end()) return;
+	auto& chunk = g_passes.chunks[found->second];
+	chunk.draws.push_back({open->second, PassStamp(buffer), vs, ps, vertices, changed});
+}
+
 // Returns the dispatch's segment index, or -1.
 int32_t DispatchBegin(VkCommandBuffer buffer) {
 	if (!g_passes.enabled) return -1;
@@ -358,7 +437,8 @@ void DispatchEnd(VkCommandBuffer buffer, int32_t index) {
 void InstallCommandCounters() {
 	const char* mode = std::getenv("KYTY_VK_COUNT");
 	const char* gpu_time = std::getenv("KYTY_GPU_TIME");
-	if (mode == nullptr && (gpu_time == nullptr || std::strcmp(gpu_time, "passes") != 0)) {
+	if (mode == nullptr && (gpu_time == nullptr || (std::strcmp(gpu_time, "passes") != 0 &&
+	                                                 std::strcmp(gpu_time, "draws") != 0))) {
 		return;
 	}
 	g_sites          = mode != nullptr && std::strcmp(mode, "sites") == 0;
@@ -476,7 +556,9 @@ void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBu
 			info.queryType  = vk::QueryType::eTimestamp;
 			info.queryCount = static_cast<uint32_t>(timer.pending.size() * 2);
 			timer.enabled   = device.createQueryPool(&info, nullptr, &timer.pool) == vk::Result::eSuccess;
-			if (timer.enabled && std::strcmp(std::getenv("KYTY_GPU_TIME"), "passes") == 0) {
+			if (timer.enabled && (std::strcmp(std::getenv("KYTY_GPU_TIME"), "passes") == 0 ||
+			                      DrawTimingEnabled())) {
+				g_passes.draws_enabled = DrawTimingEnabled();
 				info.queryCount  = PassTimer::ChunkQueries * PassTimer::Chunks;
 				g_passes.enabled = device.createQueryPool(&info, nullptr, &g_passes.pool) == vk::Result::eSuccess;
 			}
@@ -508,6 +590,32 @@ void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBu
 	timer.active[buffer] = slot;
 	buffer.resetQueryPool(timer.pool, slot * 2, 2);
 	buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timer.pool, slot * 2);
+}
+
+bool DrawTimingEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_TIME");
+		return value != nullptr && std::strcmp(value, "draws") == 0;
+	}();
+	return enabled;
+}
+
+void DrawStamp(vk::CommandBuffer buffer, uint64_t vs_id, uint64_t ps_id, uint64_t vertices,
+               bool pipeline_changed) {
+	if (!g_passes.draws_enabled) return;
+	PassDrawStamp(buffer, vs_id, ps_id, vertices, pipeline_changed);
+}
+
+void DumpSpirv(const char* stage, uint64_t hash, uint64_t id, std::span<const uint32_t> spirv) {
+	static const char* dir = std::getenv("KYTY_SPV_DUMP");
+	if (dir == nullptr) return;
+	char name[512];
+	std::snprintf(name, sizeof(name), "%s/%s_%016llx_%016llx.spv", dir, stage,
+	              static_cast<unsigned long long>(hash), static_cast<unsigned long long>(id));
+	if (FILE* file = std::fopen(name, "wb"); file != nullptr) {
+		std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), file);
+		std::fclose(file);
+	}
 }
 
 void EndCommandBuffer(vk::CommandBuffer buffer) {

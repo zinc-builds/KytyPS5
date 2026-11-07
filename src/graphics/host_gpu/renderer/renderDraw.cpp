@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -1314,6 +1315,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		ShaderWriteHazardBarrier(buffer.Handle(), shader_write_stages);
 	}
 	buffer.BeginRendering(rendering);
+	const bool pipeline_changed = bound.BoundPipeline() != pipeline.pipeline;
 	bound.BindPipeline(buffer, pipeline.pipeline, pipeline.pipeline_layout);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query =
@@ -1346,6 +1348,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			} else {
 				cb.drawIndirect(handle, offset, count, stride);
 			}
+		});
+	}
+	if (VulkanDiagnostics::DrawTimingEnabled()) {
+		buffer.Record([vs = state.vertex_info[0].stage.module->id,
+		               ps = state.ps_active ? state.ps_input_info.stage.module->id : 0,
+		               vertices = args_buffer.first != nullptr
+		                              ? 0
+		                              : uint64_t {draw.index_count} * draw.instance_count,
+		               pipeline_changed](vk::CommandBuffer cb) {
+			VulkanDiagnostics::DrawStamp(cb, vs, ps, vertices, pipeline_changed);
 		});
 	}
 	if (occlusion_query >= 0) {

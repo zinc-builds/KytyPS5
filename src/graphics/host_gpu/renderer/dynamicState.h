@@ -54,6 +54,7 @@ public:
 		m_writes_valid    = false;
 	}
 
+	[[nodiscard]] vk::Pipeline BoundPipeline() const { return m_pipeline; }
 	void BindPipeline(const CommandBuffer& buffer, vk::Pipeline pipeline,
 	                  vk::PipelineLayout layout);
 	// offset and size in bytes, multiples of 4.
