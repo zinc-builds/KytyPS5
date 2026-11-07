@@ -153,6 +153,21 @@ void Report() {
 		}                                                                                          \
 	} while (false)
 
+// Like KYTY_COUNT_COMMAND, also timing the command as a transfer or clear segment.
+#define KYTY_TIME_COMMAND(name, kind, segment_kind, command)                                      \
+	do {                                                                                           \
+		static PFN_##name original = nullptr;                                                      \
+		if (dispatcher.name != nullptr) {                                                          \
+			original        = dispatcher.name;                                                     \
+			dispatcher.name = [](VkCommandBuffer buffer, auto... args) {                           \
+				Count(kind);                                                                       \
+				const auto segment = DispatchBegin(buffer, segment_kind, command);                 \
+				original(buffer, args...);                                                         \
+				DispatchEnd(buffer, segment);                                                      \
+			};                                                                                     \
+		}                                                                                          \
+	} while (false)
+
 // GPU timer state. Each command scheduler (rendering, presentation) records on its own thread.
 struct GpuTimer {
 	std::mutex                            mutex;
@@ -182,11 +197,17 @@ struct PassTimer {
 		uint32_t begin = 0, end = 0; // query indices
 		bool     pass  = false;
 		uint32_t draws = 0, width = 0, height = 0, colors = 0;
+		uint8_t  kind     = 0; // SegmentKind
+		uint8_t  command  = 0; // transfers and clears: index into TransferNames
+		uint32_t barriers = 0; // barriers recorded since the previous segment ended
 	};
+	enum SegmentKind : uint8_t { Pass, Dispatch, Transfer, Clear };
 	struct Chunk {
 		bool                 owned   = false; // a recording buffer writes it
 		bool                 pending = false;
 		uint32_t             used    = 0;
+		uint32_t             start = UINT32_MAX, finish = UINT32_MAX; // command buffer bounds
+		uint32_t             barriers = 0; // since the last segment ended
 		std::vector<Segment> segments;
 		struct Draw {
 			int32_t  segment = -1;
@@ -211,6 +232,12 @@ struct PassTimer {
 	std::unordered_map<VkCommandBuffer, uint32_t> active; // buffer -> chunk
 	std::unordered_map<VkCommandBuffer, int32_t>  open_pass; // buffer -> segment index
 	double pass_ns = 0, dispatch_ns = 0;
+	// Outside passes and dispatches: transfers, clears, and the gaps between segments, split by
+	// whether barriers were recorded in the gap; lead and tail are the buffer's start and end.
+	double   transfer_ns = 0, clear_ns = 0, gap_barrier_ns = 0, gap_plain_ns = 0, lead_ns = 0,
+	         tail_ns = 0;
+	uint64_t transfers = 0, clears = 0, gaps_barrier = 0, gaps_plain = 0;
+	std::array<std::pair<double, uint64_t>, 9> by_command {}; // ns, n
 	uint64_t passes = 0, dispatches = 0, pass_draws = 0;
 	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::pair<double, uint64_t>> by_shape; // wxh,colors -> ns, n
 };
@@ -264,11 +291,46 @@ void PassCollect(uint32_t index) {
 					}
 				}
 			}
+			const auto at = [&](uint32_t query) { return stamps[query - base]; };
+			bool     bounded  = chunk.start != UINT32_MAX && chunk.finish != UINT32_MAX;
+			uint64_t last_end = bounded ? at(chunk.start) : 0;
+			bool     first    = true;
 			for (const auto& segment: chunk.segments) {
-				if (segment.end == UINT32_MAX || segment.begin == UINT32_MAX) continue;
-				const auto b = stamps[segment.begin - base], e = stamps[segment.end - base];
+				if (segment.end == UINT32_MAX || segment.begin == UINT32_MAX) {
+					bounded = false;
+					continue;
+				}
+				const auto b = at(segment.begin), e = at(segment.end);
 				if (e < b) continue;
+				if (bounded && b >= last_end) {
+					const double gap = static_cast<double>(b - last_end) * g_timer.period;
+					if (first) {
+						g_passes.lead_ns += gap;
+					} else if (segment.barriers != 0) {
+						g_passes.gap_barrier_ns += gap;
+						g_passes.gaps_barrier++;
+					} else {
+						g_passes.gap_plain_ns += gap;
+						g_passes.gaps_plain++;
+					}
+				}
+				first    = false;
+				last_end = std::max(last_end, e);
 				const double ns = static_cast<double>(e - b) * g_timer.period;
+				if (segment.kind == PassTimer::Transfer || segment.kind == PassTimer::Clear) {
+					g_passes.by_command[segment.command].first += ns;
+					g_passes.by_command[segment.command].second++;
+				}
+				if (segment.kind == PassTimer::Transfer) {
+					g_passes.transfer_ns += ns;
+					g_passes.transfers++;
+					continue;
+				}
+				if (segment.kind == PassTimer::Clear) {
+					g_passes.clear_ns += ns;
+					g_passes.clears++;
+					continue;
+				}
 				if (segment.pass) {
 					g_passes.pass_ns += ns;
 					g_passes.passes++;
@@ -281,11 +343,22 @@ void PassCollect(uint32_t index) {
 					g_passes.dispatches++;
 				}
 			}
+			if (bounded && at(chunk.finish) >= last_end) {
+				g_passes.tail_ns += static_cast<double>(at(chunk.finish) - last_end) * g_timer.period;
+			}
 		}
 	}
 	chunk.used = 0;
+	chunk.start = chunk.finish = UINT32_MAX;
+	chunk.barriers = 0;
 	chunk.segments.clear();
 	chunk.draws.clear();
+}
+
+std::string fmt_command(const char* name, double ms, double n) {
+	char buffer[96];
+	std::snprintf(buffer, sizeof(buffer), " %s=%.2fms/%.0f", name, ms, n);
+	return buffer;
 }
 
 void PrintDrawTotals(const char* what, std::unordered_map<uint64_t, PassTimer::DrawTotal>& totals,
@@ -354,6 +427,28 @@ void Collect(uint32_t slot) {
 				PrintDrawTotals("vs", g_passes.by_vs, s, 25);
 				PrintDrawTotals("ps", g_passes.by_ps, s, 15);
 			}
+			std::printf("GPUGAP transfer_ms_s=%.1f transfers_s=%.0f clear_ms_s=%.1f clears_s=%.0f "
+			            "gap_barrier_ms_s=%.1f gaps_barrier_s=%.0f gap_plain_ms_s=%.1f gaps_plain_s=%.0f "
+			            "lead_ms_s=%.1f tail_ms_s=%.1f\n",
+			            g_passes.transfer_ns / 1e6 / s, g_passes.transfers / s, g_passes.clear_ns / 1e6 / s,
+			            g_passes.clears / s, g_passes.gap_barrier_ns / 1e6 / s, g_passes.gaps_barrier / s,
+			            g_passes.gap_plain_ns / 1e6 / s, g_passes.gaps_plain / s, g_passes.lead_ns / 1e6 / s,
+			            g_passes.tail_ns / 1e6 / s);
+			{
+				static constexpr std::array<const char*, 9> names = {
+				    "copy_buffer", "fill_buffer", "update_buffer", "copy_image", "buffer_to_image",
+				    "image_to_buffer", "blit_image", "clear_color", "clear_depth"};
+				std::string line = "GPUXFER";
+				for (size_t i = 0; i < names.size(); i++) {
+					const auto& [ns, n] = g_passes.by_command[i];
+					line += fmt_command(names[i], ns / 1e6 / s, static_cast<double>(n) / s);
+				}
+				std::printf("%s\n", line.c_str());
+				g_passes.by_command = {};
+			}
+			g_passes.transfer_ns = g_passes.clear_ns = g_passes.gap_barrier_ns = g_passes.gap_plain_ns = 0;
+			g_passes.lead_ns = g_passes.tail_ns = 0;
+			g_passes.transfers = g_passes.clears = g_passes.gaps_barrier = g_passes.gaps_plain = 0;
 			g_passes.pass_ns = g_passes.dispatch_ns = 0;
 			g_passes.passes = g_passes.dispatches = g_passes.pass_draws = 0;
 			g_passes.by_shape.clear();
@@ -375,6 +470,8 @@ void PassBegin(VkCommandBuffer buffer, const VkRenderingInfo* info) {
 	segment.begin  = PassStamp(buffer);
 	segment.end    = UINT32_MAX;
 	segment.pass   = true;
+	segment.barriers = chunk.barriers;
+	chunk.barriers   = 0;
 	segment.width  = info->renderArea.extent.width;
 	segment.height = info->renderArea.extent.height;
 	segment.colors = info->colorAttachmentCount;
@@ -410,14 +507,27 @@ void PassDrawStamp(VkCommandBuffer buffer, uint64_t vs, uint64_t ps, uint64_t ve
 	chunk.draws.push_back({open->second, PassStamp(buffer), vs, ps, vertices, changed});
 }
 
+void PassBarrier(VkCommandBuffer buffer) {
+	if (!g_passes.enabled) return;
+	std::lock_guard lock(g_timer.mutex);
+	if (const auto found = g_passes.active.find(buffer); found != g_passes.active.end()) {
+		g_passes.chunks[found->second].barriers++;
+	}
+}
+
 // Returns the dispatch's segment index, or -1.
-int32_t DispatchBegin(VkCommandBuffer buffer) {
+int32_t DispatchBegin(VkCommandBuffer buffer, uint8_t kind = PassTimer::Dispatch,
+                      uint8_t command = 0) {
 	if (!g_passes.enabled) return -1;
 	std::lock_guard lock(g_timer.mutex);
 	const auto found = g_passes.active.find(buffer);
 	if (found == g_passes.active.end()) return -1;
 	auto&              chunk = g_passes.chunks[found->second];
 	PassTimer::Segment segment;
+	segment.kind     = kind;
+	segment.command  = command;
+	segment.barriers = chunk.barriers;
+	chunk.barriers   = 0;
 	segment.begin = PassStamp(buffer);
 	segment.end   = UINT32_MAX;
 	chunk.segments.push_back(segment);
@@ -448,6 +558,7 @@ void InstallCommandCounters() {
 		dispatcher.vkCmdPipelineBarrier          = [](auto... args) {
             Count(Barrier);
             Site(Barrier);
+            PassBarrier(std::get<0>(std::tuple {args...}));
             original(args...);
 		};
 	}
@@ -456,6 +567,7 @@ void InstallCommandCounters() {
 		dispatcher.vkCmdPipelineBarrier2 = [](VkCommandBuffer buffer, const VkDependencyInfo* info) {
 			Count(Barrier2);
 			Site(Barrier2);
+			PassBarrier(buffer);
 			{
 				std::lock_guard lock(g_mutex);
 				for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
@@ -523,15 +635,15 @@ void InstallCommandCounters() {
 		};
 	}
 	KYTY_COUNT_COMMAND(vkCmdPushConstants, PushConstants);
-	KYTY_COUNT_COMMAND(vkCmdCopyBuffer, CopyBuffer);
-	KYTY_COUNT_COMMAND(vkCmdFillBuffer, CopyBuffer);
-	KYTY_COUNT_COMMAND(vkCmdUpdateBuffer, CopyBuffer);
-	KYTY_COUNT_COMMAND(vkCmdCopyImage, CopyImage);
-	KYTY_COUNT_COMMAND(vkCmdCopyBufferToImage, CopyImage);
-	KYTY_COUNT_COMMAND(vkCmdCopyImageToBuffer, CopyImage);
-	KYTY_COUNT_COMMAND(vkCmdBlitImage, CopyImage);
-	KYTY_COUNT_COMMAND(vkCmdClearColorImage, Clear);
-	KYTY_COUNT_COMMAND(vkCmdClearDepthStencilImage, Clear);
+	KYTY_TIME_COMMAND(vkCmdCopyBuffer, CopyBuffer, PassTimer::Transfer, 0);
+	KYTY_TIME_COMMAND(vkCmdFillBuffer, CopyBuffer, PassTimer::Transfer, 1);
+	KYTY_TIME_COMMAND(vkCmdUpdateBuffer, CopyBuffer, PassTimer::Transfer, 2);
+	KYTY_TIME_COMMAND(vkCmdCopyImage, CopyImage, PassTimer::Transfer, 3);
+	KYTY_TIME_COMMAND(vkCmdCopyBufferToImage, CopyImage, PassTimer::Transfer, 4);
+	KYTY_TIME_COMMAND(vkCmdCopyImageToBuffer, CopyImage, PassTimer::Transfer, 5);
+	KYTY_TIME_COMMAND(vkCmdBlitImage, CopyImage, PassTimer::Transfer, 6);
+	KYTY_TIME_COMMAND(vkCmdClearColorImage, Clear, PassTimer::Clear, 7);
+	KYTY_TIME_COMMAND(vkCmdClearDepthStencilImage, Clear, PassTimer::Clear, 8);
 	KYTY_COUNT_COMMAND(vkCmdClearAttachments, Clear);
 	KYTY_COUNT_COMMAND(vkCmdBeginQuery, BeginQuery);
 	if (mode != nullptr) std::thread(Report).detach();
@@ -540,6 +652,7 @@ void InstallCommandCounters() {
 #undef KYTY_COUNT_COMMAND
 #undef KYTY_COUNT_DRAW
 #undef KYTY_COUNT_DISPATCH
+#undef KYTY_TIME_COMMAND
 
 void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBuffer buffer) {
 	{
@@ -581,6 +694,7 @@ void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBu
 			                      PassTimer::ChunkQueries);
 			g_passes.chunks[chunk].owned = true;
 			g_passes.active[buffer]      = chunk;
+			g_passes.chunks[chunk].start = PassStamp(buffer);
 			break;
 		}
 	}
@@ -633,6 +747,7 @@ void EndCommandBuffer(vk::CommandBuffer buffer) {
 			g_passes.chunks[pass->second].segments[open->second].end = PassStamp(buffer);
 			g_passes.open_pass.erase(open);
 		}
+		g_passes.chunks[pass->second].finish  = PassStamp(buffer);
 		g_passes.chunks[pass->second].pending = true;
 		g_passes.chunks[pass->second].owned   = false;
 		g_passes.active.erase(pass);
