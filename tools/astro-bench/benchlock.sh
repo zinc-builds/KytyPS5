@@ -26,14 +26,21 @@ benchlock_acquire() {
 	s) echo "benchlock: inside a shared (build) hold; cannot take the exclusive lock" >&2; return 1 ;;
 	esac
 	exec 9>>"$KYTY_BENCH_LOCK" || return 1
-	if ! flock -n "-$mode" 9; then
+	# Turnstile: everyone passes through the gate, and a waiter keeps it while it waits for the
+	# lock. flock alone has no queue, so a benchmark could wait forever while builds keep
+	# overlapping each other; with the gate, later arrivals queue behind it instead.
+	exec 8>>"$KYTY_BENCH_LOCK.gate" || return 1
+	local timeout=${KYTY_BENCH_LOCK_TIMEOUT:-5400} start=$SECONDS
+	if ! flock -n -x 8 || ! flock -n "-$mode" 9; then
 		echo "benchlock: waiting for $KYTY_BENCH_LOCK (holder: $(cat "$(benchlock_owner_file)" 2>/dev/null || echo unknown))" >&2
-		if ! flock -w "${KYTY_BENCH_LOCK_TIMEOUT:-5400}" "-$mode" 9; then
-			echo "benchlock: gave up after ${KYTY_BENCH_LOCK_TIMEOUT:-5400}s" >&2
-			exec 9>&-
+		if ! flock -w "$timeout" -x 8 ||
+			! flock -w "$((timeout - (SECONDS - start) > 0 ? timeout - (SECONDS - start) : 0))" "-$mode" 9; then
+			echo "benchlock: gave up after ${timeout}s" >&2
+			exec 8>&- 9>&-
 			return 1
 		fi
 	fi
+	exec 8>&-
 	export KYTY_BENCH_LOCKED=$mode
 	echo "$mode $what pid=$$ cwd=$PWD since=$(date +%T)" > "$(benchlock_owner_file)"
 	return 0
