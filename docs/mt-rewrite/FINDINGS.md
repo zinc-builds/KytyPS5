@@ -57,6 +57,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Compute and pixel shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` ae6d8c77 35.09; GPU 14.34 → 13.86 ms/frame, dispatches 3.68 → 3.39, in passes 8.42 → 8.23; FPS unchanged, the command thread limits) | 35.21 | 184.1k | 40.0 (max 66.6) | 26.1 |
 | 2026-11-07 | Consecutive dispatches the guest lets overlap share their barriers (Track G3; same batch: ref `dev` ae6d8c77 34.81; with `KYTY_GPU_TIME=passes`, GPU 14.14 → 13.29 ms/frame, dispatches 3.68 → 3.04, barrier gaps 0.80 → 0.54) | 35.19 | 183.4k | 38.5 (max 50.6) | 27.4 |
 | 2026-11-07 | Game-created threads on the efficiency cores, the game's render thread and the emulator on the performance cores (same batch: ref `dev` e5ef1e84 35.03 / 35.27, worst_ms 39.0 / 38.5) | 36.02 / 36.45 | 188.8k / 191.7k | 33.5 (max 33.5) | 28.7 / 29.9 |
+| 2026-11-07 | Large buffer uploads cross PCIe on the copy engine into a device-local ring; the universal queue copies from there at VRAM speed (Track G4; same batch: ref `dev` abc268e0 35.01; `KYTY_GPU_TIME=1` GPU 13.04 → 12.42 ms/frame; with `=passes` 13.25 → 12.47, transfers 1.35 → 0.58; FPS unchanged, the command thread limits) | 35.28 | 185.0k | 38.3 (max 51.0) | 26.7 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -847,6 +848,46 @@ through `RELEASE_MEM` (which records nothing here) changed nothing: the wait fol
   comparisons; the rest feed sqrt, division, reciprocal square root and log2, where the
   guest's flush is needed.
 
+### Buffer uploads, Track G4 (2026-11-07)
+
+`KYTY_GPU_TIME=passes` now splits `vkCmdCopyBuffer` time by size (`GPUCOPY` lines: time, copies,
+MB and the idle gaps before and after, per second) and, with `KYTY_VK_COUNT=sites`, by recording
+call site and its caller (`GPUCOPYSITE`, addresses for `symbolize.py`). On `dev` abc268e0, per
+frame at ~33 FPS:
+
+| Copies | ms | per frame | MB |
+|---|---|---|---|
+| ≥ 4 MB | 0.74 | 2.0 | 17.5 |
+| 64 KB – 1 MB | 0.14 | 9.8 | 2.9 |
+| 4–64 KB | 0.11 | 64 | 0.9 |
+| < 4 KB | 0.02 | 22 | 0.0 |
+
+By site, `SynchronizeBuffersInRange` (`PrepareBda`) → `SynchronizeBuffer` is 29 of the 31 ms/s,
+at ~610 MB/s. So the copies were not per-copy overhead: two ~8.7 MB uploads per frame ran at
+~22 GB/s, the PCIe bandwidth of a copy from host memory, with the universal queue doing nothing
+else (the copy sits between an `ALL_COMMANDS → TRANSFER` and a `TRANSFER → ALL_COMMANDS`
+barrier). The bytes are real: #44 found 94% of `PrepareBda`'s pages changed since their last upload.
+
+**Ruled out: staging in device-local, host-visible memory (ReBAR).** Same binary, staging ring
+chosen by an env switch: GPU 13.39 → 12.42 ms/frame (the ≥ 4 MB copies 0.75 → 0.05 ms), but
+35.13 → 34.10 FPS: the command thread's copy into staging now crosses PCIe as write-combined
+stores (~600 MB/s more of them).
+
+**Uploads on the copy engine (landed).** Uploads of at least 256 KiB (`SynchronizeBuffer`, ~5 per
+frame, ~620 MB/s) still go into host memory, then a transfer-only queue copies them into a
+256 MiB device-local ring right away, while the universal queue runs earlier work. The ring
+range is fresh, so nothing queued earlier can read it (ranges are reused only after the command
+buffer that read them completes). In the command buffer where the upload would have been, the
+universal queue copies ring → destination with the same barriers as before, and that submission
+waits for the transfer's timeline value at the transfer stage. The destination's write-after-read
+ordering is unchanged; only the PCIe part leaves the universal queue. Same batch against `dev`
+abc268e0: `KYTY_GPU_TIME=1` 13.04 → 12.42 ms/frame, `=passes` 13.25 → 12.47 (transfers 1.35 →
+0.58, the ≥ 4 MB copies 0.74 → 0.05 ms). FPS 35.01 → 35.28 (unchanged; the CPU side is the same
+copy into host memory plus ~5 transfer submits per frame). `KYTY_ASYNC_UPLOAD_VERIFY=1` read
+every asynchronous upload's destination back after its copy and compared it with the bytes the
+host wrote: 7.4k uploads, 30 GB, 0 mismatches. `KYTY_ASYNC_UPLOAD=0` turns it off (no transfer
+queue), `=stats` prints `ASYNCUPLOAD` lines, `KYTY_ASYNC_UPLOAD_MIN=<bytes>` sets the threshold.
+
 ### Draw state cache, Track B (2026-11-06)
 
 **B0: per-draw state does not repeat; its shape does.** A walk memo keyed on a program's user
@@ -1236,3 +1277,9 @@ What this means:
   `KYTY_DISPATCH_CHAIN=stats` prints `DISPCHAIN` lines (dispatches and chained dispatches per second).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
   hit and exits on a disagreement, `KYTY_DTC_STATS=1` prints `DTC` hit-rate lines once per second.
+- Uploads (Track G4): `KYTY_GPU_TIME=passes` prints `GPUCOPY` (buffer copies by size: ms/copies/MB
+  and the idle gap before + after, per second); with `KYTY_VK_COUNT=sites` also `GPUCOPYSITE
+  addr=… caller=…`. `KYTY_ASYNC_UPLOAD=0` uploads from host memory on the universal queue again,
+  `=stats` prints `ASYNCUPLOAD` lines, `KYTY_ASYNC_UPLOAD_MIN=<bytes>` (default 262144) is the
+  smallest upload sent through the transfer queue, `KYTY_ASYNC_UPLOAD_VERIFY=1` reads each one's
+  destination back and compares (`ASYNCVERIFY` lines; slow).

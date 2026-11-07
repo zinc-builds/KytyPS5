@@ -32,6 +32,9 @@ public:
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// The next submission waits (at the transfer stage) until semaphore reaches value: work the
+	// current command buffer consumes from another queue.
+	void           WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t value);
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -104,6 +107,8 @@ private:
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	std::atomic<int64_t>         m_last_refresh {0}; // steady_clock ticks of the last tick read
 	OperationState               m_operation_state      = OperationState::Open;
+	vk::Semaphore                m_next_wait_semaphore  = nullptr;
+	uint64_t                     m_next_wait_value      = 0;
 };
 
 } // namespace Libs::Graphics

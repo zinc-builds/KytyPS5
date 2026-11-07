@@ -337,6 +337,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
+	if (m_next_wait_value != 0) {
+		submit.AddWait(m_next_wait_semaphore, m_next_wait_value, vk::PipelineStageFlagBits::eTransfer);
+		m_next_wait_value = 0;
+	}
+
 	vk::Result result;
 	uint64_t   tick;
 	{
@@ -370,6 +375,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.m_buffer = nullptr;
 	return tick;
+}
+
+void CommandScheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t value) {
+	EXIT_IF(semaphore == nullptr || (m_next_wait_semaphore != nullptr && m_next_wait_semaphore != semaphore));
+	m_next_wait_semaphore = semaphore;
+	m_next_wait_value     = std::max(m_next_wait_value, value);
 }
 
 void CommandScheduler::BeginNext() {

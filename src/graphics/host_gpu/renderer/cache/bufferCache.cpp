@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <tuple>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -272,6 +273,11 @@ size_t StreamCopySlot(uint64_t vaddr, uint64_t size) {
 	return static_cast<size_t>(key >> 51u); // 13 bits: STREAM_COPY_SLOTS
 }
 
+bool AsyncUploadVerifyEnabled() {
+	static const bool on = std::getenv("KYTY_ASYNC_UPLOAD_VERIFY") != nullptr;
+	return on;
+}
+
 // KYTY_STREAM_VERIFY=1: compare every reused stream copy against the guest bytes.
 bool StreamVerifyEnabled() {
 	static const bool on = std::getenv("KYTY_STREAM_VERIFY") != nullptr;
@@ -497,6 +503,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+      m_async_uploader(graphics, scheduler),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -768,6 +775,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		if (m_last_upload_async && AsyncUploadVerifyEnabled()) {
+			VerifyAsyncUpload(buffer, copies, total_size);
+		}
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -782,17 +792,83 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
-	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
-	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
-		for (auto& copy: copies) {
+	// Fills the staging bytes; copy source offsets are still relative to their start.
+	const auto write = [&](uint8_t* mapped) {
+		for (const auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
-			copy.srcOffset += base_offset;
+		}
+	};
+	vk::Buffer source;
+	uint64_t   base_offset = 0;
+	m_last_upload_async    = false;
+	if (m_async_uploader.Enabled() && total_size >= m_async_uploader.MinSize()) {
+		std::tie(source, base_offset) = m_async_uploader.Upload(total_size, [&](uint8_t* mapped) {
+			write(mapped);
+			if (AsyncUploadVerifyEnabled()) {
+				m_async_verify_bytes.assign(mapped, mapped + total_size);
+			}
+		});
+		m_last_upload_async = static_cast<bool>(source);
+	}
+	if (!source) {
+		const auto staged = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
+		    vk::BufferUsageFlagBits::eTransferSrc,
+		    [&](uint8_t* mapped, uint64_t) { write(mapped); });
+		source      = staged.first->Handle();
+		base_offset = staged.second;
+	}
+	for (auto& copy: copies) {
+		copy.srcOffset += base_offset;
+	}
+	return source;
+}
+
+void BufferCache::VerifyAsyncUpload(const Buffer& buffer, std::span<const vk::BufferCopy> copies,
+                                    uint64_t total_size) {
+	struct Totals {
+		std::atomic<uint64_t> uploads {0}, bytes {0}, mismatches {0};
+	};
+	static Totals totals;
+	auto readback = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         vk::BufferUsageFlagBits::eTransferDst, total_size);
+	std::vector<vk::BufferCopy> back;
+	back.reserve(copies.size());
+	for (const auto& copy: copies) {
+		back.emplace_back(copy.dstOffset, copy.srcOffset - copies[0].srcOffset, copy.size);
+	}
+	const auto native = m_scheduler.Current().Handle();
+	native.copyBuffer(buffer.Handle(), readback->Handle(), static_cast<uint32_t>(back.size()),
+	                  back.data());
+	const vk::MemoryBarrier to_host {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+	                                 .dstAccessMask = vk::AccessFlagBits::eHostRead};
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                       vk::DependencyFlags {}, 1, &to_host, 0, nullptr, 0, nullptr);
+	m_scheduler.DeferOperation([readback, expected = std::move(m_async_verify_bytes),
+	                            address = buffer.CpuAddress(), size = total_size,
+	                            first = copies[0].dstOffset]() mutable {
+		readback->Invalidate(0, size);
+		const bool same = std::memcmp(readback->Mapped().data(), expected.data(), size) == 0;
+		const auto n    = totals.uploads.fetch_add(1) + 1;
+		totals.bytes.fetch_add(size);
+		if (!same) {
+			totals.mismatches.fetch_add(1);
+			std::printf("ASYNCVERIFY mismatch buffer=0x%llx first=0x%llx size=0x%llx\n",
+			            static_cast<unsigned long long>(address),
+			            static_cast<unsigned long long>(address + first),
+			            static_cast<unsigned long long>(size));
+		}
+		if (n % 256 == 0 || !same) {
+			std::printf("ASYNCVERIFY checked=%llu bytes=%llu mismatches=%llu\n",
+			            static_cast<unsigned long long>(n),
+			            static_cast<unsigned long long>(totals.bytes.load()),
+			            static_cast<unsigned long long>(totals.mismatches.load()));
+			std::fflush(stdout);
 		}
 	});
-	return source.first->Handle();
+	m_async_verify_bytes = {};
 }
 
 bool BufferCache::VerifyStreamHit(uint64_t vaddr, uint64_t size, uint64_t offset) {

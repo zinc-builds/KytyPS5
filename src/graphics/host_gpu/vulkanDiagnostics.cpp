@@ -203,6 +203,8 @@ struct PassTimer {
 		uint8_t  command  = 0; // transfers and clears: index into TransferNames
 		uint64_t module   = 0; // dispatches: compute module id (KYTY_GPU_TIME=draws)
 		uint32_t barriers = 0; // barriers recorded since the previous segment ended
+		uint64_t bytes    = 0; // copy_buffer: bytes copied
+		uintptr_t site = 0, site2 = 0; // copy_buffer with KYTY_VK_COUNT=sites: recorder, its caller
 	};
 	enum SegmentKind : uint8_t { Pass, Dispatch, Transfer, Clear };
 	struct Chunk {
@@ -242,6 +244,14 @@ struct PassTimer {
 	         tail_ns = 0;
 	uint64_t transfers = 0, clears = 0, gaps_barrier = 0, gaps_plain = 0;
 	std::array<std::pair<double, uint64_t>, 9> by_command {}; // ns, n
+	// copy_buffer by size class (< 4 KiB, < 64 KiB, < 1 MiB, < 4 MiB, larger) and by call site.
+	struct CopyTotal {
+		double   ns = 0, gap_ns = 0; // gap: idle time before the copy since the last segment
+		double   next_gap_ns = 0;   // idle time after the copy until the next segment
+		uint64_t n = 0, bytes = 0;
+	};
+	std::array<CopyTotal, 5>                copy_by_size {};
+	std::map<std::pair<uintptr_t, uintptr_t>, CopyTotal> copy_by_site;
 	uint64_t passes = 0, dispatches = 0, pass_draws = 0;
 	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::pair<double, uint64_t>> by_shape; // wxh,colors -> ns, n
 };
@@ -299,6 +309,7 @@ void PassCollect(uint32_t index) {
 			bool     bounded  = chunk.start != UINT32_MAX && chunk.finish != UINT32_MAX;
 			uint64_t last_end = bounded ? at(chunk.start) : 0;
 			bool     first    = true;
+			PassTimer::CopyTotal* previous_copy[2] = {nullptr, nullptr};
 			for (const auto& segment: chunk.segments) {
 				if (segment.end == UINT32_MAX || segment.begin == UINT32_MAX) {
 					bounded = false;
@@ -306,8 +317,13 @@ void PassCollect(uint32_t index) {
 				}
 				const auto b = at(segment.begin), e = at(segment.end);
 				if (e < b) continue;
+				double gap_before = 0;
 				if (bounded && b >= last_end) {
 					const double gap = static_cast<double>(b - last_end) * g_timer.period;
+					gap_before       = gap;
+					for (auto* total: previous_copy) {
+						if (total != nullptr) total->next_gap_ns += gap;
+					}
 					if (first) {
 						g_passes.lead_ns += gap;
 					} else if (segment.barriers != 0) {
@@ -320,10 +336,23 @@ void PassCollect(uint32_t index) {
 				}
 				first    = false;
 				last_end = std::max(last_end, e);
+				previous_copy[0] = previous_copy[1] = nullptr;
 				const double ns = static_cast<double>(e - b) * g_timer.period;
 				if (segment.kind == PassTimer::Transfer || segment.kind == PassTimer::Clear) {
 					g_passes.by_command[segment.command].first += ns;
 					g_passes.by_command[segment.command].second++;
+				}
+				if (segment.kind == PassTimer::Transfer && segment.command == 0) {
+					const uint64_t bytes = segment.bytes;
+					const size_t   klass = bytes < 4096 ? 0 : bytes < 65536 ? 1 : bytes < (1u << 20u) ? 2 : bytes < (4u << 20u) ? 3 : 4;
+					previous_copy[0] = &g_passes.copy_by_size[klass];
+					previous_copy[1] = &g_passes.copy_by_site[{segment.site, segment.site2}];
+					for (auto* total: previous_copy) {
+						total->ns += ns;
+						total->gap_ns += gap_before;
+						total->n++;
+						total->bytes += bytes;
+					}
 				}
 				if (segment.kind == PassTimer::Transfer) {
 					g_passes.transfer_ns += ns;
@@ -455,6 +484,29 @@ void Collect(uint32_t slot) {
 				}
 				std::printf("%s\n", line.c_str());
 				g_passes.by_command = {};
+				static constexpr std::array<const char*, 5> size_names = {"lt4k", "lt64k", "lt1m",
+				                                                          "lt4m", "ge4m"};
+				line = "GPUCOPY";
+				for (size_t i = 0; i < size_names.size(); i++) {
+					const auto& t = g_passes.copy_by_size[i];
+					char        text[128];
+					std::snprintf(text, sizeof(text), " %s=%.3fms/%.0f/%.2fMB/gap%.3f+%.3f", size_names[i],
+					              t.ns / 1e6 / s, static_cast<double>(t.n) / s,
+					              static_cast<double>(t.bytes) / 1e6 / s, t.gap_ns / 1e6 / s,
+					              t.next_gap_ns / 1e6 / s);
+					line += text;
+				}
+				std::printf("%s\n", line.c_str());
+				g_passes.copy_by_size = {};
+				for (const auto& [site, t]: g_passes.copy_by_site) {
+					if (site.first == 0) continue;
+					std::printf("GPUCOPYSITE addr=%lx caller=%lx ms_s=%.3f gap_ms_s=%.3f+%.3f copies_s=%.0f mb_s=%.2f\n",
+					            static_cast<unsigned long>(site.first),
+					            static_cast<unsigned long>(site.second), t.ns / 1e6 / s,
+					            t.gap_ns / 1e6 / s, t.next_gap_ns / 1e6 / s,
+					            static_cast<double>(t.n) / s, static_cast<double>(t.bytes) / 1e6 / s);
+				}
+				g_passes.copy_by_site.clear();
 			}
 			g_passes.transfer_ns = g_passes.clear_ns = g_passes.gap_barrier_ns = g_passes.gap_plain_ns = 0;
 			g_passes.lead_ns = g_passes.tail_ns = 0;
@@ -652,7 +704,40 @@ void InstallCommandCounters() {
 		};
 	}
 	KYTY_COUNT_COMMAND(vkCmdPushConstants, PushConstants);
-	KYTY_TIME_COMMAND(vkCmdCopyBuffer, CopyBuffer, PassTimer::Transfer, 0);
+	if (dispatcher.vkCmdCopyBuffer != nullptr) {
+		static PFN_vkCmdCopyBuffer original = dispatcher.vkCmdCopyBuffer;
+		dispatcher.vkCmdCopyBuffer = [](VkCommandBuffer buffer, VkBuffer src, VkBuffer dst,
+		                                uint32_t count, const VkBufferCopy* regions) {
+			Count(CopyBuffer);
+			const auto segment = DispatchBegin(buffer, PassTimer::Transfer, 0);
+			original(buffer, src, dst, count, regions);
+			DispatchEnd(buffer, segment);
+			if (segment >= 0) {
+				uint64_t bytes = 0;
+				for (uint32_t i = 0; i < count; i++) {
+					bytes += regions[i].size;
+				}
+				uintptr_t site = 0, site2 = 0;
+#if defined(__linux__)
+				if (g_sites) {
+					// This lambda, then the vulkan.hpp method (usually inlined) and its caller.
+					std::array<void*, 4> frames {};
+					const int depth = backtrace(frames.data(), static_cast<int>(frames.size()));
+					const auto base = reinterpret_cast<uintptr_t>(&__ehdr_start);
+					if (depth >= 2) site = reinterpret_cast<uintptr_t>(frames[1]) - base;
+					if (depth >= 3) site2 = reinterpret_cast<uintptr_t>(frames[2]) - base;
+				}
+#endif
+				std::lock_guard lock(g_timer.mutex);
+				if (const auto found = g_passes.active.find(buffer); found != g_passes.active.end()) {
+					auto& seg = g_passes.chunks[found->second].segments[segment];
+					seg.bytes = bytes;
+					seg.site  = site;
+					seg.site2 = site2;
+				}
+			}
+		};
+	}
 	KYTY_TIME_COMMAND(vkCmdFillBuffer, CopyBuffer, PassTimer::Transfer, 1);
 	KYTY_TIME_COMMAND(vkCmdUpdateBuffer, CopyBuffer, PassTimer::Transfer, 2);
 	KYTY_TIME_COMMAND(vkCmdCopyImage, CopyImage, PassTimer::Transfer, 3);
