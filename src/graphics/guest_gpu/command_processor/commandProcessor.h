@@ -127,6 +127,7 @@ private:
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext& m_renderer;
+	bool           m_in_dispatch_packet = false; // ProcessPm4 runs a dispatch packet's handler
 	HW::Context    m_ctx;
 	std::optional<HW::Context> m_saved_ctx;
 	HW::UserConfig m_ucfg;

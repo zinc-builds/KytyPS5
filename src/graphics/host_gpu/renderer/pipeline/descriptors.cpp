@@ -1288,7 +1288,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			bound.PushConstants(buffer, pipeline.pipeline_layout, pipeline.push_stages, 0,
 			                    sizeof(push_data), push_data.dwords.data());
 		} else {
-			buffer.Handle().pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
+			buffer.BindingHandle().pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 			                        sizeof(push_data), push_data.dwords.data());
 		}
 	}
@@ -1297,7 +1297,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (pipeline.uses_push_descriptors && graphics) {
 			bound.PushDescriptors(buffer, pipeline.pipeline_layout, m_descriptor_writes);
 		} else if (pipeline.uses_push_descriptors) {
-			buffer.Handle().pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+			buffer.BindingHandle().pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                                     static_cast<uint32_t>(m_descriptor_writes.size()),
 			                                     m_descriptor_writes.data());
 		} else {
@@ -1327,7 +1327,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				device.updateDescriptorSets(static_cast<uint32_t>(m_descriptor_writes.size()),
 				                            m_descriptor_writes.data(), 0, nullptr);
-				buffer.Handle().bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+				buffer.BindingHandle().bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
 				                                   0, 1, &set, 0, nullptr);
 			}
 		}

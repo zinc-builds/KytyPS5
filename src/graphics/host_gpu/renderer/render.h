@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -112,12 +113,35 @@ public:
 		if (m_recorder != nullptr) {
 			m_recorder->Drain();
 		}
+		if (m_dispatch_barrier_pending) {
+			RecordDispatchBarrier();
+		}
 		return m_buffer;
+	}
+	// Like Handle(), but keeps a deferred dispatch barrier pending: only for a dispatch's own
+	// pipeline, descriptor and push-constant binds, which access no memory.
+	[[nodiscard]] vk::CommandBuffer BindingHandle() const noexcept {
+		if (m_recorder != nullptr) {
+			m_recorder->Drain();
+		}
+		return m_buffer;
+	}
+	// Dispatch chains (RenderExecutor::DispatchDirect): a dispatch's closing barrier is recorded
+	// before whatever is recorded next (Handle(), Record(), End()), unless the next command is a
+	// dispatch the guest let overlap with it, which drops it.
+	void DeferDispatchBarrier() const noexcept { m_dispatch_barrier_pending = true; }
+	[[nodiscard]] bool DispatchBarrierPending() const noexcept { return m_dispatch_barrier_pending; }
+	void DropDispatchBarrier() const noexcept { m_dispatch_barrier_pending = false; }
+	void FlushDispatchBarrier() const noexcept {
+		if (m_dispatch_barrier_pending) {
+			(void)Handle();
+		}
 	}
 	// Records f(vk::CommandBuffer) on the recording thread, in order with everything else, or now
 	// if this buffer has none. Queued commands start recording at Publish().
 	template <typename F>
 	void Record(F&& f) const {
+		FlushDispatchBarrier();
 		if (m_recorder != nullptr) {
 			m_recorder->Record(m_buffer, std::forward<F>(f));
 		} else {
@@ -127,6 +151,7 @@ public:
 	// Records f(vk::CommandBuffer, data) where fill(data) writes `size` bytes now.
 	template <typename Fill, typename F>
 	void Record(size_t size, Fill&& fill, F&& f) const {
+		FlushDispatchBarrier();
 		if (m_recorder != nullptr) {
 			m_recorder->Record(m_buffer, size, std::forward<Fill>(fill), std::forward<F>(f));
 		} else {
@@ -157,6 +182,7 @@ private:
 
 	void Begin();
 	void End() const;
+	void RecordDispatchBarrier() const noexcept;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -164,6 +190,7 @@ private:
 	DeferredRecorder*   m_recorder = nullptr; // the render scheduler's recording thread
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_dispatch_barrier_pending = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -182,10 +209,16 @@ public:
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
+	// may_chain: the command processor's packet loop dispatches, and ends chains (below).
 	void DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x, uint32_t thread_group_y,
-	                    uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	                    uint32_t thread_group_z, uint32_t mode, bool async_compute,
+	                    bool may_chain = false);
 	void DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                      bool async_compute);
+	// The command processor calls this before any packet that may order GPU work (anything
+	// but register writes and dispatches): consecutive direct dispatches the guest let overlap
+	// share their barriers until then (see DispatchDirect).
+	void EndDispatchChain(CommandBuffer& buffer);
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
@@ -223,6 +256,16 @@ public:
 	[[nodiscard]] bool HasQueuedDraw() const { return m_queued_count != 0; }
 
 private:
+	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,
+	                                         const PreparedBindings& bindings, uint32_t mode);
+	void               PrintDispatchChainStats();
+	struct DispatchChain {
+		bool                                  hazard_barrier = false; // the chain has one
+		uint64_t                              dispatches     = 0;
+		uint64_t                              chained        = 0;
+		std::chrono::steady_clock::time_point last {};
+	} m_dispatch_chain;
+
 	// A queued draw: what it was given, its registers when queued, and the worker's lookup.
 	struct QueuedDraw {
 		HW::Context                      registers;
