@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -21,6 +22,7 @@ CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_dispatch_barrier_pending = false;
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -38,6 +40,11 @@ void CommandBuffer::End() const {
 	auto result = buffer.end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+void CommandBuffer::RecordDispatchBarrier() const noexcept {
+	m_dispatch_barrier_pending = false;
+	ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
 }
 
 static void RecordBeginRendering(vk::CommandBuffer buffer, const RenderState& state) {

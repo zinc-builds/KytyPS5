@@ -32,6 +32,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -269,9 +272,53 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+// KYTY_DISPATCH_CHAIN=0 records every dispatch's barriers; =stats also prints "DISPCHAIN" lines.
+static int DispatchChainSetting() {
+	static const int setting = [] {
+		const char* value = std::getenv("KYTY_DISPATCH_CHAIN");
+		if (value == nullptr) return 1;
+		if (std::strcmp(value, "0") == 0) return 0;
+		return std::strcmp(value, "stats") == 0 ? 2 : 1;
+	}();
+	return setting;
+}
+
+// Whether this dispatch may overlap a directly preceding one, and a following one this one. On
+// the guest, consecutive dispatches overlap unless a packet between them waits (a partial flush,
+// a cache operation, a label wait, ...); the command processor ends a chain at any such packet
+// (EndDispatchChain). Dispatches that use emulator-owned memory shared between dispatches (the
+// LDS utility buffer, GDS, the BDA fault bitmap, which shaders update without atomics) or the
+// ordered-append path keep their barriers.
+bool RenderExecutor::ChainsDispatch(const ShaderComputeInputInfo& input_info,
+                                    const PreparedBindings& bindings, uint32_t mode) {
+	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
+	const auto&        program = input_info.stage.module->info;
+	return DispatchChainSetting() != 0 && bindings.shared_memory.buffer == nullptr &&
+	       bindings.gds.buffer == nullptr && !program.info.uses_gds && !program.info.uses_dma &&
+	       !input_info.lds_storage &&
+	       (mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) == 0;
+}
+
+void RenderExecutor::EndDispatchChain(CommandBuffer& buffer) {
+	buffer.FlushDispatchBarrier();
+}
+
+void RenderExecutor::PrintDispatchChainStats() {
+	if (DispatchChainSetting() != 2) return;
+	const auto now = std::chrono::steady_clock::now();
+	if (m_dispatch_chain.last.time_since_epoch().count() == 0) m_dispatch_chain.last = now;
+	const double s = std::chrono::duration<double>(now - m_dispatch_chain.last).count();
+	if (s < 1.0) return;
+	std::printf("DISPCHAIN dispatches_s=%.0f chained_s=%.0f\n",
+	            static_cast<double>(m_dispatch_chain.dispatches) / s,
+	            static_cast<double>(m_dispatch_chain.chained) / s);
+	m_dispatch_chain.dispatches = m_dispatch_chain.chained = 0;
+	m_dispatch_chain.last = now;
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
-                                    bool async_compute) {
+                                    bool async_compute, bool may_chain) {
 	m_context.GetCommandScheduler().PopPendingOperations();
 	FlushAtomicWrites(buffer);
 	auto& sh_ctx = buffer.GetShaders();
@@ -376,13 +423,30 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	const auto vk_buffer = buffer.Handle();
+	// Binds only: a deferred barrier of the previous dispatch stays pending through them.
+	const auto vk_buffer = buffer.BindingHandle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	if (HasStorageWrites(input_info, bindings)) {
+	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
+	const bool         writes   = HasStorageWrites(input_info, bindings);
+	const bool         chains   = may_chain && ChainsDispatch(input_info, bindings, mode);
+	const bool         chained  = chains && buffer.DispatchBarrierPending();
+	if (chained) {
+		// Nothing but binds since the previous dispatch, and the guest put no synchronization
+		// between the two (see ChainsDispatch): drop its closing barrier.
+		buffer.DropDispatchBarrier();
+		m_dispatch_chain.chained++;
+	} else {
+		buffer.FlushDispatchBarrier();
+		m_dispatch_chain.hazard_barrier = false;
+	}
+	m_dispatch_chain.dispatches++;
+	if (writes && !m_dispatch_chain.hazard_barrier) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
+		// while allowing the queue to execute asynchronously. Within a chain, the first one
+		// orders everything recorded before the chain against all its dispatches.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		m_dispatch_chain.hazard_barrier = true;
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -447,7 +511,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
@@ -472,8 +535,14 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The removed host fence also ordered read-only dispatches before later writers. Deferred,
+	// it is recorded before anything else that follows, unless a dispatch chains onto this one.
+	if (chains) {
+		buffer.DeferDispatchBarrier();
+	} else {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	PrintDispatchChainStats();
 	ResetBindings();
 }
 

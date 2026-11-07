@@ -691,9 +691,35 @@ static bool KeepsQueuedDraw(uint32_t packet_header) {
 	}
 }
 
+// Packets that neither wait nor touch memory, so consecutive dispatches around them may overlap
+// on the guest: register writes, markers and the dispatches themselves. Any other packet may be
+// the guest's synchronization between two dispatches (a partial flush, a cache operation, a label
+// write or wait), or GPU work of another kind.
+static bool KeepsDispatchChain(uint32_t packet_header) {
+	switch ((packet_header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_DISPATCH_DIRECT: return true;
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(packet_header);
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+		}
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool debug_dump = graphics_debug_dump_enabled();
 	auto&      executor   = m_renderer.GetRenderExecutor();
+	// A dispatch chain never spans two calls: another queue may have run in between.
+	bool       first_packet = true;
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			// Guest commands (readbacks, unmaps) see every draw before them committed.
@@ -746,6 +772,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (!DefersAsyncCollect(packet_header)) {
 			m_renderer.CollectAsyncWritesIfRequested();
 		}
+		if (first_packet || !KeepsDispatchChain(packet_header)) {
+			executor.EndDispatchChain(CurrentBuffer());
+			first_packet = false;
+		}
 		if (!KeepsAtomicWrites(packet_header)) {
 			// The same packets may signal the guest or store into its memory.
 			GuestSyncEpoch::Advance();
@@ -769,8 +799,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
+		// Only dispatches from the packet loop chain: it ends chains at synchronizing packets.
+		m_in_dispatch_packet = opcode == Pm4::IT_DISPATCH_DIRECT;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		m_in_dispatch_packet = false;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1013,7 +1046,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
-	                                              thread_group_z, mode, IsAsyncComputeQueue());
+	                                              thread_group_z, mode, IsAsyncComputeQueue(),
+	                                              m_in_dispatch_packet);
 }
 
 void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
