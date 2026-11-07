@@ -2,6 +2,7 @@
 
 #include "common/hybridAffinity.h"
 #include "common/profiler.h"
+#include "common/stallDiag.h"
 
 #include <chrono>
 
@@ -63,6 +64,7 @@ void DeferredRecorder::WaitDone(uint64_t position) {
 	if (m_done.load(std::memory_order_acquire) >= position) {
 		return;
 	}
+	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdRecorder);
 	Publish();
 	for (uint32_t spins = 0; m_done.load(std::memory_order_acquire) < position; spins++) {
 		if (spins < 4096) {
@@ -93,6 +95,7 @@ void DeferredRecorder::Run() {
 			}
 			// Draws arrive every few microseconds: spin a while before sleeping.
 			const auto start = std::chrono::steady_clock::now();
+			auto       stall = Common::StallDiag::Now();
 			for (uint32_t spins = 1;; spins++) {
 				KYTY_RECORDER_PAUSE();
 				published = m_published.load(std::memory_order_acquire);
@@ -101,17 +104,23 @@ void DeferredRecorder::Run() {
 				}
 				if ((spins & 255u) == 0 &&
 				    std::chrono::steady_clock::now() - start > std::chrono::microseconds(50)) {
+					Common::StallDiag::Add(Common::StallDiag::Cause::RecorderSpin, stall);
+					stall = Common::StallDiag::Now();
 					m_sleeping.store(true, std::memory_order_seq_cst);
 					if (m_published.load(std::memory_order_seq_cst) == done &&
 					    !m_stop.load(std::memory_order_seq_cst)) {
 						m_sleeping.wait(true, std::memory_order_seq_cst);
 					}
 					m_sleeping.store(false, std::memory_order_relaxed);
+					Common::StallDiag::Add(Common::StallDiag::Cause::RecorderSleep, stall);
+					stall = 0;
 					break;
 				}
 			}
+			Common::StallDiag::Add(Common::StallDiag::Cause::RecorderSpin, stall);
 			continue;
 		}
+		Common::StallDiag::Scope busy(Common::StallDiag::Cause::RecorderBusy);
 		while (done != published) {
 			auto*      header = reinterpret_cast<Header*>(m_ring + done % Capacity);
 			const auto size   = header->size;

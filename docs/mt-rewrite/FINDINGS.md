@@ -52,7 +52,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
 | 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same binary, same batch, `KYTY_MASKED_SELECTS=0`: 29.53; in passes 9.14 → 8.93 ms/frame, GPU 15.14 → 14.77; FPS unchanged, the command thread limits. Re-measured after an external load overlapped the first runs) | 29.31 | 153.0k | 48.9 (max 65.4) | 20.1 |
 | 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4, #37; re-run without the external build's load, same batch: `dev` 4d170b12 before it 29.56 / 29.21; 6.53 → 5.47 µs/draw) | 34.99 / 34.84 | 183.2k / 182.5k | 35.7 / 37.3 (max 50.1) | 28.6 / 28.4 |
-| 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
+| 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, re-measured without the external build's load, two pairs against `dev` 204abd61 34.68 / 34.38: FPS unchanged, prepare worker 2.90 → 2.76 µs/draw, busy 52% → 49%) | 34.43 / 34.47 | 180.6k / 180.7k | – | – |
 | 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 204abd61 34.46; in passes 8.90 → 8.43 ms/frame, GPU 14.79 → 14.38; against `dev` 4d170b12 earlier: in passes 8.93 → 8.53) | 34.80 | 181.7k | 40.9 (max 65.5) | 25.0 |
 | 2026-11-07 | Compute and pixel shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` ae6d8c77 35.09; GPU 14.34 → 13.86 ms/frame, dispatches 3.68 → 3.39, in passes 8.42 → 8.23; FPS unchanged, the command thread limits) | 35.21 | 184.1k | 40.0 (max 66.6) | 26.1 |
 | 2026-11-07 | Consecutive dispatches the guest lets overlap share their barriers (Track G3; same batch: ref `dev` ae6d8c77 34.81; with `KYTY_GPU_TIME=passes`, GPU 14.14 → 13.29 ms/frame, dispatches 3.68 → 3.04, barrier gaps 0.80 → 0.54) | 35.19 | 183.4k | 38.5 (max 50.6) | 27.4 |
@@ -1220,6 +1220,39 @@ What this means:
 
 `dev` 458607ad (everything through #11): 24.20 / 24.41 / 24.22 FPS, worst_ms ~52–54, low1 ~19.
 
+## Critical path after B4 (2026-11-07)
+
+`KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
+
+| Thread | Busy | Waiting |
+|---|---|---|
+| GPU command thread | ~86% | another thread's synchronous command 9.7–10.9% (of which on the GPU 8.2–9.0%), prepare worker 2.2–2.3%, scheduler callbacks 1.7–2.6%, recorder ring 0.3–0.5%, no guest work 0%, blocked guest waits 0% |
+| Prepare worker | ~50% | spinning ~23%, sleeping ~26% |
+| Recorder | ~9% | spinning ~63%, sleeping ~26% |
+
+- **The command thread is the gate, and the guest is always ahead of it.** It never runs out of
+  submitted work. Waits on PM4 GPU work are 0%. Its waits on the GPU all happen inside other
+  threads' synchronous commands: a guest read fault on GPU-written memory runs
+  `BufferCache::ReadMemory` → `DownloadBufferMemory` → `CommandScheduler::Wait` on the command
+  thread, which then waits for the GPU to finish everything queued before the download (gdb
+  stack sample: `MasterSemaphore::Wait <- CommandScheduler::Wait <- DownloadBufferMemory <-
+  ReadMemory <- SendCommandSync <- GuestGpu::ProcessCommands <- CommandProcessor::ProcessPm4`).
+  That is ~9% of the command thread doing nothing.
+- **The worker and the recorder have headroom.** Their CPU use (~73% each in `top`) is mostly
+  spinning for the next draw. The recorder does ~9% real work.
+- **Vsync.** `KYTY_TIME_DIAG=1`: 35 flips/s, `flip_vbl` p50 2, p99 2, max 3, so frames take 1 or
+  2 vblanks. FPS equals command-thread throughput: 181k draws/s ÷ 5.2k draws per frame. No stage
+  waits on vblank. For 60 FPS every frame has to fit one vblank: ~3.2 µs per draw on the
+  command thread.
+- **The game's threads.** gdb samples of the busiest guest thread (35% CPU): 26 of 40 samples are
+  blocked on a guest pthread mutex inside the game, and one guest site calls `usleep` ~1M times a
+  second (polling). The tbb workers mostly wait on guest condition variables. None of the game's
+  threads limits the frame: the command thread always has work queued.
+- **Locked instructions.** ~50 per draw on the command thread (`perf` event
+  `mem_inst_retired.lock_loads`). Removing the texture cache's lock from memo hits moved its cost
+  to the next locked instruction: no gain. Resolving texture memo misses into their slot (two
+  1.2 KB copies instead of five) gave no gain either. Neither is merged.
+
 ## Remaining costs and candidate directions
 
 1. **Per-draw CPU cost (~10.5 µs × 5.8k draws).** Spread thinly; only structural change helps:
@@ -1273,6 +1306,10 @@ What this means:
   the worker elsewhere, `KYTY_PREPARE_VERIFY=1` looks every adopted draw up again and exits on a
   difference, `KYTY_PREPARE_STATS=1` prints `PREPARE` lines once per second (adopted and rejected
   draws, drains, the command thread's wait and the worker's time per draw).
+- Critical path: `KYTY_STALL_DIAG=1` prints a `STALL` line once per second with the GPU command
+  thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
+  GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)
+  and the prepare worker's and recorder's busy, spinning and sleeping shares.
 - Dispatch chains (Track G3): `KYTY_DISPATCH_CHAIN=0` records every dispatch's barriers again,
   `KYTY_DISPATCH_CHAIN=stats` prints `DISPCHAIN` lines (dispatches and chained dispatches per second).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every

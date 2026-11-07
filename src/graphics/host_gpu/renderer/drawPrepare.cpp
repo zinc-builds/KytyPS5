@@ -2,6 +2,7 @@
 
 #include "common/hybridAffinity.h"
 #include "common/profiler.h"
+#include "common/stallDiag.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <chrono>
@@ -79,6 +80,7 @@ uint64_t Worker::Wait(uint64_t sequence) {
 		return 0;
 	}
 	const auto start = NowNs();
+	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdPrepare);
 	Wake();
 	for (uint32_t spins = 0; m_done.load(std::memory_order_acquire) < sequence; spins++) {
 		if ((spins & 1023u) == 1023u) {
@@ -110,6 +112,7 @@ void Worker::Loop() {
 			}
 			// Draws arrive every few microseconds: spin a while before sleeping.
 			const auto start = std::chrono::steady_clock::now();
+			auto       stall = Common::StallDiag::Now();
 			for (uint32_t spins = 1;; spins++) {
 				KYTY_PREPARE_PAUSE();
 				posted = m_posted.load(std::memory_order_acquire);
@@ -118,17 +121,23 @@ void Worker::Loop() {
 				}
 				if ((spins & 255u) == 0 &&
 				    std::chrono::steady_clock::now() - start > std::chrono::microseconds(50)) {
+					Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSpin, stall);
+					stall = Common::StallDiag::Now();
 					m_sleeping.store(true, std::memory_order_seq_cst);
 					if (m_posted.load(std::memory_order_seq_cst) == done &&
 					    !m_stop.load(std::memory_order_seq_cst)) {
 						m_sleeping.wait(true, std::memory_order_seq_cst);
 					}
 					m_sleeping.store(false, std::memory_order_relaxed);
+					Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSleep, stall);
+					stall = 0;
 					break;
 				}
 			}
+			Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSpin, stall);
 			continue;
 		}
+		Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
 		const auto start = NowNs();
 		while (done != posted) {
 			m_run(m_context, ++done);
