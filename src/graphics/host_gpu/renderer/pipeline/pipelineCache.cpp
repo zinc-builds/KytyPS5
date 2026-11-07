@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -112,11 +113,30 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	if (DrawPrepare::OnWorker()) {
+		// GPU-written bytes would need a download on the command thread; they are checked where
+		// the draw is adopted.
+		DrawPrepare::NoteRead(address, values.size_bytes());
+		return Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes());
+	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
+
+// The image heap of lookups on the prepare worker: acquiring host texture state is the command
+// thread's, so a draw that would use one is prepared there.
+class PrepareWorkerImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
+public:
+	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest&, ShaderRecompiler::IR::ImageHeapView&) override {
+		DrawPrepare::Fail();
+		return false;
+	}
+};
+PrepareWorkerImageHeap g_prepare_worker_image_heap;
 
 void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -283,8 +303,13 @@ template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor,
                                                  StageResources& resources) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources.snapshot,
-	                                                    resources.specialization));
+	if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources.snapshot,
+	                                               resources.specialization)) {
+		// On the worker, a heap it may not acquire can be why.
+		EXIT_IF(!DrawPrepare::OnWorker());
+		DrawPrepare::Fail();
+		return nullptr;
+	}
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -363,11 +388,13 @@ template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor, StageResources& resources) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
+	const bool worker = DrawPrepare::OnWorker();
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
 	    .shader_base                = params.Base(),
 	    .read_specialization_memory = ReadShaderGuestMemory,
-	    .image_heap                 = m_image_heap,
+	    .image_heap                 = worker && m_image_heap != nullptr ? &g_prepare_worker_image_heap
+	                                                                    : m_image_heap,
 	};
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -403,6 +430,21 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		return &module;
 	};
 	bool source_changed = false;
+	if (worker) {
+		// Only finds: a miss, a compile or a call-target refresh is the command thread's.
+		if (entry == m_program_cache.end() || entry->second.call_source) {
+			DrawPrepare::Fail();
+			return nullptr;
+		}
+		auto& cached = entry->second;
+		if (cached.skip_dispatch) return nullptr;
+		auto* module = cached.FindModule<false>(runtime, push_data_cursor, resources);
+		if (module == nullptr) {
+			DrawPrepare::Fail();
+			return nullptr;
+		}
+		return bind(*module);
+	}
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
@@ -652,11 +694,18 @@ void PipelineCache::WriteDriverCache() const {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
-	const auto& context           = command.GetRegisters();
-	const auto& user_config       = command.GetUserConfig();
+	GetGraphicsPrograms(command.GetRegisters(), command.GetUserConfig(), command.GetShaders(),
+	                    state, m_graphics_resources);
+}
+
+void PipelineCache::GetGraphicsPrograms(const HW::Context& context,
+                                        const HW::UserConfig& user_config,
+                                        const HW::Shader& shaders, DrawRenderState& state,
+                                        GraphicsResources& resources) {
+	const bool  worker            = DrawPrepare::OnWorker();
 	const auto& sh                = context.GetShaderRegisters();
-	const auto& vertex_regs       = command.GetShaders().GetVs();
-	const auto& pixel_regs        = command.GetShaders().GetPs();
+	const auto& vertex_regs       = shaders.GetVs();
+	const auto& pixel_regs        = shaders.GetPs();
 	auto&       vertex_info       = state.vertex_info;
 	auto&       pixel_info        = state.ps_input_info;
 	const bool  object_primitive_id = context.HasObjectPrimitiveIdOutput();
@@ -689,8 +738,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
 		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
 		                                   sh.m_vgtTfParam};
-		const auto [layout, inserted] = m_tess_layouts.try_emplace(
-		    XXH3_64bits(layout_key, sizeof(layout_key)), vertex_info[0].tess);
+		const auto layout_hash = XXH3_64bits(layout_key, sizeof(layout_key));
+		if (worker && !m_tess_layouts.contains(layout_hash)) {
+			DrawPrepare::Fail();
+			return;
+		}
+		const auto [layout, inserted] =
+		    m_tess_layouts.try_emplace(layout_hash, vertex_info[0].tess);
 		if (inserted) {
 			ShaderRecompiler::AnalyzeTessellationPrograms(vertex_params[0].code,
 			                                              vertex_params[1].code, layout->second);
@@ -862,8 +916,14 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module =
-		    *GetProgram(pixel_params, pixel_info, push_data_cursor, m_graphics_resources[3]);
+		const auto* found = GetProgram(pixel_params, pixel_info, push_data_cursor, resources[3]);
+		if (found == nullptr) {
+			// A skipped pixel program is unsupported; the worker fails there or earlier.
+			EXIT_IF(!worker);
+			DrawPrepare::Fail();
+			return;
+		}
+		const auto& pixel_module = *found;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -873,7 +933,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, m_graphics_resources[i]);
+		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, resources[i]);
 	}
 }
 

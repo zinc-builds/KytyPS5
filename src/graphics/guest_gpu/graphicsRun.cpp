@@ -581,6 +581,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(execution);
 
 	ProcessPm4(execution);
+	// Nothing stays queued past the packet loop.
+	m_renderer.GetRenderExecutor().FinishQueuedDraws(CurrentBuffer());
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -656,10 +658,48 @@ static bool KeepsAtomicWrites(uint32_t packet_header) {
 	}
 }
 
+// Packets that touch nothing the caches hold and write no guest memory, besides direct draws
+// (which queue themselves, see RenderExecutor::QueueDrawIndex), so a queued draw may wait past
+// them. The indirect register writes read guest memory, which a queued draw's shaders could
+// write only racily: the hardware command processor reads these packets long before earlier
+// draws run, so a guest must put a wait or cache operation in between, and those finish the
+// queue. Sky Garden uses them for nearly every draw.
+static bool KeepsQueuedDraw(uint32_t packet_header) {
+	switch ((packet_header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_MULTI_INST:
+		case Pm4::IT_DRAW_INDEX_AUTO: return true;
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(packet_header);
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+		}
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool debug_dump = graphics_debug_dump_enabled();
+	auto&      executor   = m_renderer.GetRenderExecutor();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
+			// Guest commands (readbacks, unmaps) see every draw before them committed.
+			if (executor.HasQueuedDraw() && g_gpu_state->HasPendingCommands()) {
+				executor.FinishQueuedDraws(CurrentBuffer());
+			}
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
@@ -698,13 +738,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 
+		if (executor.HasQueuedDraw() &&
+		    (!KeepsQueuedDraw(packet_header) ||
+		     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
+			executor.FinishQueuedDraws(CurrentBuffer());
+		}
 		if (!DefersAsyncCollect(packet_header)) {
 			m_renderer.CollectAsyncWritesIfRequested();
 		}
 		if (!KeepsAtomicWrites(packet_header)) {
 			// The same packets may signal the guest or store into its memory.
 			GuestSyncEpoch::Advance();
-			if (auto& executor = m_renderer.GetRenderExecutor(); executor.HasAtomicWrites()) {
+			if (executor.HasAtomicWrites()) {
 				executor.FlushAtomicWrites(CurrentBuffer());
 			}
 		}
@@ -825,11 +870,16 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	auto& executor           = m_renderer.GetRenderExecutor();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
+		if (m_num_instances_addr != 0) {
+			// Reads guest memory a queued draw may write.
+			executor.FinishQueuedDraws(CurrentBuffer());
+		}
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(CurrentBuffer(), args);
+	executor.QueueDrawIndex(CurrentBuffer(), args);
 }
 
 const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
@@ -984,10 +1034,14 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.instance_count == 0) {
+		if (m_num_instances_addr != 0) {
+			executor.FinishQueuedDraws(CurrentBuffer());
+		}
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(CurrentBuffer(), args);
+	executor.QueueDrawAuto(CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

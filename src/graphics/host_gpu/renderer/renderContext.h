@@ -68,6 +68,7 @@ public:
 	// Where the guest may have published data mid-stream (a satisfied wait), the collection
 	// can wait until the next packet that reads guest data: see CollectAsyncWritesIfRequested.
 	void RequestAsyncCollect() noexcept { m_async_collect_requested = true; }
+	[[nodiscard]] bool AsyncCollectRequested() const noexcept { return m_async_collect_requested; }
 	void CollectAsyncWritesIfRequested() {
 		if (m_async_collect_requested) {
 			CollectAsyncWrites();
