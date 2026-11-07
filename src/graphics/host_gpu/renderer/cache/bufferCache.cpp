@@ -750,7 +750,24 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		}
 	}
 #endif
-	if (source) {
+	if (source && m_upload_batch.active && !AsyncUploadVerifyEnabled()) {
+		// One barrier pair for the whole batch: the global barriers cover every destination.
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		if (!m_upload_batch.open) {
+			m_upload_batch.open = true;
+			const vk::MemoryBarrier before {
+			    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+			                     vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+			    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1,
+			                       &before, 0, nullptr, 0, nullptr);
+		}
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data());
+	} else if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -1173,6 +1190,29 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 RangeSet BufferCache::TakeBdaSync() {
 	std::lock_guard lock(m_bda_sync_mutex);
 	return std::exchange(m_bda_sync, {});
+}
+
+void BufferCache::BeginUploadBatch() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_UPLOAD_BATCH");
+		return env == nullptr || std::strcmp(env, "0") != 0;
+	}();
+	EXIT_IF(m_upload_batch.active);
+	m_upload_batch = {enabled, false};
+}
+
+void BufferCache::EndUploadBatch() {
+	if (m_upload_batch.open) {
+		const vk::MemoryBarrier after {
+		    .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		    .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                 vk::PipelineStageFlagBits::eAllCommands,
+		                                 vk::DependencyFlags {}, 1, &after, 0, nullptr, 0, nullptr);
+	}
+	m_upload_batch = {};
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

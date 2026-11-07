@@ -195,6 +195,13 @@ std::map<std::pair<VkCommandBuffer, int>, VkPipeline> g_last_bind;
 struct PassTimer {
 	static constexpr uint32_t ChunkQueries = 16384;
 	static constexpr uint32_t Chunks       = 64;
+	// KYTY_VK_COUNT=sites: the recording site of a barrier (its caller and that one's caller)
+	// and its stage masks.
+	struct BarrierInfo {
+		uintptr_t site = 0, site2 = 0;
+		uint64_t  src = 0, dst = 0;
+		auto      operator<=>(const BarrierInfo&) const = default;
+	};
 	struct Segment {
 		uint32_t begin = 0, end = 0; // query indices
 		bool     pass  = false;
@@ -205,6 +212,8 @@ struct PassTimer {
 		uint32_t barriers = 0; // barriers recorded since the previous segment ended
 		uint64_t bytes    = 0; // copy_buffer: bytes copied
 		uintptr_t site = 0, site2 = 0; // copy_buffer with KYTY_VK_COUNT=sites: recorder, its caller
+		BarrierInfo last_barrier;      // the last barrier before this segment (sites mode)
+		uint8_t     previous_kind = 0xff; // kind of the segment before (0xff: none)
 	};
 	enum SegmentKind : uint8_t { Pass, Dispatch, Transfer, Clear };
 	struct Chunk {
@@ -213,6 +222,7 @@ struct PassTimer {
 		uint32_t             used    = 0;
 		uint32_t             start = UINT32_MAX, finish = UINT32_MAX; // command buffer bounds
 		uint32_t             barriers = 0; // since the last segment ended
+		BarrierInfo          last_barrier;
 		std::vector<Segment> segments;
 		struct Draw {
 			int32_t  segment = -1;
@@ -252,6 +262,10 @@ struct PassTimer {
 	};
 	std::array<CopyTotal, 5>                copy_by_size {};
 	std::map<std::pair<uintptr_t, uintptr_t>, CopyTotal> copy_by_site;
+	// Gaps after barriers by the last barrier before them (sites mode) and by the kinds of the
+	// segments around them.
+	std::map<BarrierInfo, std::pair<double, uint64_t>> gap_by_barrier;
+	std::array<std::pair<double, uint64_t>, 5 * 4>     gap_by_kinds {}; // previous (or none) x next
 	uint64_t passes = 0, dispatches = 0, pass_draws = 0;
 	std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::pair<double, uint64_t>> by_shape; // wxh,colors -> ns, n
 };
@@ -329,6 +343,15 @@ void PassCollect(uint32_t index) {
 					} else if (segment.barriers != 0) {
 						g_passes.gap_barrier_ns += gap;
 						g_passes.gaps_barrier++;
+						const size_t previous = segment.previous_kind == 0xff ? 4 : segment.previous_kind;
+						auto& by_kind = g_passes.gap_by_kinds[previous * 4 + segment.kind];
+						by_kind.first += gap;
+						by_kind.second++;
+						if (g_sites) {
+							auto& by_barrier = g_passes.gap_by_barrier[segment.last_barrier];
+							by_barrier.first += gap;
+							by_barrier.second++;
+						}
 					} else {
 						g_passes.gap_plain_ns += gap;
 						g_passes.gaps_plain++;
@@ -474,6 +497,39 @@ void Collect(uint32_t slot) {
 			            g_passes.gap_plain_ns / 1e6 / s, g_passes.gaps_plain / s, g_passes.lead_ns / 1e6 / s,
 			            g_passes.tail_ns / 1e6 / s);
 			{
+				static constexpr std::array<const char*, 5> kinds = {"pass", "dispatch", "transfer",
+				                                                     "clear", "start"};
+				std::string line = "GPUGAPKIND";
+				for (size_t previous = 0; previous < 5; previous++) {
+					for (size_t next = 0; next < 4; next++) {
+						const auto& [ns, n] = g_passes.gap_by_kinds[previous * 4 + next];
+						if (n == 0) continue;
+						char text[96];
+						std::snprintf(text, sizeof(text), " %s>%s=%.2fms/%.0f", kinds[previous],
+						              kinds[next], ns / 1e6 / s, static_cast<double>(n) / s);
+						line += text;
+					}
+				}
+				std::printf("%s\n", line.c_str());
+				g_passes.gap_by_kinds = {};
+				std::vector<std::pair<double, std::pair<PassTimer::BarrierInfo, uint64_t>>> top;
+				for (const auto& [info, value]: g_passes.gap_by_barrier) {
+					top.push_back({value.first, {info, value.second}});
+				}
+				std::sort(top.begin(), top.end(),
+				          [](const auto& a, const auto& b) { return a.first > b.first; });
+				for (size_t i = 0; i < top.size() && i < 16; i++) {
+					const auto& [info, n] = top[i].second;
+					std::printf("GPUGAPSITE addr=%lx caller=%lx src=0x%llx dst=0x%llx ms_s=%.3f gaps_s=%.0f\n",
+					            static_cast<unsigned long>(info.site),
+					            static_cast<unsigned long>(info.site2),
+					            static_cast<unsigned long long>(info.src),
+					            static_cast<unsigned long long>(info.dst), top[i].first / 1e6 / s,
+					            static_cast<double>(n) / s);
+				}
+				g_passes.gap_by_barrier.clear();
+			}
+			{
 				static constexpr std::array<const char*, 9> names = {
 				    "copy_buffer", "fill_buffer", "update_buffer", "copy_image", "buffer_to_image",
 				    "image_to_buffer", "blit_image", "clear_color", "clear_depth"};
@@ -534,6 +590,10 @@ void PassBegin(VkCommandBuffer buffer, const VkRenderingInfo* info) {
 	segment.pass   = true;
 	segment.barriers = chunk.barriers;
 	chunk.barriers   = 0;
+	segment.last_barrier  = chunk.last_barrier;
+	segment.previous_kind = chunk.segments.empty() ? uint8_t {0xff}
+	                        : chunk.segments.back().pass ? uint8_t {PassTimer::Pass}
+	                                                     : chunk.segments.back().kind;
 	segment.width  = info->renderArea.extent.width;
 	segment.height = info->renderArea.extent.height;
 	segment.colors = info->colorAttachmentCount;
@@ -569,11 +629,26 @@ void PassDrawStamp(VkCommandBuffer buffer, uint64_t vs, uint64_t ps, uint64_t ve
 	chunk.draws.push_back({open->second, PassStamp(buffer), vs, ps, vertices, changed});
 }
 
-void PassBarrier(VkCommandBuffer buffer) {
+[[gnu::noinline]] void PassBarrier(VkCommandBuffer buffer, uint64_t src = 0, uint64_t dst = 0) {
 	if (!g_passes.enabled) return;
+	PassTimer::BarrierInfo info;
+#if defined(__linux__)
+	if (g_sites) {
+		// PassBarrier, the wrapper, then the caller of the vulkan.hpp method and its caller.
+		std::array<void*, 5> frames {};
+		const int  count = backtrace(frames.data(), static_cast<int>(frames.size()));
+		const auto base  = reinterpret_cast<uintptr_t>(&__ehdr_start);
+		if (count >= 3) info.site = reinterpret_cast<uintptr_t>(frames[2]) - base;
+		if (count >= 4) info.site2 = reinterpret_cast<uintptr_t>(frames[3]) - base;
+		info.src = src;
+		info.dst = dst;
+	}
+#endif
 	std::lock_guard lock(g_timer.mutex);
 	if (const auto found = g_passes.active.find(buffer); found != g_passes.active.end()) {
-		g_passes.chunks[found->second].barriers++;
+		auto& chunk = g_passes.chunks[found->second];
+		chunk.barriers++;
+		chunk.last_barrier = info;
 	}
 }
 
@@ -597,6 +672,10 @@ int32_t DispatchBegin(VkCommandBuffer buffer, uint8_t kind = PassTimer::Dispatch
 	}
 	segment.barriers = chunk.barriers;
 	chunk.barriers   = 0;
+	segment.last_barrier  = chunk.last_barrier;
+	segment.previous_kind = chunk.segments.empty() ? uint8_t {0xff}
+	                        : chunk.segments.back().pass ? uint8_t {PassTimer::Pass}
+	                                                     : chunk.segments.back().kind;
 	segment.begin = PassStamp(buffer);
 	segment.end   = UINT32_MAX;
 	chunk.segments.push_back(segment);
@@ -627,7 +706,9 @@ void InstallCommandCounters() {
 		dispatcher.vkCmdPipelineBarrier          = [](auto... args) {
             Count(Barrier);
             Site(Barrier);
-            PassBarrier(std::get<0>(std::tuple {args...}));
+            const auto tuple = std::tuple {args...};
+            PassBarrier(std::get<0>(tuple), static_cast<uint64_t>(std::get<1>(tuple)),
+                        static_cast<uint64_t>(std::get<2>(tuple)));
             original(args...);
 		};
 	}
@@ -636,7 +717,20 @@ void InstallCommandCounters() {
 		dispatcher.vkCmdPipelineBarrier2 = [](VkCommandBuffer buffer, const VkDependencyInfo* info) {
 			Count(Barrier2);
 			Site(Barrier2);
-			PassBarrier(buffer);
+			uint64_t src = 0, dst = 0;
+			for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
+				src |= info->pMemoryBarriers[i].srcStageMask;
+				dst |= info->pMemoryBarriers[i].dstStageMask;
+			}
+			for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
+				src |= info->pBufferMemoryBarriers[i].srcStageMask;
+				dst |= info->pBufferMemoryBarriers[i].dstStageMask;
+			}
+			for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+				src |= info->pImageMemoryBarriers[i].srcStageMask;
+				dst |= info->pImageMemoryBarriers[i].dstStageMask;
+			}
+			PassBarrier(buffer, src | (1ull << 63u), dst); // bit 63: a synchronization2 barrier
 			{
 				std::lock_guard lock(g_mutex);
 				for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {

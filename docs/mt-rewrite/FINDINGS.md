@@ -58,6 +58,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Consecutive dispatches the guest lets overlap share their barriers (Track G3; same batch: ref `dev` ae6d8c77 34.81; with `KYTY_GPU_TIME=passes`, GPU 14.14 → 13.29 ms/frame, dispatches 3.68 → 3.04, barrier gaps 0.80 → 0.54) | 35.19 | 183.4k | 38.5 (max 50.6) | 27.4 |
 | 2026-11-07 | Game-created threads on the efficiency cores, the game's render thread and the emulator on the performance cores (same batch: ref `dev` e5ef1e84 35.03 / 35.27, worst_ms 39.0 / 38.5) | 36.02 / 36.45 | 188.8k / 191.7k | 33.5 (max 33.5) | 28.7 / 29.9 |
 | 2026-11-07 | Large buffer uploads cross PCIe on the copy engine into a device-local ring; the universal queue copies from there at VRAM speed (Track G4; same batch: ref `dev` abc268e0 35.01; `KYTY_GPU_TIME=1` GPU 13.04 → 12.42 ms/frame; with `=passes` 13.25 → 12.47, transfers 1.35 → 0.58; FPS unchanged, the command thread limits) | 35.28 | 185.0k | 38.3 (max 51.0) | 26.7 |
+| 2026-11-07 | `PrepareBda`'s uploads share one barrier pair (Track G4; same binary, `KYTY_UPLOAD_BATCH=0`: 35.92; `KYTY_GPU_TIME=1` GPU 12.30 → 12.19 ms/frame, barrier gaps 0.53 → 0.45) | 35.84 | 188.7k | 33.5 (max 33.5) | 29.9 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -888,6 +889,38 @@ every asynchronous upload's destination back after its copy and compared it with
 host wrote: 7.4k uploads, 30 GB, 0 mismatches. `KYTY_ASYNC_UPLOAD=0` turns it off (no transfer
 queue), `=stats` prints `ASYNCUPLOAD` lines, `KYTY_ASYNC_UPLOAD_MIN=<bytes>` sets the threshold.
 
+**Waits after barriers** (`KYTY_GPU_TIME=passes` with `KYTY_VK_COUNT=sites`: `GPUGAPKIND` splits the
+idle gaps after barriers by the kinds of the segments around them, `GPUGAPSITE` by the call site
+and stage masks of the last barrier before each gap). On `dev` 79d64348, ~0.53 ms/frame in ~450
+gaps; per second at ~34 FPS:
+
+| Last barrier before the gap | ms/s | gaps/s |
+|---|---|---|
+| `ShaderWriteHazardBarrier` before a dispatch that doesn't chain (`ALL_COMMANDS → COMPUTE`) | 5.4 | 3.3k |
+| `SynchronizeBuffer` from `PrepareBda` (a barrier pair per uploaded buffer) | 3.2 | 2.3k |
+| `ShaderWriteHazardBarrier` before a draw whose fragment shader writes buffers | 2.6 | 1.1k |
+| `Buffer::Fill` / `Buffer::CopyFrom` from `CpOpDmaData` | 2.3 | 1.5k |
+| `Image::Transit` (clears, bindings, render targets) | 1.3 | 2.9k |
+| indirect-dispatch arguments (`→ DRAW_INDIRECT`) | 1.0 | 0.4k |
+
+By kind: dispatch → dispatch 6.0 ms/s, transfer → transfer 4.4, pass → pass 2.6, dispatch → pass
+1.3, dispatch ↔ transfer 2.2. The unchained dispatches wait because the guest put a wait between
+them (Track G3).
+
+**Ruled out: attachment accesses on their own stages.** `Image::Transit` gives every non-transfer
+access `ALL_GRAPHICS | COMPUTE`, so a render-target transition also holds back the next pass's
+vertex and fragment shading. Narrowing color attachments to `COLOR_ATTACHMENT_OUTPUT` and depth to
+the fragment-test stages (same binary, env switch): GPU 12.33 → 12.33 ms/frame. The driver drains
+at these pass boundaries either way.
+
+**One barrier pair per `PrepareBda` (landed).** Its uploads (often several buffers in a row)
+each recorded a buffer barrier before and after the copy. Between `BufferCache::BeginUploadBatch`
+and `EndUploadBatch` (around `PrepareBda`'s loop) the first copy records one global
+`ALL_COMMANDS → TRANSFER` barrier and the end one `TRANSFER → ALL_COMMANDS`; nothing else is
+recorded in between. Same binary, `KYTY_UPLOAD_BATCH=0` as the reference: `KYTY_GPU_TIME=1`
+12.30 → 12.19 ms/frame; `=passes` barrier gaps 0.53 → 0.45 ms/frame (447 → 387 gaps),
+transfer → transfer gaps 4.4 → 1.5 ms/s; FPS unchanged.
+
 ### Draw state cache, Track B (2026-11-06)
 
 **B0: per-draw state does not repeat; its shape does.** A walk memo keyed on a program's user
@@ -1320,3 +1353,7 @@ What this means:
   `=stats` prints `ASYNCUPLOAD` lines, `KYTY_ASYNC_UPLOAD_MIN=<bytes>` (default 262144) is the
   smallest upload sent through the transfer queue, `KYTY_ASYNC_UPLOAD_VERIFY=1` reads each one's
   destination back and compares (`ASYNCVERIFY` lines; slow).
+- Barrier gaps (Track G4): `KYTY_GPU_TIME=passes` prints `GPUGAPKIND` (gaps after barriers by the
+  kinds of segment before and after); with `KYTY_VK_COUNT=sites` also `GPUGAPSITE addr=… caller=…
+  src=… dst=…` (the last barrier before the gaps; bit 63 of `src` marks a synchronization2 barrier).
+  `KYTY_UPLOAD_BATCH=0` gives every `PrepareBda` upload its own barrier pair again.
