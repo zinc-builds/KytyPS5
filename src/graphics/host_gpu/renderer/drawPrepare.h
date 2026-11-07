@@ -59,6 +59,18 @@ inline void Fail() {
 void               NoteHazard() noexcept;
 [[nodiscard]] uint64_t HazardGeneration() noexcept;
 
+// Emulator stores through the backing into pages that stay read-watched until after the store
+// (buffer readbacks publish before their pages are released), recorded instead of advancing
+// GuestSyncEpoch's unranged epoch. A preparation read such bytes only through a logging reader,
+// so a result whose logged reads miss every range stored since its post is still current.
+// Called before and after the store.
+void                   NoteStoredRange(uint64_t vaddr, uint64_t size);
+[[nodiscard]] uint64_t StoredSequence() noexcept;
+// Whether a range recorded after `sequence` overlaps one of `reads`; also true when the record
+// no longer reaches back that far.
+[[nodiscard]] bool StoredSince(uint64_t sequence,
+                               const std::vector<std::pair<uint64_t, uint64_t>>& reads);
+
 // One worker thread. The command thread posts sequence numbers in order; the worker calls
 // run(context, sequence) for each, in order.
 class Worker {

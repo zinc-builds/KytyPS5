@@ -1738,7 +1738,8 @@ void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 	queued.user_config       = buffer.GetUserConfig();
 	queued.shaders           = buffer.GetShaders();
 	queued.hazard_generation = DrawPrepare::HazardGeneration();
-	queued.sync_epoch        = GuestSyncEpoch::Current();
+	queued.sync_epoch        = GuestSyncEpoch::CurrentUnranged();
+	queued.stored_sequence   = DrawPrepare::StoredSequence();
 	queued.sequence          = m_prepare_worker->Post();
 	// The worker finds the slot from the sequence.
 	EXIT_IF(queued.sequence != ++m_queued_posted ||
@@ -1825,12 +1826,12 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			const auto span  = static_cast<double>(now - stat.start_ns);
 			const auto draws = static_cast<double>(std::max<uint64_t>(stat.queued, 1));
 			std::printf("PREPARE queued=%" PRIu64 " direct=%" PRIu64 " adopted=%" PRIu64
-			            " failed=%" PRIu64 " hazard=%" PRIu64 " gpu_written=%" PRIu64
-			            " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
+			            " failed=%" PRIu64 " hazard=%" PRIu64 " stored=%" PRIu64
+			            " gpu_written=%" PRIu64 " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
 			            " drains=%" PRIu64 ") worker_ns_per_draw=%.0f"
 			            " worker_busy=%.1f%%\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
-			            stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
+			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
 			            static_cast<double>(busy - stat.worker_busy_ns) / draws,
 			            100.0 * static_cast<double>(busy - stat.worker_busy_ns) / span);
@@ -1848,10 +1849,13 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 	if (queued.log.failed) {
 		m_prepare_stat.failed++;
 	} else if (DrawPrepare::HazardGeneration() != queued.hazard_generation ||
-	           GuestSyncEpoch::Current() != queued.sync_epoch) {
+	           GuestSyncEpoch::CurrentUnranged() != queued.sync_epoch) {
 		// GPU-written bytes appeared, or the emulator stored into guest memory, while the
 		// worker read: the lookup here would have seen them.
 		m_prepare_stat.hazard++;
+	} else if (DrawPrepare::StoredSince(queued.stored_sequence, queued.log.reads)) {
+		// A readback published bytes the worker read.
+		m_prepare_stat.stored++;
 	} else if (std::ranges::any_of(queued.log.reads, [&](const auto& read) {
 		           return buffers.HasGpuDirtyBytes(read.first, read.second);
 	           })) {

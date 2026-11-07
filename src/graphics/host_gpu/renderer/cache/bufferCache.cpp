@@ -486,8 +486,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			// The pages stay GPU-owned, so read-watched, until after this store (Unmark or the
+			// release command follows publication): a prepared draw that read these bytes
+			// logged them, and DrawPrepare checks it by range.
+			const auto address = buffer_address + copy.srcOffset;
+			DrawPrepare::NoteStoredRange(address, copy.size);
+			Libs::LibKernel::Memory::WriteBacking(address, mapped + (copy.dstOffset - offset),
+			                                      copy.size, true);
+			DrawPrepare::NoteStoredRange(address, copy.size);
 		}
 		if (read != nullptr) {
 			read->published.store(true, std::memory_order_release);

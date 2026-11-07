@@ -278,9 +278,11 @@ private:
 		PipelineCache::GraphicsResources resources;
 		DrawPrepare::Log                 log;
 		uint64_t                         sequence = 0;
-		// DrawPrepare::HazardGeneration and GuestSyncEpoch when it was queued.
+		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged and
+		// DrawPrepare::StoredSequence when it was queued.
 		uint64_t                         hazard_generation = 0;
 		uint64_t                         sync_epoch        = 0;
+		uint64_t                         stored_sequence   = 0;
 	};
 
 	// False, with nothing drawn, when the draw's indirect records need CPU counts. A queued draw
@@ -445,6 +447,7 @@ private:
 	bool                                             m_prepare_stats  = false;
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t stored = 0;
 		uint64_t wait_ns = 0, verified = 0, worker_busy_ns = 0, start_ns = 0;
 		uint64_t drains = 0, waits = 0; // drains: FinishQueuedDraws with draws queued
 	} m_prepare_stat;
