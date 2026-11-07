@@ -28798,13 +28798,16 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
+  // The operands come from the buffer, so the minimum cannot constant-fold.
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 7);
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 12, 30);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 0);
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 64);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 12, 30);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 1);
@@ -28813,9 +28816,10 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   TestCase test;
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
+  test.initial = {7u, 64u};
   test.expected = {0xa1b20007u, 0xa1b2001fu};
-  test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {" UMin ", "OpSelect"};
   return test;
 }
