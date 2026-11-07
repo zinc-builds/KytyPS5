@@ -10,7 +10,8 @@
 #
 # The exclusive lock lives on an inherited file descriptor, so an emulator left running
 # (KEEP_RUNNING=1) keeps holding it until it exits: kill your emulator when you are done.
-# KYTY_BENCH_LOCK_TIMEOUT: seconds to wait (default 5400). KYTY_BENCH_LOCK: lock file path.
+# KYTY_BENCH_LOCK_TIMEOUT: seconds to wait for the gate, then again for the lock (default 5400).
+# KYTY_BENCH_LOCK: lock file path.
 #
 # Sourced by the bench scripts for benchlock_acquire; executed for the subcommands above.
 
@@ -26,14 +27,20 @@ benchlock_acquire() {
 	s) echo "benchlock: inside a shared (build) hold; cannot take the exclusive lock" >&2; return 1 ;;
 	esac
 	exec 9>>"$KYTY_BENCH_LOCK" || return 1
-	if ! flock -n "-$mode" 9; then
+	# Turnstile: everyone passes through the gate, and a waiter keeps it while it waits for the
+	# lock. flock alone has no queue, so a benchmark could wait forever while builds keep
+	# overlapping each other; with the gate, later arrivals queue behind it instead.
+	exec 8>>"$KYTY_BENCH_LOCK.gate" || return 1
+	local timeout=${KYTY_BENCH_LOCK_TIMEOUT:-5400}
+	if ! flock -n -x 8 || ! flock -n "-$mode" 9; then
 		echo "benchlock: waiting for $KYTY_BENCH_LOCK (holder: $(cat "$(benchlock_owner_file)" 2>/dev/null || echo unknown))" >&2
-		if ! flock -w "${KYTY_BENCH_LOCK_TIMEOUT:-5400}" "-$mode" 9; then
-			echo "benchlock: gave up after ${KYTY_BENCH_LOCK_TIMEOUT:-5400}s" >&2
-			exec 9>&-
+		if ! flock -w "$timeout" -x 8 || ! flock -w "$timeout" "-$mode" 9; then
+			echo "benchlock: gave up after ${timeout}s" >&2
+			exec 8>&- 9>&-
 			return 1
 		fi
 	fi
+	exec 8>&-
 	export KYTY_BENCH_LOCKED=$mode
 	echo "$mode $what pid=$$ cwd=$PWD since=$(date +%T)" > "$(benchlock_owner_file)"
 	return 0
