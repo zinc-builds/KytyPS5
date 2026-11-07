@@ -716,6 +716,25 @@ doesn't diverge. In passes 8.90 → 8.43 ms/frame against `dev` 204abd61 (same b
 candidate stays live at each read. Holding the indexed range in a function-local array instead
 would release them, but every other access to those VGPRs would then go through memory.
 
+**Where the remaining GPU time is (`dev` 8df89588, ~13.8 ms/frame at ~34.5 FPS):** in passes ~8.2,
+dispatches ~3.4, transfers ~1.3 (buffer copies ~1.0), gaps after barriers ~0.8.
+
+- **Buffer copies (~1.0 ms/frame) are Track C's uploads.** A local counter on `vkCmdCopyBuffer`
+  with `KYTY_VK_COUNT=sites`: ~95 copies and ~19.6 MB per frame (about 4 of 2–16 MB carry most
+  bytes, ~55 of 4–32 KB, ~30 under 512 B). 20 MB is ~0.05 ms of bandwidth, so the time is
+  per-copy overhead and the barriers around them. By call site, 66% come from `PrepareBda` →
+  `SynchronizeBuffersInRange` → `SynchronizeBuffer` (CPU-written guest pages uploaded before
+  dispatches), 15% from `CpOpDmaData`, 10% from `ReadMemory` downloads, 5% from new-buffer
+  joins. Batching those uploads into fewer copies and barriers belongs to the buffer cache.
+- **Masked selects in mesh shaders: not worth it.** Enabled for the mesh stage (the GS-on-mesh
+  modules, also two guest lanes per invocation with EXEC-guarded exports): `74d9612c` 17.6 →
+  16.4 ms/s, `dc33907e` 10.3 → 9.4, but GPU 13.82 → 13.78 ms/frame, within noise. Left off.
+- **Indexed VGPR range, rest of the ceiling (~0.5 ms):** every candidate VGPR stays live at each
+  `V_MOVRELS` read (213 registers in the skinned family after the switch). A function-local array
+  for the indexed range would free them, but each other access to those VGPRs would become a
+  local-memory load or store; worth trying only with the range limited to VGPRs the guest writes
+  as an array.
+
 **More ceilings (local experiments, same binary, warmed shader stores, `KYTY_GPU_TIME=passes`):**
 
 | Experiment | GPU effect | Status |
