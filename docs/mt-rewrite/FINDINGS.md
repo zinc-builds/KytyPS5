@@ -1215,6 +1215,38 @@ against `dev` e5ef1e84: 35.03 / 35.27 → **36.02 / 36.45 FPS (+3.1%)**, worst f
 33.5 ms (no frame over two vblanks), 1% low 25.3 → 29.3. Moving the recorder to a
 performance core costs nothing (b), so a performance core is free for it if it gets more work.
 
+### Prepare waits after asynchronous readbacks (2026-11-07)
+
+After #52 the command thread is the gate (~98% busy). Where it waits for the prepare worker, per
+second on `dev` b4a91152 (temporary instrumentation, one run):
+
+| Wait | Waits/s | ms/s | Cause |
+|---|---|---|---|
+| Ring full | 1,875 | 10 | The worker is 4 draws behind, on a slow draw (~5.4 µs per wait) |
+| Draw not adopted | 1,400 | 6, plus ~5 re-looking up | ~2,000 hazards/s: 77% guest-sync epoch, 21% GPU-written growth |
+| Drain at a packet | 1,650 | 4.8 | Mostly the last posted draw (~2.7 µs): RELEASE_MEM, EVENT_WRITE, NOP sub-ops, ACQUIRE_MEM |
+
+The worker was never asleep when a wait started, so the spin-then-sleep wake-up is not a
+cause. Nearly all epoch hazards (~1,500 draws/s) were buffer readbacks publishing into guest
+memory through the backing. Those pages stay GPU-owned, so read-watched, until after
+publication, which means a prepared draw that read the bytes logged the read. Readbacks now
+record their ranges with DrawPrepare instead of advancing the epoch that queued draws check,
+and a draw is voided only if a published range overlaps its logged reads. Hazards fall from
+1,850 to 820/s, about 1,000 fewer fallbacks per second (~0.6% of the command thread). Same batch
+against `dev` b4a91152: 39.36 → 39.50 FPS (noise). `KYTY_PREPARE_VERIFY=1` is clean, and no
+published range overlapped a logged read (`stored=0` in `KYTY_PREPARE_STATS`).
+
+Ruled out:
+- A deeper prepare queue (`KYTY_PREPARE_DEPTH=12`): ring waits fall from 9.4 to 5.6 ms/s, but
+  every hazard now voids more queued draws, so fallbacks rise from 4.9 to 13.4 ms/s
+  (38.90 → 38.62 FPS).
+- Remembering clean read-only `ObtainBuffer` lookups per (address, size), invalidated by the
+  tracker region's CPU-dirty growth and buffer (un)registration. Verify-clean, 49% hits
+  (1.1M/s), but no saving. With the memo on, `SynchronizeBuffer` and tracker queries lose ~1.2%
+  of the command thread, and the memo's own hit path gains ~1.3% (table and region cache
+  misses). Buffer-cache code totals 8.46% vs 8.52% of the thread, and the FPS change is noise
+  (39.28 → 38.97).
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
