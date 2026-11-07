@@ -867,8 +867,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		const char* value = std::getenv("KYTY_MASKED_SELECTS");
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
-	if (prefix_entry_lanes && masked_selects) {
-		// One guest lane per invocation: drop EXEC selects whose skipped lanes nothing reads.
+	// The analysis is per guest lane (compute runs two lanes per invocation, but each IR value is
+	// still one lane's). Tessellation, geometry and mesh stages are left out: not measured.
+	const bool masked_stage =
+	    prefix_entry_lanes || options.stage == ShaderType::Compute ||
+	    options.stage == ShaderType::Pixel;
+	if (masked_stage && masked_selects) {
+		// Drop EXEC selects whose skipped lanes nothing reads.
 		const auto masked = IR::EliminateMaskedSelects(ir.blocks);
 		if (masked.eliminated != 0) {
 			LOGF("ShaderRecompiler %s masked selects: eliminated=%" PRIu32 " of %" PRIu32 "\n",

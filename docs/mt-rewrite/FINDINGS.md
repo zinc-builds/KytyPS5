@@ -54,6 +54,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4, #37; re-run without the external build's load, same batch: `dev` 4d170b12 before it 29.56 / 29.21; 6.53 → 5.47 µs/draw) | 34.99 / 34.84 | 183.2k / 182.5k | 35.7 / 37.3 (max 50.1) | 28.6 / 28.4 |
 | 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
 | 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 204abd61 34.46; in passes 8.90 → 8.43 ms/frame, GPU 14.79 → 14.38; against `dev` 4d170b12 earlier: in passes 8.93 → 8.53) | 34.80 | 181.7k | 40.9 (max 65.5) | 25.0 |
+| 2026-11-07 | Compute and pixel shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` ae6d8c77 35.09; GPU 14.34 → 13.86 ms/frame, dispatches 3.68 → 3.39, in passes 8.42 → 8.23; FPS unchanged, the command thread limits) | 35.21 | 184.1k | 40.0 (max 66.6) | 26.1 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -682,6 +683,14 @@ outside load (GPU 15.14 → 14.77); FPS unchanged. An earlier pair against the `
 no difference (9.15 / 9.13) and ran while an external build loaded the machine. That is about a third of the
 −0.47 ms ceiling below; the rest needs the region outputs unpredicated (a per-lane `if (exec)`
 around the region with phis at its end).
+
+**Masked selects in compute and pixel shaders (landed).** The pass's analysis is per guest lane
+and treats every cross-lane operation (ballots, shuffles, DPP, derivatives through implicit-LOD
+sampling) as an observer, so it holds for compute (two guest lanes per invocation, each IR value
+still one lane's) and pixel shaders too. Compute shaders are predicated on an EXEC that is not
+folded to a constant, so almost every temporary was a select. Same binary first (`KYTY_MASKED_SELECTS`
+for compute and pixel off/on): GPU 14.42 → 13.68 ms/frame, dispatches 3.67 → 3.32, in passes
+8.47 → 8.12, top dispatch `0ec2f135` 702 → 592 µs. Against `dev` ae6d8c77: GPU 14.34 → 13.86.
 
 **Vertex-shader code size (`KYTY_PIPELINE_STATS`).** The driver's own statistics per pipeline,
 joined with `KYTY_GPU_TIME=draws` by module id (Sky Garden, `dev` 4d170b12):

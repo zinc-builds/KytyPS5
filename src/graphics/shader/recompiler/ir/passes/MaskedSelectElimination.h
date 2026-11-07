@@ -16,8 +16,8 @@ struct MaskedSelectStats {
 // result: every path from it goes through lane-local arithmetic and phis to a select on the same
 // c that takes it only where c is true, or into a memory access or export whose EXEC argument is
 // c (the emitter skips those lanes). Anything else (cross-lane operations, other memory, block
-// conditions) keeps the select. Per-lane semantics only; the caller restricts it to stages that
-// map one guest lane to one invocation.
+// conditions) keeps the select. Per-lane semantics: the caller runs it on stages whose IR values
+// are one guest lane's.
 MaskedSelectStats EliminateMaskedSelects(const BlockList& blocks);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
