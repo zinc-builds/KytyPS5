@@ -105,6 +105,6 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 
 | Track | Current step | Notes |
 |---|---|---|
-| A | A1 done (#7, #8); A2 done; A3 measured: transfers end only ~10 passes/frame; A4 done (#10); A5: per-pass GPU timing in the tree; redundant binds, queries and same-target pass breaks ruled out; next: CPU cost of recording (CommitBindings) | GPU ~18.4 ms/frame (11.0 in passes, 4.0 dispatches); indirect-dispatch syncs 0 |
+| A | A1 done (#7, #8); A2 done; A3 measured: transfers end only ~10 passes/frame; A4 done (#10); A5: redundant binds, queries and same-target pass breaks ruled out on the GPU; recording cost measured (~10% of the thread) and bind/push dedupe landed (+1.2%); next: what the ~1.3 µs of GPU per draw is (vertex vs front-end) | GPU ~17.4 ms/frame (9.9 in passes, of which ~1.6 fragment work; 3.9 dispatches); indirect-dispatch syncs 0 |
 | B | B1′ (B0 done: B1 dropped; B2 +6.2% and B2b +3.8% merged; B2c ruled out) | texture resolve 16.7% → 8.7%, render-target resolve 10.8% → 5.6% of the GPU thread; next: per-draw struct copies, then walker codegen |
 | C | C1a merged (#6, +5.7%). C2 (async write protection) in progress: prototype gives guest threads −20% CPU per frame at neutral FPS; it merges only with a clean `KYTY_ASYNC_WP_VERIFY` (the verifier is being fixed first). C3 moved to the lead | C0 in FINDINGS: guest threads fit once faults are gone, no Track D. C1 import deferred: labels are written before the host GPU reads. Later: the 1,088 trapped VRSQRTPS sites |
