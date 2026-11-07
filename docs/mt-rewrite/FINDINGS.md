@@ -51,7 +51,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
 | 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
 | 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same binary, same batch, `KYTY_MASKED_SELECTS=0`: 29.53; in passes 9.14 → 8.93 ms/frame, GPU 15.14 → 14.77; FPS unchanged, the command thread limits. Re-measured after an external load overlapped the first runs) | 29.31 | 153.0k | 48.9 (max 65.4) | 20.1 |
-| 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4; same batch: ref `dev` 84e51e33 29.61; 6.48 → 5.57 µs/draw) | 34.42 | 179.4k | 40.0 (max 51.4) | 24.6 |
+| 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4, #37; re-run without the external build's load, same batch: `dev` 4d170b12 before it 29.56 / 29.21; 6.53 → 5.47 µs/draw) | 34.99 / 34.84 | 183.2k / 182.5k | 35.7 / 37.3 (max 50.1) | 28.6 / 28.4 |
 | 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
 | 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 204abd61 34.46; in passes 8.90 → 8.43 ms/frame, GPU 14.79 → 14.38; against `dev` 4d170b12 earlier: in passes 8.93 → 8.53) | 34.80 | 181.7k | 40.9 (max 65.5) | 25.0 |
 
@@ -915,9 +915,11 @@ hardware command processor reads them long before earlier draws' shaders run, so
 that reads shader output there must put a wait or a cache operation in between, and those
 packets drain the queue. Drains fell to 2.4k/s and waits to 0.2 µs/draw.
 
-**Result** (frame-range bench, same batch against `dev` 84e51e33, one run each): 29.61 →
-**34.42 FPS (+16.2%)**, 154.4k → 179.4k draws/s (6.48 → 5.57 µs per draw on the command
-thread), worst frame 47.0 → 40.0 ms, 1% low 20.1 → 24.6. The worker spends 2.9 µs per draw
+**Result** (frame-range bench; re-run after the external build on efficiency cores 12–15 was
+paused during benchmarks, two runs each, `dev` 4d170b12 against 204abd61): 29.56 / 29.21 →
+**34.99 / 34.84 FPS (+18.8%)**, 153.3k → 182.9k draws/s (6.53 → 5.47 µs per draw on the
+command thread), worst frame 48.8 → 36.5 ms, 1% low 20.1 → 28.5. (The PR's own batch ran with
+that load: 29.61 → 34.42.) The worker spends 2.9 µs per draw
 (53% busy); the command thread waits for it 0.16 µs per draw, mostly when a queue drains.
 Before #25 (which removed the 16 KB of per-draw state zeroing the worker had taken over) the
 same design gave +27% over its reference.
@@ -970,7 +972,7 @@ dispatches (~234 per frame at ~11 µs each, mostly `PrepareBda` and `Synchronize
 
 Ruled out: skipping `PopPendingOperations`' lock when no operation is ready (an atomic copy of
 the queue's front tick). Its 73 ns per call measured under TSC marks did not show up in FPS
-(same batch: 35.03 → 34.89).
+(same batch, without the external load: `dev` 204abd61 34.99 / 34.84, with the change 34.26).
 
 ### Tooling notes
 
