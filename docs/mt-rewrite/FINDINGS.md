@@ -378,8 +378,22 @@ did the compare read it.
 
 **The other signal source on guest threads:** the `siglock` contention in the C0 profile is
 shared. Write-fault SIGBUS is ~3% of tbb time. SIGILL from the 1,088 VRSQRTPS sites the
-`--amd-cpu` patcher couldn't relocate (~85k traps/s) is ~6%. Patching those sites
-(`loader/guestInstructionPatcher.cpp`) is the cheaper guest-side win.
+`--amd-cpu` patcher couldn't relocate (~85k traps/s) is ~6%.
+
+### The trapped VRSQRTPS sites (measured, not pursued)
+
+After C2 the SIGILL traps (~123k/s) are the main signal source on guest threads.
+- **Ceiling:** `KYTY_AMD_SKIP_RSQRT=1` (host-precision VRSQRTPS, no traps) against the default on
+  `dev` 74b1d351: 26.48 / 26.25 vs 25.79 / 26.05 FPS, at most **+1.7%**. Draws per frame also
+  change (5,400 vs 5,490): the precision changes game state, so AMD-exact results stay.
+- **Why they trap:** all 1,088 sites are 4-byte `vrsqrtps xmm, xmm` in 472 functions with an
+  indirect jump the patcher can't resolve, so it may not move neighbouring instructions to fit a
+  5-byte jump.
+- **Padding caves:** only 7 sites have ≥ 5 bytes of int3 padding within short-jump reach.
+- **Treating `jmp [reg+disp]` as a tail call** (it leaves the function) would unblock 516 sites
+  (47%). The other functions also contain `jmp reg`, which can't be told apart from an
+  unresolved jump table. Expected gain: about half the ceiling (~0.8%), for a guest-code
+  heuristic. Not worth the risk now; revisit if guest threads become the bottleneck.
 
 ### Notes for Tracks B and C (from the Track A agent, 2026-11-06)
 
