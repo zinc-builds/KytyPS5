@@ -59,6 +59,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Game-created threads on the efficiency cores, the game's render thread and the emulator on the performance cores (same batch: ref `dev` e5ef1e84 35.03 / 35.27, worst_ms 39.0 / 38.5) | 36.02 / 36.45 | 188.8k / 191.7k | 33.5 (max 33.5) | 28.7 / 29.9 |
 | 2026-11-07 | Large buffer uploads cross PCIe on the copy engine into a device-local ring; the universal queue copies from there at VRAM speed (Track G4; same batch: ref `dev` abc268e0 35.01; `KYTY_GPU_TIME=1` GPU 13.04 → 12.42 ms/frame; with `=passes` 13.25 → 12.47, transfers 1.35 → 0.58; FPS unchanged, the command thread limits) | 35.28 | 185.0k | 38.3 (max 51.0) | 26.7 |
 | 2026-11-07 | `PrepareBda`'s uploads share one barrier pair (Track G4; same binary, `KYTY_UPLOAD_BATCH=0`: 35.92; `KYTY_GPU_TIME=1` GPU 12.30 → 12.19 ms/frame, barrier gaps 0.53 → 0.45) | 35.84 | 188.7k | 33.5 (max 33.5) | 29.9 |
+| 2026-11-07 | Guest read faults on GPU-written memory no longer stall the command thread: it records and submits the download in PM4 order and moves on, the faulting thread waits (Track B; same batch: ref `dev` c7600e89 36.40 / 36.11; `KYTY_STALL_DIAG` command-thread time in readbacks 9.4–10.2% → 0.8%, of it on the GPU 8.4–9.3% → 0.0%; a single longer frame per run, max 50–83 ms vs 33.8) | 38.99 / 38.90 | 204.3k / 204.8k | 35.6 (max 66.7) / 35.6 (max 50.0) | 27.8 / 28.7 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1311,6 +1312,16 @@ What this means:
   `mem_inst_retired.lock_loads`). Removing the texture cache's lock from memo hits moved its cost
   to the next locked instruction: no gain. Resolving texture memo misses into their slot (two
   1.2 KB copies instead of five) gave no gain either. Neither is merged.
+- **Asynchronous readbacks (after the above).** A guest thread's read fault now costs the command
+  thread only the download's recording and submission; the faulting thread waits for the
+  priority runner to publish the bytes, then a second short command releases the pages
+  (`BufferCache::ReadMemoryAsync`). Pages stay GPU-owned until no newer GPU write or download
+  covers them; faults on a page with a download in flight join it. `KYTY_SYNC_READBACK=1` restores
+  the blocking path; `KYTY_READBACK_VERIFY=1` downloads each published range again before its
+  pages are released and compares: 26,000 checks in a Sky Garden run, 0 mismatches. The command
+  thread is now ~98% busy (STALL: prepare ~2%, scheduler ~0.6%, everything else < 1%), so FPS is
+  its per-draw cost alone. Note `KYTY_FAULT_DIAG=1` itself costs ~9% FPS (a locked map update per
+  written bind): don't compare FPS from runs with it.
 
 ## Remaining costs and candidate directions
 

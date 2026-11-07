@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -134,9 +135,35 @@ private:
 	// back after its copy and compares them with the bytes written to the host ring.
 	void VerifyAsyncUpload(const Buffer& buffer, std::span<const vk::BufferCopy> copies,
 	                       uint64_t total_size);
+	// A readback for a guest thread (KYTY_SYNC_READBACK=1 turns these off). The GPU thread records
+	// its download at its point in PM4 order and submits it without waiting; the priority runner
+	// publishes the bytes after the tick; the first waiter's next command finishes it: its pages
+	// lose GPU ownership (and protection) only once no newer GPU write or download covers them.
+	struct PendingRead {
+		uint64_t                                   start = 0; // download window
+		uint64_t                                   size  = 0;
+		uint64_t                                   tick  = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges; // downloaded bytes, [begin, end)
+		std::atomic<bool>                          published {false};
+		bool                                       finished = false; // GPU thread only
+	};
+	[[nodiscard]] bool ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write);
+	[[nodiscard]] std::shared_ptr<PendingRead> StartRead(Buffer& buffer, uint64_t start,
+	                                                     uint64_t size);
+	void FinishRead(PendingRead& read);
+	// Waits for and finishes every pending read whose window overlaps the range.
+	void RetireReads(uint64_t start, uint64_t size);
+	// Releases GPU ownership of the range's pages that hold no GPU-dirty or in-flight bytes.
+	void UnmarkCleanPages(uint64_t start, uint64_t size);
+	void VerifyRead(const PendingRead& read);
+	// GPU-dirty plus in-flight bytes: what the tracker's GPU-dirty pages must cover.
+	[[nodiscard]] const RangeSet& OwnedRanges();
+
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+	// An asynchronous download for `read` records its bytes there and marks it published.
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        std::shared_ptr<PendingRead> read = {});
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool VerifyStreamHit(uint64_t vaddr, uint64_t size, uint64_t offset);
 
@@ -165,6 +192,11 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	std::vector<std::shared_ptr<PendingRead>>         m_pending_reads; // in record order
+	RangeSet                                          m_inflight_ranges; // their bytes
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	RangeSet                                          m_owned_scratch;
+#endif
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
