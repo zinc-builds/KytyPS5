@@ -842,8 +842,11 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     stage, options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
-	const auto simplify = [&ir] {
-		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	// Vertex stages start with the subgroup's lowest lanes (see the translator's NGG counts).
+	const bool prefix_entry_lanes =
+	    options.stage == ShaderType::Vertex || options.stage == ShaderType::Local;
+	const auto simplify = [&ir, prefix_entry_lanes] {
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size, prefix_entry_lanes);
 		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	};
