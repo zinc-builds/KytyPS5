@@ -451,7 +451,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
-	VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide
@@ -462,11 +461,13 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 					if ((x | y | z) != 0u) {
 						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 					}
+					VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
 					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
 				}
 			}
 		}
 	} else {
+		VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
