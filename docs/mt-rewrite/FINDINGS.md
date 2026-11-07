@@ -4,7 +4,9 @@ Host: Intel i5-14600K (6 P-cores = CPUs 0-11 with SMT, 8 E-cores = CPUs 12-19), 
 16 GB (NVIDIA 615.78), 32 GB RAM, CachyOS, kernel 7.3. Game: Astro Bot PPSA21567 v01.019.000
 (`~/Games/PS5/PPSA21567.zar`). Benchmark: `tools/astro-bench/garden.sh` — scripted route from
 save slot 1 into Sky Garden (`aerial_garden`), 45 s average starting 25 s after `StartLevel`.
-Run-to-run noise is about ±0.3 FPS; always compare two runs per configuration.
+Since 2026-11-07 it boots straight into the level and measures game frames 1000–1600 after
+`StartLevel` (see "Benchmark window" below): run-to-run noise is about ±0.1 FPS and one run per
+configuration is enough. Before that, noise was about ±0.3 FPS with two runs per configuration.
 
 ## Where Sky Garden stands
 
@@ -47,6 +49,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Vertex shaders stop predicating every instruction on an always-set EXEC bit (Track G; same batch: ref `dev` a456fbcb 27.61 / 27.62; GPU 16.97 → 16.13 ms/frame, in passes 9.78 → 8.91) | 28.09 / 28.68 | 152.2k / 154.4k | 50.8 (max 99.9) | 19.8 |
 | 2026-11-07 | Render targets tiled and detiled straight from and into the image (Track G; menu route; same batch: ref `dev` f2848f29 27.97 / 27.36, with `KYTY_GPU_TIME` 26.09 / 27.40; GPU 16.26 → 14.89 ms/frame, transfers 2.71 → 1.34; FPS unchanged, the command thread limits) | 27.63 / 25.85 | 150.1k / 141.1k | 53.0 (max 83.1) | 19.3 |
 | 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
+| 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -79,6 +82,24 @@ The scene is the same (draws/frame match, same opening flight). `lvl` reads 0.4 
 average, which is about the run-to-run spread (0.35 and 0.58 within each route) but above the
 ±0.3 bar. So the progress table marks the route change, and A/B pairs must use one route.
 `GARDEN_ROUTE=menu` keeps the old route.
+
+### Benchmark window (2026-11-07)
+
+Four identical runs of one binary, per-second FPS from `StartLevel`, all follow the same curve:
+a rise to ~29, a dip to ~25.5 around 27–35 s, then a plateau at 29.5–30.5. It is the same
+scripted flight every time. The time window (25 s settle, 45 s) still spread 1.15 FPS (27.66 /
+28.51 / 28.36 / 28.81): part of it is the first run of the batch reading slow, the rest is that a
+time window samples a different part of the flight whenever the curve shifts by a second. And
+because the game is frame-locked, a faster build reaches later scene content within the same
+seconds, so an A/B by time compares different scenes.
+
+`garden.sh` now measures game frames 1000–1600 after `StartLevel` (the plateau; fps = frames over
+the seconds between the two `PERF` lines, which now carry `frames=` and `t=`), and `batch.sh`
+starts with a short warm-up run. Four identical runs of one build: **29.56 / 29.48 / 29.65 /
+29.61**, spread 0.17 (sd 0.07). A run takes ~78 s at 29 FPS instead of ~90 s, and gets shorter as
+FPS rises (frame 1600 comes ~27 s after level start at 60 FPS). **Benchmark method changed:**
+rows from this point read about 1 FPS higher than the time window on the same build (the plateau
+instead of the whole flight); compare them only with each other.
 
 ## The bottleneck now
 
