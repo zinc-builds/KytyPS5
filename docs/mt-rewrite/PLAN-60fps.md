@@ -78,6 +78,59 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 | C2 | Write-fault storm: stop re-protecting pages the game rewrites every frame (`PrepareBda`, ~280 MB/s). Track them as always-dirty, or snapshot them per frame instead. | kernel fault time < 3% of the draw thread |
 | C3 | (lead, done) Side task: how Astro Bot derives its frame delta (upstream #1931). Does any emulator-side timing make the slowdown worse than the FPS alone explains? Don't fake timing. | written up in FINDINGS |
 
+## Command-thread budget and the structural plan (2026-11-07, plan of record)
+
+60 FPS needs every frame in one vblank: ~3.2 µs per draw on the GPU command thread against
+~4.8 µs now, so about a third must come off. Small cuts do not add up to that; three structural
+changes might.
+
+Where the command thread's time goes on `dev` ab1429f1 (98% busy, 204k draws/s), from LBR call
+stacks (`perf record --call-graph lbr --user-callchains`), each sample charged to the innermost
+stage on its stack. Class: (a) inherent, stays on this thread in order; (b) movable to another
+thread; (c) removable or cachable.
+
+| Stage | ns/draw | Share | Class | Main parts |
+|---|---|---|---|---|
+| Texture and render-target resolve | 1,647 | 34% | b, part c | RefindExactImage 286, ResolveStageTexture 240, FindTextureDescription 124, GetSampler 85, MaterializeColorClear 85, FindView 79 |
+| Draw flow, other | 715 | 15% | a, part b | ExecutePreparedDraw's own (inlined) code 422, PrepareBindings 117, DrawIndex 65, PostQueuedDraw 44 |
+| Buffer acquisition | 668 | 14% | b | ObtainBuffer 282, SynchronizeBuffer 86, RebindBuffers 74, FindBuffers 65, HasGpuDirtyBytes 52, FindBuffer 46 |
+| Pipeline and program lookups | 274 | 6% | b | GetGraphicsPipeline 156, compute programs |
+| CommitBindings | 274 | 6% | a (push order), b (building) | |
+| Prepare hand-off | 253 | 5% | c | Worker::Wait 202, 85% of it at packet drains |
+| PrepareBda guest copy | 229 | 5% | a | snapshot, memory-bound |
+| Scheduler | 198 | 4% | c | PopPendingOperations 156 (Track B fence unit) |
+| PM4 decode and registers | 182 | 4% | a | |
+| Recorder hand-off | 106 | 2% | a | |
+| Image transitions | 86 | 2% | a | |
+| Labels and events | 76 | 2% | a | |
+| Compute other, PrepareBda rest | 72 | 1.5% | a | |
+
+Submissions: the graphics queue takes 235 per second (~6 per frame, in order) and 94% of the
+thread's time. The three compute queues used take 57 ms/s together, and two of them block on
+graphics labels ~196 times/s each. A second command processor for compute could save at most
+~6%, so it is ruled out.
+
+Structural changes, in order:
+
+1. **Buffer acquisition on the prepare worker (Track B4, now).** The worker runs FindBuffers and
+   ObtainBuffer for the draw. The commit adopts the result after one buffer-registration
+   generation check and one CPU-dirty generation check per draw; anything else falls back. Stream
+   copies move too: the worker runs after the draw's PM4 position and before any later
+   guest-visible packet, so their snapshot holds. Requires a verify mode (worker result vs a fresh
+   command-thread acquisition), a kill switch, and an A/B. Estimate −0.4 to −0.5 µs/draw. Risk:
+   medium.
+2. **A second prepare worker on a reserved performance core (Track B4).** Once item 1 (and later
+   item 3) push the worker near saturation; measure its busy share before and after item 1.
+   Risk: medium.
+3. **Texture and render-target resolve on the worker**, speculated and validated by the texture
+   cache's registration generation and per-image settled state. Track B leads: it owns the lookups
+   and the fence unit that provides lock-free lookups. Track B4 provides the prepared-draw format
+   and the worker integration. Starts once B's fence unit and item 1 have landed. Estimate −0.9 to
+   −1.2 µs/draw. Risk: high.
+
+Also: a TSC split of ExecutePreparedDraw's own 0.42 µs/draw (unexplained); after the above,
+deferring RELEASE_MEM/EVENT_WRITE in queue order instead of draining (~0.15 µs/draw).
+
 ## Shared rules (all tracks)
 
 - **One machine.** Anything that launches `kyty_emulator` takes the exclusive bench lock:
