@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <array>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -59,7 +60,7 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool shared)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -68,6 +69,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	const std::array<uint32_t, 2> families {graphics.queue_family, graphics.transfer_queue_family};
+	if (shared && graphics.transfer_queue_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+		buffer_info.pQueueFamilyIndices   = families.data();
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
@@ -197,9 +204,9 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
+                           uint64_t size, bool shared)
     : Buffer(graphics, scheduler, usage, 0,
-             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size, shared),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

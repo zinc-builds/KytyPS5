@@ -53,6 +53,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// A transfer-only queue (the copy engine) for uploads that run beside the universal queue;
+	// none when the device has no such family or KYTY_ASYNC_UPLOAD=0.
+	uint32_t                           transfer_queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                          transfer_queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

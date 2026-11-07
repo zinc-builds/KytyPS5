@@ -24,6 +24,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -132,6 +134,26 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 		if (properties.queueCount != 0 && (properties.queueFlags & required) == required &&
 		    presentation_supported == VK_TRUE) {
 			LOGF("\tselected universal queue family %u\n", family);
+			return family;
+		}
+	}
+	return static_cast<uint32_t>(-1);
+}
+
+// A transfer-only family (the copy engine), or -1 when there is none or KYTY_ASYNC_UPLOAD=0.
+static uint32_t VulkanFindTransferQueueFamily(vk::PhysicalDevice device) {
+	if (const char* env = std::getenv("KYTY_ASYNC_UPLOAD"); env != nullptr && std::strcmp(env, "0") == 0) {
+		return static_cast<uint32_t>(-1);
+	}
+	uint32_t count = 0;
+	device.getQueueFamilyProperties(&count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(count);
+	device.getQueueFamilyProperties(&count, families.data());
+	for (uint32_t family = 0; family < count; family++) {
+		const auto flags = families[family].queueFlags;
+		if (families[family].queueCount != 0 && (flags & vk::QueueFlagBits::eTransfer) &&
+		    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+			LOGF("\tselected transfer queue family %u\n", family);
 			return family;
 		}
 	}
@@ -582,12 +604,20 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
 	     graphics.robust_buffer_access_enabled ? "robustBufferAccess2" : "shader checks");
 
-	const float                     queue_priority = 1.0f;
-	const vk::DeviceQueueCreateInfo queue_create_info {
-	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+	const float queue_priority = 1.0f;
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {vk::DeviceQueueCreateInfo {
+	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = &queue_priority}};
+	uint32_t queue_create_count = 1;
+	graphics.transfer_queue_family = VulkanFindTransferQueueFamily(physical_device);
+	if (graphics.transfer_queue_family != static_cast<uint32_t>(-1)) {
+		queue_create_infos[queue_create_count++] =
+		    vk::DeviceQueueCreateInfo {.queueFamilyIndex = graphics.transfer_queue_family,
+		                               .queueCount       = 1,
+		                               .pQueuePriorities = &queue_priority};
+	}
 	const auto                 extension_count = static_cast<uint32_t>(device_extensions.size());
-	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = 1,
-	                                        .pQueueCreateInfos       = &queue_create_info,
+	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = queue_create_count,
+	                                        .pQueueCreateInfos       = queue_create_infos.data(),
 	                                        .enabledExtensionCount   = extension_count,
 	                                        .ppEnabledExtensionNames = device_extensions.data(),
 	                                        .pEnabledFeatures        = &device_features};
@@ -952,6 +982,10 @@ void WindowContext::CreateVulkan() {
 	VulkanDiagnostics::InstallCommandCounters();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.transfer_queue_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.transfer_queue_family, 0, &graphic_ctx.transfer_queue);
+		EXIT_IF(graphic_ctx.transfer_queue == nullptr);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -995,6 +1029,7 @@ WindowContext::~WindowContext() {
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;
 		graphic_ctx.queue  = nullptr;
+		graphic_ctx.transfer_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);

@@ -2814,6 +2814,76 @@ public:
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
   }
 
+  // Uploads through the transfer queue into a small device ring: the ring wraps inside one
+  // command buffer (the uploader submits it to wait for reuse), and every copy out of the ring
+  // must still see its own bytes.
+  void CheckAsyncUpload() {
+    constexpr const char *name = "AsyncUpload";
+    EnsureRuntimeContext();
+    if (m_runtime_context.transfer_queue == nullptr) {
+      std::printf("[host]    %-32s skipped (no transfer-only queue family)\n", name);
+      return;
+    }
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    constexpr uint64_t ring = 1ull << 20;
+    constexpr uint64_t chunk = 320ull << 10;
+    constexpr uint32_t uploads = 12;
+    AsyncUploader uploader(m_runtime_context, scheduler, ring);
+    Require(name, "enabled", uploader.Enabled(), "uploader is off with a transfer queue");
+    Require(name, "oversized upload",
+            uploader.Upload(ring + 256, [](uint8_t *) {}).first == nullptr,
+            "an upload larger than the ring did not fall back");
+    const auto flags = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    Libs::Graphics::Buffer destination(m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0,
+                                       flags, chunk * uploads);
+    Libs::Graphics::Buffer readback(m_runtime_context, scheduler, MemoryUsage::Download, 0, flags,
+                                    chunk * uploads);
+    const auto pattern = [](uint32_t upload, uint64_t index) {
+      return static_cast<uint8_t>((index * 131u + upload * 17u + (index >> 9u)) & 0xffu);
+    };
+    const auto first_tick = scheduler.CurrentTick();
+    for (uint32_t upload = 0; upload < uploads; upload++) {
+      const auto [source, offset] = uploader.Upload(chunk, [&](uint8_t *mapped) {
+        for (uint64_t i = 0; i < chunk; i++) mapped[i] = pattern(upload, i);
+      });
+      Require(name, "upload", source != nullptr && offset + chunk <= ring,
+              "upload did not return a ring range");
+      const vk::BufferCopy copy{offset, chunk * upload, chunk};
+      scheduler.Current().Handle().copyBuffer(source, destination.Handle(), 1, &copy);
+    }
+    Require(name, "ring wrap", scheduler.CurrentTick() > first_tick,
+            "the ring wrapped without waiting for the command buffer that reads it");
+    const vk::MemoryBarrier to_transfer{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                        .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+    auto native = scheduler.Current().Handle();
+    native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                           {}, 1, &to_transfer, 0, nullptr, 0, nullptr);
+    const vk::BufferCopy back{0, 0, chunk * uploads};
+    native.copyBuffer(destination.Handle(), readback.Handle(), 1, &back);
+    const vk::MemoryBarrier to_host{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                    .dstAccessMask = vk::AccessFlagBits::eHostRead};
+    native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                           {}, 1, &to_host, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    readback.Invalidate(0, chunk * uploads);
+    const auto *bytes = readback.Mapped().data();
+    for (uint32_t upload = 0; upload < uploads; upload++) {
+      for (uint64_t i = 0; i < chunk; i++) {
+        if (bytes[chunk * upload + i] != pattern(upload, i)) {
+          Fail(name, "contents",
+               fmt::format("upload {} byte {} is 0x{:02x}, expected 0x{:02x}", upload, i,
+                           bytes[chunk * upload + i], pattern(upload, i)));
+        }
+      }
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -23392,6 +23462,8 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    m_runtime_context.transfer_queue_family = m_transfer_queue_family;
+    m_runtime_context.transfer_queue = m_transfer_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.r8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8Srgb);
@@ -23644,10 +23716,29 @@ private:
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
 
+    // A transfer-only family, as the emulator uses for asynchronous uploads.
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{queue_info, queue_info};
+    {
+      u32 family_count = 0;
+      m_physical_device.getQueueFamilyProperties(&family_count, nullptr);
+      std::vector<vk::QueueFamilyProperties> families(family_count);
+      m_physical_device.getQueueFamilyProperties(&family_count, families.data());
+      for (u32 family = 0; family < family_count; family++) {
+        const auto flags = families[family].queueFlags;
+        if (families[family].queueCount != 0 && (flags & vk::QueueFlagBits::eTransfer) &&
+            !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+          m_transfer_queue_family = family;
+          queue_infos[1].queueFamilyIndex = family;
+          break;
+        }
+      }
+    }
+
     vk::DeviceCreateInfo device_info{};
     device_info.sType = vk::StructureType::eDeviceCreateInfo;
-    device_info.queueCreateInfoCount = 1;
-    device_info.pQueueCreateInfos = &queue_info;
+    device_info.queueCreateInfoCount =
+        m_transfer_queue_family != static_cast<u32>(-1) ? 2u : 1u;
+    device_info.pQueueCreateInfos = queue_infos.data();
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
@@ -23759,6 +23850,9 @@ private:
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
+    if (m_transfer_queue_family != static_cast<u32>(-1)) {
+      m_device.getQueue(m_transfer_queue_family, 0, &m_transfer_queue);
+    }
 
     vk::CommandPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
@@ -24074,6 +24168,8 @@ private:
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
+  vk::Queue m_transfer_queue = nullptr;
+  u32 m_transfer_queue_family = static_cast<u32>(-1);
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
@@ -56024,6 +56120,11 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuMappedRangeLifecycle();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--async-upload-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckAsyncUpload();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--stream-buffer-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStreamBufferRing();
@@ -56620,6 +56721,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckAsyncUpload();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

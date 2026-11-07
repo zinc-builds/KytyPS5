@@ -774,6 +774,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	add_test(NAME async_upload
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-upload-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_flip
