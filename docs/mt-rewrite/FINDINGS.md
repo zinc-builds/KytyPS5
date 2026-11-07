@@ -55,6 +55,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | SRT walker references skip the thunk call for values already known; short unknown exits, one-byte state offsets (Track B1′. Measured before B4, two pairs against `dev` 84e51e33 29.41 / 29.39: 30.15 / 30.32, walker 12.8% → 10.2% of the GPU thread. On top of B4, against `dev` 204abd61 34.38: FPS unchanged, prepare worker 2.98 → 2.80 µs/draw, busy 52% → 49%) | 34.36 | 179.3k | 40.1 (max 66.0) | 25.1 |
 | 2026-11-07 | Indexed VGPR reads (`V_MOVRELS`) are a switch on M0, not a select per VGPR (Track G; same batch: ref `dev` 204abd61 34.46; in passes 8.90 → 8.43 ms/frame, GPU 14.79 → 14.38; against `dev` 4d170b12 earlier: in passes 8.93 → 8.53) | 34.80 | 181.7k | 40.9 (max 65.5) | 25.0 |
 | 2026-11-07 | Compute and pixel shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` ae6d8c77 35.09; GPU 14.34 → 13.86 ms/frame, dispatches 3.68 → 3.39, in passes 8.42 → 8.23; FPS unchanged, the command thread limits) | 35.21 | 184.1k | 40.0 (max 66.6) | 26.1 |
+| 2026-11-07 | Consecutive dispatches the guest lets overlap share their barriers (Track G3; same batch: ref `dev` ae6d8c77 34.81; with `KYTY_GPU_TIME=passes`, GPU 14.14 → 13.29 ms/frame, dispatches 3.68 → 3.04, barrier gaps 0.80 → 0.54) | 35.19 | 183.4k | 38.5 (max 50.6) | 27.4 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -776,6 +777,41 @@ tail of one-per-frame passes of 90–160 µs. The large ones are wave64 guest co
 guest lanes per host invocation (NVIDIA subgroups are 32 wide): 763 KB and 1.2 MB of SPIR-V,
 with thousands of selects and hundreds of ballots and shuffles.
 
+### Compute dispatches, Track G3 (2026-11-07)
+
+`KYTY_GPU_TIME=draws` on `dev` ae6d8c77 (~34 FPS): GPU 14.26 ms/frame, 8.39 in passes, 3.69 in
+248 dispatches, 1.30 transfers, 0.80 barrier gaps. The compute modules that cost most per frame:
+
+| Module | ms/frame | per frame | Registers | NVIDIA binary | Local size (host) |
+|---|---|---|---|---|---|
+| `0ec2f135` | 0.64 | 1 | 168 | 335 KB | 128 (256 guest lanes) |
+| `d637f68e` | 0.42 | 38 | 41 | 23 KB | 32 |
+| emulator tiling/blits (`cs=0`) | ~0.35, spiky | ~12 | | | |
+| `2a150e06` | 0.26 | 17 | 73 | 70 KB | 32 |
+| `abbbd166` | 0.16 | 1 | 255 | 522 KB | 32 |
+| `c4fbbdb0` | 0.13 | 1 | 100 | 28 KB | 32 |
+
+Most are wave64 guest code with one 64-lane wave per workgroup, run as 32 host invocations with
+two guest lanes each. `0ec2f135` is an image pass under a bounds check: ~2k of its 6.3k selects
+are EXEC selects on "this pixel is inside the image", ~650 are the denormal flushes of
+comparisons.
+
+**Dispatch chains (landed).** Every dispatch was bracketed by an `ALL_COMMANDS → COMPUTE` hazard
+barrier (when it writes) and a `COMPUTE → ALL_COMMANDS` barrier after it, so back-to-back
+dispatches never overlapped. On the guest, consecutive dispatches do overlap unless a packet
+between them waits (`EVENT_WRITE` CS_PARTIAL_FLUSH, `ACQUIRE_MEM`, `RELEASE_MEM`,
+`WAIT_REG_MEM`, ...), so the game synchronizes explicitly wherever it needs ordering. Now a
+direct dispatch from the packet loop defers its closing barrier; anything recorded afterwards
+(`CommandBuffer::Handle()`, `Record()`, `End()`) records it first. A direct dispatch with only
+register writes and markers before it drops it, and within such a chain only the first writing
+dispatch records the hazard barrier (it orders everything before the chain against all of its
+dispatches). Dispatches using the LDS utility buffer, GDS, BDA (the fault bitmap is updated
+without atomics), ordered append, and indirect dispatches keep both barriers. 54% of dispatches
+chain (4.1k of 7.7k per second). Same batch, `KYTY_GPU_TIME=passes`, against `dev` ae6d8c77:
+GPU 14.14 → 13.29 ms/frame, dispatches 3.68 → 3.04, barrier gaps 0.80 → 0.54. FPS unchanged
+(the command thread limits). `KYTY_DISPATCH_CHAIN=0` records every barrier again,
+`=stats` prints `DISPCHAIN` lines.
+
 ### Draw state cache, Track B (2026-11-06)
 
 **B0: per-draw state does not repeat; its shape does.** A walk memo keyed on a program's user
@@ -1135,5 +1171,7 @@ What this means:
   the worker elsewhere, `KYTY_PREPARE_VERIFY=1` looks every adopted draw up again and exits on a
   difference, `KYTY_PREPARE_STATS=1` prints `PREPARE` lines once per second (adopted and rejected
   draws, drains, the command thread's wait and the worker's time per draw).
+- Dispatch chains (Track G3): `KYTY_DISPATCH_CHAIN=0` records every dispatch's barriers again,
+  `KYTY_DISPATCH_CHAIN=stats` prints `DISPCHAIN` lines (dispatches and chained dispatches per second).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
   hit and exits on a disagreement, `KYTY_DTC_STATS=1` prints `DTC` hit-rate lines once per second.
