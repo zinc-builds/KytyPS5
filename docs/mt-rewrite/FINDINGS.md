@@ -1011,9 +1011,11 @@ dispatches (~234 per frame at ~11 µs each, mostly `PrepareBda` and `Synchronize
   over 28.6k distinct pages, so each hot page about 5 times a second. 83% of its time is the
   copy from guest pages into the staging buffer, already at ~18 GB/s.
 - Ruled out for `PrepareBda`: skipping pages whose bytes did not change since their last
-  upload (only 5.6% did not), and splitting the copy across threads (at ~18 GB/s it is near
-  the memory bandwidth; at best ~1%). Only not copying would remove it: reading those pages in
-  place (C1 host import), which still waits on labels being written at host-GPU completion.
+  upload (only 5.6% did not). Not tried: splitting the copy across threads. The copy is
+  ~33 ms/s (3.3% of the thread) and already runs at ~18 GB/s, so a split could save at most
+  that and probably much less if it is bandwidth-bound; unmeasured. Only not copying would
+  remove it: reading those pages in place (C1 host import), which still waits on labels being
+  written at host-GPU completion.
 
 Ruled out: skipping `PopPendingOperations`' lock when no operation is ready (an atomic copy of
 the queue's front tick). Its 73 ns per call measured under TSC marks did not show up in FPS
