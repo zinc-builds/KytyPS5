@@ -50,6 +50,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Render targets tiled and detiled straight from and into the image (Track G; menu route; same batch: ref `dev` f2848f29 27.97 / 27.36, with `KYTY_GPU_TIME` 26.09 / 27.40; GPU 16.26 → 14.89 ms/frame, transfers 2.71 → 1.34; FPS unchanged, the command thread limits) | 27.63 / 25.85 | 150.1k / 141.1k | 53.0 (max 83.1) | 19.3 |
 | 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
 | 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
+| 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` 84e51e33 29.72; same binary with `KYTY_MASKED_SELECTS=0` in passes 9.09 → 8.91 ms/frame, GPU 14.96 → 14.77; FPS unchanged, the command thread limits) | 29.68 | 155.0k | 45.1 (max 68.5) | 21.3 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -662,6 +663,23 @@ another binds `0x53ad00000` as a written storage buffer, which marks that image 
 so the next sampling re-creates and detiles it (2× per frame). The copies run at 100–170 GB/s,
 well below VRAM bandwidth: each round-trip is a copy plus a separate tiling dispatch.
 
+**Masked selects (landed).** Inside a guest branch region every VGPR write is
+`Select(exec, value, old)`, so region temporaries keep their old values live and every write is
+predicated. `EliminateMaskedSelects` (vertex and local stages) first folds repeated writes under
+one condition (`Select(c, a, Select(c, b, d))` → `Select(c, a, d)`), then replaces `Select(c, a,
+b)` with `a` when no lane where `c` is false can observe it: every path goes through lane-local
+arithmetic and phis to a select on the same `c` that takes it only where `c` holds, or into a
+buffer/shared access or export whose EXEC argument is `c`. Past a phi on a CFG cycle the masking
+is not trusted (the next iteration may recompute `c`). The top vertex shader goes from 1,848 to
+826 selects and from 227 to 174 KB of SPIR-V; the 4,150-select ones only to ~3,320, because what
+remains are region outputs (merged by phis, or read by an enclosing region). Same binary, same
+batch, `KYTY_MASKED_SELECTS=0` as the reference: in passes 8.91 / 8.97 → 8.75 / 8.81 ms/frame
+(time window, two runs each), and 9.09 → 8.91 with the frame-range method (GPU 14.96 → 14.77;
+`dev` 84e51e33 9.11 / 15.12); FPS unchanged. One more frame-range pair against the `dev` build
+showed no difference (9.15 / 9.13), so take it as −0.15 ± 0.05 ms. That is about a third of the
+−0.47 ms ceiling below; the rest needs the region outputs unpredicated (a per-lane `if (exec)`
+around the region with phis at its end).
+
 **More ceilings (local experiments, same binary, warmed shader stores, `KYTY_GPU_TIME=passes`):**
 
 | Experiment | GPU effect | Status |
@@ -916,5 +934,7 @@ What this means:
   linear buffer and a copy again; `KYTY_TILER_VERIFY=1` also runs that path for every transfer
   the image path takes and compares the bytes on the host (`TILERVERIFY` lines, one per image
   shape, a count every 64 checks; slow).
+- `KYTY_MASKED_SELECTS=0` (Track G): vertex shaders keep every EXEC select. For A/B only, in
+  an install dir of its own: the shader store doesn't record the setting.
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
   hit and exits on a disagreement, `KYTY_DTC_STATS=1` prints `DTC` hit-rate lines once per second.

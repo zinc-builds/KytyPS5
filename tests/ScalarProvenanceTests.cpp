@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/MaskedSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -821,6 +822,100 @@ void TestCompleteWaveReduction() {
 }
 
 
+// A guest VGPR write under EXEC is Select(exec, value, old). The old value only matters if a
+// lane outside EXEC can read it: an export or a select under the same EXEC hides it, a raw use,
+// a cross-lane read, another EXEC, or a later loop iteration (where the same SSA condition may
+// differ) does not.
+void TestMaskedSelectElimination() {
+  enum class Case { Temporary, RawUse, OtherExec, CrossLane, Chain, Loop };
+  for (const auto test : {Case::Temporary, Case::RawUse, Case::OtherExec, Case::CrossLane,
+                          Case::Chain, Case::Loop}) {
+    const bool loop = test == Case::Loop;
+    Fixture fixture(loop ? 3 : 1);
+    fixture.program.stage = ShaderType::Vertex;
+    const uint32_t body = loop ? 1u : 0u;
+    const auto lane = fixture.Emit(ValueOpcode::LaneId);
+    const auto old = fixture.Emit(ValueOpcode::IAdd32, {lane, Value(1u)});
+    const auto value = fixture.Emit(ValueOpcode::IAdd32, {lane, Value(2u)});
+    const auto export_of = [&](Value word, Value exec, uint32_t block) {
+      fixture.Emit(ValueOpcode::SetAttribute,
+                   {fixture.Emit(ValueOpcode::CompositeConstructU32x4, {word, word, word, word},
+                                 0, block),
+                    exec},
+                   0, block);
+    };
+    if (loop) {
+      fixture.BlockAt(0).AddBranch(&fixture.BlockAt(1));
+      fixture.BlockAt(1).AddBranch(&fixture.BlockAt(1));
+      fixture.BlockAt(1).AddBranch(&fixture.BlockAt(2));
+      // The register carried around the loop; EXEC is recomputed every iteration.
+      auto &carried = fixture.BlockAt(1).AppendNewInst(ValueOpcode::Phi);
+      carried.SetFlags(Type::U32);
+      auto &counter = fixture.BlockAt(1).AppendNewInst(ValueOpcode::Phi);
+      counter.SetFlags(Type::U32);
+      const auto next = fixture.Emit(ValueOpcode::IAdd32, {Value(&counter), Value(1u)}, 0, body);
+      counter.AddPhiOperand(&fixture.BlockAt(0), Value(0u));
+      counter.AddPhiOperand(&fixture.BlockAt(1), next);
+      const auto condition = fixture.Emit(
+          ValueOpcode::ULessThan32,
+          {fixture.Emit(ValueOpcode::IAdd32, {lane, Value(&counter)}, 0, body), Value(5u)}, 0,
+          body);
+      const auto masked = fixture.Emit(ValueOpcode::SelectU32,
+                                       {condition, Value(&carried), Value(0u)}, 0, body);
+      const auto write = fixture.Emit(ValueOpcode::SelectU32,
+                                      {condition, value, Value(&carried)}, 0, body);
+      carried.AddPhiOperand(&fixture.BlockAt(0), old);
+      carried.AddPhiOperand(&fixture.BlockAt(1), write);
+      export_of(masked, condition, 2);
+      const auto stats = EliminateMaskedSelects(fixture.program.blocks);
+      Check(write.Instruction()->GetOpcode() == ValueOpcode::SelectU32,
+            "a select read by the next loop iteration under a recomputed EXEC was dropped");
+      Check(masked.Instruction()->GetOpcode() == ValueOpcode::Identity && stats.eliminated == 1u,
+            "a select only exported under its own EXEC was kept");
+      continue;
+    }
+    const auto exec = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(5u)});
+    const auto other = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(9u)});
+    if (test == Case::Chain) {
+      const auto inner = fixture.Emit(ValueOpcode::SelectU32, {exec, value, old});
+      const auto outer = fixture.Emit(ValueOpcode::SelectU32, {exec, lane, inner});
+      fixture.Emit(ValueOpcode::ReferenceU32, {outer});
+      EliminateMaskedSelects(fixture.program.blocks);
+      Check(outer.Instruction()->GetOpcode() == ValueOpcode::SelectU32 &&
+                outer.Instruction()->Arg(2) == old,
+            "a select overwritten under the same EXEC was not skipped");
+      continue;
+    }
+    // A temporary: computed under EXEC, then written back under the same EXEC.
+    const auto temporary = fixture.Emit(ValueOpcode::SelectU32, {exec, value, old});
+    const auto sum = fixture.Emit(ValueOpcode::IAdd32, {temporary, Value(3u)});
+    const auto result = fixture.Emit(ValueOpcode::SelectU32, {exec, sum, old});
+    switch (test) {
+      case Case::Temporary: export_of(result, exec, 0); break;
+      case Case::RawUse: fixture.Emit(ValueOpcode::ReferenceU32, {result}); break;
+      case Case::OtherExec: export_of(result, other, 0); break;
+      default:
+        fixture.Emit(ValueOpcode::ReferenceU32,
+                     {fixture.Emit(ValueOpcode::ReadFirstLane, {result, Value(true)})});
+        break;
+    }
+    const auto stats = EliminateMaskedSelects(fixture.program.blocks);
+    const bool dropped = temporary.Instruction()->GetOpcode() == ValueOpcode::Identity &&
+                         result.Instruction()->GetOpcode() == ValueOpcode::Identity;
+    // The temporary only reaches the result's own EXEC select, so it goes either way.
+    const bool kept = temporary.Instruction()->GetOpcode() == ValueOpcode::Identity &&
+                      result.Instruction()->GetOpcode() == ValueOpcode::SelectU32;
+    if (test == Case::Temporary) {
+      Check(dropped && stats.eliminated == 2u && sum.Instruction()->Arg(0).Resolve() == value,
+            "selects whose skipped lanes only reach an export under the same EXEC were kept");
+    } else {
+      Check(kept && stats.eliminated == 1u,
+            "a select whose skipped lanes are observable was dropped");
+    }
+  }
+}
+
+
 // A vertex stage builds EXEC from its NGG vertex count, the entry ballot's popcount. Every
 // launched lane is below it, so the lane's EXEC bit folds to true; lane predicates that change
 // with the number of active lanes, or a ballot outside the entry block, stay dynamic.
@@ -989,6 +1084,7 @@ void DbgExitHandler(const char *, int, std::string_view text) {
   throw std::runtime_error(std::string(text));
 }
 
+
 } // namespace Common
 
 int main() {
@@ -1014,6 +1110,7 @@ int main() {
     TestCompleteWaveReduction();
     TestOptimizationPipeline();
     TestEntryLanePredicateFold();
+    TestMaskedSelectElimination();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();
@@ -1035,3 +1132,4 @@ int main() {
 #include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
+#include "../src/graphics/shader/recompiler/ir/passes/MaskedSelectElimination.cpp"

@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/MaskedSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -18,6 +19,8 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -859,6 +862,20 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
+	// KYTY_MASKED_SELECTS=0 keeps them (A/B only: shader stores don't record the setting).
+	static const bool masked_selects = [] {
+		const char* value = std::getenv("KYTY_MASKED_SELECTS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (prefix_entry_lanes && masked_selects) {
+		// One guest lane per invocation: drop EXEC selects whose skipped lanes nothing reads.
+		const auto masked = IR::EliminateMaskedSelects(ir.blocks);
+		if (masked.eliminated != 0) {
+			LOGF("ShaderRecompiler %s masked selects: eliminated=%" PRIu32 " of %" PRIu32 "\n",
+			     stage, masked.eliminated, masked.selects);
+			simplify();
+		}
+	}
 	if (decoded.has_swap_pc) {
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
 		for (const auto* block: ir.blocks)
