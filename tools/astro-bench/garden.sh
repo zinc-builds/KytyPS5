@@ -25,7 +25,14 @@ for _ in $(seq 20); do pgrep -f '^\./kyty_emulator --game' >/dev/null || break; 
 pgrep -f '^\./kyty_emulator --game' >/dev/null && { echo "emulator already running" >&2; exit 1; }
 [ -p /tmp/vpad.fifo ] || { echo "vpad.py not running" >&2; exit 1; }
 rm -f "$log"
+# On any failure (a timeout below, a signal), stop the emulator: left running, it would keep
+# holding the bench lock. KEEP_RUNNING only applies to a run that reaches the level.
+# Kill only this run's emulator (a child of run.sh): a pattern kill could hit the emulator of
+# whoever takes the lock next.
+cleanup() { pkill -P "$run_pid" -x kyty_emulator; wait_s 3; pkill -9 -P "$run_pid" -x kyty_emulator; }
+trap 'cleanup' EXIT
 nohup "$(dirname "$0")/run.sh" "$label" "$@" >/dev/null 2>&1 &
+run_pid=$!
 wait_s 5
 wait_log 'Level has started: title_controller_ship' 90 || exit 1
 wait_s 4; pad press a 0.3          # title: press any button
@@ -51,4 +58,4 @@ sed -n "${from},${to}p" "$log" | grep '^PERF' |
 	     END {printf "%s: fps=%.2f draws/frame=%.0f draws/s=%.0f wt_faults/s=%.0f sigill/s=%.0f worst_ms=%.1f (max %.1f) low1=%.1f (n=%d)\n", l, f/n, d/n, s/n, w/n, ill/n, wm/n, wx, lo/n, n}'
 grep -E '^AMD CPU compatibility' "$log" | head -3
 echo "level start at log line $start" >&2
-[ -n "$KEEP_RUNNING" ] || { pkill -f '^\./kyty_emulator --game'; wait_s 3; pkill -9 -f '^\./kyty_emulator --game'; }
+if [ -n "$KEEP_RUNNING" ]; then trap - EXIT; fi

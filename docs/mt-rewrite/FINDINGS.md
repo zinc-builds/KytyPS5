@@ -290,15 +290,62 @@ can't legally rewrite the range. `KYTY_STREAM_VERIFY=1` compares every reuse aga
 bytes: 0 mismatches over a 30 s Sky Garden run, with 31k reuses/s against 3.4k copies/s (90%
 reused). `KYTY_NO_STREAM_REUSE=1` turns it off. Result: 19.00 → 20.08 FPS (+5.7%, same batch).
 
-### Write tracking without signals (C2 direction)
+### Write tracking without signals (C2, prototype not merged)
 
 The kernel (7.3) supports userfaultfd **asynchronous** write protection (`UFFD_FEATURE_WP_ASYNC`)
 on shared-memory views, plus `PAGEMAP_SCAN` to collect written pages and re-protect them in one
 ioctl. Probe on a 1 GiB memfd view: an async write fault costs 0.47 µs, resolved in the kernel
 with no signal and no `siglock`, against several µs plus lock contention for today's SIGBUS. A
-scan of a clean 1 GiB costs 0.15 ms, and 0.27 ms after 5,000 written pages. Writes through
-the backing alias are not reported, as now. This replaces fault-time notification with a scan at
-guest-sync points. The guest-sync contract that makes C1a safe makes that sufficient too.
+scan of a clean 1 GiB costs 0.15 ms, and 0.27 ms after 5,000 written pages.
+
+**Where the faults land** (`KYTY_MEM_DIAG=1`, `WFAULTS` and `MEMSCAN`):
+- ~140k write faults/s hit only ~16k distinct pages, in 55 2-MiB chunks (mostly
+  0x50b600000–0x50ee00000). 27 chunks take 90% of them.
+- The page tracker watches ~0.94–1.03 M pages (3.7–4 GB) in ~1,430 regions. One `PAGEMAP_SCAN`
+  over all of it costs ~1.5 ms, so scanning everything at each submission (19 per frame) is
+  out. Only the hot chunks can be scanned.
+
+**Prototype** (branch `trackc/c2-async-wp-prototype`):
+- A chunk with ≥ 64 SIGBUS write faults in one second moves to a second userfaultfd with
+  `WP_ASYNC`.
+- At each submission start, and at each satisfied wait, `PAGEMAP_SCAN` with `WP_MATCHING`
+  collects the written pages and re-protects them. Waits on a value the command processor stored
+  itself (a label) are skipped.
+- Written pages that a cache still watches are invalidated, as a fault would do.
+- 26 chunks were promoted; a scan takes ~32 µs, ~250 scans/s.
+- The first version also scanned at every satisfied `WAIT_REG_MEM`. That took 17% of the GPU
+  thread and cost 21% FPS.
+
+| Same binary, 2 runs each | async off (`KYTY_NO_ASYNC_WP=1`) | async on |
+|---|---|---|
+| FPS | 20.22 / 20.64 | 20.25 / 20.15 |
+| SIGBUS write faults/s | ~159k | ~500 |
+| Game main thread, ms of CPU per frame | 12.2 | 9.7 |
+| Each `tbb_thead` worker, ms per frame | 11.3 | 8.7 |
+| GPU thread, ms per frame | 41.9 | 42.6 |
+
+**Why it is not merged:** correctness is unproven, and the gain today is off the critical path.
+- The verifier (`KYTY_ASYNC_WP_VERIFY=1`) snapshots the watched pages of async chunks and
+  compares them at the next scan. It reports pages that changed with no report, ~0.13% of
+  checks.
+- A dry run (`KYTY_ASYNC_WP_DRYRUN=1`) keeps the chunks on the faulting path. It reports more
+  of them (179k against 79k), so the verifier has a false-positive class that isn't identified
+  yet. It can neither clear nor convict the async path.
+- The prototype found and closed two real holes:
+  - The GPU thread's own CPU stores into guest memory (labels, `WRITE_DATA`, CPU-side DMA
+    fills and copies, occlusion results, LOD stats, GDS reads, memory semaphores) raise no fault
+    in async ranges, so each must invalidate explicitly (`NoteGpuWrite`, 9 call sites).
+  - Lifting the read protection of a GPU-dirty page re-applies the write protection. That erases
+    the written state of an earlier guest store, so a scan has to run first.
+- Next for C2: a verifier for the invariant that matters, that a clean page's cached device copy
+  equals guest memory (read back sampled cached-buffer ranges at scan points). Then re-measure.
+  Worth it once the draw thread approaches 16 ms. Today the guest threads finish their frame
+  before the GPU thread does.
+
+**The other signal source on guest threads:** the `siglock` contention in the C0 profile is
+shared. Write-fault SIGBUS is ~3% of tbb time. SIGILL from the 1,088 VRSQRTPS sites the
+`--amd-cpu` patcher couldn't relocate (~85k traps/s) is ~6%. Patching those sites
+(`loader/guestInstructionPatcher.cpp`) is the cheaper guest-side win.
 
 ### Notes for Tracks B and C (from the Track A agent, 2026-11-06)
 
@@ -474,6 +521,10 @@ touches per draw is the next small step.
   sampling `sleep N` works while the emulator runs as the user.
 - Keep a copy of `kyty_emulator_clang_lld.map` with each perf capture. A rebuild overwrites it
   and old captures no longer symbolize.
+- `garden.sh` used to exit on a timeout (level never started) without stopping the emulator,
+  which then kept holding the bench lock for everyone. It now stops its own emulator on any
+  failure, by parent PID: a pattern `pkill -9` can kill the emulator of whoever takes the lock
+  next, and did once.
 - Do not pipe `garden.sh` through `head`. SIGPIPE kills the script before its cleanup and leaves
   the emulator running.
 - `cmake --install` fails resolving the Qt launcher's image-plugin dependencies (`libheif`,

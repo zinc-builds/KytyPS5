@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/memory.h"
@@ -29,6 +30,12 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#include <chrono>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
@@ -336,6 +343,8 @@ struct PageManager::Impl {
 		return AccessSucceeds(page_addr, access);
 	}
 
+	void DiagReport();
+
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
@@ -344,7 +353,75 @@ struct PageManager::Impl {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__) && defined(PAGEMAP_SCAN)
+namespace {
+void* g_diag_impl = nullptr;
+} // namespace
+
+// KYTY_MEM_DIAG: write-watch footprint, and what one PAGEMAP_SCAN over it costs.
+void PageManager::Impl::DiagReport() {
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	uint64_t                                   watched_pages = 0;
+	uint64_t                                   regions_total = 0;
+	{
+		std::lock_guard lock(region_mutex);
+		for (uint64_t index = 0; index < REGION_COUNT; index++) {
+			auto* region = regions[index].load(std::memory_order_acquire);
+			if (region == nullptr) {
+				continue;
+			}
+			regions_total++;
+			uint64_t count = 0;
+			for (const auto& page: region->pages) {
+				count += page.write_watchers != 0 ? 1 : 0;
+			}
+			if (count == 0) {
+				continue;
+			}
+			watched_pages += count;
+			const auto base = index * REGION_SIZE;
+			if (!ranges.empty() && ranges.back().second == base) {
+				ranges.back().second = base + REGION_SIZE;
+			} else {
+				ranges.emplace_back(base, base + REGION_SIZE);
+			}
+		}
+	}
+	static const int pagemap = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+	static std::vector<page_region> out(4096);
+	uint64_t   written = 0;
+	const auto start   = std::chrono::steady_clock::now();
+	for (const auto& [begin, end]: ranges) {
+		pm_scan_arg arg {};
+		arg.size          = sizeof(arg);
+		arg.start         = begin;
+		arg.end           = end;
+		arg.vec           = reinterpret_cast<uint64_t>(out.data());
+		arg.vec_len       = out.size();
+		arg.category_mask = PAGE_IS_WRITTEN;
+		arg.return_mask   = PAGE_IS_WRITTEN;
+		const auto n      = ::ioctl(pagemap, PAGEMAP_SCAN, &arg);
+		for (long i = 0; i < n; i++) {
+			written += (out[i].end - out[i].start) / PAGE_SIZE;
+		}
+	}
+	const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	std::printf(" | MEMSCAN regions=%llu watched_regions_ranges=%zu watched_pages=%llu "
+	            "scan_us=%.0f unprotected_pages=%llu",
+	            static_cast<unsigned long long>(regions_total), ranges.size(),
+	            static_cast<unsigned long long>(watched_pages), us,
+	            static_cast<unsigned long long>(written));
+}
+#endif
+
+PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__) && defined(PAGEMAP_SCAN)
+	if (MemDiag::Enabled()) {
+		g_diag_impl          = m_impl.get();
+		MemDiag::g_report_hook = [] { static_cast<Impl*>(g_diag_impl)->DiagReport(); };
+	}
+#endif
+}
 
 PageManager::~PageManager() = default;
 
