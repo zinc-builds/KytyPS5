@@ -74,11 +74,12 @@ else
 	done
 	wait_log 'StartLevel aerial_garden' 60 || exit 1
 fi
-start=$(wc -l < "$log")
+# The StartLevel line itself: PERF lines strictly after it belong to the level.
+start=$(grep -n -m1 'StartLevel aerial_garden' "$log" | cut -d: -f1)
 summary='{f+=$1; d+=$2; s+=$3; w+=$4; ill+=$5; wm+=$6; if ($6>wx) wx=$6; lo+=$7; n++}
 	END {if (fw != "") f = fw * n; printf "%s: fps=%.2f draws/frame=%.0f draws/s=%.0f wt_faults/s=%.0f sigill/s=%.0f worst_ms=%.1f (max %.1f) low1=%.1f (n=%d)%s\n", l, f/n, d/n, s/n, w/n, ill/n, wm/n, wx, lo/n, n, note}'
 fields() { sed -E 's/.*fps=([0-9.]+).*worst_ms=([0-9.]+) low1=([0-9.]+) draws_frame=([0-9]+) draws_s=([0-9]+).*wt_faults_s=([0-9]+).*sigill_s=([0-9]+).*/\1 \4 \5 \6 \7 \2 \3/'; }
-perf_since_start() { tail -n +"$start" "$log" | grep '^PERF'; }
+perf_since_start() { tail -n +"$((start + 1))" "$log" | grep '^PERF'; }
 last_frames() { perf_since_start | grep -o 'frames=[0-9]*' | tail -1 | cut -d= -f2; }
 # Frame window (default): the game is frame-locked and the scripted opening flight is the same in
 # every run, so game frames [F0, F1) after level start always show the same scene, whatever the

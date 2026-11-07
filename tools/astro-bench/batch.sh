@@ -21,7 +21,7 @@ mapfile -t lines
 first=
 for line in "${lines[@]}"; do [ -n "$line" ] && { first=$line; break; }; done
 if [ -n "$first" ] && [ "${BATCH_WARMUP:-1}" != 0 ]; then
-	run_line "$first" "GARDEN_FRAMES=0-150" "-warmup" > /dev/null
+	run_line "$first" "GARDEN_FRAMES=0-150 GARDEN_WINDOW=" "-warmup" > /dev/null
 fi
 for line in "${lines[@]}"; do
 	[ -z "$line" ] && continue
