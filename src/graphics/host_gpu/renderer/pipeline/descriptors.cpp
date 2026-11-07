@@ -17,6 +17,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -1271,17 +1272,30 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	// Graphics draws record only the push constants and descriptors that changed.
+	const bool graphics = pipeline_bind_point == vk::PipelineBindPoint::eGraphics;
+	auto&      bound    = m_context.GetCommandScheduler().GetDynamicState().bindings;
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
-		                        sizeof(push_data), push_data.dwords.data());
+		if (graphics) {
+			bound.PushConstants(vk_buffer, pipeline.pipeline_layout, pipeline.push_stages, 0,
+			                    sizeof(push_data), push_data.dwords.data());
+		} else {
+			vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
+			                        sizeof(push_data), push_data.dwords.data());
+		}
 	}
 
 	if (!m_descriptor_writes.empty()) {
-		if (pipeline.uses_push_descriptors) {
+		if (pipeline.uses_push_descriptors && graphics) {
+			bound.PushDescriptors(vk_buffer, pipeline.pipeline_layout, m_descriptor_writes);
+		} else if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
 		} else {
+			if (graphics) {
+				bound.ForgetLayout();
+			}
 			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;

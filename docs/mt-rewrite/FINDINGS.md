@@ -39,6 +39,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-06 | Indirect dispatches no longer wait for the GPU in their SRT walk (same batch: merge-base 20.06 / 20.16) | 21.94 / 22.17 | 122.1k / 123.3k | 55.3 (max 84.5) | 18.0 |
 | 2026-11-06 | Stage image slots reuse their last texture resolve (Track B2; measured on 582e4043, without the stream-copy row: ref 19.33 / 19.57) | 20.68 / 20.66 | 115.6k / 115.5k | 58.3 (max 83.9) | 16.7 |
 | 2026-11-07 | Color and depth target slots reuse their last resolve (Track B2b; same batch: ref `dev` 277a708e 24.24 / 24.24) | 24.95 / 25.36 | 136.8k / 139.0k | 53.0 (max 82.2) | 19.2 |
+| 2026-11-07 | Draws re-record only a changed pipeline, push constants and push descriptors (Track A; same batch: ref `dev` 9af34700 24.78 / 24.87) | 24.90 / 25.38 | 136.7k / 139.1k | 52.5 (max 82.6) | 19.1 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -442,6 +443,40 @@ The command thread rarely waits for the GPU now: `Scheduler::Wait` under `Proces
 its time (Tracy), and comes from servicing guest-thread readbacks (Track C).
 
 Root-only Nsight metrics would separate front-end from shading cost; not available tonight.
+
+### Recording cost and GPU time per draw, Track A (2026-11-07)
+
+**Recording on the command thread is ~10%, spread thin.** perf (LBR, 10 s, `dev` 458607ad at
+~24 FPS): the NVIDIA driver is 9.6% of the thread. By call site: `vkCmdPushDescriptorSetKHR`
+2.3%, `vkCmdBindPipeline` ~1.0% (80% of binds re-bound the bound pipeline), the descriptor-set
+path for layouts too large to push (`DescriptorHeap::Allocate` + `vkUpdateDescriptorSets`) ~1.5%,
+`bindVertexBuffers2`, `drawIndexed` and `pushConstants` ~0.3% each, `CommitBindings` itself
+~1.7% self. ~70 ns per Vulkan call; even a separate recording thread would win ≤ ~7%, so it is
+not worth its complexity yet.
+
+**Bind dedupe (landed).** `GraphicsBindings` (in `DynamicState`) keeps the graphics pipeline,
+push-constant dwords and push-descriptor elements recorded last in the command buffer. A draw
+binds only a different pipeline, pushes only changed dword ranges, and pushes only changed runs
+of descriptor array elements (`dstArrayElement`) while the pipeline layout is the one last pushed
+with (each pipeline owns its layout). Per second: pipeline binds 142.7k → 34.6k, push-constant
+calls 146k → 79k, pushed descriptors 16.8 → 6.0 per push. FPS +1.2% (A/B above).
+`KYTY_BIND_DEDUPE=0` turns it off; `KYTY_VK_COUNT` now also counts
+`push_descriptor_elements`.
+
+**GPU time in passes is per-draw vertex/front-end cost, not shading.** A local experiment
+(`KYTY_EXP_DRAW`, not merged) with `KYTY_GPU_TIME=passes`, per frame at ~23 FPS:
+
+| Draws | In passes | Dispatches |
+|---|---|---|
+| normal | 9.9 ms | 3.9 ms |
+| not recorded (all state still recorded) | 1.0 ms | 6.1 ms¹ |
+| 1×1 scissor (almost no fragments) | 8.3 ms | 3.3 ms |
+
+¹ Dispatches that read the skipped draws' output change their work.
+
+Fragment work is only ~1.6 ms per frame; ~7.3 ms is ~1.3 µs per draw that remains with nothing
+rasterized: vertex shading or per-draw front-end state. Next: zero-instance draws and per-draw
+timestamps by category to separate the two.
 
 ### Draw state cache, Track B (2026-11-06)
 
