@@ -141,6 +141,14 @@ inline void ApplyToGpuThread() {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
+// Call from an emulator helper thread that a pinned thread may have started.
+inline void ApplyToEmulatorThread() {
+	const auto& plan = GetPlan();
+	if (plan.active) {
+		(void)pthread_setaffinity_np(pthread_self(), sizeof(plan.process), &plan.process);
+	}
+}
+
 // Call from the draw prepare thread: a performance core the emulator leaves to it (see GetPlan).
 inline void ApplyToPrepareThread() {
 	int cpu = EnvCpu("KYTY_PREPARE_CPU");

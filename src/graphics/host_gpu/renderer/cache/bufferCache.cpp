@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
+#include "common/hybridAffinity.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -18,6 +19,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <string>
+#include <thread>
+#include <x86intrin.h>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -511,6 +516,132 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+// KYTY_UPLOAD_COPY_THREADS=<n> helpers (default 2, 0: the caller copies alone).
+class ParallelGuestCopy {
+public:
+	struct Piece {
+		uint64_t address;
+		uint8_t* destination;
+		uint64_t size;
+	};
+	// Guest bytes [address, address + size) to place at destination + offset.
+	struct Copy {
+		uint64_t address;
+		uint64_t size;
+		uint64_t offset;
+	};
+
+	ParallelGuestCopy() {
+		const char* value   = std::getenv("KYTY_UPLOAD_COPY_THREADS");
+		const int   helpers = value != nullptr ? std::clamp(std::atoi(value), 0, 8) : 2;
+		for (int i = 0; i < helpers; i++) {
+			m_threads.emplace_back([this, i] { Loop(i); });
+		}
+	}
+	~ParallelGuestCopy() {
+		{
+			std::scoped_lock lock(m_mutex);
+			m_stop = true;
+		}
+		m_cv.notify_all();
+		for (auto& thread: m_threads) {
+			thread.join();
+		}
+	}
+	KYTY_CLASS_NO_COPY(ParallelGuestCopy);
+
+	// Copies [address, address + size) of every copy to destination + offset; returns when done.
+	// One caller at a time.
+	void Run(std::span<const Copy> copies, uint8_t* destination) {
+		m_pieces.clear();
+		for (const auto& copy: copies) {
+			for (uint64_t done = 0; done < copy.size; done += ChunkSize) {
+				m_pieces.push_back({copy.address + done, destination + copy.offset + done,
+				                    std::min<uint64_t>(ChunkSize, copy.size - done)});
+			}
+		}
+		if (m_threads.empty() || m_pieces.size() < 2) {
+			for (const auto& piece: m_pieces) {
+				CopyPiece(piece);
+			}
+			return;
+		}
+		uint64_t generation = 0;
+		{
+			std::scoped_lock lock(m_mutex);
+			generation = ++m_generation;
+			m_count    = m_pieces.size();
+			m_done.store(0, std::memory_order_relaxed);
+			m_ticket.store(generation << 32u, std::memory_order_release);
+		}
+		m_cv.notify_all();
+		Work(generation, m_pieces.size());
+		while (m_done.load(std::memory_order_acquire) != m_pieces.size()) {
+			_mm_pause();
+		}
+	}
+
+private:
+	static constexpr uint64_t ChunkSize = 256 * 1024;
+
+	static void CopyPiece(const Piece& piece) {
+		if (!LibKernel::Memory::CopySparseMemory(piece.address, piece.destination, piece.size)) {
+			EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+		}
+	}
+
+	// Claims and copies pieces of this run; a ticket holds the run in its high half, so a late
+	// helper never claims a piece of the next run.
+	size_t Work(uint64_t generation, size_t count) {
+		size_t copied = 0;
+		for (;;) {
+			auto ticket = m_ticket.load(std::memory_order_acquire);
+			if ((ticket >> 32u) != generation || (ticket & 0xffffffffu) >= count) {
+				return copied;
+			}
+			if (!m_ticket.compare_exchange_weak(ticket, ticket + 1, std::memory_order_acq_rel)) {
+				continue;
+			}
+			CopyPiece(m_pieces[ticket & 0xffffffffu]);
+			copied++;
+			m_done.fetch_add(1, std::memory_order_release);
+		}
+	}
+
+	void Loop(int index) {
+#if defined(__linux__)
+		pthread_setname_np(pthread_self(), ("KytyUploadCopy" + std::to_string(index)).c_str());
+		Common::HybridAffinity::ApplyToEmulatorThread();
+#endif
+		uint64_t seen = 0;
+		for (;;) {
+			uint64_t generation = 0;
+			size_t   count      = 0;
+			{
+				std::unique_lock lock(m_mutex);
+				m_cv.wait(lock, [&] { return m_stop || m_generation != seen; });
+				if (m_stop) {
+					return;
+				}
+				seen       = m_generation;
+				generation = m_generation;
+				count      = m_count;
+			}
+			Work(generation, count);
+		}
+	}
+
+	std::vector<std::thread>  m_threads;
+	std::vector<Piece>        m_pieces; // read by helpers only while a run claims them
+	std::mutex                m_mutex;
+	std::condition_variable   m_cv;
+	uint64_t                  m_generation = 0;
+	size_t                    m_count      = 0;
+	bool                      m_stop       = false;
+	std::atomic<uint64_t>     m_ticket {0};
+	std::atomic<size_t>       m_done {0};
+};
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -523,6 +654,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_async_uploader(graphics, scheduler),
+      m_parallel_copy(std::make_unique<ParallelGuestCopy>()),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -1081,7 +1213,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	m_last_upload_async    = false;
 	if (m_async_uploader.Enabled() && total_size >= m_async_uploader.MinSize()) {
 		std::tie(source, base_offset) = m_async_uploader.Upload(total_size, [&](uint8_t* mapped) {
-			write(mapped);
+			thread_local std::vector<ParallelGuestCopy::Copy> guest;
+			guest.clear();
+			for (const auto& copy: copies) {
+				guest.push_back({buffer.CpuAddress() + copy.dstOffset, copy.size, copy.srcOffset});
+			}
+			m_parallel_copy->Run(guest, mapped);
 			if (AsyncUploadVerifyEnabled()) {
 				m_async_verify_bytes.assign(mapped, mapped + total_size);
 			}

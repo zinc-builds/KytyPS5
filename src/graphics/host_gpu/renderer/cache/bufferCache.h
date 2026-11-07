@@ -30,6 +30,10 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// Copies guest memory into upload memory on the calling thread and helper threads together; a
+// run returns once every byte is copied, so uploads keep their snapshot semantics.
+class ParallelGuestCopy;
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -207,6 +211,7 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	AsyncUploader                                     m_async_uploader;
+	std::unique_ptr<ParallelGuestCopy>                m_parallel_copy;
 	bool                                              m_last_upload_async = false;
 	struct UploadBatch {
 		bool active = false; // between BeginUploadBatch and EndUploadBatch
