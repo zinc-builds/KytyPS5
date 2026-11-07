@@ -57,8 +57,8 @@ prepared draw, which a worker thread can produce later.
 |---|---|---|
 | B0 | **Measure repetition** (done, FINDINGS "Draw state cache"). A user-SGPR-keyed walk memo hits 7–8%: buffer descriptors carry per-frame addresses. The module, samplers and images match the program's previous lookup 99%, 99.5% and 91% of the time. | killed B1 as planned |
 | ~~B1~~ | ~~Memoize the SRT walk on user SGPRs, validated against the read set~~. Dropped: keys rarely repeat, and validating a ~50-load read set costs most of a walk. | — |
-| B2 | Memoize texture resolve per stage image slot: same T# words and no image registrations on its pages since → reuse (done, +6.2%; B2b: color and depth targets the same way, +3.8%) | `ResolveTexture` < 4% (now 8.7%: the misses dominate; next, keep a few descriptors per slot) |
-| B1′ | Make the walk's remainder cheap instead of skipping the walk: reuse the specialization and module when the specialization-relevant descriptor fields match the program's previous lookup (99.7%); memoize `PrepareProgram`'s static vertex input decode (4%). Then the JIT walker itself: cut per-load overhead in its load stub. | `GetGraphicsPrograms` ≤ 12% of the thread |
+| B2 | Memoize texture resolve per stage image slot: same T# words and no image registrations on its pages since → reuse (done, +6.2%; B2b: color and depth targets the same way, +3.8%) | `ResolveTexture` < 4% (now ~10% with its hits' lock and copies; a second way per slot did not help, see FINDINGS) |
+| B1′ | Make the walk's remainder cheap instead of skipping the walk. The JIT walker (12% of the thread) needs straight-line code instead of memoized thunks; the rest of `MaterializeResources` (9%) and `PrepareProgram` (5%) need their per-draw allocations and copies cut. Separately, stop zeroing and copying ~1 KB `ImageDesc`s per draw (~7% of the thread in memset/memcpy). | `GetGraphicsPrograms` ≤ 12% of the thread |
 | B3 | Whole prepared-draw cache. Preparation becomes side-effect free (no writes to the shared `Program::resources`) and returns an immutable `PreparedDraw`; per-stage samplers, shader data and texture bindings are reused by slot. | ≤ 3 µs/draw |
 | B4 | Prepare misses on a worker thread (prepare/commit split), if misses still matter after B3 | ≤ 2 µs/draw |
 
@@ -106,5 +106,5 @@ mirror that only gets dirty ranges. No per-draw stream copies, and no write-faul
 | Track | Current step | Notes |
 |---|---|---|
 | A | A1 done (#7, #8); A2 done; A3 measured: transfers end only ~10 passes/frame; A4 done (#10); A5: per-pass GPU timing in the tree; redundant binds, queries and same-target pass breaks ruled out; next: CPU cost of recording (CommitBindings) | GPU ~18.4 ms/frame (11.0 in passes, 4.0 dispatches); indirect-dispatch syncs 0 |
-| B | B1′ (B0 done: B1 dropped; B2 +6.2% and B2b +3.8% merged) | texture resolve 16.7% → 8.7%, render-target resolve 10.8% → 5.6% of the GPU thread; next: the walk's remainder |
+| B | B1′ (B0 done: B1 dropped; B2 +6.2% and B2b +3.8% merged; B2c ruled out) | texture resolve 16.7% → 8.7%, render-target resolve 10.8% → 5.6% of the GPU thread; next: per-draw struct copies, then walker codegen |
 | C | C1a merged (#6, +5.7%). C2 (async write protection) in progress: prototype gives guest threads −20% CPU per frame at neutral FPS; it merges only with a clean `KYTY_ASYNC_WP_VERIFY` (the verifier is being fixed first). C3 moved to the lead | C0 in FINDINGS: guest threads fit once faults are gone, no Track D. C1 import deferred: labels are written before the host GPU reads. Later: the 1,088 trapped VRSQRTPS sites |
