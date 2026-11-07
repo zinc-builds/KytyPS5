@@ -34,6 +34,12 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 struct ShaderParams;
+
+namespace HW {
+class Context;
+class UserConfig;
+class Shader;
+} // namespace HW
 class CommandBuffer;
 
 namespace ShaderRecompiler {
@@ -233,8 +239,25 @@ public:
 		bool                    uses_image_heap       = false;
 	};
 
+	// What one lookup materializes for a stage. Lookups write it, not the shared Program, so a
+	// stage's resources belong to the draw or dispatch that looked it up.
+	struct StageResources {
+		ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+	};
+	// A draw's stages, indexed like GraphicsPipelineKey::stage_ids.
+	using GraphicsResources = std::array<StageResources, 4>;
+
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	// The same from given registers, materializing into `resources`, which must outlive the
+	// draw. On the draw prepare worker (DrawPrepare::OnWorker) it only finds what exists: a
+	// program or module miss, a call-target program, a new tessellation layout or an image heap
+	// marks the preparation failed (DrawPrepare::Fail) and leaves the state incomplete. The
+	// command thread must not look up programs while the worker does.
+	void GetGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+	                         const HW::Shader& shaders, DrawRenderState& state,
+	                         GraphicsResources& resources);
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
@@ -244,13 +267,6 @@ public:
 
 private:
 	friend struct PipelineCacheTestAccess;
-
-	// What one lookup materializes for a stage. Lookups write it, not the shared Program, so a
-	// stage's resources belong to the draw or dispatch that looked it up.
-	struct StageResources {
-		ShaderRecompiler::IR::ResourceSnapshot       snapshot;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-	};
 
 	struct Program {
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
@@ -293,7 +309,7 @@ private:
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	// Graphics stages indexed like GraphicsPipelineKey::stage_ids, and the dispatch's stage. A
 	// stage's resources stay valid until the next lookup of that stage kind.
-	std::array<StageResources, 4>          m_graphics_resources;
+	GraphicsResources                      m_graphics_resources;
 	StageResources                         m_compute_resources;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;

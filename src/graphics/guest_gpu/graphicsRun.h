@@ -43,6 +43,10 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// Guest-thread commands wait for ProcessCommands.
+	[[nodiscard]] bool HasPendingCommands() const noexcept {
+		return m_pending_commands.load(std::memory_order_acquire) != 0;
+	}
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

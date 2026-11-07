@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/assert.h"
 #include "common/profiler.h"
@@ -38,6 +39,12 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 	g_shader_reader_context = this;
 	ShaderSetGuestReader([](uint64_t vaddr, void* dst, uint64_t size) -> bool {
 		auto* context = g_shader_reader_context;
+		if (DrawPrepare::OnWorker()) {
+			// The prepare worker never reads in place (a fault there would need the command
+			// thread); whether the bytes were GPU-written is checked where the draw is adopted.
+			DrawPrepare::NoteRead(vaddr, size);
+			return LibKernel::Memory::CopySparseMemory(vaddr, dst, size);
+		}
 		static const bool disabled = std::getenv("KYTY_NO_SHADER_FASTREAD") != nullptr;
 		if (disabled || context == nullptr || !GuestGpu::IsGpuThread() ||
 		    context->GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
@@ -50,6 +57,12 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 	ShaderRecompiler::IR::SetSrtWalkerGuestAccess(
 	    watch_table, pages_offset, [](uint64_t vaddr, uint32_t* value) {
 		    auto* context = g_shader_reader_context;
+		    if (DrawPrepare::OnWorker()) {
+			    DrawPrepare::NoteRead(vaddr, sizeof(*value));
+			    return LibKernel::Memory::CopySparseMemory(vaddr, value, sizeof(*value))
+			               ? SrtWalkerRead::Ok
+			               : SrtWalkerRead::Failed;
+		    }
 		    if (context != nullptr && GuestGpu::IsGpuThread() &&
 		        context->GetBufferCache().HasGpuDirtyBytes(vaddr, sizeof(*value))) {
 			    return SrtWalkerRead::GpuWritten;
@@ -105,6 +118,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	    !m_page_manager.IsTrackingFault(fault_vaddr, access)) {
 		return false;
 	}
+	// Its reads go through the backing view; serving a fault here would wait for the command
+	// thread, which may be waiting for the worker.
+	EXIT_IF(DrawPrepare::OnWorker());
 	if (MemDiag::Enabled()) {
 		if (access == PageFaultAccess::Write) {
 			MemDiag::NoteWriteFault(fault_vaddr);

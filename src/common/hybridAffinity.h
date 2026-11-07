@@ -53,7 +53,14 @@ struct Plan {
 	bool      active = false;
 	cpu_set_t process {};
 	int       gpu_cpu = -1;
+	// The draw prepare thread's CPU, or -1 for none chosen.
+	int       prepare_cpu = -1;
 };
+
+inline int EnvCpu(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr ? std::atoi(value) : -1;
+}
 
 inline Plan& GetPlan() {
 	static Plan plan = [] {
@@ -76,9 +83,29 @@ inline Plan& GetPlan() {
 		const auto siblings = ReadCpuList("/sys/devices/system/cpu/cpu" + std::to_string(gpu) +
 		                                  "/topology/thread_siblings_list");
 		result.gpu_cpu = siblings.empty() ? gpu : *siblings.begin();
+		// The draw prepare thread (KYTY_PREPARE_THREAD) gets the first thread of the next
+		// performance core to itself; its SMT sibling stays with the emulator.
+		// KYTY_PREPARE_CPU=<n> picks another CPU, which the emulator keeps if it is not a
+		// performance core.
+		const char* prepare_env = std::getenv("KYTY_PREPARE_THREAD");
+		const bool  prepare_on  = prepare_env == nullptr || prepare_env[0] != '0';
+		int         prepare     = prepare_on ? EnvCpu("KYTY_PREPARE_CPU") : -1;
+		if (prepare_on && prepare < 0) {
+			for (auto it = performance.rbegin(); it != performance.rend(); ++it) {
+				if (siblings.count(*it) == 0 && *it != gpu) {
+					const auto core = ReadCpuList("/sys/devices/system/cpu/cpu" +
+					                              std::to_string(*it) +
+					                              "/topology/thread_siblings_list");
+					prepare = core.empty() ? *it : *core.begin();
+					break;
+				}
+			}
+		}
+		result.prepare_cpu = prepare;
 		CPU_ZERO(&result.process);
 		for (const int cpu: performance) {
-			if (siblings.count(cpu) == 0 && cpu != gpu && CPU_ISSET(cpu, &allowed)) {
+			if (siblings.count(cpu) == 0 && cpu != gpu && cpu != prepare &&
+			    CPU_ISSET(cpu, &allowed)) {
 				CPU_SET(cpu, &result.process);
 			}
 		}
@@ -92,8 +119,9 @@ inline Plan& GetPlan() {
 inline void ApplyToProcess() {
 	auto& plan = GetPlan();
 	if (plan.active && sched_setaffinity(0, sizeof(plan.process), &plan.process) == 0) {
-		std::printf("Hybrid CPU: emulator on %d performance threads, GPU command thread on CPU %d\n",
-		            CPU_COUNT(&plan.process), plan.gpu_cpu);
+		std::printf("Hybrid CPU: emulator on %d performance threads, GPU command thread on CPU %d, "
+		            "draw prepare thread on CPU %d\n",
+		            CPU_COUNT(&plan.process), plan.gpu_cpu, plan.prepare_cpu);
 	}
 }
 
@@ -106,6 +134,21 @@ inline void ApplyToGpuThread() {
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	CPU_SET(plan.gpu_cpu, &set);
+	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
+// Call from the draw prepare thread: a performance core the emulator leaves to it (see GetPlan).
+inline void ApplyToPrepareThread() {
+	int cpu = EnvCpu("KYTY_PREPARE_CPU");
+	if (cpu < 0 && GetPlan().active) {
+		cpu = GetPlan().prepare_cpu;
+	}
+	if (cpu < 0) {
+		return;
+	}
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 

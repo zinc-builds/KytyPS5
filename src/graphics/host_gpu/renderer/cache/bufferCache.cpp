@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -885,6 +886,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			NoteWritten(vaddr, size, __builtin_return_address(0), nullptr);
 		}
 #endif
+		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
+			// A draw prepared on the worker may have read these bytes before they became
+			// GPU-written.
+			DrawPrepare::NoteHazard();
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}

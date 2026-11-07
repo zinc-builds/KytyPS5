@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -27,6 +28,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -36,14 +38,17 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -842,9 +847,13 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                            DrawRenderState& state) {
+                                            DrawRenderState& state, QueuedDraw* queued) {
 	m_context.GetImageHeap().BeginDraw();
-	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	if (queued != nullptr) {
+		AdoptPrograms(*queued, state);
+	} else {
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	}
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
@@ -1416,7 +1425,8 @@ void RenderExecutor::FlushAtomicWrites(CommandBuffer& buffer) {
 	m_atomic_batch = {};
 }
 
-bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
+bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
+                               QueuedDraw* queued) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1460,8 +1470,13 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	hw_check(buffer);
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	// A queued draw's state already holds the worker's program lookup.
+	std::optional<DrawRenderState> own_state;
+	if (queued == nullptr) {
+		own_state.emplace(DrawRenderState {.indirect_offsets = args.indirect.offsets,
+		                                   .indirect_draw    = args.indirect.address != 0});
+	}
+	auto& state = queued != nullptr ? queued->state : *own_state;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1491,7 +1506,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count};
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, state, queued)) {
 		ResetBindings();
 		return true;
 	}
@@ -1508,7 +1523,8 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
+bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args,
+                              QueuedDraw* queued) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1550,13 +1566,17 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	std::optional<DrawRenderState> own_state;
+	if (queued == nullptr) {
+		own_state.emplace(DrawRenderState {.indirect_offsets = args.indirect.offsets,
+		                                   .indirect_draw    = args.indirect.address != 0});
+	}
+	auto& state = queued != nullptr ? queued->state : *own_state;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;
 	}
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, state, queued)) {
 		ResetBindings();
 		return true;
 	}
@@ -1584,6 +1604,282 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 	ResetBindings();
 	return emit.has_value();
+}
+
+namespace {
+
+uint64_t PrepareNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+bool EnvFlag(const char* name, bool fallback) {
+	const char* value = std::getenv(name);
+	return value == nullptr ? fallback : value[0] != '0';
+}
+
+// A fresh state for a program lookup, keeping what the draw path set before it.
+void ResetProgramState(DrawRenderState& state) {
+	const auto topology = state.topology;
+	const auto restart  = state.primitive_restart_enable;
+	const auto offsets  = state.indirect_offsets;
+	const auto indirect = state.indirect_draw;
+	// Reconstructed, not assigned: its arrays are left unset until used.
+	std::destroy_at(&state);
+	std::construct_at(&state, DrawRenderState {.topology                 = topology,
+	                                           .primitive_restart_enable = restart,
+	                                           .indirect_offsets         = offsets,
+	                                           .indirect_draw            = indirect});
+}
+
+bool SameSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& a,
+                  const ShaderRecompiler::IR::ResourceSnapshot& b) {
+	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
+	       a.specialization_reads == b.specialization_reads && a.uniform_fill == b.uniform_fill;
+}
+
+template <typename Info>
+std::string CompareStage(const char* name, const Info& a, const PipelineCache::StageResources& ar,
+                         const Info& b, const PipelineCache::StageResources& br) {
+	if (a.stage.module != b.stage.module) {
+		return std::string(name) + ": module";
+	}
+	if (a.stage.module == nullptr) {
+		return {};
+	}
+	if (!SameSnapshot(ar.snapshot, br.snapshot)) {
+		return std::string(name) + ": resources";
+	}
+	if (ar.specialization != br.specialization) {
+		return std::string(name) + ": specialization";
+	}
+	std::vector<uint32_t> ka;
+	std::vector<uint32_t> kb;
+	BuildStageStaticKey(a, ka);
+	BuildStageStaticKey(b, kb);
+	if (ka != kb) {
+		return std::string(name) + ": static inputs";
+	}
+	if constexpr (std::is_same_v<Info, ShaderVertexInputInfo>) {
+		if (a.buffers_num != b.buffers_num || a.resources_num != b.resources_num ||
+		    std::memcmp(a.buffers, b.buffers, sizeof(a.buffers[0]) * std::max(a.buffers_num, 0)) != 0 ||
+		    std::memcmp(a.resources, b.resources,
+		                sizeof(a.resources[0]) * std::max(a.resources_num, 0)) != 0) {
+			return std::string(name) + ": vertex inputs";
+		}
+	}
+	return {};
+}
+
+// The first difference between two lookups of one draw, or empty.
+std::string ComparePrograms(const DrawRenderState& a, const PipelineCache::GraphicsResources& ar,
+                            const DrawRenderState& b, const PipelineCache::GraphicsResources& br) {
+	if (a.ps_active != b.ps_active || a.mrt_mask != b.mrt_mask ||
+	    a.vertex_stage_count != b.vertex_stage_count) {
+		return "pixel activity, targets or vertex stages";
+	}
+	static constexpr const char* names[] = {"vertex", "hull", "domain"};
+	for (uint32_t i = 0; i < a.vertex_stage_count; i++) {
+		if (auto diff = CompareStage(names[i], a.vertex_info[i], ar[i], b.vertex_info[i], br[i]);
+		    !diff.empty()) {
+			return diff;
+		}
+	}
+	if (a.ps_active) {
+		return CompareStage("pixel", a.ps_input_info, ar[3], b.ps_input_info, br[3]);
+	}
+	return {};
+}
+
+// What the draw path would do with these registers besides an ordinary draw.
+bool QueueableRegisters(const HW::Context& ctx, const HW::UserConfig& ucfg, const HW::Shader& sh) {
+	const auto mode = ctx.GetColorControl().mode;
+	if (mode != static_cast<uint8_t>(CbColorMode::Normal)) {
+		const auto& override = ctx.GetDepthRenderOverride();
+		if (mode != static_cast<uint8_t>(CbColorMode::Disable) || override.force_z_dirty ||
+		    override.force_stencil_dirty) {
+			return false; // metadata operations, resolves, depth and stencil copies
+		}
+	}
+	vk::PrimitiveTopology topology {};
+	return DrawHasValidVertexShader(sh) && GetDrawTopology(ucfg, topology);
+}
+
+} // namespace
+
+RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& buffer) {
+	static const bool enabled = EnvFlag("KYTY_PREPARE_THREAD", true);
+	if (!enabled ||
+	    !QueueableRegisters(buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders())) {
+		return nullptr;
+	}
+	if (m_prepare_worker == nullptr) {
+		const char* depth_text = std::getenv("KYTY_PREPARE_DEPTH");
+		const auto  depth = std::clamp(depth_text != nullptr ? std::atoi(depth_text) : 4, 1, 16);
+		m_queued_draws.resize(depth + 1);
+		for (auto& slot: m_queued_draws) {
+			slot = std::make_unique<QueuedDraw>();
+		}
+		m_prepare_verify = EnvFlag("KYTY_PREPARE_VERIFY", false);
+		m_prepare_stats  = EnvFlag("KYTY_PREPARE_STATS", false);
+		m_prepare_worker = std::make_unique<DrawPrepare::Worker>(&PrepareQueuedDraw, this);
+		Log::WriteToConsoleAndLog(fmt::format("Draw preparation thread on, {} draws ahead{}\n",
+		                                      depth, m_prepare_verify ? " (verifying)" : ""));
+	}
+	// The ring holds one more slot than the queue, so the next one is free.
+	EXIT_IF(m_queued_count >= m_queued_draws.size());
+	return m_queued_draws[m_queued_posted % m_queued_draws.size()].get();
+}
+
+void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
+	queued.registers         = buffer.GetRegisters();
+	queued.user_config       = buffer.GetUserConfig();
+	queued.shaders           = buffer.GetShaders();
+	queued.hazard_generation = DrawPrepare::HazardGeneration();
+	queued.sync_epoch        = GuestSyncEpoch::Current();
+	queued.sequence          = m_prepare_worker->Post();
+	// The worker finds the slot from the sequence.
+	EXIT_IF(queued.sequence != ++m_queued_posted ||
+	        m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued);
+	m_queued_count++;
+	m_prepare_stat.queued++;
+	while (m_queued_count + 1 > m_queued_draws.size()) {
+		FinishQueuedDraw(buffer);
+	}
+}
+
+void RenderExecutor::QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
+	auto* queued = args.indirect.address == 0 && args.index_count != 0 && args.instance_count != 0
+	                   ? NextQueuedDraw(buffer)
+	                   : nullptr;
+	if (queued == nullptr) {
+		FinishQueuedDraws(buffer);
+		m_prepare_stat.direct++;
+		(void)DrawIndex(buffer, args);
+		return;
+	}
+	queued->indexed    = true;
+	queued->index_args = args;
+	PostQueuedDraw(buffer, *queued);
+}
+
+void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
+	auto* queued = args.indirect.address == 0 && args.vertex_count != 0 && args.instance_count != 0
+	                   ? NextQueuedDraw(buffer)
+	                   : nullptr;
+	if (queued == nullptr) {
+		FinishQueuedDraws(buffer);
+		m_prepare_stat.direct++;
+		(void)DrawAuto(buffer, args);
+		return;
+	}
+	queued->indexed   = false;
+	queued->auto_args = args;
+	PostQueuedDraw(buffer, *queued);
+}
+
+void RenderExecutor::PrepareQueuedDraw(void* executor, uint64_t sequence) {
+	auto& self   = *static_cast<RenderExecutor*>(executor);
+	auto& queued = *self.m_queued_draws[(sequence - 1) % self.m_queued_draws.size()];
+	queued.log.Reset();
+	DrawPrepare::SetLog(&queued.log);
+	std::destroy_at(&queued.state);
+	std::construct_at(&queued.state);
+	self.m_context.GetPipelineCache().GetGraphicsPrograms(
+	    queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
+	DrawPrepare::SetLog(nullptr);
+}
+
+void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
+	KYTY_PROFILER_FUNCTION();
+	const auto sequence = m_queued_posted - m_queued_count + 1;
+	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
+	EXIT_IF(m_queued_count == 0 || queued.sequence != sequence);
+	m_queued_count--;
+	m_prepare_stat.wait_ns += m_prepare_worker->Wait(queued.sequence);
+	// The draw reads the registers it was queued with.
+	auto& registers   = *buffer.m_registers;
+	auto& user_config = *buffer.m_user_config;
+	auto& shaders     = *buffer.m_shaders;
+	buffer.Bind(queued.registers, queued.user_config, queued.shaders);
+	if (queued.indexed) {
+		(void)DrawIndex(buffer, queued.index_args, &queued);
+	} else {
+		(void)DrawAuto(buffer, queued.auto_args, &queued);
+	}
+	buffer.Bind(registers, user_config, shaders);
+
+	if (m_prepare_stats) {
+		auto&      stat = m_prepare_stat;
+		const auto now  = PrepareNowNs();
+		if (stat.start_ns == 0) {
+			stat.start_ns       = now;
+			stat.worker_busy_ns = m_prepare_worker->BusyNs();
+		} else if (now - stat.start_ns >= 1'000'000'000ull) {
+			const auto busy  = m_prepare_worker->BusyNs();
+			const auto span  = static_cast<double>(now - stat.start_ns);
+			const auto draws = static_cast<double>(std::max<uint64_t>(stat.queued, 1));
+			std::printf("PREPARE queued=%" PRIu64 " direct=%" PRIu64 " adopted=%" PRIu64
+			            " failed=%" PRIu64 " hazard=%" PRIu64 " gpu_written=%" PRIu64
+			            " verified=%" PRIu64 " wait_ns_per_draw=%.0f worker_ns_per_draw=%.0f"
+			            " worker_busy=%.1f%%\n",
+			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
+			            stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
+			            static_cast<double>(busy - stat.worker_busy_ns) / draws,
+			            100.0 * static_cast<double>(busy - stat.worker_busy_ns) / span);
+			stat                = {};
+			stat.start_ns       = now;
+			stat.worker_busy_ns = busy;
+		}
+	}
+}
+
+void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
+	auto& pipelines = m_context.GetPipelineCache();
+	auto& buffers   = m_context.GetBufferCache();
+	bool  usable    = false;
+	if (queued.log.failed) {
+		m_prepare_stat.failed++;
+	} else if (DrawPrepare::HazardGeneration() != queued.hazard_generation ||
+	           GuestSyncEpoch::Current() != queued.sync_epoch) {
+		// GPU-written bytes appeared, or the emulator stored into guest memory, while the
+		// worker read: the lookup here would have seen them.
+		m_prepare_stat.hazard++;
+	} else if (std::ranges::any_of(queued.log.reads, [&](const auto& read) {
+		           return buffers.HasGpuDirtyBytes(read.first, read.second);
+	           })) {
+		// Here those reads would have waited for the GPU.
+		m_prepare_stat.gpu_written++;
+	} else {
+		usable = true;
+	}
+	if (!usable) {
+		// The command thread may not look programs up while the worker does.
+		m_prepare_worker->WaitIdle();
+		ResetProgramState(state);
+		pipelines.GetGraphicsPrograms(queued.registers, queued.user_config, queued.shaders, state,
+		                              queued.resources);
+		return;
+	}
+	m_prepare_stat.adopted++;
+	if (m_prepare_verify) {
+		m_prepare_worker->WaitIdle();
+		static auto check = std::make_unique<std::pair<DrawRenderState, PipelineCache::GraphicsResources>>();
+		check->first = state;
+		ResetProgramState(check->first);
+		pipelines.GetGraphicsPrograms(queued.registers, queued.user_config, queued.shaders,
+		                              check->first, check->second);
+		if (const auto diff = ComparePrograms(state, queued.resources, check->first, check->second);
+		    !diff.empty()) {
+			EXIT("KYTY_PREPARE_VERIFY: the worker's lookup differs (%s): vs=0x%016" PRIx64
+			     " ps=0x%016" PRIx64 "\n",
+			     diff.c_str(), queued.shaders.GetVs().es_regs.data_addr,
+			     queued.shaders.GetPs().ps_regs.data_addr);
+		}
+		m_prepare_stat.verified++;
+	}
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer) {

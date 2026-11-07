@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/deferredRecorder.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -13,6 +14,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -167,6 +169,7 @@ private:
 	HW::Shader*         m_shaders     = nullptr;
 
 	friend class CommandScheduler;
+	friend class RenderExecutor; // commits queued draws from their register copies
 };
 
 namespace Pssr {
@@ -201,10 +204,55 @@ public:
 	void FlushAtomicWrites(CommandBuffer& buffer);
 	[[nodiscard]] bool HasAtomicWrites() const { return static_cast<bool>(m_atomic_batch.stages); }
 
+	// Threaded draw preparation (DrawPrepare): a direct draw whose registers describe an ordinary
+	// draw is queued. Its programs are looked up on the prepare worker from a copy of the
+	// registers while the draw queued before it is committed here, from its own copy. Anything
+	// else that uses the caches or records must FinishQueuedDraws first, and nothing stays queued
+	// outside the command processor's packet loop. KYTY_PREPARE_THREAD=0 draws at once instead.
+	void QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
+	void QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
+	void FinishQueuedDraws(CommandBuffer& buffer) {
+		while (m_queued_count != 0) {
+			FinishQueuedDraw(buffer);
+		}
+	}
+	[[nodiscard]] bool HasQueuedDraw() const { return m_queued_count != 0; }
+
 private:
-	// False, with nothing drawn, when the draw's indirect records need CPU counts.
-	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
-	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
+	// A queued draw: what it was given, its registers when queued, and the worker's lookup.
+	struct QueuedDraw {
+		HW::Context                      registers;
+		HW::UserConfig                   user_config;
+		HW::Shader                       shaders;
+		bool                             indexed = true;
+		DrawIndexArgs                    index_args;
+		DrawAutoArgs                     auto_args;
+		DrawRenderState                  state;
+		PipelineCache::GraphicsResources resources;
+		DrawPrepare::Log                 log;
+		uint64_t                         sequence = 0;
+		// DrawPrepare::HazardGeneration and GuestSyncEpoch when it was queued.
+		uint64_t                         hazard_generation = 0;
+		uint64_t                         sync_epoch        = 0;
+	};
+
+	// False, with nothing drawn, when the draw's indirect records need CPU counts. A queued draw
+	// brings its registers (bound to `buffer`) and the worker's lookup.
+	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args, QueuedDraw* queued = nullptr);
+	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args, QueuedDraw* queued = nullptr);
+	// The slot for a draw to queue, or null when it must be drawn at once: preparation threading
+	// is off, or the registers select a special operation (metadata, resolve, depth copy) or no
+	// draw at all.
+	QueuedDraw* NextQueuedDraw(const CommandBuffer& buffer);
+	// Copies the registers into the filled slot, hands it to the worker and commits the oldest
+	// queued draws beyond the queue depth.
+	void        PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued);
+	// Commits the oldest queued draw.
+	void        FinishQueuedDraw(CommandBuffer& buffer);
+	// The queued draw's programs: the worker's if nothing they depend on changed since it was
+	// queued, else looked up here.
+	void AdoptPrograms(QueuedDraw& queued, DrawRenderState& state);
+	static void PrepareQueuedDraw(void* executor, uint64_t sequence);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -255,7 +303,7 @@ private:
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                          DrawRenderState& state);
+	                                          DrawRenderState& state, QueuedDraw* queued);
 	void                      ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                              DrawRenderState& state, const DrawEmitInfo& emit,
 	                                              const DrawIndexBufferSource& index_source);
@@ -338,6 +386,20 @@ private:
 	struct {
 		uint64_t lookups = 0, hits = 0;
 	} m_color_target_stats;
+
+	// Draws queued for the prepare worker, in a ring of depth + 1 slots: up to `depth` queued
+	// (prepared or being prepared) and one being filled. Slot i takes sequences i + 1, i + 1 +
+	// ring size, ...
+	std::unique_ptr<DrawPrepare::Worker>             m_prepare_worker;
+	std::vector<std::unique_ptr<QueuedDraw>>         m_queued_draws;
+	uint64_t                                         m_queued_posted = 0; // sequences posted
+	uint32_t                                         m_queued_count  = 0; // posted, not committed
+	bool                                             m_prepare_verify = false;
+	bool                                             m_prepare_stats  = false;
+	struct PrepareStats {
+		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t wait_ns = 0, verified = 0, worker_busy_ns = 0, start_ns = 0;
+	} m_prepare_stat;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
