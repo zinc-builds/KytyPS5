@@ -163,8 +163,10 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 	return (ActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
 }
 
+thread_local bool t_prepare_thread = false;
+
 const uint8_t* Scratch(const ResourcePlan& plan) {
-	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
+	return reinterpret_cast<const uint8_t*>(SrtWalkScratch(plan).srt.data());
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
@@ -1482,18 +1484,38 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
 
+SrtWalkScratchRef SrtWalkScratch(const ResourcePlan& plan) {
+	if (!t_prepare_thread) return {plan.srt_scratch, plan.material_keys, plan.selector_keys};
+	if (plan.prepare_scratch == nullptr ||
+	    plan.prepare_scratch->srt.size() != plan.srt_scratch.size()) {
+		// The command thread's scratch has this plan's layout; the walker writes before it reads.
+		plan.prepare_scratch = std::make_unique<ResourcePlan::WalkScratch>(ResourcePlan::WalkScratch {
+		    .srt           = std::vector<uint64_t>(plan.srt_scratch.size(), 0u),
+		    .material_keys = {},
+		    .selector_keys = std::vector<ResourcePlan::SelectorKeys>(plan.selector_keys.size()),
+		});
+	}
+	auto& scratch = *plan.prepare_scratch;
+	return {scratch.srt, scratch.material_keys, scratch.selector_keys};
+}
+
+void SetSrtWalkPrepareThread(bool prepare) {
+	t_prepare_thread = prepare;
+}
+
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
+	auto& scratch = SrtWalkScratch(plan).srt;
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	                                                     scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
-		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
+		for (auto* read = scratch.data() + plan.srt_captures / 8u; read != end; ++read)
 			reads->emplace_back(*read, sizeof(uint32_t));
 	}
 	return true;
