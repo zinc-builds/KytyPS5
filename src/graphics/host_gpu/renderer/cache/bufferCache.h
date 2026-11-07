@@ -89,6 +89,11 @@ public:
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads between these two share one barrier pair (global barriers before the first copy and
+	// after the last) instead of a pair per copy. Nothing but uploads may be recorded in between.
+	// KYTY_UPLOAD_BATCH=0: a pair per copy again.
+	void               BeginUploadBatch();
+	void               EndUploadBatch();
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
@@ -171,6 +176,11 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	AsyncUploader                                     m_async_uploader;
 	bool                                              m_last_upload_async = false;
+	struct UploadBatch {
+		bool active = false; // between BeginUploadBatch and EndUploadBatch
+		bool open   = false; // its opening barrier is recorded
+	};
+	UploadBatch                                       m_upload_batch;
 	std::vector<uint8_t>                              m_async_verify_bytes;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
