@@ -1246,6 +1246,17 @@ Ruled out:
   of the command thread, and the memo's own hit path gains ~1.3% (table and region cache
   misses). Buffer-cache code totals 8.46% vs 8.52% of the thread, and the FPS change is noise
   (39.28 → 38.97).
+- Building and deduplicating graphics descriptor writes on the recording thread. One run, `dev`
+  4c86dc01, ns per graphics draw in `CommitBindings`: image transitions 104 (they must stay),
+  descriptor dedupe and record 97, write building 69, push-constant dedupe and record 35,
+  setup 11. Moving the dedupe of push constants and push descriptors to the recorder, with an
+  epoch for invalidation and `KYTY_BIND_VERIFY` comparing both sides' decisions (7M pushes
+  matched), measured 38.90 → 38.97 FPS. In the command thread's profile, `PushDescriptors` +
+  `PushConstants` fall from 1.11% to 0.87%, but `Reserve`, `Publish` and `WaitDone` rise from 2.17%
+  to 2.23%. The compare was cheap; the cost is copying into the ring. The command thread copies
+  only changed runs today, and the recorder needs every write. Building the writes on the
+  recorder (69 ns) still needs the same descriptor infos copied, so it is not pursued. Unmerged
+  branch `trackB/recorder-descriptors`.
 
 ### Tooling notes
 
