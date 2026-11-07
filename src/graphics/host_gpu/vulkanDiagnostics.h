@@ -39,6 +39,9 @@ bool DrawTimingEnabled();
 void DrawStamp(vk::CommandBuffer buffer, uint64_t vs_id, uint64_t ps_id, uint64_t vertices,
                bool pipeline_changed);
 
+// KYTY_GPU_TIME=draws: the compute module of the next dispatch recorded into the buffer.
+void TagDispatch(vk::CommandBuffer buffer, uint64_t module_id);
+
 void DumpSpirv(const char* stage, uint64_t hash, uint64_t id, std::span<const uint32_t> spirv);
 
 } // namespace Libs::Graphics::VulkanDiagnostics

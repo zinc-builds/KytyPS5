@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -450,6 +451,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
+	VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide
@@ -546,6 +548,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

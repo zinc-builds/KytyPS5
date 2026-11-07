@@ -199,6 +199,7 @@ struct PassTimer {
 		uint32_t draws = 0, width = 0, height = 0, colors = 0;
 		uint8_t  kind     = 0; // SegmentKind
 		uint8_t  command  = 0; // transfers and clears: index into TransferNames
+		uint64_t module   = 0; // dispatches: compute module id (KYTY_GPU_TIME=draws)
 		uint32_t barriers = 0; // barriers recorded since the previous segment ended
 	};
 	enum SegmentKind : uint8_t { Pass, Dispatch, Transfer, Clear };
@@ -224,7 +225,8 @@ struct PassTimer {
 	};
 	bool                                          enabled = false;
 	bool                                          draws_enabled = false;
-	std::unordered_map<uint64_t, DrawTotal>       by_vs, by_ps;
+	std::unordered_map<uint64_t, DrawTotal>       by_vs, by_ps, by_cs;
+	std::unordered_map<VkCommandBuffer, uint64_t> next_dispatch_module;
 	DrawTotal                                     draw_total;
 	vk::QueryPool                                 pool;
 	std::array<Chunk, Chunks>                     chunks;
@@ -341,6 +343,11 @@ void PassCollect(uint32_t index) {
 				} else {
 					g_passes.dispatch_ns += ns;
 					g_passes.dispatches++;
+					if (g_passes.draws_enabled) {
+						auto& total = g_passes.by_cs[segment.module];
+						total.ns += ns;
+						total.n++;
+					}
 				}
 			}
 			if (bounded && at(chunk.finish) >= last_end) {
@@ -426,6 +433,7 @@ void Collect(uint32_t slot) {
 				g_passes.draw_total = {};
 				PrintDrawTotals("vs", g_passes.by_vs, s, 25);
 				PrintDrawTotals("ps", g_passes.by_ps, s, 15);
+				PrintDrawTotals("cs", g_passes.by_cs, s, 15);
 			}
 			std::printf("GPUGAP transfer_ms_s=%.1f transfers_s=%.0f clear_ms_s=%.1f clears_s=%.0f "
 			            "gap_barrier_ms_s=%.1f gaps_barrier_s=%.0f gap_plain_ms_s=%.1f gaps_plain_s=%.0f "
@@ -526,6 +534,13 @@ int32_t DispatchBegin(VkCommandBuffer buffer, uint8_t kind = PassTimer::Dispatch
 	PassTimer::Segment segment;
 	segment.kind     = kind;
 	segment.command  = command;
+	if (kind == PassTimer::Dispatch) {
+		if (const auto tag = g_passes.next_dispatch_module.find(buffer);
+		    tag != g_passes.next_dispatch_module.end()) {
+			segment.module = tag->second;
+			g_passes.next_dispatch_module.erase(tag);
+		}
+	}
 	segment.barriers = chunk.barriers;
 	chunk.barriers   = 0;
 	segment.begin = PassStamp(buffer);
@@ -718,6 +733,12 @@ void DrawStamp(vk::CommandBuffer buffer, uint64_t vs_id, uint64_t ps_id, uint64_
                bool pipeline_changed) {
 	if (!g_passes.draws_enabled) return;
 	PassDrawStamp(buffer, vs_id, ps_id, vertices, pipeline_changed);
+}
+
+void TagDispatch(vk::CommandBuffer buffer, uint64_t module_id) {
+	if (!g_passes.draws_enabled) return;
+	std::lock_guard lock(g_timer.mutex);
+	g_passes.next_dispatch_module[buffer] = module_id;
 }
 
 void DumpSpirv(const char* stage, uint64_t hash, uint64_t id, std::span<const uint32_t> spirv) {
