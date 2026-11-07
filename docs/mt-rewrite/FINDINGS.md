@@ -728,7 +728,7 @@ What this means:
   (`~/AI/emu/tracy-build` has binaries); export with `tracy-csvexport`. Tracy renames the main
   thread, so match the process by command line (`^\./kyty_emulator --game`), never by name.
 - Thread name `KytyGpuCmd` for the GPU thread (top/perf/taskset).
-- `KYTY_TIME_DIAG=1`: one `TIMEDIAG` line per second: vblanks, flips on screen with their interval
+- `KYTY_TIME_DIAG=1` (costs ~1 FPS while on): one `TIMEDIAG` line per second: vblanks, flips on screen with their interval
   in ms and in vblanks (`flip_vbl`, the real-speed check), flip modes, the game's clock and
   video-out calls per second with their top call sites (`eboot.bin+0x…`), and the sites read
   about once per flip (`per_flip:`). `KYTY_TIME_DIAG=dump` also writes the code around every
