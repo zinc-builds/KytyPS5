@@ -867,6 +867,13 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return written;
 }
 
+bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
+	Graphics::GuestSyncEpoch::Advance();
+	const bool written = g_guest_address_space->TryStoreLabelBacking(vaddr, value, size);
+	Graphics::GuestSyncEpoch::Advance();
+	return written;
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }

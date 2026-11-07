@@ -41,7 +41,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Color and depth target slots reuse their last resolve (Track B2b; same batch: ref `dev` 277a708e 24.24 / 24.24) | 24.95 / 25.36 | 136.8k / 139.0k | 53.0 (max 82.2) | 19.2 |
 | 2026-11-07 | Draws re-record only a changed pipeline, push constants and push descriptors (Track A; same batch: ref `dev` 9af34700 24.78 / 24.87) | 24.90 / 25.38 | 136.7k / 139.1k | 52.5 (max 82.6) | 19.1 |
 | 2026-11-07 | Draws record their Vulkan commands on a second thread (Track A; same batch: ref `dev` 7f737011 24.99 / 25.19) | 25.50 / 25.55 | 139.8k / 139.9k | 52.9 (max 68.7) | 19.2 |
-| 2026-11-07 | Hot write-tracked chunks use asynchronous write protection (same binary, async off: 25.38 / 25.10; guest main thread 15.0 → 11.3 ms/frame) | 25.96 / 26.20 | 142.0k / 142.9k | 51.6 (max 82.6) | 19.6 |
+| 2026-11-07 | Hot write-tracked chunks use asynchronous write protection (same binary, async off: 25.24 / 25.37; guest main thread 15.0 → 11.3 ms/frame) | 25.88 / 25.85 | 141.6k / 141.4k | 52.7 (max 83.4) | 19.5 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -320,13 +320,15 @@ scan of a clean 1 GiB costs 0.15 ms, and 0.27 ms after 5,000 written pages.
   waits and markers in between don't).
 - Unless the wait is provably on the command processor's own label. `RELEASE_MEM` and
   `WRITE_DATA` into an async page re-protect that page (one-page `PAGEMAP_SCAN`), then store
-  through the backing alias, which leaves no written mark, and record (address, value, page
-  token). A wait whose value matches, whose page token is still current and whose page shows no
+  through the backing alias with one scalar store (the guest may reuse a label at once), which
+  leaves no written mark, and record (address, value, page token). Pages whose bytes another
+  guest view also maps get no proof: a store through the alias would not mark this view. A wait whose value matches, whose page token is still current and whose page shows no
   store since (a one-page scan without `WP_MATCHING`) skips the collection: the value is the
   processor's own, so the guest published nothing by it.
 - The page token advances whenever a page's written state is cleared outside a collection (the
   label store's re-protect, a new write watcher, the end of a read watch), since that would hide
-  a guest store from the "written since?" check. Remaps and zeroing void all labels.
+  a guest store from the "written since?" check; those writes are kept for the next collection
+  (a new watcher's range can span pages already watched). Remaps and zeroing void all labels.
 - Inside async chunks a page stays write-protected after its last watcher leaves.
 - Earlier versions: scanning at every satisfied wait took 17% of the GPU thread (−21% FPS);
   skipping waits on any value the processor had stored was unsound (the guest can store the
@@ -337,9 +339,9 @@ scan of a clean 1 GiB costs 0.15 ms, and 0.27 ms after 5,000 written pages.
 
 | 2 runs each | async off | async on |
 |---|---|---|
-| FPS | 25.38 / 25.10 | 25.96 / 26.20 |
-| SIGBUS write faults/s | ~196k | ~420 |
-| Whole process, CPU (10 s profile) | 688% | 565% |
+| FPS | 25.24 / 25.37 | 25.88 / 25.85 |
+| SIGBUS write faults/s | ~196k | ~410 |
+| Whole process, CPU (10 s profile, review-round-1 build) | 688% | 565% |
 | Game main thread, ms of CPU per frame | 15.0 | 11.3 |
 | Each `tbb_thead` worker, ms per frame | 13.6 | 9.8 |
 | GPU thread, ms per frame | 42.5 | 44.4 |
@@ -367,7 +369,7 @@ It compares them at the next one and flags any page whose bytes changed without 
 written, invalidated, unwatched, remapped or stored through the backing alias. It reads the
 pages before taking those logs, so a store racing the check can't be misreported.
 `KYTY_ASYNC_WP_DRYRUN=1` runs the same bookkeeping with the chunks left on the faulting path.
-That is the control: 0 lost writes in 323M page checks. With async on, in Sky Garden: 0 in 67.4M.
+That is the control: 0 lost writes in 323M page checks. With async on, in Sky Garden: 0 in 67.5M.
 `KYTY_ASYNC_WP_TRACE=<page>` prints every tracking event of one page.
 
 Earlier verifier reports (~0.1% "lost writes", even in the dry run) were the verifier's own

@@ -393,6 +393,32 @@ public:
 		    [](uint64_t, uint64_t) {});
 	}
 
+	// One aligned 4- or 8-byte store (a label: the guest may see it and reuse the label at
+	// once, so the bytes must not be written twice as memcpy may).
+	bool StoreLabel(uint64_t vaddr, uint64_t value, uint64_t size) {
+		if ((size != 4 && size != 8) || (vaddr & (size - 1)) != 0) {
+			return false;
+		}
+		LogAliasWrite(vaddr, size);
+		std::shared_lock lock(m_mutex);
+		auto             it = m_maps.upper_bound(vaddr);
+		if (it == m_maps.begin()) {
+			return false;
+		}
+		--it;
+		const auto& entry = it->second;
+		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) {
+			return false;
+		}
+		auto* target = m_backing_base + (entry.backing_offset + vaddr - entry.vaddr);
+		if (size == 4) {
+			*reinterpret_cast<volatile uint32_t*>(target) = static_cast<uint32_t>(value);
+		} else {
+			*reinterpret_cast<volatile uint64_t*>(target) = value;
+		}
+		return true;
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -477,6 +503,8 @@ public:
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
 		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode, write_protected});
+		// Again once the view is in: a new alias voids labels proven against the old views.
+		g_remap_generation.fetch_add(1, std::memory_order_relaxed);
 		return true;
 	}
 
@@ -737,6 +765,16 @@ public:
 			return false;
 		}
 		std::lock_guard kept_lock(m_kept_mutex);
+		// A store through another guest view of the same bytes leaves this view's page clean,
+		// so no proof for aliased pages. (A later alias advances the remap generation.)
+		const auto generation = g_remap_generation.load(std::memory_order_relaxed);
+		auto&      alias      = m_alias_memo[(page >> 12u) % m_alias_memo.size()];
+		if (alias.page != page || alias.generation != generation) {
+			alias = {page, generation, AliasedUnlocked(page)};
+		}
+		if (alias.aliased) {
+			return false;
+		}
 		m_write_protection.Scan(page, 0x1000, [&](uint64_t begin, uint64_t end) {
 			HideWritesLocked(begin, end, true);
 		});
@@ -880,6 +918,27 @@ private:
 		}
 	}
 
+	// Whether another view maps the bytes behind this page (under m_mutex).
+	[[nodiscard]] bool AliasedUnlocked(uint64_t page) const {
+		auto it = m_maps.upper_bound(page);
+		if (it == m_maps.begin()) {
+			return true;
+		}
+		--it;
+		const auto& self = it->second;
+		if (page < self.vaddr || page + 0x1000 > self.vaddr + self.size) {
+			return true;
+		}
+		const auto offset = self.backing_offset + (page - self.vaddr);
+		for (const auto& [_, entry]: m_maps) {
+			if (&entry != &self && entry.backing_offset < offset + 0x1000 &&
+			    offset < entry.backing_offset + entry.size) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// Under m_kept_mutex: the page's current token.
 	uint64_t PageTokenLocked(uint64_t page) const {
 		auto& slot = m_page_seq[(page >> 12u) % m_page_seq.size()];
@@ -914,11 +973,12 @@ private:
 			// a store there costs no signal, and the protection keeps "not written since" provable
 			// (RenderContext::IsCpLabel).
 			if (async && write_protect) {
-				// The page gains a watcher (no cache holds it): earlier stores need no report,
-				// but re-protecting hides them, so through the scan that voids page tokens.
+				// Re-protecting would erase written state: the range can include pages already
+				// watched (the page manager batches across them), so their stores are kept for
+				// the next collection, and page tokens advance.
 				std::lock_guard kept_lock(m_kept_mutex);
 				m_write_protection.Scan(start, stop - start, [&](uint64_t begin, uint64_t end) {
-					HideWritesLocked(begin, end, false);
+					HideWritesLocked(begin, end, true);
 				});
 			} else if (!async && !m_write_protection.Protect(start, stop - start, write_protect, async)) {
 				return false;
@@ -1099,6 +1159,12 @@ private:
 	mutable std::array<PageSeq, 4096> m_page_seq {};
 	mutable uint64_t                  m_seq       = 0;
 	mutable uint64_t                  m_seq_floor = 0; // tokens at or below are void
+	struct AliasMemo {
+		uint64_t page       = 0;
+		uint64_t generation = 0;
+		bool     aliased    = true;
+	};
+	std::array<AliasMemo, 1024> m_alias_memo {}; // under m_kept_mutex
 #endif
 #endif
 
@@ -1192,6 +1258,14 @@ public:
 		}
 		m_backing->WriteBacking(vaddr, data, size);
 		return true;
+	}
+
+	bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->StoreLabel(vaddr, value, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

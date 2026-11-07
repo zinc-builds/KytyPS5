@@ -1036,7 +1036,11 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		if (GuestRange {vaddr, size}.Valid() && !buffers.HasGpuDirtyBytes(vaddr, size)) {
 			const bool gpu_modified = buffers.IsRegionGpuModified(vaddr, size);
 			if (m_renderer.StoreCpLabel(vaddr, value, size, !gpu_modified) ||
-			    (gpu_modified && LibKernel::Memory::TryWriteBacking(vaddr, value, size))) {
+			    (gpu_modified && [&] {
+				    uint64_t stored = 0;
+				    std::memcpy(&stored, value, size);
+				    return LibKernel::Memory::TryStoreLabelBacking(vaddr, stored, size);
+			    }())) {
 				return;
 			}
 		}

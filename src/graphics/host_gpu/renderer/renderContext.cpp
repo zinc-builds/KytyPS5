@@ -380,14 +380,14 @@ bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t siz
 		LibKernel::Memory::RequestAsyncWriteTracking(vaddr);
 		return false;
 	}
-	if (!LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+	uint64_t stored = 0;
+	std::memcpy(&stored, value, size);
+	if (!LibKernel::Memory::TryStoreLabelBacking(vaddr, stored, size)) {
 		return false;
 	}
 	if (invalidate) {
 		(void)InvalidateMemory(vaddr, size);
 	}
-	uint64_t stored = 0;
-	std::memcpy(&stored, value, size);
 	m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()] = {vaddr, stored, size, generation, token};
 	if (size == sizeof(uint64_t)) {
 		m_cp_labels[((vaddr + 4) >> 2u) % m_cp_labels.size()] = {vaddr + 4, stored >> 32u, 4,
