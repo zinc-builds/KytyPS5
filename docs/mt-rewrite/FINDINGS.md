@@ -51,6 +51,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | **Route changed:** `garden.sh` boots straight into the level (`GARDEN_ROUTE=lvl`, see "Benchmark route" below). Same binary (`dev` f2848f29 + `KYTY_APP0_OVERLAY`), same batch, menu route: 27.36 / 27.94, worst_ms 50.8 / 50.9, low1 19.7 / 19.5. Compare later rows with this one, not with the rows above | 27.89 / 28.24 | 151.2k / 153.3k | 51.1 (max 66.9) | 19.5 |
 | 2026-11-07 | **Benchmark method changed:** frames 1000–1600 after level start instead of a 25 s + 45 s time window, warm-up run first, one run per configuration (see "Benchmark window"). `dev` 4516792f, four identical runs (worst_ms 47.0 / 48.5 / 46.1 / 46.4, low1 19.8 / 20.0 / 20.5 / 20.9). Compare later rows with this one only | 29.56 / 29.48 / 29.65 / 29.61 | 153.9k / 155.0k | 47.0 (max 68.1) | 20.3 |
 | 2026-11-07 | Vertex shaders drop EXEC selects whose skipped lanes nothing reads (Track G; same batch: ref `dev` 84e51e33 29.72; same binary with `KYTY_MASKED_SELECTS=0` in passes 9.09 → 8.91 ms/frame, GPU 14.96 → 14.77; FPS unchanged, the command thread limits) | 29.68 | 155.0k | 45.1 (max 68.5) | 21.3 |
+| 2026-11-07 | Draw programs looked up on a worker thread from a copy of the registers, up to 4 draws ahead (Track B4; same batch: ref `dev` 84e51e33 29.61; 6.48 → 5.57 µs/draw) | 34.42 | 179.4k | 40.0 (max 51.4) | 24.6 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -833,6 +834,76 @@ data it reads mostly hits. What would help is less walker code per walk, for exa
 computing a buffer's base and size once per V# instead of per read, or a denser thunk
 encoding. Removing calls alone does not help.
 
+### Threaded draw preparation, Track B4 (2026-11-07)
+
+**Design (the "snapshot" variant of B4).** A direct draw whose registers describe an ordinary
+draw is queued instead of drawn: the command thread copies the register state (`HW::Context`,
+`UserConfig`, `Shader`) into a ring slot and posts it to one worker thread, which runs
+`PipelineCache::GetGraphicsPrograms` (program lookup, SRT walk, resource materialization,
+module selection) from the copy into the slot's `DrawRenderState` and `StageResources`. Up to
+four draws are queued; the command thread commits the oldest one (render targets, bindings,
+buffers, recording) with `CommandBuffer`'s register pointers bound to the slot's copy. It adopts
+the worker's lookup only if:
+- the worker did not fail. It only finds: a program or module miss, a call-target program, a new
+  tessellation layout or an image heap fails the preparation;
+- nothing it read could have changed since the post: `DrawPrepare::HazardGeneration` (advanced
+  when the buffer cache's GPU-written set grows) and `GuestSyncEpoch` (emulator stores into
+  guest memory) are unchanged;
+- no guest range it read through the backing view (watched pages, buffer-backing reads) is
+  GPU-written now. The worker never reads in place, so it never faults into the caches.
+
+Otherwise the command thread waits for the worker to go idle and looks the programs up itself.
+Packets other than register writes (direct and indirect), `SET_BASE`/`INDEX_*`/`NUM_INSTANCES`,
+`INDIRECT_BUFFER`, marker NOPs and direct draws commit the queue first, as do pending
+guest-thread commands, a requested asynchronous-write collection, `NUM_INSTANCES` read from
+memory and the end of each `CommandProcessor::Process`.
+
+`KYTY_PREPARE_VERIFY=1` looks every adopted draw up again on the command thread and exits on
+any difference (module, resources, specialization, static inputs, vertex inputs). Clean over
+full benches at queue depths 1 and 4 (3–4M draws each). Rejected lookups: ~0.5% (hazards), 0
+failed, 0 GPU-written reads.
+
+**Where the worker runs decides the gain.** Same binary, one run each (old time-window bench,
+`dev` 3bafedba + #26):
+
+| Worker CPU | FPS | Worker µs/draw |
+|---|---|---|
+| none (`KYTY_PREPARE_THREAD=0`) | 24.65 | – |
+| efficiency core 18 (next to the recorder) | 26.62 | 5.0 |
+| efficiency core 15 (other cluster) | 26.52 | 5.0 |
+| performance CPU 8, shared with guest threads | 29.48 | 3.2 |
+| performance CPU 8, taken from the guests (sibling 9 kept) | **31.27** | 3.2 |
+| performance CPU 8 and 9 both taken | 31.23 | 3.0 |
+| CPU 8 taken, recorder moved to its sibling 9 | 30.46 | 3.5 |
+
+The worker now takes the first thread of the second-to-last performance core, which the
+emulator's affinity mask leaves out (`KYTY_PREPARE_CPU` overrides). Queue depth: 1 draw 31.31,
+2 → 31.90, 4 → 32.12, 8 → 32.14 FPS; rejections grow with depth (0.1% → 0.7%), so 4 it is.
+
+**The indirect register writes must not drain the queue.** Sky Garden loads register blocks
+from memory (`SET_CONTEXT_REG_INDIRECT`, `SET_UCONFIG_REG_INDIRECT`) for nearly every draw.
+Draining the queue at them (a review suggestion: they read guest memory a queued draw might
+write) made 33k drains/s, about one every 5 draws, and the command thread waited 0.8 µs/draw
+for the worker; 94% of the drains came from those two packets. They now keep the queue: the
+hardware command processor reads them long before earlier draws' shaders run, so a guest
+that reads shader output there must put a wait or a cache operation in between, and those
+packets drain the queue. Drains fell to 2.4k/s and waits to 0.2 µs/draw.
+
+**Result** (frame-range bench, same batch against `dev` 84e51e33, one run each): 29.61 →
+**34.42 FPS (+16.2%)**, 154.4k → 179.4k draws/s (6.48 → 5.57 µs per draw on the command
+thread), worst frame 47.0 → 40.0 ms, 1% low 20.1 → 24.6. The worker spends 2.9 µs per draw
+(53% busy); the command thread waits for it 0.16 µs per draw, mostly when a queue drains.
+Before #25 (which removed the 16 KB of per-draw state zeroing the worker had taken over) the
+same design gave +27% over its reference.
+
+What is left on the command thread (perf, flat, user mode; LBR call graphs need
+`perf_event_paranoid` ≤ 1, which was 2 this time): texture resolve and its validation
+(`RefindExactImage` 4.9%, `FindTextureDescription` 2.6%, `ResolveStageTexture` 2.0%, texture
+cache hash lookups ~2.5%, `FindView` 1.2%), libc `memcpy` and friends ~12% (stream copies and
+per-draw structs), `ObtainBuffer`/`FindBuffer`/`SynchronizeBuffer`/`FindBuffers`/`RebindBuffers`
+~6.6%, `pthread_rwlock_*` ~4% (the guest address-space lock in `CopySparseMemory`),
+`CommitBindings` 2.1%, the NVIDIA driver 2.2% (pushes and binds not deferred to the recorder).
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
@@ -851,6 +922,9 @@ encoding. Removing calls alone does not help.
   which then kept holding the bench lock for everyone. It now stops its own emulator on any
   failure, by parent PID: a pattern `pkill -9` can kill the emulator of whoever takes the lock
   next, and did once.
+- A helper that starts `vpad.py` from inside a benchmark must close the bench-lock descriptors
+  (`9>&- 8>&- 7>&-`): otherwise vpad inherits the exclusive lock and holds it after the
+  benchmark exits, blocking every agent (it happened once, for ~25 min).
 - Do not pipe `garden.sh` through `head`. SIGPIPE kills the script before its cleanup and leaves
   the emulator running.
 - `cmake --install` fails resolving the Qt launcher's image-plugin dependencies (`libheif`,
@@ -936,5 +1010,10 @@ What this means:
   shape, a count every 64 checks; slow).
 - `KYTY_MASKED_SELECTS=0` (Track G): vertex shaders keep every EXEC select. For A/B only, in
   an install dir of its own: the shader store doesn't record the setting.
+- Threaded draw preparation (Track B4): `KYTY_PREPARE_THREAD=0` draws at once on the command
+  thread, `KYTY_PREPARE_DEPTH=<n>` queues up to n draws (default 4), `KYTY_PREPARE_CPU=<n>` pins
+  the worker elsewhere, `KYTY_PREPARE_VERIFY=1` looks every adopted draw up again and exits on a
+  difference, `KYTY_PREPARE_STATS=1` prints `PREPARE` lines once per second (adopted and rejected
+  draws, drains, the command thread's wait and the worker's time per draw).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
   hit and exits on a disagreement, `KYTY_DTC_STATS=1` prints `DTC` hit-rate lines once per second.
