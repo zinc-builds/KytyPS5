@@ -40,6 +40,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-06 | Stage image slots reuse their last texture resolve (Track B2; measured on 582e4043, without the stream-copy row: ref 19.33 / 19.57) | 20.68 / 20.66 | 115.6k / 115.5k | 58.3 (max 83.9) | 16.7 |
 | 2026-11-07 | Color and depth target slots reuse their last resolve (Track B2b; same batch: ref `dev` 277a708e 24.24 / 24.24) | 24.95 / 25.36 | 136.8k / 139.0k | 53.0 (max 82.2) | 19.2 |
 | 2026-11-07 | Draws re-record only a changed pipeline, push constants and push descriptors (Track A; same batch: ref `dev` 9af34700 24.78 / 24.87) | 24.90 / 25.38 | 136.7k / 139.1k | 52.5 (max 82.6) | 19.1 |
+| 2026-11-07 | Draws record their Vulkan commands on a second thread (Track A; same batch: ref `dev` 7f737011 24.99 / 25.19) | 25.50 / 25.55 | 139.8k / 139.9k | 52.9 (max 68.7) | 19.2 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -451,8 +452,7 @@ Root-only Nsight metrics would separate front-end from shading cost; not availab
 2.3%, `vkCmdBindPipeline` ~1.0% (80% of binds re-bound the bound pipeline), the descriptor-set
 path for layouts too large to push (`DescriptorHeap::Allocate` + `vkUpdateDescriptorSets`) ~1.5%,
 `bindVertexBuffers2`, `drawIndexed` and `pushConstants` ~0.3% each, `CommitBindings` itself
-~1.7% self. ~70 ns per Vulkan call; even a separate recording thread would win ≤ ~7%, so it is
-not worth its complexity yet.
+~1.7% self. ~70 ns per Vulkan call.
 
 **Bind dedupe (landed).** `GraphicsBindings` (in `DynamicState`) keeps the graphics pipeline,
 push-constant dwords and push-descriptor elements recorded last in the command buffer. A draw
@@ -475,8 +475,33 @@ calls 146k → 79k, pushed descriptors 16.8 → 6.0 per push. FPS +1.2% (A/B abo
 ¹ Dispatches that read the skipped draws' output change their work.
 
 Fragment work is only ~1.6 ms per frame; ~7.3 ms is ~1.3 µs per draw that remains with nothing
-rasterized: vertex shading or per-draw front-end state. Next: zero-instance draws and per-draw
-timestamps by category to separate the two.
+rasterized. **It is vertex shading, not per-draw state:** with every draw recorded at zero
+instances (all binds, pushes and dynamic state still recorded), passes take 0.7 ms per frame.
+
+Per-draw GPU timestamps (a timestamp after each draw, grouped by draw shape; local diagnostic)
+put 53% of in-pass time in the 18% of draws that switch pipelines (5.9 µs vs 1.1 µs per draw).
+The same draw shape costs ~1.0–1.3 µs more after a switch (G-buffer draws with 512–4k indices:
+0.58 → 1.87 µs). Only 0.1% of those switches keep the same VS and PS, so making blend, color
+mask or topology dynamic would not avoid them: they are shader changes, and part of the cost is
+the new material's own vertex work. Other heavy groups: mesh-shader draws (~16% of in-pass
+time), full-screen passes (3–6 indices, 37–53 µs each), instanced draws with 9–64 instances.
+
+**Recording thread (landed).** `DeferredRecorder` takes each draw's final Vulkan commands
+(descriptor pushes and the non-push set update and bind, push constants, vertex/index binds,
+dynamic state, the pass begin, the pipeline bind, the draw) as closures in a 4 MB SPSC ring, and
+a recording thread pinned to an efficiency core records them while the command thread prepares
+the next draw. `CommandBuffer::Handle()` drains the ring, so all other recording keeps its order.
+`Image::Transit` has an overload that takes the command buffer only when it emits a barrier;
+before it, `AcquireRenderTargets` drained every draw (4.3% of the thread waiting). After:
+the driver is 5.0% of the command thread (was 9.1%), waits for the recorder 1.8%
+(`EndRendering` before downloads and dispatches, `Submit`). On the SMT sibling of the command
+thread's core the recorder costs 11% FPS; on an efficiency core it gains ~2%.
+`KYTY_RECORD_THREAD=0` turns it off. Also: descriptor pools 4× larger (they refilled every ~300
+sets with failed allocations; 19.6k non-push sets/s), and the GPU tick is read at most every
+20 µs per draw.
+
+**Dispatches cost ~11 µs each on the command thread** (~236/frame, 6.5%), almost all in
+`PrepareBda` and `SynchronizeBuffer` (Track C).
 
 ### Draw state cache, Track B (2026-11-06)
 
