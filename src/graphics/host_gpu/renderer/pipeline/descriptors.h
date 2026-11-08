@@ -62,6 +62,21 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	// Stage binding-set reuse (KYTY_BINDING_REUSE=0 turns it off): the module, worker texture
+	// record serials and sampler values images and samplers were last resolved from, at which
+	// TextureCache::BindingEpoch and GcTick. A draw with the same ones keeps them.
+	struct Reuse {
+		bool                                               valid  = false;
+		const void*                                        module = nullptr;
+		uint64_t                                           epoch  = 0;
+		uint64_t                                           tick   = 0;
+		std::vector<uint64_t>                              serials;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> samplers;
+	} reuse;
+	// This draw kept the images, views and samplers of the last one (RebindImages keeps views).
+	bool reused = false;
+	// A full resolve of this draw that RebindImages may make reusable.
+	bool reuse_candidate = false;
 };
 
 [[nodiscard]] vk::DescriptorType

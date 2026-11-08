@@ -324,6 +324,14 @@ private:
 	// Prepare worker, after the program lookup: proposes the draw's color targets and writes
 	// them into its state.color_info.
 	void SpeculateTargets(QueuedDraw& queued, WorkerTargetMemo& memo);
+	// Stage binding-set reuse (PreparedBindings::Reuse).
+	[[nodiscard]] bool CanReuseBindings(const ShaderStageRuntime& runtime,
+	                                    const PreparedBindings&   prepared,
+	                                    const std::vector<TextureProposal>* proposals) const;
+	void NoteReusableBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                          const std::vector<TextureProposal>* proposals);
+	void VerifyReusedBindings(const ShaderStageRuntime& runtime, const PreparedBindings& prepared);
+	[[nodiscard]] static bool BindingReuseVerify();
 	// Command thread: color_info entry r of render target slot `slot` as the worker proposed it
 	// (record null: no output); the texture cache side, or the whole resolve if the record's image
 	// no longer holds.
@@ -584,6 +592,7 @@ private:
 		uint64_t drains = 0, waits = 0; // drains: FinishQueuedDraws with draws queued
 		uint64_t texture_updates = 0; // resolves handed back for the workers' memo
 		uint64_t texture_generation_refreshes = 0; // adopted records whose page check ran again
+		uint64_t binding_sets = 0, binding_reuses = 0; // stage binding sets, and those reused
 	} m_prepare_stat;
 
 	friend class CommandProcessor;

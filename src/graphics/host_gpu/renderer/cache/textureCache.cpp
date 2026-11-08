@@ -1586,6 +1586,11 @@ void TextureCache::VerifySettled(const Image& image, uint8_t need) {
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	AcquireTexture(id, desc);
+	return m_slot_images[id].FindView(desc.view_info);
+}
+
+void TextureCache::AcquireTexture(ImageId id, const ImageDesc& desc) {
 	auto& image = m_slot_images[id];
 	const auto need = desc.type == BindingType::Storage ? Image::SettledWrite : Image::SettledRefresh;
 	if ((image.settled.load(std::memory_order_acquire) & need) != 0 && image.registered &&
@@ -1595,7 +1600,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		if (desc.type == BindingType::Storage) {
 			TrackImageDownload(id, image);
 		}
-		return image.FindView(desc.view_info);
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	TouchImage(image);
@@ -1624,7 +1629,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
 	Settle(image);
-	return image.FindView(desc.view_info);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
