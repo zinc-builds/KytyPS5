@@ -314,7 +314,27 @@ private:
 	// Resolves made for the queued draw being committed, handed to its slot after the draw.
 	std::vector<TextureMemoRecord> m_texture_updates;
 	// Worker only: the resolve memo, and records replaced in the last jobs.
-	std::unordered_map<uint64_t, std::unique_ptr<WorkerTextureRecord>> m_worker_texture_memo;
+	// Open addressing by TextureDescriptionKey (a mixed hash), linear probing, at most half full;
+	// records are only replaced or all dropped, so no tombstones.
+	struct WorkerTextureMemo {
+		struct Entry {
+			uint64_t                             key = 0;
+			std::unique_ptr<WorkerTextureRecord> record; // null: empty
+		};
+		std::vector<Entry> entries;
+		size_t             size = 0;
+		// The entry holding `key`, or the empty one it would go to.
+		[[nodiscard]] Entry& Slot(uint64_t key) {
+			const auto mask = entries.size() - 1;
+			for (auto index = (key ^ (key >> 29u)) & mask;; index = (index + 1) & mask) {
+				auto& entry = entries[index];
+				if (entry.record == nullptr || entry.key == key) {
+					return entry;
+				}
+			}
+		}
+	};
+	WorkerTextureMemo m_worker_texture_memo;
 	std::vector<std::vector<std::unique_ptr<WorkerTextureRecord>>>    m_worker_texture_retired;
 	uint64_t                                                           m_worker_texture_jobs = 0;
 	// The worker's proposals for a stage being prepared, if it made them for this runtime.

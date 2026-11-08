@@ -886,18 +886,27 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
 	auto& retired = m_worker_texture_retired[m_worker_texture_jobs++ % retire_slots];
 	retired.clear();
 	constexpr size_t MaxRecords = 16384;
-	const auto       file       = [&](std::unique_ptr<WorkerTextureRecord> record) {
-        if (memo.size() >= MaxRecords) {
-            for (auto& [key, old]: memo) {
-                retired.push_back(std::move(old));
-            }
-            memo.clear();
-        }
-        auto& slot = memo[TextureDescriptionKey(record->inputs, record->value)];
-        if (slot != nullptr) {
-            retired.push_back(std::move(slot));
-        }
-        slot = std::move(record);
+	if (memo.entries.empty()) {
+		memo.entries.resize(MaxRecords * 2);
+	}
+	const auto file = [&](std::unique_ptr<WorkerTextureRecord> record) {
+		if (memo.size >= MaxRecords) {
+			for (auto& entry: memo.entries) {
+				if (entry.record != nullptr) {
+					retired.push_back(std::move(entry.record));
+				}
+			}
+			memo.size = 0;
+		}
+		const auto key  = TextureDescriptionKey(record->inputs, record->value);
+		auto&      slot = memo.Slot(key);
+		if (slot.record != nullptr) {
+			retired.push_back(std::move(slot.record));
+		} else {
+			memo.size++;
+		}
+		slot.key    = key;
+		slot.record = std::move(record);
 	};
 	for (auto& update: queued.texture_updates) {
 		file(std::move(update.record));
@@ -932,10 +941,9 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
 			}
 			const auto  inputs = TextureDescriptionInputs(images[i]);
 			const auto& value  = snapshot.images[i];
-			const auto  found  = memo.find(TextureDescriptionKey(inputs, value));
-			if (found != memo.end() && found->second->value == value &&
-			    found->second->inputs == inputs) {
-				out[i] = {found->second.get()};
+			const auto* found = memo.Slot(TextureDescriptionKey(inputs, value)).record.get();
+			if (found != nullptr && found->value == value && found->inputs == inputs) {
+				out[i] = {found};
 				continue;
 			}
 			auto record         = std::make_unique<WorkerTextureRecord>();

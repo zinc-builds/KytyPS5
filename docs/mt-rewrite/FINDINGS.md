@@ -65,6 +65,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | The last per-draw fences: the render context mutex is biased to the command thread (other threads force a `membarrier` and wait; `KYTY_RENDER_MUTEX_BIASED=0` turns it off), `FindDepthTarget` skips the texture cache lock for settled images, `ClampRangeSize` remembers answers per thread until the ranges change (Track B; same batches: ref `dev` ee714f06 40.70 / 40.83 / 40.68 / 40.46; settled verify 106M checks clean) | 40.78 / 41.06 / 41.01 / 40.99 | 214.2k / 215.1k / 215.8k / 215.6k | 33.5–35.7 (max 33.6–66.7) | 28.7 / 29.9 / – / – |
 | 2026-11-08 | The prepare worker looks up the draw's clean buffers too: storage buffer sources and vertex ranges, validated at the commit by the buffer registration sequence and a global CPU-dirty generation (Track B4 item 2; same batch: ref `dev` 1ed41724 40.55, worst_ms 33.5; buffer acquisition 668 → 519 ns/draw on ab1429f1, worker 2.33 → 2.57 µs/draw, 51% busy) | 42.13 | 221.0k | 33.5 (max 33.6) | 29.9 |
 | 2026-11-08 | Texture resolves proposed by the prepare worker from its own resolve memo (one record per resource and T#, description precomputed there); the command thread keeps the registration check, LRU touch and color-clear work, and resolves misses with the worker's description (Track B; same binary, `KYTY_WORKER_TEXTURES=0`: 41.01 / 41.34; `KYTY_WORKER_TEXTURES_VERIFY` 84M checks clean) | 41.41 / 41.96 | 217.9k / 220.1k | 33.5 (max 33.5) / 33.5 (max 33.6) | – |
+| 2026-11-08 | The prepare worker's texture memo is a flat open-addressed table instead of `std::unordered_map` (Track B; same batch: ref `dev` 78fa7f97 41.03 / 41.29; worker 2.90 → 2.80 µs/draw, command thread's wait for it 316 → 223 ns/draw, `KYTY_PREPARE_STATS`; verify 81M checks clean) | 42.18 / 42.42 | – | – | – |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1429,7 +1430,8 @@ What this means:
   2.94 µs/draw, busy 55% → 64%, and the command thread now waits for it 8.2% of the time
   (2.6% before; 351 vs 107 ns/draw). FPS +1.2%: the worker co-limits the pipeline in bursts, so
   most of the command thread's saving waits for a second worker. A deeper queue
-  (`KYTY_PREPARE_DEPTH=8`) does not help.
+  (`KYTY_PREPARE_DEPTH=8`) does not help. Making the worker's memo a flat table (−0.1 µs/draw on
+  the worker) gave +2.8%: the waits are bursty, so worker latency counts more than its average.
 
 ## Remaining costs and candidate directions
 
