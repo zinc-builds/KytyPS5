@@ -4,6 +4,7 @@
 #endif
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/memDiag.h"
 
 #include "common/assert.h"
@@ -219,9 +220,20 @@ void GuestGpu::ApplyLateStore(LateStore& item) {
 			}
 		}
 	}
+	// Queued draws prepared meanwhile are checked against the label's range, not dropped: a
+	// late store lands between them, unlike a store at decode, which drains them first.
+	const bool ranged = item.size != 0;
+	if (ranged) {
+		DrawPrepare::NoteStoredRange(item.vaddr, item.size);
+		GuestSyncEpoch::g_label_stores_ranged = true;
+	}
 	m_late_applying = true;
 	item.store();
 	m_late_applying = false;
+	if (ranged) {
+		GuestSyncEpoch::g_label_stores_ranged = false;
+		DrawPrepare::NoteStoredRange(item.vaddr, item.size);
+	}
 	m_late_applied  = item.sequence;
 	if (label != nullptr) {
 		label->written     = item.value & mask;
@@ -551,7 +563,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		g_gpu_state->m_late_stats.fenced++;
 		std::vector<uint32_t> values(src, src + dw_num);
 		g_gpu_state->DeferLateStore(0, 0, 0, [this, dst, values = std::move(values), write_control] {
+			// Ranged like a label store (see ApplyLateStore).
+			const auto vaddr = reinterpret_cast<uint64_t>(dst);
+			const auto bytes = ((write_control >> 16u) & 1u) != 0
+			                       ? sizeof(uint32_t)
+			                       : values.size() * sizeof(uint32_t);
+			DrawPrepare::NoteStoredRange(vaddr, bytes);
+			GuestSyncEpoch::g_label_stores_ranged = true;
 			WriteData(dst, values.data(), static_cast<uint32_t>(values.size()), write_control);
+			GuestSyncEpoch::g_label_stores_ranged = false;
+			DrawPrepare::NoteStoredRange(vaddr, bytes);
 		});
 		return;
 	}
