@@ -116,7 +116,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto& [address, size, id, speculated] = source;
 	if (address == 0 || size == 0) {
 		// Null descriptors read zero and drop writes, with or without shader bounds checks.
 		return {nullptr, 0, vk::WholeSize};
@@ -128,7 +128,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
+	    speculated);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -952,22 +953,23 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
-	KYTY_PROFILER_FUNCTION();
-	auto& cache = m_context.GetBufferCache();
-	for (auto* stage: stages) {
-		auto&       prepared = *stage;
-		const auto& program  = prepared.runtime->module->info;
-		const auto& snapshot = *prepared.runtime->resources;
+void DecodeBufferSources(const GraphicContext&                                     graphics,
+                         std::span<const ShaderStageRuntime* const>                runtimes,
+                         std::span<std::vector<PreparedBindings::BufferSource>* const> outs,
+                         BufferLookup lookup, void* context) {
+	for (size_t stage = 0; stage < runtimes.size(); stage++) {
+		const auto& program  = runtimes[stage]->module->info;
+		const auto& snapshot = *runtimes[stage]->resources;
 		const auto& layout   = program.bindings;
-		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+		auto&       sources  = *outs[stage];
+		sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
 		}
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
-			auto& source = prepared.buffer_sources[metadata.descriptor_index];
+			auto& source = sources[metadata.descriptor_index];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -984,8 +986,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
 					// Sentinel write ranges end before tables captured by any bound stage.
-					for (const auto* reader: stages) {
-						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
+					for (const auto* reader: runtimes) {
+						for (const auto [read_address, read_size]: reader->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
@@ -996,8 +998,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					}
 				}
 				//  PPSA15246
-				const auto& graphics = m_context.GetGraphics();
-				const auto  limit =
+				const auto limit =
 				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 				    (graphics.StorageMinAlignment() - 1);
 				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
@@ -1006,9 +1007,71 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			source    = {address, size, {}, UINT32_MAX};
+			source.id = lookup(context, address, size, source.speculated);
 		}
 	}
+}
+
+void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+	KYTY_PROFILER_FUNCTION();
+	auto& cache = m_context.GetBufferCache();
+	// The prepare worker's sources, when it decoded these same stages.
+	if (const auto* adopted = m_adopted_buffers;
+	    adopted != nullptr && adopted->stage_count == stages.size() &&
+	    std::ranges::equal(stages, std::span {adopted->runtimes.data(), adopted->stage_count},
+	                       [](const PreparedBindings* stage, const ShaderStageRuntime* runtime) {
+		                       return stage->runtime == runtime;
+	                       })) {
+		const bool verify = BufferCache::WorkerBuffersVerify();
+		for (size_t i = 0; i < stages.size(); i++) {
+			auto& sources = stages[i]->buffer_sources;
+			sources       = adopted->sources[i];
+			if (verify) {
+				std::vector<PreparedBindings::BufferSource> fresh;
+				const ShaderStageRuntime*                   runtime = stages[i]->runtime;
+				auto*                                       out     = &fresh;
+				DecodeBufferSources(
+				    m_context.GetGraphics(), std::span {&runtime, 1}, std::span {&out, 1},
+				    [](void* context, uint64_t address, uint64_t size, uint32_t&) {
+					    return static_cast<BufferCache*>(context)->FindBuffer(address, size);
+				    },
+				    &cache);
+				bool same = fresh.size() == sources.size();
+				for (size_t j = 0; same && j < fresh.size(); j++) {
+					same = fresh[j].address == sources[j].address && fresh[j].size == sources[j].size &&
+					       (!sources[j].id || !cache.SpeculationValid(adopted->speculation) ||
+					        sources[j].id == fresh[j].id);
+				}
+				if (!same) {
+					EXIT("KYTY_WORKER_BUFFERS=verify: the worker's buffer sources differ (stage %zu)\n",
+					     i);
+				}
+			}
+			for (auto& source: sources) {
+				// The worker does not create buffers: those it found no buffer for are created
+				// here, in the order they always were.
+				if (source.size != 0 && !source.id) {
+					source.id = cache.FindBuffer(source.address, source.size);
+				}
+			}
+		}
+		return;
+	}
+	std::array<const ShaderStageRuntime*, 4>                     runtimes {};
+	std::array<std::vector<PreparedBindings::BufferSource>*, 4>  outs {};
+	EXIT_IF(stages.size() > runtimes.size());
+	for (size_t i = 0; i < stages.size(); i++) {
+		runtimes[i] = stages[i]->runtime;
+		outs[i]     = &stages[i]->buffer_sources;
+	}
+	DecodeBufferSources(
+	    m_context.GetGraphics(), std::span {runtimes.data(), stages.size()},
+	    std::span {outs.data(), stages.size()},
+	    [](void* context, uint64_t address, uint64_t size, uint32_t&) {
+		    return static_cast<BufferCache*>(context)->FindBuffer(address, size);
+	    },
+	    &cache);
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {

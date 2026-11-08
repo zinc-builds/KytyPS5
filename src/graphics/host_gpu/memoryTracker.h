@@ -27,6 +27,28 @@ public:
 	// not wait for CPU write faults of other threads, which only add CPU-dirty pages.
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Any thread: true only if every tracked page of the range exists and is CPU-clean (a page
+	// of a region not created yet counts as dirty). Creates nothing.
+	[[nodiscard]] bool IsRegionCpuCleanNoCreate(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || vaddr / TRACKER_REGION_SIZE >= REGION_COUNT ||
+		    (vaddr + size - 1) / TRACKER_REGION_SIZE >= REGION_COUNT) {
+			return false;
+		}
+		uint64_t remaining = size;
+		uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+		uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+		while (remaining != 0) {
+			const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+			const auto* region = m_regions[index].load(std::memory_order_acquire);
+			if (region == nullptr || region->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes)) {
+				return false;
+			}
+			remaining -= bytes;
+			offset = 0;
+			index++;
+		}
+		return true;
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.

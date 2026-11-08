@@ -62,7 +62,8 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        BufferId id              = {},
+	                                                        uint32_t speculated      = UINT32_MAX);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -99,6 +100,36 @@ public:
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
+
+	// Buffer lookups made ahead on the draw prepare worker (KYTY_WORKER_BUFFERS=0|verify|stats).
+	// A lookup covers a read-only range that one registered buffer holds and that had no
+	// CPU-dirty page. It stays valid while no page anywhere newly became CPU-dirty
+	// (g_cpu_dirty_generation) and no buffer was registered or unregistered since the
+	// generations were read, which happens before the lookups.
+	struct SpeculatedRange {
+		uint64_t vaddr  = 0;
+		uint64_t size   = 0;
+		uint64_t offset = 0;
+		BufferId id {};
+	};
+	struct Speculation {
+		uint64_t                     cpu_dirty_generation = 0;
+		uint64_t                     registration_seq     = 1; // odd: none
+		std::vector<SpeculatedRange> ranges;
+	};
+	[[nodiscard]] static bool WorkerBuffersEnabled();
+	[[nodiscard]] static bool WorkerBuffersVerify();
+	// Prepare worker: the generations a speculation is taken against, read before any lookup.
+	void BeginSpeculation(Speculation& speculation) const;
+	// Prepare worker: records the buffer holding [vaddr, vaddr + size) if it is CPU-clean and
+	// returns its index in the speculation (pass it to ObtainBuffer), else UINT32_MAX.
+	[[nodiscard]] uint32_t SpeculateLookup(Speculation& speculation, uint64_t vaddr,
+	                                       uint64_t size) const;
+	// GPU command thread: whether a speculation still holds now.
+	[[nodiscard]] bool SpeculationValid(const Speculation& speculation) const;
+	// GPU command thread: ObtainBuffer answers read-only ranges given a speculated index from
+	// `speculation` while it holds (null: none).
+	void SetSpeculation(const Speculation* speculation) { m_speculation = speculation; }
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -219,6 +250,13 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+
+	// Worker-readable buffer extents, set and cleared under an odd m_registration_seq.
+	static constexpr size_t                    EXTENT_CAPACITY = size_t {1} << 18u;
+	std::atomic<uint64_t>                      m_registration_seq {0};
+	std::unique_ptr<std::atomic<uint64_t>[]>   m_extent_begin;
+	std::unique_ptr<std::atomic<uint64_t>[]>   m_extent_end;
+	const Speculation*                         m_speculation = nullptr;
 };
 
 } // namespace Libs::Graphics
