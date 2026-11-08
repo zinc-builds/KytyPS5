@@ -121,6 +121,18 @@ public:
 		return false;
 	}
 
+	// Any thread: a sum of counters, one per 64-page word, each advanced after a page of its word
+	// newly became CPU-dirty (and after the bit is published). Unchanged between two reads: no
+	// page of the words holding the range newly became CPU-dirty in between.
+	[[nodiscard]] uint64_t CpuGrowth(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(offset, size);
+		uint64_t sum = 0;
+		for (auto word = start / 64; word <= (end - 1) / 64; word++) {
+			sum += m_cpu_growth[word].load(std::memory_order_acquire);
+		}
+		return sum;
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t offset, uint64_t size) {
 		const auto [start, end] = GetPageRange(offset, size);
@@ -171,10 +183,14 @@ private:
 	void PublishDirtyBits() {
 		bool cpu_grew = false;
 		for (size_t word = 0; word < RegionBits::kWordCount; word++) {
-			const auto cpu = m_cpu_dirty.Word(word);
-			cpu_grew |= (cpu & ~m_cpu_words[word].load(std::memory_order_relaxed)) != 0;
+			const auto cpu  = m_cpu_dirty.Word(word);
+			const bool grew = (cpu & ~m_cpu_words[word].load(std::memory_order_relaxed)) != 0;
 			m_cpu_words[word].store(cpu, std::memory_order_release);
 			m_gpu_words[word].store(m_gpu_dirty.Word(word), std::memory_order_release);
+			if (grew) {
+				m_cpu_growth[word].fetch_add(1, std::memory_order_release);
+				cpu_grew = true;
+			}
 		}
 		if (cpu_grew) {
 			g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
@@ -234,6 +250,7 @@ private:
 	// Copies of the dirty bits for IsModifiedUnlocked, stored under the lock.
 	std::array<std::atomic<uint64_t>, RegionBits::kWordCount> m_cpu_words {};
 	std::array<std::atomic<uint64_t>, RegionBits::kWordCount> m_gpu_words {};
+	std::array<std::atomic<uint64_t>, RegionBits::kWordCount> m_cpu_growth {};
 };
 
 } // namespace Libs::Graphics

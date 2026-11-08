@@ -29,6 +29,22 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Any thread: true only if every tracked page of the range exists and is CPU-clean (a page
 	// of a region not created yet counts as dirty). Creates nothing.
+	// Calls func(region or null, offset, bytes) for each region part of a range that lies below
+	// REGION_COUNT regions (callers check the bounds).
+	template <typename Func>
+	void ForEachRegionNoCreate(uint64_t vaddr, uint64_t size, Func&& func) const {
+		uint64_t remaining = size;
+		uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+		uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+		while (remaining != 0 && index < REGION_COUNT) {
+			const auto bytes = std::min(TRACKER_REGION_SIZE - offset, remaining);
+			func(static_cast<const RegionManager*>(m_regions[index].load(std::memory_order_acquire)),
+			     offset, bytes);
+			remaining -= bytes;
+			offset = 0;
+			index++;
+		}
+	}
 	[[nodiscard]] bool IsRegionCpuCleanNoCreate(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || vaddr / TRACKER_REGION_SIZE >= REGION_COUNT ||
 		    (vaddr + size - 1) / TRACKER_REGION_SIZE >= REGION_COUNT) {
@@ -48,6 +64,47 @@ public:
 			index++;
 		}
 		return true;
+	}
+	// Any thread, for a stream copy taken ahead: whether every page of the range exists, none is
+	// GPU-dirty and one is CPU-dirty; `growth` gets RegionManager::CpuGrowth summed over the
+	// range (read before the bits). Creates nothing.
+	[[nodiscard]] bool IsRegionStreamableNoCreate(uint64_t vaddr, uint64_t size,
+	                                              uint64_t& growth) const {
+		if (size == 0 || vaddr / TRACKER_REGION_SIZE >= REGION_COUNT ||
+		    (vaddr + size - 1) / TRACKER_REGION_SIZE >= REGION_COUNT) {
+			return false;
+		}
+		growth        = 0;
+		bool cpu      = false;
+		bool complete = true;
+		ForEachRegionNoCreate(vaddr, size, [&](const RegionManager* region, uint64_t offset,
+		                                       uint64_t bytes) {
+			if (region == nullptr) {
+				complete = false;
+				return;
+			}
+			growth += region->CpuGrowth(offset, bytes);
+		});
+		if (!complete) {
+			return false;
+		}
+		ForEachRegionNoCreate(vaddr, size, [&](const RegionManager* region, uint64_t offset,
+		                                       uint64_t bytes) {
+			if (region->IsModifiedUnlocked<DirtySource::Gpu>(offset, bytes)) {
+				complete = false;
+			}
+			cpu |= region->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes);
+		});
+		return complete && cpu;
+	}
+	// Any thread: the same sum now (0 if a region is missing).
+	[[nodiscard]] uint64_t CpuGrowthNoCreate(uint64_t vaddr, uint64_t size) const {
+		uint64_t growth = 0;
+		ForEachRegionNoCreate(vaddr, size, [&](const RegionManager* region, uint64_t offset,
+		                                       uint64_t bytes) {
+			growth += region != nullptr ? region->CpuGrowth(offset, bytes) : 0;
+		});
+		return growth;
 	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
