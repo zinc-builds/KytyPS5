@@ -92,6 +92,8 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
+bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+
 static uint64_t LateNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -198,6 +200,23 @@ void GuestGpu::ApplyLateStore(LateStore& item) {
 			}
 			m_late_stats.foreign++;
 			m_late_stats.foreign_zero += current == 0 ? 1 : 0;
+			// Safety net: that value would have released a wait passed early on this label, so the
+			// guest may have been waiting for the other writer. From now on: the strict rule.
+			for (uint32_t i = 0; i < label->passed_count && !label->strict; i++) {
+				const auto& wait = label->passed[i];
+				if (TestWaitRegMemValue(current, wait.ref, wait.mask, wait.func)) {
+					label->strict = true;
+					m_late_stats.releasing_foreign++;
+					static std::atomic_bool warned {false};
+					if (!warned.exchange(true)) {
+						Log::WriteToConsoleAndLog(fmt::format(
+						    "Late labels: something else stored 0x{:x} to label 0x{:016x}, which "
+						    "releases a wait passed on a pending label; that label waits strictly "
+						    "from now on\n",
+						    current, item.vaddr));
+					}
+				}
+			}
 		}
 	}
 	m_late_applying = true;
@@ -245,10 +264,10 @@ void GuestGpu::ReportLateLabels(uint64_t now_ns) {
 		any_value += label.foreign_any ? 1 : 0;
 		pending += label.pending != 0 ? 1 : 0;
 	}
-	std::printf("LATELABELS deferred_s=%.0f applied_s=%.0f satisfied_s=%.0f refused_s=%.0f "
-	            "fenced_s=%.0f foreign_labels=%zu (any value %zu; stores seen %" PRIu64 ", zero %" PRIu64
+	std::printf("LATELABELS releasing_foreign=%" PRIu64 " deferred_s=%.0f applied_s=%.0f "
+	            "satisfied_s=%.0f refused_s=%.0f fenced_s=%.0f foreign_labels=%zu (any value %zu; stores seen %" PRIu64 ", zero %" PRIu64
 	            ") delay_us=%.1f max_us=%.1f pending=%zu\n",
-	            static_cast<double>(stats.deferred) / seconds,
+	            stats.releasing_foreign, static_cast<double>(stats.deferred) / seconds,
 	            static_cast<double>(stats.applied) / seconds,
 	            static_cast<double>(stats.satisfied) / seconds,
 	            static_cast<double>(stats.refused) / seconds,
@@ -426,13 +445,13 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 bool GuestGpu::LateLabelSatisfies(uint64_t vaddr, uint64_t ref, uint64_t mask, uint32_t func) {
 	const auto it = m_late_labels.find(vaddr);
-	if (it == m_late_labels.end() || it->second.pending == 0 ||
+	if (it == m_late_labels.end() || it->second.pending == 0 || it->second.strict ||
 	    !TestWaitRegMemValue(it->second.value, ref, mask, func)) {
 		return false;
 	}
 	// Only if this processor is the only writer seen to store a value that releases the wait:
 	// otherwise the guest may be waiting for the other writer.
-	const auto& label            = it->second;
+	const auto& label             = it->second;
 	bool        released_by_other = label.foreign_any;
 	for (uint32_t i = 0; i < label.foreign_count && !released_by_other; i++) {
 		released_by_other = TestWaitRegMemValue(label.foreign[i], ref, mask, func);
@@ -442,6 +461,10 @@ bool GuestGpu::LateLabelSatisfies(uint64_t vaddr, uint64_t ref, uint64_t mask, u
 		return false;
 	}
 	// The wait passes before its label is stored: CP stores after it wait for that label.
+	auto& passed = it->second;
+	passed.passed[passed.passed_count < passed.passed.size() ? passed.passed_count++
+	                                                          : passed.passed.size() - 1] =
+	    {ref, mask, func};
 	m_late_fence = m_late_deferred;
 	m_late_stats.satisfied++;
 	return true;

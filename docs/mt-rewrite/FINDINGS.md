@@ -1321,10 +1321,14 @@ the command thread in order (`=verify` prints `LATELABELS` lines).
   something else stores to ~40k label addresses (~12k stores/s), always 0 (the game resets its
   labels), which releases none of the waits. Refusing every label something else touches
   (the first version) left ~40 waits/s passing and 11 FPS.
+- Safety net: the last waits passed early on each label are remembered. If something else is
+  later seen storing a value that would have released one, that is counted (`releasing_foreign`
+  in `LATELABELS`), warned about once, and the label waits strictly from then on. Sky Garden: 0.
 - Reference-clock labels keep the clock read at decode. Read at completion, Sky Garden runs 4%
   slower: the game sees its real GPU time and reacts (`Image::FindView` from `RebindImages`
   doubles).
-- Cost with it on: 45.59 → 44.40 FPS (−2.6%), about the experiment's: the deferral, the held
+- Cost with it on: on `dev` 700d3924, same binary, 45.15 → 44.68 FPS (−1.0%); on 23191d32,
+  45.59 → 44.40 (−2.6%), about the experiment's: the deferral, the held
   CP stores and the bookkeeping on the command thread. Labels reach the guest 5.6 ms after
   decode on average (max ~16 ms); flips, the game's sleep time and the command thread's blocked
   time do not change. With it off, behaviour is as before.

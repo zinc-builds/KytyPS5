@@ -109,6 +109,15 @@ private:
 		std::array<uint64_t, 4> foreign {};
 		uint32_t                foreign_count = 0;
 		bool                    foreign_any   = false;
+		// The last waits passed on a pending value here. If something else is later seen storing
+		// a value that would have released one, waits on this label no longer pass early.
+		struct Wait {
+			uint64_t ref = 0, mask = 0;
+			uint32_t func = 0;
+		};
+		std::array<Wait, 2> passed {};
+		uint32_t            passed_count = 0;
+		bool                strict       = false;
 	};
 	struct LateStore {
 		uint64_t                     sequence    = 0;
@@ -155,6 +164,7 @@ private:
 	struct {
 		uint64_t deferred = 0, applied = 0, satisfied = 0, foreign = 0, foreign_zero = 0,
 		         refused = 0, fenced = 0, delay_ns = 0, max_delay_ns = 0, start_ns = 0;
+		uint64_t releasing_foreign = 0; // other stores that would have released a passed wait
 	} m_late_stats;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
