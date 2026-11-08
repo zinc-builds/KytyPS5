@@ -921,7 +921,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	EXIT_IF(targets != nullptr && proposal != targets->count);
-	ResolveRenderDepthTarget(buffer, state.depth_info);
+	if (targets != nullptr) {
+		ResolveProposedDepthTarget(buffer, targets->depth, state.depth_info);
+	} else {
+		ResolveRenderDepthTarget(buffer, state.depth_info);
+	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {state.color_info.data(), state.color_count};
@@ -1977,6 +1981,8 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	// The worker files these in its records when it next uses the slot.
 	std::swap(queued.target_updates, m_target_updates);
 	m_target_updates.clear();
+	std::swap(queued.depth_updates, m_depth_updates);
+	m_depth_updates.clear();
 	// The worker files these in its memo when it next uses the slot.
 	m_prepare_stat.texture_updates += m_texture_updates.size();
 	std::swap(queued.texture_updates, m_texture_updates);

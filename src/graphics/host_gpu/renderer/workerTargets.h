@@ -3,6 +3,7 @@
 
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
 #include <array>
 #include <cstdint>
@@ -31,6 +32,18 @@ struct WorkerColorTargetRecord {
 	mutable uint64_t generation = 0;
 };
 
+// The same for the depth target: its registers, and its description as decoded, or with the image
+// the command thread last found for it. The draw's other depth state (tests, clears, stencil) is
+// decoded for every draw.
+struct WorkerDepthTargetRecord {
+	HW::DepthRenderTarget   z {}; // compared as bytes
+	TextureCache::ImageDesc desc;
+	ImageId                 image_id;
+	bool                    resolved            = false;
+	uint32_t                metadata_base_layer = 0;
+	mutable uint64_t        generation          = 0; // command thread only
+};
+
 // A queued draw's color targets, in the order PrepareDrawRenderState resolves them (the slots of
 // the pixel program's mrt_mask, ascending); color_info holds the same number of entries.
 struct WorkerTargets {
@@ -38,6 +51,9 @@ struct WorkerTargets {
 	uint32_t count = 0;
 	// Null: the slot has no color output (color_info holds it unbound).
 	std::array<const WorkerColorTargetRecord*, RENDER_COLOR_ATTACHMENTS_MAX> color {};
+	// Null: no depth or stencil attachment (depth_info left as constructed). Else depth_info holds
+	// the decoded state and the record's description.
+	const WorkerDepthTargetRecord* depth = nullptr;
 };
 
 // One prepare worker's records: a few per slot, replaced round robin.
@@ -48,7 +64,10 @@ struct WorkerTargetMemo {
 	                                                                   slots;
 	std::array<uint32_t, RENDER_COLOR_ATTACHMENTS_MAX>                 next {};
 	std::vector<std::vector<std::unique_ptr<WorkerColorTargetRecord>>> retired;
-	uint64_t                                                           jobs = 0;
+	std::array<std::unique_ptr<WorkerDepthTargetRecord>, Ways>          depth;
+	uint32_t                                                            depth_next = 0;
+	std::vector<std::vector<std::unique_ptr<WorkerDepthTargetRecord>>>  depth_retired;
+	uint64_t                                                            jobs = 0;
 };
 
 } // namespace Libs::Graphics
