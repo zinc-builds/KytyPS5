@@ -72,12 +72,13 @@ void                   NoteStoredRange(uint64_t vaddr, uint64_t size);
                                const std::vector<std::pair<uint64_t, uint64_t>>& reads);
 
 // One worker thread. The command thread posts sequence numbers in order; the worker calls
-// run(context, sequence) for each, in order.
+// run(context, sequence) for each, in order. Workers have distinct indices below
+// ResourcePlan::MaxPrepareWorkers (CPU and walk scratch).
 class Worker {
 public:
 	using Run = void (*)(void* context, uint64_t sequence);
 
-	Worker(Run run, void* context);
+	Worker(Run run, void* context, uint32_t index);
 	~Worker();
 	KYTY_CLASS_NO_COPY(Worker);
 
@@ -98,8 +99,9 @@ private:
 	// Wakes the worker if it sleeps.
 	void Wake();
 
-	Run   m_run;
-	void* m_context;
+	Run      m_run;
+	void*    m_context;
+	uint32_t m_index;
 	uint64_t m_posted_local = 0; // command thread only
 	alignas(64) std::atomic<uint64_t> m_posted {0};
 	alignas(64) std::atomic<uint64_t> m_done {0};

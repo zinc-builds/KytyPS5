@@ -163,7 +163,7 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 	return (ActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
 }
 
-thread_local bool t_prepare_thread = false;
+thread_local uint32_t t_prepare_worker = 0; // 1 + the prepare worker's index; 0 off them
 
 const uint8_t* Scratch(const ResourcePlan& plan) {
 	return reinterpret_cast<const uint8_t*>(SrtWalkScratch(plan).srt.data());
@@ -1513,22 +1513,22 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 }
 
 SrtWalkScratchRef SrtWalkScratch(const ResourcePlan& plan) {
-	if (!t_prepare_thread) return {plan.srt_scratch, plan.material_keys, plan.selector_keys};
-	if (plan.prepare_scratch == nullptr ||
-	    plan.prepare_scratch->srt.size() != plan.srt_scratch.size()) {
+	if (t_prepare_worker == 0) return {plan.srt_scratch, plan.material_keys, plan.selector_keys};
+	auto& prepare = plan.prepare_scratch[t_prepare_worker - 1];
+	if (prepare == nullptr || prepare->srt.size() != plan.srt_scratch.size()) {
 		// The command thread's scratch has this plan's layout; the walker writes before it reads.
-		plan.prepare_scratch = std::make_unique<ResourcePlan::WalkScratch>(ResourcePlan::WalkScratch {
+		prepare = std::make_unique<ResourcePlan::WalkScratch>(ResourcePlan::WalkScratch {
 		    .srt           = std::vector<uint64_t>(plan.srt_scratch.size(), 0u),
 		    .material_keys = {},
 		    .selector_keys = std::vector<ResourcePlan::SelectorKeys>(plan.selector_keys.size()),
 		});
 	}
-	auto& scratch = *plan.prepare_scratch;
-	return {scratch.srt, scratch.material_keys, scratch.selector_keys};
+	return {prepare->srt, prepare->material_keys, prepare->selector_keys};
 }
 
-void SetSrtWalkPrepareThread(bool prepare) {
-	t_prepare_thread = prepare;
+void SetSrtWalkPrepareThread(uint32_t worker) {
+	EXIT_IF(worker > ResourcePlan::MaxPrepareWorkers);
+	t_prepare_worker = worker;
 }
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,

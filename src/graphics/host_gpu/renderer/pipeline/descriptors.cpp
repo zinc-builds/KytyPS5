@@ -887,14 +887,15 @@ void RenderExecutor::ResolveProposedTexture(const WorkerTextureRecord&          
 // Prepare worker: files the resolves the command thread handed back through this slot, then
 // proposes each image binding's record in the worker's resolve memo (a new record, with only
 // the description, for a resource and T# it has not seen).
-void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
-	auto& memo = m_worker_texture_memo;
-	// A record replaced now may be proposed to queued draws until the ring comes round.
+void RenderExecutor::SpeculateTextures(QueuedDraw& queued, WorkerTextureState& worker_memo) {
+	auto& memo = worker_memo.records;
+	// A record replaced now may be proposed to queued draws until the ring comes round (in
+	// this worker's jobs, every N-th draw: sooner).
 	const auto retire_slots = m_queued_draws.size() + 1;
-	if (m_worker_texture_retired.size() != retire_slots) {
-		m_worker_texture_retired.resize(retire_slots);
+	if (worker_memo.retired.size() != retire_slots) {
+		worker_memo.retired.resize(retire_slots);
 	}
-	auto& retired = m_worker_texture_retired[m_worker_texture_jobs++ % retire_slots];
+	auto& retired = worker_memo.retired[worker_memo.jobs++ % retire_slots];
 	retired.clear();
 	constexpr size_t MaxRecords = 16384;
 	if (memo.entries.empty()) {
@@ -961,7 +962,7 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
 			record->inputs      = inputs;
 			record->value       = value;
 			record->description = DescribeTexture(inputs, value, m_context.GetGraphics());
-			record->serial      = m_worker_texture_serial += 2;
+			record->serial      = worker_memo.serial += worker_memo.serial_step;
 			out[i]              = {record.get()};
 			file(std::move(record));
 		}

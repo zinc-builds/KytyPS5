@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 
@@ -93,7 +94,8 @@ bool StoredSince(uint64_t sequence, const std::vector<std::pair<uint64_t, uint64
 	return false;
 }
 
-Worker::Worker(Run run, void* context): m_run(run), m_context(context), m_thread([this] { Loop(); }) {}
+Worker::Worker(Run run, void* context, uint32_t index)
+    : m_run(run), m_context(context), m_index(index), m_thread([this] { Loop(); }) {}
 
 Worker::~Worker() {
 	WaitIdle();
@@ -143,11 +145,15 @@ uint64_t Worker::Wait(uint64_t sequence) {
 void Worker::Loop() {
 	KYTY_PROFILER_THREAD("Thread_GpuPrepare");
 #if defined(__linux__)
-	pthread_setname_np(pthread_self(), "KytyGpuPrep");
-	Common::HybridAffinity::ApplyToPrepareThread();
+	char name[16] = "KytyGpuPrep";
+	if (m_index != 0) {
+		std::snprintf(name, sizeof(name), "KytyGpuPrep%u", m_index);
+	}
+	pthread_setname_np(pthread_self(), name);
+	Common::HybridAffinity::ApplyToPrepareThread(m_index);
 #endif
 	t_worker = true;
-	ShaderRecompiler::IR::SetSrtWalkPrepareThread(true);
+	ShaderRecompiler::IR::SetSrtWalkPrepareThread(m_index + 1);
 	uint64_t done = 0;
 	for (;;) {
 		auto posted = m_posted.load(std::memory_order_acquire);

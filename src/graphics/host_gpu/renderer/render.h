@@ -309,13 +309,9 @@ private:
 	void                 SpeculateBuffers(QueuedDraw& queued);
 	// The worker's texture side for the queued draw being committed, while it may be used.
 	const WorkerTextures* m_adopted_textures = nullptr;
-	// Prepare worker, after SpeculateBuffers: proposes the draw's texture resolves.
-	void SpeculateTextures(QueuedDraw& queued);
-	// Resolves made for the queued draw being committed, handed to its slot after the draw.
-	std::vector<TextureMemoRecord> m_texture_updates;
-	// Worker only: the resolve memo, and records replaced in the last jobs.
-	// Open addressing by TextureDescriptionKey (a mixed hash), linear probing, at most half full;
-	// records are only replaced or all dropped, so no tombstones.
+	// A prepare worker's resolve memo. Open addressing by TextureDescriptionKey (a mixed hash),
+	// linear probing, at most half full; records are only replaced or all dropped, so no
+	// tombstones.
 	struct WorkerTextureMemo {
 		struct Entry {
 			uint64_t                             key = 0;
@@ -334,12 +330,21 @@ private:
 			}
 		}
 	};
-	WorkerTextureMemo m_worker_texture_memo;
-	// WorkerTextureRecord serials: odd from the worker, even from the command thread.
-	uint64_t m_worker_texture_serial  = 1;
+	// One prepare worker's texture side: its memo, records it replaced in its last jobs, and
+	// the next serial of its records (odd, unique among workers: see PrepareLane).
+	struct WorkerTextureState {
+		WorkerTextureMemo                                              records;
+		std::vector<std::vector<std::unique_ptr<WorkerTextureRecord>>> retired;
+		uint64_t                                                       jobs   = 0;
+		uint64_t                                                       serial = 1;
+		uint64_t                                                       serial_step = 2;
+	};
+	// Prepare worker, after SpeculateBuffers: proposes the draw's texture resolves from its memo.
+	void SpeculateTextures(QueuedDraw& queued, WorkerTextureState& state);
+	// Resolves made for the queued draw being committed, handed to its slot after the draw.
+	std::vector<TextureMemoRecord> m_texture_updates;
+	// WorkerTextureRecord serials: odd from the workers, even from the command thread.
 	uint64_t m_command_texture_serial = 0;
-	std::vector<std::vector<std::unique_ptr<WorkerTextureRecord>>>    m_worker_texture_retired;
-	uint64_t                                                           m_worker_texture_jobs = 0;
 	// The worker's proposals for a stage being prepared, if it made them for this runtime.
 	[[nodiscard]] const std::vector<TextureProposal>* AdoptedTextureProposals(
 	    const ShaderStageRuntime& runtime) const;
@@ -360,7 +365,17 @@ private:
 	// The queued draw's programs: the worker's if nothing they depend on changed since it was
 	// queued, else looked up here.
 	void AdoptPrograms(QueuedDraw& queued, DrawRenderState& state);
-	static void PrepareQueuedDraw(void* executor, uint64_t sequence);
+	static void PrepareQueuedDraw(void* lane, uint64_t job);
+	// The worker a queued draw goes to, and its job number there.
+	[[nodiscard]] DrawPrepare::Worker& PrepareWorker(uint64_t sequence) const {
+		return *m_prepare_lanes[(sequence - 1) % m_prepare_lanes.size()]->worker;
+	}
+	[[nodiscard]] uint64_t PrepareJob(uint64_t sequence) const {
+		return (sequence - 1) / m_prepare_lanes.size() + 1;
+	}
+	// Waits until every worker has finished its posted jobs.
+	void WaitPrepareIdle();
+	[[nodiscard]] uint64_t PrepareBusyNs() const;
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -508,7 +523,16 @@ private:
 	// Draws queued for the prepare worker, in a ring of depth + 1 slots: up to `depth` queued
 	// (prepared or being prepared) and one being filled. Slot i takes sequences i + 1, i + 1 +
 	// ring size, ...
-	std::unique_ptr<DrawPrepare::Worker>             m_prepare_worker;
+	// A prepare worker and what only it uses. Draw `sequence` goes to worker (sequence - 1) % N
+	// as its job (sequence - 1) / N + 1; the ring's size is a multiple of N, so a slot always
+	// goes to the same worker (its texture_updates are for that worker's memo).
+	struct PrepareLane {
+		RenderExecutor*                      executor = nullptr;
+		uint32_t                             index    = 0;
+		WorkerTextureState                   textures;
+		std::unique_ptr<DrawPrepare::Worker> worker;
+	};
+	std::vector<std::unique_ptr<PrepareLane>>        m_prepare_lanes;
 	std::vector<std::unique_ptr<QueuedDraw>>         m_queued_draws;
 	uint64_t                                         m_queued_posted = 0; // sequences posted
 	uint32_t                                         m_queued_count  = 0; // posted, not committed
