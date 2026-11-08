@@ -61,6 +61,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | `PrepareBda`'s uploads share one barrier pair (Track G4; same binary, `KYTY_UPLOAD_BATCH=0`: 35.92; `KYTY_GPU_TIME=1` GPU 12.30 → 12.19 ms/frame, barrier gaps 0.53 → 0.45) | 35.84 | 188.7k | 33.5 (max 33.5) | 29.9 |
 | 2026-11-07 | Guest read faults on GPU-written memory no longer stall the command thread: it records and submits the download in PM4 order and moves on, the faulting thread waits (Track B; same batch: ref `dev` c7600e89 36.40 / 36.11; `KYTY_STALL_DIAG` command-thread time in readbacks 9.4–10.2% → 0.8%, of it on the GPU 8.4–9.3% → 0.0%; a single longer frame per run, max 50–83 ms vs 33.8) | 38.99 / 38.90 | 204.3k / 204.8k | 35.6 (max 66.7) / 35.6 (max 50.0) | 27.8 / 28.7 |
 | 2026-11-07 | Guest reads inside one backing mapping copy without locks: a per-thread translation cache checked against a sequence count that backing-store writers make odd (same batch: ref `dev` 75f3eebc 38.97, worst_ms 33.7) | 39.56 | 208.0k | 33.5 (max 33.6) | 29.2 |
+| 2026-11-07 | Per-draw fences off the command thread: lookups of unchanged images skip the texture cache's lock (a per-image atomic "settled" state that CPU write faults clear), retired-operation checks skip the scheduler's mutex, recorder hand-offs skip the full fence, overlay counters are per thread (Track B; same batch: ref `dev` ab1429f1 39.21 / 39.52; before #55, on 75f3eebc +1.5% and on b4a91152 4 pairs +1.9%; samples right after a locked instruction 8.1% → 1.1% of the command thread; `KYTY_TC_SETTLED_VERIFY` 104M checks clean) | 39.98 / 39.78 | 209.3k / 209.9k | 33.5 (max 33.6) / 33.5 (max 33.7) | 28.7 / 28.6 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1397,6 +1398,25 @@ What this means:
   thread is now ~98% busy (STALL: prepare ~2%, scheduler ~0.6%, everything else < 1%), so FPS is
   its per-draw cost alone. Note `KYTY_FAULT_DIAG=1` itself costs ~9% FPS (a locked map update per
   written bind): don't compare FPS from runs with it.
+
+- **Long frames in Sky Garden (checked after #52).** Both modes show 50–100 ms frames in the same
+  stretch of wall time, 22–36 s after level start (in-level frames over 40 ms per run: async
+  2.4, `KYTY_SYNC_READBACK=1` and the pre-#52 reference 2.25; 12 and 8 runs). They are not
+  readback latency: capping the GPU backlog a read can see at 2 or 4 submissions
+  (`KYTY_READBACK_MAX_BACKLOG`, local experiment) leaves them unchanged. Async runs show them
+  in the 1000–1600 window more often only because a faster run reaches frame 1000 earlier in
+  wall time; their peaks are sometimes one vblank longer (66.7 vs 50 ms). Likely streaming or
+  first-use work tied to wall time; not investigated further.
+- **Fences on the command thread (dev b4a91152).** A locked instruction waits for the store
+  buffer to drain, and the command thread stores a lot between them, so each lock costs what
+  the stores before it cost. Samples right after a locked instruction: 8.1% of the thread (the
+  texture cache's spin lock 6.7%, 4.8% of it in `RefindExactImage`; recorder `Publish` 0.7%;
+  overlay counters 0.3%), plus the scheduler mutex in `PopPendingOperations` ~2.5%. Removing
+  them cut that to 1.1% and gave +1.3–1.9%. The drain cost moved to the locks left: the
+  guest-memory rwlocks (now gone, #55) and the render context mutex `DrawIndex`/`DrawAuto` take
+  per draw (~2.5%). A local experiment without those as well measured 40.18 / 40.33 against
+  38.69 / 38.59 on b4a91152 (+4.2% in all). Any one lock left absorbs the drain, so they pay
+  only together.
 
 ## Remaining costs and candidate directions
 

@@ -197,6 +197,10 @@ void CommandScheduler::PopPendingOperations() {
 		m_master.Refresh();
 	}
 	for (;;) {
+		// Every draw comes here: look at the oldest operation's tick without the lock (a fence).
+		if (!m_master.IsFree(m_pending_front_tick.load(std::memory_order_acquire))) {
+			return;
+		}
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
@@ -206,6 +210,7 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			NotePendingFront();
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -227,6 +232,9 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		if (!priority) {
+			NotePendingFront();
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();

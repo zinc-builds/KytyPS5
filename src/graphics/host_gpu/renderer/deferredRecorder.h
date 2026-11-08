@@ -68,6 +68,7 @@ public:
 	}
 
 private:
+	void Wake();
 	// Records are multiples of a header, so a padding header always fits the end of the ring.
 	static constexpr size_t Alignment = 32;
 	static constexpr size_t Capacity  = size_t {4} << 20u;

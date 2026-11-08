@@ -21,6 +21,8 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -273,6 +275,7 @@ void TextureCache::RegisterImage(ImageId id) {
 
 void TextureCache::UnregisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	image.Unsettle();
 	image.HeapChanged();
 	UntrackImage(id);
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
@@ -410,6 +413,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		return;
 	}
+	image.Unsettle();
 	const auto address   = image.track_addr;
 	const auto size      = image.track_addr_end - image.track_addr;
 	image.track_addr     = 0;
@@ -427,6 +431,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	}
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
+	image.Unsettle();
 	image.track_addr   = address;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
@@ -445,6 +450,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
+	image.Unsettle();
 	image.track_addr_end = address;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
@@ -1074,7 +1080,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto  range = desc.info.metadata.range;
 	const auto& view  = desc.view_info;
 	{
-		std::scoped_lock lock {m_lock};
+		// Image metadata and m_surface_metas belong to the GPU thread: CPU write faults do not
+		// read them.
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
@@ -1310,8 +1317,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 bool TextureCache::RefindExactImage(ImageId id, GuestRange data, const ImageDesc* found,
                                     uint32_t metadata_base_layer, uint64_t& generation) {
 	{
-		std::scoped_lock lock {m_lock};
-		auto*            image = m_slot_images.try_get(id);
+		// Registrations, generations and the LRU change only on the GPU thread (this one); CPU
+		// write faults on other threads, which take m_lock, never touch them.
+		auto* image = m_slot_images.try_get(id);
 		if (image == nullptr || !image->registered) {
 			return false;
 		}
@@ -1534,9 +1542,62 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
-vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+Image::Settled TextureCache::SettledState(const Image& image) const {
+	const bool refresh = image.registered && !image.depth_id && !image.info.HasStencil() &&
+	                     image.track_addr == image.info.data.address &&
+	                     image.track_addr_end == image.info.data.End() && !image.IsCpuDirty() &&
+	                     !image.IsBufferModified();
+	if (!refresh) {
+		return Image::Settled {0};
+	}
+	uint8_t state = Image::SettledRefresh;
+	if (image.IsGpuModified() && image.backing.image != nullptr) {
+		state |= Image::SettledWrite;
+		if (image.usage.render_target) {
+			state |= Image::SettledTarget;
+		}
+	}
+	return static_cast<Image::Settled>(state);
+}
+
+void TextureCache::Settle(Image& image) {
+	image.settled.store(SettledState(image), std::memory_order_release);
+}
+
+// KYTY_TC_SETTLED_VERIFY=1: a lock-free lookup re-checks, under the lock, that the image is still
+// settled for it or that something cleared the flag since.
+void TextureCache::VerifySettled(const Image& image, uint8_t need) {
+	static const bool verify = std::getenv("KYTY_TC_SETTLED_VERIFY") != nullptr;
+	if (!verify) {
+		return;
+	}
+	static std::atomic<uint64_t> checks {0};
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
+	if ((image.settled.load(std::memory_order_relaxed) & need) != 0 &&
+	    (SettledState(image) & need) == 0) {
+		EXIT("TextureCache: settled image 0x%016" PRIx64 " needs work (need %u, state %u)\n",
+		     image.info.data.address, static_cast<unsigned>(need),
+		     static_cast<unsigned>(SettledState(image)));
+	}
+	if (const auto n = checks.fetch_add(1) + 1; (n % 1000000) == 0) {
+		std::printf("TC_SETTLED_VERIFY checks=%" PRIu64 "\n", n);
+		std::fflush(stdout);
+	}
+}
+
+vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	auto& image = m_slot_images[id];
+	const auto need = desc.type == BindingType::Storage ? Image::SettledWrite : Image::SettledRefresh;
+	if ((image.settled.load(std::memory_order_acquire) & need) != 0 && image.registered &&
+	    !image.depth_id && !image.binding.needs_rebind) {
+		VerifySettled(image, need);
+		TouchImage(image);
+		if (desc.type == BindingType::Storage) {
+			TrackImageDownload(id, image);
+		}
+		return image.FindView(desc.view_info);
+	}
+	std::scoped_lock lock {m_lock};
 	TouchImage(image);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
@@ -1562,12 +1623,20 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
+	Settle(image);
 	return image.FindView(desc.view_info);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	auto& image = m_slot_images[id];
+	if ((image.settled.load(std::memory_order_acquire) & Image::SettledTarget) != 0 &&
+	    image.registered && !image.depth_id && !image.binding.needs_rebind) {
+		VerifySettled(image, Image::SettledTarget);
+		TouchImage(image);
+		TrackImageDownload(id, image);
+		return image.FindView(desc.view_info);
+	}
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
@@ -1576,6 +1645,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
+	Settle(image);
 	return image.FindView(desc.view_info);
 }
 
