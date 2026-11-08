@@ -675,13 +675,21 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
-static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
-                                                  const ShaderVertexInputInfo& vs_input_info) {
+// The vertex buffers' guest ranges, merged where they overlap or touch and clamped to mapped
+// memory, as AcquireVertexBuffers acquires them. Any thread.
+struct MergedVertexRanges {
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+	uint32_t                                                      count = 0;
+};
+
+static MergedVertexRanges MergeVertexRanges(const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
+	MergedVertexRanges merged;
+	auto&              sizes = merged.sizes;
 	// Collect the non-empty guest vertex ranges.
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
@@ -704,8 +712,8 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	          });
 
 	// Merge overlapping or touching ranges before acquiring host buffers.
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
-	uint32_t                                                      merged_count = 0;
+	auto&     merged_ranges = merged.ranges;
+	uint32_t& merged_count  = merged.count;
 	for (uint32_t i = 0; i < range_count; i++) {
 		const auto& range = ranges[i];
 		if (merged_count != 0 &&
@@ -717,14 +725,31 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 	}
 
-	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+	}
+	return merged;
+}
+
+// speculated: the prepare worker's lookups of the merged ranges, if it made them (count must
+// match).
+static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
+                                                  const ShaderVertexInputInfo& vs_input_info,
+                                                  std::span<const uint32_t>    speculated) {
+	auto        merged        = MergeVertexRanges(vs_input_info);
+	const auto& sizes         = merged.sizes;
+	auto&       merged_ranges = merged.ranges;
+	const auto  merged_count  = merged.count;
+	auto& cache = buffer.GetContext().GetBufferCache();
+	for (uint32_t i = 0; i < merged_count; i++) {
+		auto& range   = merged_ranges[i];
+		range.binding = cache.ObtainBuffer(
+		    range.base_address, range.acquired_end - range.base_address, false, false, {},
+		    speculated.size() == merged_count ? speculated[i] : UINT32_MAX);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -1149,7 +1174,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+		vertex_bindings = AcquireVertexBuffers(
+		    buffer, state.vertex_info[0],
+		    m_adopted_buffers != nullptr
+		        ? std::span<const uint32_t> {m_adopted_buffers->vertex_speculated.data(),
+		                                     m_adopted_buffers->vertex_count}
+		        : std::span<const uint32_t> {});
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
@@ -1791,6 +1821,57 @@ void RenderExecutor::PrepareQueuedDraw(void* executor, uint64_t sequence) {
 	self.m_context.GetPipelineCache().GetGraphicsPrograms(
 	    queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
 	DrawPrepare::SetLog(nullptr);
+	self.SpeculateBuffers(queued);
+}
+
+// Prepare worker: the draw's buffer ranges and the clean buffers holding them, as FindBuffers
+// and AcquireVertexBuffers will ask for them (BufferCache::Speculation).
+void RenderExecutor::SpeculateBuffers(QueuedDraw& queued) {
+	auto& buffers = queued.buffers;
+	buffers.ready = false;
+	auto& state   = queued.state;
+	if (!BufferCache::WorkerBuffersEnabled() || queued.log.failed ||
+	    state.vertex_info[0].stage.module == nullptr) {
+		return;
+	}
+	auto& cache = m_context.GetBufferCache();
+	cache.BeginSpeculation(buffers.speculation);
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < state.vertex_stage_count; i++) {
+		buffers.runtimes[count++] = &state.vertex_info[i].stage;
+	}
+	if (state.ps_active) {
+		buffers.runtimes[count++] = &state.ps_input_info.stage;
+	}
+	buffers.stage_count = count;
+	std::array<std::vector<PreparedBindings::BufferSource>*, 4> outs {};
+	for (uint32_t i = 0; i < count; i++) {
+		outs[i] = &buffers.sources[i];
+	}
+	struct Context {
+		BufferCache&              cache;
+		BufferCache::Speculation& speculation;
+	} context {cache, buffers.speculation};
+	DecodeBufferSources(
+	    m_context.GetGraphics(), std::span {buffers.runtimes.data(), count},
+	    std::span {outs.data(), count},
+	    [](void* data, uint64_t address, uint64_t size, uint32_t& speculated) {
+		    auto& c    = *static_cast<Context*>(data);
+		    speculated = c.cache.SpeculateLookup(c.speculation, address, size);
+		    return speculated != UINT32_MAX ? c.speculation.ranges[speculated].id : BufferId {};
+	    },
+	    &context);
+	buffers.vertex_count = 0;
+	if (state.vertex_info[0].stage.module->info.stage != ShaderType::Mesh) {
+		const auto merged = MergeVertexRanges(state.vertex_info[0]);
+		for (uint32_t i = 0; i < merged.count; i++) {
+			const auto& range = merged.ranges[i];
+			buffers.vertex_speculated[i] = cache.SpeculateLookup(
+			    buffers.speculation, range.base_address, range.acquired_end - range.base_address);
+		}
+		buffers.vertex_count = merged.count;
+	}
+	buffers.ready = true;
 }
 
 void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
@@ -1813,6 +1894,8 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	} else {
 		(void)DrawAuto(buffer, queued.auto_args, &queued);
 	}
+	m_adopted_buffers = nullptr;
+	m_context.GetBufferCache().SetSpeculation(nullptr);
 	buffer.Bind(registers, user_config, shaders);
 
 	if (m_prepare_stats) {
@@ -1873,6 +1956,11 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		return;
 	}
 	m_prepare_stat.adopted++;
+	if (queued.buffers.ready) {
+		// FindBuffers and ObtainBuffer use the worker's buffer side while it holds.
+		m_adopted_buffers = &queued.buffers;
+		buffers.SetSpeculation(&queued.buffers.speculation);
+	}
 	if (m_prepare_verify) {
 		m_prepare_worker->WaitIdle();
 		static auto check = std::make_unique<std::pair<DrawRenderState, PipelineCache::GraphicsResources>>();

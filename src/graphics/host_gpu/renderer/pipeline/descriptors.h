@@ -42,6 +42,8 @@ struct PreparedBindings {
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		BufferId id;
+		// The prepare worker's lookup of this range (BufferCache::Speculation), or none.
+		uint32_t speculated = UINT32_MAX;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
@@ -61,6 +63,16 @@ struct PreparedBindings {
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
+
+// The guest ranges of the stages' buffer bindings, by descriptor index: outs[i] for runtimes[i].
+// lookup(context, address, size, speculated) names each range's buffer, or null, and may set
+// the source's speculated index. Any thread.
+using BufferLookup = BufferId (*)(void* context, uint64_t address, uint64_t size,
+                                  uint32_t& speculated);
+void DecodeBufferSources(const GraphicContext&                                     graphics,
+                         std::span<const ShaderStageRuntime* const>                runtimes,
+                         std::span<std::vector<PreparedBindings::BufferSource>* const> outs,
+                         BufferLookup lookup, void* context);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
 

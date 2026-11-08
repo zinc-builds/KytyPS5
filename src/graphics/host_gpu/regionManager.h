@@ -75,6 +75,11 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Advanced whenever a page anywhere newly becomes CPU-dirty, after its bit is published. A result
+// that relied on pages being CPU-clean, taken after reading this, stays valid while it does not
+// move (the prepare worker's buffer lookups).
+inline std::atomic<uint64_t> g_cpu_dirty_generation {0};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -164,9 +169,15 @@ public:
 
 private:
 	void PublishDirtyBits() {
+		bool cpu_grew = false;
 		for (size_t word = 0; word < RegionBits::kWordCount; word++) {
-			m_cpu_words[word].store(m_cpu_dirty.Word(word), std::memory_order_release);
+			const auto cpu = m_cpu_dirty.Word(word);
+			cpu_grew |= (cpu & ~m_cpu_words[word].load(std::memory_order_relaxed)) != 0;
+			m_cpu_words[word].store(cpu, std::memory_order_release);
 			m_gpu_words[word].store(m_gpu_dirty.Word(word), std::memory_order_release);
+		}
+		if (cpu_grew) {
+			g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
 		}
 	}
 

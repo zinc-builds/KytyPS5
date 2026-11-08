@@ -24,6 +24,7 @@
 #include <cstring>
 #include <memory>
 #include <tuple>
+#include <string_view>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -362,15 +363,28 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
+	// Odd while the page table and extents change: worker lookups retry or give up.
+	m_registration_seq.fetch_add(1, std::memory_order_acq_rel);
+	struct SeqEnd {
+		std::atomic<uint64_t>& seq;
+		~SeqEnd() { seq.fetch_add(1, std::memory_order_release); }
+	} seq_end {m_registration_seq};
 	auto& buffer = m_slot_buffers[id];
+	if (id.index < EXTENT_CAPACITY) {
+		m_extent_begin[id.index].store(insert ? buffer.CpuAddress() : 0, std::memory_order_relaxed);
+		m_extent_end[id.index].store(insert ? buffer.CpuAddress() + buffer.Size() : 0,
+		                             std::memory_order_relaxed);
+	}
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		if constexpr (insert) {
 			m_page_table[page] = id;
+			SetShadowOwner(page, id.index + 1);
 		} else {
 			m_page_table[page] = {};
+			SetShadowOwner(page, 0);
 		}
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
@@ -524,6 +538,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_async_uploader(graphics, scheduler),
       m_texture_cache(texture_cache) {
+	m_shadow_pages = std::make_unique<std::atomic<std::atomic<uint32_t>*>[]>(SHADOW_BUCKETS);
+	m_extent_begin = std::make_unique<std::atomic<uint64_t>[]>(EXTENT_CAPACITY);
+	m_extent_end   = std::make_unique<std::atomic<uint64_t>[]>(EXTENT_CAPACITY);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -551,6 +568,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (m_shadow_pages != nullptr) {
+		for (size_t i = 0; i < SHADOW_BUCKETS; i++) {
+			delete[] m_shadow_pages[i].load(std::memory_order_relaxed);
+		}
+	}
 	// A guest thread can stop waiting for its read only by exiting; its download has landed.
 	while (!m_pending_reads.empty() &&
 	       m_pending_reads.front()->published.load(std::memory_order_acquire)) {
@@ -1169,9 +1191,143 @@ bool BufferCache::VerifyStreamHit(uint64_t vaddr, uint64_t size, uint64_t offset
 	return false;
 }
 
+bool BufferCache::WorkerBuffersEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WORKER_BUFFERS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+// KYTY_WORKER_BUFFERS=verify: every speculated answer is checked against the full lookup.
+bool BufferCache::WorkerBuffersVerify() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WORKER_BUFFERS");
+		return value != nullptr && std::string_view(value) == "verify";
+	}();
+	return on;
+}
+
+namespace {
+// KYTY_WORKER_BUFFERS=stats: WORKERBUFFERS lines.
+bool WorkerBuffersStats() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WORKER_BUFFERS");
+		return value != nullptr && std::string_view(value) == "stats";
+	}();
+	return on;
+}
+struct WorkerBufferStats {
+	uint64_t hits = 0, stale = 0, unlisted = 0;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+void NoteWorkerBuffer(int kind) {
+	static WorkerBufferStats stats;
+	(kind == 0 ? stats.hits : kind == 1 ? stats.stale : stats.unlisted)++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - stats.last >= std::chrono::seconds(1)) {
+		const double s = std::chrono::duration<double>(now - stats.last).count();
+		std::printf("WORKERBUFFERS hits_s=%.0f stale_s=%.0f unlisted_s=%.0f\n", stats.hits / s,
+		            stats.stale / s, stats.unlisted / s);
+		std::fflush(stdout);
+		stats      = {};
+		stats.last = now;
+	}
+}
+} // namespace
+
+void BufferCache::BeginSpeculation(Speculation& speculation) const {
+	speculation.ranges.clear();
+	speculation.registration_seq = m_registration_seq.load(std::memory_order_acquire);
+	speculation.cpu_dirty_generation = g_cpu_dirty_generation.load(std::memory_order_acquire);
+}
+
+uint32_t BufferCache::SpeculateLookup(Speculation& speculation, uint64_t vaddr,
+                                      uint64_t size) const {
+	const auto seq = speculation.registration_seq;
+	if ((seq & 1u) != 0 || size == 0 || !(GuestRange {vaddr, size}.Valid())) {
+		return UINT32_MAX;
+	}
+	const auto owner = ShadowOwner(vaddr >> PageTable::kPageBits);
+	if (owner == 0 || owner - 1 >= EXTENT_CAPACITY) {
+		return UINT32_MAX;
+	}
+	const BufferId id {owner - 1};
+	const auto     begin = m_extent_begin[id.index].load(std::memory_order_relaxed);
+	const auto     end   = m_extent_end[id.index].load(std::memory_order_relaxed);
+	if (vaddr < begin || vaddr + size > end ||
+	    !m_memory_tracker.IsRegionCpuCleanNoCreate(vaddr, size)) {
+		return UINT32_MAX;
+	}
+	// The page table and extents read above belong to `seq` only if it did not move.
+	if (m_registration_seq.load(std::memory_order_acquire) != seq) {
+		return UINT32_MAX;
+	}
+	speculation.ranges.push_back({vaddr, size, vaddr - begin, id});
+	return static_cast<uint32_t>(speculation.ranges.size() - 1);
+}
+
+void BufferCache::SetShadowOwner(size_t page, uint32_t value) {
+	auto& slot   = m_shadow_pages[page >> SHADOW_BUCKET_BITS];
+	auto* bucket = slot.load(std::memory_order_acquire);
+	if (bucket == nullptr) {
+		if (value == 0) {
+			return;
+		}
+		// Value-initialized: every entry 0. Published after initialization.
+		bucket = new std::atomic<uint32_t>[size_t {1} << SHADOW_BUCKET_BITS]();
+		slot.store(bucket, std::memory_order_release);
+	}
+	bucket[page & ((size_t {1} << SHADOW_BUCKET_BITS) - 1)].store(value, std::memory_order_relaxed);
+}
+
+uint32_t BufferCache::ShadowOwner(size_t page) const {
+	if (page >= PageTable::kPageCount) {
+		return 0;
+	}
+	const auto* bucket = m_shadow_pages[page >> SHADOW_BUCKET_BITS].load(std::memory_order_acquire);
+	return bucket == nullptr
+	           ? 0
+	           : bucket[page & ((size_t {1} << SHADOW_BUCKET_BITS) - 1)].load(std::memory_order_relaxed);
+}
+
+bool BufferCache::SpeculationValid(const Speculation& speculation) const {
+	// Relaxed: this thread is the only registrar, and a page turning dirty concurrently is the
+	// same race a full lookup has with it.
+	return (speculation.registration_seq & 1u) == 0 &&
+	       m_registration_seq.load(std::memory_order_relaxed) == speculation.registration_seq &&
+	       g_cpu_dirty_generation.load(std::memory_order_relaxed) ==
+	           speculation.cpu_dirty_generation;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id) {
+                                                       BufferId id, uint32_t speculated) {
+	if (speculated != UINT32_MAX && m_speculation != nullptr && !is_written && !is_texel_buffer) {
+		const auto& ranges = m_speculation->ranges;
+		if (speculated >= ranges.size() || ranges[speculated].vaddr != vaddr ||
+		    ranges[speculated].size != size || (id && ranges[speculated].id != id)) {
+			if (WorkerBuffersStats()) NoteWorkerBuffer(2);
+		} else if (!SpeculationValid(*m_speculation)) {
+			if (WorkerBuffersStats()) NoteWorkerBuffer(1);
+		} else {
+			const auto& found  = ranges[speculated];
+			auto&       buffer = m_slot_buffers[found.id];
+			if (WorkerBuffersVerify()) {
+				const bool dirty = m_memory_tracker.IsRegionCpuModified(vaddr, size);
+				const auto full  = ObtainBuffer(vaddr, size, is_written, is_texel_buffer, id);
+				if (dirty || full.first != &buffer || full.second != found.offset) {
+					EXIT("KYTY_WORKER_BUFFERS=verify: 0x%016" PRIx64 "+%" PRIu64
+					     " dirty=%d worker id=%u offset=%" PRIu64 ", full offset=%" PRIu64 "\n",
+					     vaddr, size, dirty ? 1 : 0, found.id.index, found.offset, full.second);
+				}
+				return full;
+			}
+			if (WorkerBuffersStats()) NoteWorkerBuffer(0);
+			TouchBuffer(buffer);
+			return {&buffer, found.offset};
+		}
+	}
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 	if (MemDiag::Enabled()) {
 		MemDiag::MaybePrint();

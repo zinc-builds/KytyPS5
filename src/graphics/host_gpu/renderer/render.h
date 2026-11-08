@@ -266,6 +266,19 @@ private:
 		std::chrono::steady_clock::time_point last {};
 	} m_dispatch_chain;
 
+	// The buffer side of a queued draw, prepared by the worker (BufferCache::Speculation): the
+	// stages' buffer ranges and the clean buffers holding them and its vertex ranges.
+	struct WorkerBuffers {
+		bool                                                       ready       = false;
+		uint32_t                                                   stage_count = 0;
+		std::array<const ShaderStageRuntime*, 4>                   runtimes {};
+		std::array<std::vector<PreparedBindings::BufferSource>, 4> sources;
+		// Speculation index of each merged vertex range (AcquireVertexBuffers' order).
+		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> vertex_speculated {};
+		uint32_t                                             vertex_count = 0;
+		BufferCache::Speculation                             speculation;
+	};
+
 	// A queued draw: what it was given, its registers when queued, and the worker's lookup.
 	struct QueuedDraw {
 		HW::Context                      registers;
@@ -283,7 +296,11 @@ private:
 		uint64_t                         hazard_generation = 0;
 		uint64_t                         sync_epoch        = 0;
 		uint64_t                         stored_sequence   = 0;
+		WorkerBuffers                    buffers;
 	};
+	// The worker's buffer side for the queued draw being committed, while it may be used.
+	const WorkerBuffers* m_adopted_buffers = nullptr;
+	void                 SpeculateBuffers(QueuedDraw& queued);
 
 	// False, with nothing drawn, when the draw's indirect records need CPU counts. A queued draw
 	// brings its registers (bound to `buffer`) and the worker's lookup.
