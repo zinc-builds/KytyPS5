@@ -1822,6 +1822,27 @@ void RenderExecutor::PrepareQueuedDraw(void* executor, uint64_t sequence) {
 	    queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
 	DrawPrepare::SetLog(nullptr);
 	self.SpeculateBuffers(queued);
+	self.SpeculateTextures(queued);
+}
+
+void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
+	// Track B: apply and clear queued.texture_updates, then propose queued.textures.
+	queued.texture_updates.clear();
+	queued.textures.ready = false;
+}
+
+const std::vector<TextureProposal>*
+RenderExecutor::AdoptedTextureProposals(const ShaderStageRuntime& runtime) const {
+	const auto* adopted = m_adopted_textures;
+	if (adopted == nullptr || !adopted->ready) {
+		return nullptr;
+	}
+	for (uint32_t i = 0; i < adopted->stage_count; i++) {
+		if (adopted->runtimes[i] == &runtime) {
+			return &adopted->stages[i];
+		}
+	}
+	return nullptr;
 }
 
 // Prepare worker: the draw's buffer ranges and the clean buffers holding them, as FindBuffers
@@ -1894,7 +1915,8 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	} else {
 		(void)DrawAuto(buffer, queued.auto_args, &queued);
 	}
-	m_adopted_buffers = nullptr;
+	m_adopted_buffers  = nullptr;
+	m_adopted_textures = nullptr;
 	m_context.GetBufferCache().SetSpeculation(nullptr);
 	buffer.Bind(registers, user_config, shaders);
 
@@ -1960,6 +1982,9 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		// FindBuffers and ObtainBuffer use the worker's buffer side while it holds.
 		m_adopted_buffers = &queued.buffers;
 		buffers.SetSpeculation(&queued.buffers.speculation);
+	}
+	if (queued.textures.ready) {
+		m_adopted_textures = &queued.textures;
 	}
 	if (m_prepare_verify) {
 		m_prepare_worker->WaitIdle();
