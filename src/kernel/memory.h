@@ -174,6 +174,11 @@ bool               ProtectAsyncGuestPage(uint64_t page, uint64_t& token);
 [[nodiscard]] bool AsyncGuestPageUntouched(uint64_t page, uint64_t token);
 // Advances on remaps and zeroing: guest bytes that change without a store.
 [[nodiscard]] uint64_t GuestRemapGeneration() noexcept;
+// The guest backing store (one shared mapping of all direct memory) and where a guest range
+// lies in it, when one mapping holds all of it (C1: the GPU reads it in place).
+[[nodiscard]] uint8_t* GuestBackingBase() noexcept;
+[[nodiscard]] uint64_t GuestBackingSize() noexcept;
+[[nodiscard]] bool     GuestBackingOffset(uint64_t vaddr, uint64_t size, uint64_t& offset);
 // KYTY_ASYNC_WP_VERIFY: takes the ranges the emulator wrote through the backing alias.
 void TakeAliasWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 

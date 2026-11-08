@@ -414,7 +414,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(program.has_address_writes);
 	}
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
@@ -588,7 +588,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("DI:PrepareBda");
-		m_context.PrepareBda();
+		m_context.PrepareBda(program.has_address_writes);
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	if (program.info.uses_image_heap) {

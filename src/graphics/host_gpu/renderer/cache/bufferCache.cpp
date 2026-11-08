@@ -389,6 +389,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
+	// The entries below replace any redirection of these pages.
+	if (!m_bda_redirected.empty() || !m_bda_entry_writes.empty()) {
+		for (uint64_t page = buffer.CpuAddress(); page < buffer.CpuAddress() + buffer.Size();
+		     page += CACHING_PAGESIZE) {
+			m_bda_redirected.erase(page);
+			m_bda_entry_writes.erase(PageIndex(page));
+		}
+	}
 	if constexpr (insert) {
 		m_buffers.emplace(buffer.CpuAddress(), id);
 		m_total_used_memory += buffer.Size();
@@ -568,6 +576,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	for (auto& [index, chunk]: m_bda_imports) {
+		(void)index;
+		if (chunk.buffer) m_graphics.device.destroyBuffer(chunk.buffer);
+		if (chunk.memory) m_graphics.device.freeMemory(chunk.memory);
+	}
 	if (m_shadow_pages != nullptr) {
 		for (size_t i = 0; i < SHADOW_BUCKETS; i++) {
 			delete[] m_shadow_pages[i].load(std::memory_order_relaxed);
@@ -979,6 +992,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	// The GPU is about to write here: DMA reads must see the buffer, not guest memory.
+	if (is_written && !m_bda_redirected.empty()) {
+		RestoreBdaPages(vaddr, size, !m_bda_inplace_active);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -1645,12 +1662,304 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		auto&      buffer = m_slot_buffers[it->second];
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
+		if (start < finish && m_bda_inplace_active) {
+			for (auto page = Common::AlignDown(start, CACHING_PAGESIZE); page < finish;
+			     page += CACHING_PAGESIZE) {
+				const auto lo    = std::max(page, start);
+				const auto hi    = std::min(page + CACHING_PAGESIZE, finish);
+				const bool whole = page >= buffer.CpuAddress() &&
+				                   page + CACHING_PAGESIZE <= buffer.CpuAddress() + buffer.Size();
+				const auto host = whole && !m_memory_tracker.IsRegionGpuModified(page, CACHING_PAGESIZE)
+				                      ? BdaHostAddress(page)
+				                      : vk::DeviceAddress {0};
+				if (host == 0) {
+					m_bda_inplace_stats.fallback++;
+					if (m_bda_redirected.contains(page)) {
+						RestoreBdaPages(page, CACHING_PAGESIZE, false);
+					} else {
+						g_sync_kind = MemDiag::Sync::Bda;
+						(void)SynchronizeBuffer(buffer, lo, hi - lo, false, false);
+						g_sync_kind = MemDiag::Sync::Obtain;
+					}
+					continue;
+				}
+				RedirectBdaPage(page, host);
+				if (m_bda_verify_mode) {
+					uint64_t offset = 0;
+					if (LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, offset)) {
+						m_bda_verify.emplace_back(
+						    page, XXH3_64bits(LibKernel::Memory::GuestBackingBase() + offset,
+						                      CACHING_PAGESIZE));
+					}
+				}
+			}
+		} else if (start < finish) {
 			g_sync_kind = MemDiag::Sync::Bda;
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 			g_sync_kind = MemDiag::Sync::Obtain;
 		}
 	}
+}
+
+static int BdaInPlaceMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_BDA_INPLACE");
+		if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+			return 0;
+		}
+		return std::strcmp(value, "verify") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+void BufferCache::BeginBdaInPlace(bool address_writes) {
+	const int  mode   = BdaInPlaceMode();
+	const bool usable = mode != 0 && GuestGpu::LateLabelsMode() != 0 &&
+	                    m_graphics.external_memory_host_enabled;
+	if (mode != 0 && !usable) {
+		static std::atomic_bool warned {false};
+		if (!warned.exchange(true)) {
+			Log::WriteToConsoleAndLog("KYTY_BDA_INPLACE needs KYTY_LATE_LABELS and "
+			                          "VK_EXT_external_memory_host; uploading as before\n");
+		}
+	}
+	m_bda_verify_mode    = mode == 2;
+	m_bda_inplace_active = false;
+	if (!usable) {
+		if (!m_bda_redirected.empty()) {
+			RestoreAllBdaPages();
+		}
+		return;
+	}
+	// A remap may move a page to other backing: start over.
+	if (const auto generation = LibKernel::Memory::GuestRemapGeneration();
+	    generation != m_bda_remap_generation) {
+		RestoreAllBdaPages();
+		m_bda_remap_generation = generation;
+	}
+	if (address_writes) {
+		// Stores through BDA pointers would land in guest memory behind the cache's back.
+		m_bda_inplace_stats.address_writes++;
+		RestoreAllBdaPages();
+		return;
+	}
+	m_bda_inplace_active = true;
+}
+
+void BufferCache::FlushBdaEntries() {
+	if (!m_bda_entry_writes.empty()) {
+		// Contiguous runs of entries, one copy each.
+		std::vector<vk::DeviceAddress> run;
+		uint64_t                       run_first = 0;
+		const auto                     flush     = [&] {
+			if (!run.empty()) {
+				WriteDataBuffer(m_bda_pagetable_buffer, run_first * sizeof(vk::DeviceAddress),
+				                run.data(), run.size() * sizeof(vk::DeviceAddress));
+				run.clear();
+			}
+		};
+		for (const auto& [index, address]: m_bda_entry_writes) {
+			if (!run.empty() && index != run_first + run.size()) {
+				flush();
+			}
+			if (run.empty()) {
+				run_first = index;
+			}
+			run.push_back(address);
+		}
+		flush();
+		m_bda_entry_writes.clear();
+	}
+}
+
+void BufferCache::EndBdaInPlace() {
+	auto& stats = m_bda_inplace_stats;
+	FlushBdaEntries();
+	if (!m_bda_verify.empty()) {
+		struct Totals {
+			std::atomic<uint64_t> pages {0}, changed {0};
+		};
+		static Totals totals;
+		m_scheduler.DeferPriorityOperation([pages = std::move(m_bda_verify)] {
+			for (const auto& [page, hash]: pages) {
+				uint64_t offset = 0;
+				if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, offset)) {
+					continue;
+				}
+				totals.pages.fetch_add(1, std::memory_order_relaxed);
+				if (XXH3_64bits(LibKernel::Memory::GuestBackingBase() + offset, CACHING_PAGESIZE) !=
+				    hash) {
+					// The guest changed bytes a DMA shader may have read in place before the work
+					// that reads them finished: a copy would have kept the old bytes.
+					if (totals.changed.fetch_add(1, std::memory_order_relaxed) < 8) {
+						std::printf("BDAINPLACE verify: page 0x%016llx changed before completion\n",
+						            static_cast<unsigned long long>(page));
+					}
+				}
+			}
+			static std::atomic<uint64_t> reported {0};
+			const auto                   checked = totals.pages.load(std::memory_order_relaxed);
+			if (checked / 100000 != reported.load(std::memory_order_relaxed)) {
+				reported.store(checked / 100000, std::memory_order_relaxed);
+				std::printf("BDAINPLACE verify pages=%llu changed=%llu\n",
+				            static_cast<unsigned long long>(checked),
+				            static_cast<unsigned long long>(
+				                totals.changed.load(std::memory_order_relaxed)));
+				std::fflush(stdout);
+			}
+		});
+		m_bda_verify = {};
+	}
+	m_bda_inplace_active = false;
+	if (BdaInPlaceMode() == 0) {
+		return;
+	}
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (stats.start_ns == 0) {
+		stats.start_ns = now;
+	} else if (now - stats.start_ns >= 1'000'000'000ull) {
+		const auto seconds = static_cast<double>(now - stats.start_ns) / 1e9;
+		std::printf("BDAINPLACE redirected_s=%.0f kept_s=%.0f fallback_s=%.0f restored_s=%.0f "
+		            "address_write_dispatches_s=%.0f in_place_pages=%zu imports=%llu "
+		            "import_failures=%llu\n",
+		            static_cast<double>(stats.redirected) / seconds,
+		            static_cast<double>(stats.kept) / seconds,
+		            static_cast<double>(stats.fallback) / seconds,
+		            static_cast<double>(stats.restored) / seconds,
+		            static_cast<double>(stats.address_writes) / seconds, m_bda_redirected.size(),
+		            static_cast<unsigned long long>(stats.imports),
+		            static_cast<unsigned long long>(stats.import_failures));
+		std::fflush(stdout);
+		const auto imports = stats.imports, failures = stats.import_failures;
+		stats              = {};
+		stats.imports         = imports;
+		stats.import_failures = failures;
+		stats.start_ns        = now;
+	}
+}
+
+vk::DeviceAddress BufferCache::BdaHostAddress(uint64_t page) {
+	constexpr uint64_t ChunkBits = 21;
+	constexpr uint64_t ChunkSize = uint64_t {1} << ChunkBits;
+	uint64_t           offset    = 0;
+	if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, offset) ||
+	    (offset & (CACHING_PAGESIZE - 1)) != 0) {
+		return 0;
+	}
+	auto [it, inserted] = m_bda_imports.try_emplace(offset >> ChunkBits);
+	auto& chunk         = it->second;
+	if (inserted) {
+		const auto chunk_offset = (offset >> ChunkBits) << ChunkBits;
+		const auto size = std::min(ChunkSize, LibKernel::Memory::GuestBackingSize() - chunk_offset);
+		void*      host = LibKernel::Memory::GuestBackingBase() + chunk_offset;
+		const auto device = m_graphics.device;
+		const auto type   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+		vk::MemoryHostPointerPropertiesEXT properties {};
+		vk::ExternalMemoryBufferCreateInfo external {};
+		external.handleTypes = type;
+		vk::BufferCreateInfo               buffer_info {};
+		buffer_info.pNext = &external;
+		buffer_info.size  = size;
+		buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer |
+		                    vk::BufferUsageFlagBits::eShaderDeviceAddress |
+		                    vk::BufferUsageFlagBits::eTransferSrc;
+		bool ok = device.getMemoryHostPointerPropertiesEXT(type, host, &properties) ==
+		              vk::Result::eSuccess &&
+		          device.createBuffer(&buffer_info, nullptr, &chunk.buffer) == vk::Result::eSuccess;
+		if (ok) {
+			vk::MemoryRequirements requirements {};
+			device.getBufferMemoryRequirements(chunk.buffer, &requirements);
+			const auto bits     = properties.memoryTypeBits & requirements.memoryTypeBits;
+			uint32_t   type_idx = 32;
+			for (uint32_t i = 0; i < 32; i++) {
+				if ((bits & (1u << i)) != 0) {
+					type_idx = i;
+					break;
+				}
+			}
+			vk::ImportMemoryHostPointerInfoEXT import {};
+			import.handleType   = type;
+			import.pHostPointer = host;
+			vk::MemoryAllocateFlagsInfo        flags {};
+			flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+			flags.pNext = &import;
+			vk::MemoryAllocateInfo allocate {};
+			allocate.pNext           = &flags;
+			allocate.allocationSize  = size;
+			allocate.memoryTypeIndex = type_idx;
+			ok = type_idx < 32 &&
+			     device.allocateMemory(&allocate, nullptr, &chunk.memory) == vk::Result::eSuccess &&
+			     device.bindBufferMemory(chunk.buffer, chunk.memory, 0) == vk::Result::eSuccess;
+		}
+		if (ok) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = chunk.buffer;
+			chunk.address       = device.getBufferAddress(address_info);
+			m_bda_inplace_stats.imports++;
+		} else {
+			m_bda_inplace_stats.import_failures++;
+			if (chunk.buffer) device.destroyBuffer(chunk.buffer);
+			if (chunk.memory) device.freeMemory(chunk.memory);
+			chunk = {};
+		}
+	}
+	return chunk.address == 0 ? 0 : chunk.address + (offset & (ChunkSize - 1));
+}
+
+void BufferCache::RedirectBdaPage(uint64_t page, vk::DeviceAddress address) {
+	auto [it, inserted] = m_bda_redirected.try_emplace(page, address);
+	if (!inserted && it->second == address) {
+		m_bda_inplace_stats.kept++;
+		return;
+	}
+	it->second = address;
+	m_bda_inplace_stats.redirected++;
+	m_bda_entry_writes[PageIndex(page)] = address;
+}
+
+void BufferCache::WriteBdaEntry(uint64_t page, vk::DeviceAddress address) {
+	WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(page) * sizeof(vk::DeviceAddress), &address,
+	                sizeof(address));
+}
+
+void BufferCache::RestoreBdaPages(uint64_t vaddr, uint64_t size, bool now) {
+	for (auto page = Common::AlignDown(vaddr, CACHING_PAGESIZE); page < vaddr + size;
+	     page += CACHING_PAGESIZE) {
+		if (m_bda_redirected.erase(page) == 0) {
+			continue;
+		}
+		m_bda_inplace_stats.restored++;
+		auto it = m_buffers.upper_bound(page);
+		EXIT_IF(it == m_buffers.begin());
+		--it;
+		auto& buffer = m_slot_buffers[it->second];
+		EXIT_IF(page < buffer.CpuAddress() || page + CACHING_PAGESIZE > buffer.CpuAddress() + buffer.Size());
+		// Bytes the CPU wrote while DMA reads went to guest memory are not in the buffer yet.
+		(void)SynchronizeBuffer(buffer, page, CACHING_PAGESIZE, false, false);
+		const auto address = buffer.BufferDeviceAddress() + (page - buffer.CpuAddress());
+		if (now) {
+			m_bda_entry_writes.erase(PageIndex(page));
+			WriteBdaEntry(page, address);
+		} else {
+			m_bda_entry_writes[PageIndex(page)] = address;
+		}
+	}
+}
+
+void BufferCache::RestoreAllBdaPages() {
+	std::vector<uint64_t> pages;
+	pages.reserve(m_bda_redirected.size());
+	for (const auto& [page, address]: m_bda_redirected) {
+		(void)address;
+		pages.push_back(page);
+	}
+	for (const auto page: pages) {
+		RestoreBdaPages(page, CACHING_PAGESIZE, false);
+	}
+	m_bda_inplace_active = false;
+	FlushBdaEntries();
 }
 
 } // namespace Libs::Graphics

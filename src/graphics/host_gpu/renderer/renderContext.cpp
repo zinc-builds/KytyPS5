@@ -494,9 +494,10 @@ bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t siz
 	return true;
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool address_writes) {
 	KYTY_PROFILER_FUNCTION();
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_buffer_cache.BeginBdaInPlace(address_writes);
 	m_buffer_cache.BeginUploadBatch();
 	m_buffer_cache.TakeBdaSync().ForEach([this](uint64_t begin, uint64_t end) {
 		m_mapped_ranges.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
@@ -504,6 +505,7 @@ void RenderContext::PrepareBda() {
 		});
 	});
 	m_buffer_cache.EndUploadBatch();
+	m_buffer_cache.EndBdaInPlace();
 	m_fault_process_pending = true;
 }
 

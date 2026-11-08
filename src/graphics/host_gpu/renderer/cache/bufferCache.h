@@ -99,6 +99,15 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	// C1 stage 2 (KYTY_BDA_INPLACE=1|verify; needs KYTY_LATE_LABELS and
+	// VK_EXT_external_memory_host): around PrepareBda's syncs, a CPU-written caching page with no
+	// GPU-written bytes is not uploaded; its BDA page table entry points at the guest's own memory
+	// (imported in 2 MiB chunks), which DMA shaders then read in place. Binds still upload. A page
+	// goes back to its buffer before any GPU write to it. `address_writes`: the dispatch may store
+	// through BDA pointers, so every page goes back first. `verify` hashes each page left in place
+	// and checks at the work's completion that the guest did not change it meanwhile.
+	void BeginBdaInPlace(bool address_writes);
+	void EndBdaInPlace();
 	void               RunGarbageCollector();
 
 	// Buffer lookups made ahead on the draw prepare worker (KYTY_WORKER_BUFFERS=0|verify|stats).
@@ -233,6 +242,30 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	struct BdaImport {
+		vk::DeviceMemory  memory;
+		vk::Buffer        buffer;
+		vk::DeviceAddress address = 0; // 0: the import failed
+	};
+	[[nodiscard]] vk::DeviceAddress BdaHostAddress(uint64_t page);
+	void                            RedirectBdaPage(uint64_t page, vk::DeviceAddress address);
+	// Points redirected pages in the range back at their buffers, uploading their CPU-written
+	// bytes first; `now`: writes the entries at once instead of with EndBdaInPlace.
+	void                            RestoreBdaPages(uint64_t vaddr, uint64_t size, bool now);
+	void                            RestoreAllBdaPages();
+	void                            WriteBdaEntry(uint64_t page, vk::DeviceAddress address);
+	void                            FlushBdaEntries();
+	std::unordered_map<uint64_t, BdaImport>           m_bda_imports;    // by backing offset >> 21
+	std::unordered_map<uint64_t, vk::DeviceAddress>   m_bda_redirected; // page -> its entry
+	std::map<uint64_t, vk::DeviceAddress>             m_bda_entry_writes; // page index -> entry
+	std::vector<std::pair<uint64_t, uint64_t>>        m_bda_verify;     // page, hash
+	bool                                              m_bda_inplace_active = false;
+	bool                                              m_bda_verify_mode    = false;
+	uint64_t                                          m_bda_remap_generation = 0;
+	struct {
+		uint64_t redirected = 0, kept = 0, fallback = 0, restored = 0, address_writes = 0,
+		         imports = 0, import_failures = 0, start_ns = 0;
+	} m_bda_inplace_stats;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

@@ -388,6 +388,22 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	// The backing offset of [vaddr, vaddr + size) when one mapping holds all of it.
+	[[nodiscard]] bool BackingOffset(uint64_t vaddr, uint64_t size, uint64_t& offset) {
+		std::shared_lock lock(m_mutex);
+		auto             it = m_maps.upper_bound(vaddr);
+		if (it == m_maps.begin()) {
+			return false;
+		}
+		--it;
+		const auto& entry = it->second;
+		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) {
+			return false;
+		}
+		offset = entry.backing_offset + vaddr - entry.vaddr;
+		return true;
+	}
+
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
 		std::lock_guard lock(m_mutex);
 		const TranslationWrite translation_write;
@@ -1329,6 +1345,18 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+	[[nodiscard]] bool     BackingOffset(uint64_t vaddr, uint64_t size, uint64_t& offset) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		{
+			std::shared_lock lock(m_mutex);
+			if (OverlapsPrivateUnlocked(vaddr, size)) {
+				return false;
+			}
+		}
+		return m_backing->BackingOffset(vaddr, size, offset);
+	}
 	[[nodiscard]] bool     WriteProtectsViews() const { return m_backing->WriteProtectsViews(); }
 
 	void ZeroBacking(uint64_t backing_offset, uint64_t size) {

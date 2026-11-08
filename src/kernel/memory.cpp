@@ -900,6 +900,18 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool range
 	return written;
 }
 
+uint8_t* GuestBackingBase() noexcept {
+	return reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase());
+}
+
+uint64_t GuestBackingSize() noexcept {
+	return g_guest_address_space->GetBackingSize();
+}
+
+bool GuestBackingOffset(uint64_t vaddr, uint64_t size, uint64_t& offset) {
+	return g_guest_address_space->BackingOffset(vaddr, size, offset);
+}
+
 bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 	Graphics::GuestSyncEpoch::Advance();
 	const bool written = g_guest_address_space->TryStoreLabelBacking(vaddr, value, size);

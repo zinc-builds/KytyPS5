@@ -86,7 +86,8 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	void               PrepareBda();
+	// address_writes: the shaders may store through BDA pointers (see BufferCache::BeginBdaInPlace).
+	void               PrepareBda(bool address_writes = false);
 	// Applies guest writes to asynchronously write-protected ranges as if they had faulted.
 	// Call where the guest may have published new data: a submission, a satisfied wait.
 	void               CollectAsyncWrites();
