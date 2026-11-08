@@ -40,6 +40,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <type_traits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -658,29 +659,41 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 	return size;
 }
 
+// Trivially constructible: arrays of these are set only up to their counts, never zeroed.
 struct VertexBufferRange {
-	uint64_t                     base_address  = 0;
-	uint64_t                     requested_end = 0;
-	uint64_t                     acquired_end  = 0;
-	std::pair<Buffer*, uint64_t> binding;
+	struct Binding {
+		Buffer*  first;
+		uint64_t second;
+		Binding& operator=(const std::pair<Buffer*, uint64_t>& value) {
+			first  = value.first;
+			second = value.second;
+			return *this;
+		}
+	};
+	uint64_t base_address;
+	uint64_t requested_end;
+	uint64_t acquired_end;
+	Binding  binding;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
+static_assert(std::is_trivially_default_constructible_v<VertexBufferRange>);
 
+// Only the first `count` entries are set (772 bytes in all: not zeroed or copied per draw).
 struct PreparedVertexBuffers {
 	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
 
-	std::array<vk::Buffer, MaxBuffers>     buffers {};
-	std::array<vk::DeviceSize, MaxBuffers> offsets {};
-	std::array<vk::DeviceSize, MaxBuffers> sizes {};
+	std::array<vk::Buffer, MaxBuffers>     buffers;
+	std::array<vk::DeviceSize, MaxBuffers> offsets;
+	std::array<vk::DeviceSize, MaxBuffers> sizes;
 	uint32_t                               count = 0;
 };
 
 // The vertex buffers' guest ranges, merged where they overlap or touch and clamped to mapped
 // memory, as AcquireVertexBuffers acquires them. Any thread.
 struct MergedVertexRanges {
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;  // up to buffers_num
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges; // up to count
 	uint32_t                                                      count = 0;
 };
 
@@ -691,7 +704,7 @@ static MergedVertexRanges MergeVertexRanges(const ShaderVertexInputInfo& vs_inpu
 	MergedVertexRanges merged;
 	auto&              sizes = merged.sizes;
 	// Collect the non-empty guest vertex ranges.
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges;
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
@@ -704,7 +717,7 @@ static MergedVertexRanges MergeVertexRanges(const ShaderVertexInputInfo& vs_inpu
 			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     vertex.addr, size);
 		}
-		ranges[range_count++] = {vertex.addr, vertex.addr + size};
+		ranges[range_count++] = {vertex.addr, vertex.addr + size, 0, {}};
 	}
 
 	std::sort(ranges.begin(), ranges.begin() + range_count,
@@ -723,7 +736,7 @@ static MergedVertexRanges MergeVertexRanges(const ShaderVertexInputInfo& vs_inpu
 			    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
 			continue;
 		}
-		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
+		merged_ranges[merged_count++] = {range.base_address, range.requested_end, 0, {}};
 	}
 
 	for (uint32_t i = 0; i < merged_count; i++) {
@@ -738,9 +751,9 @@ static MergedVertexRanges MergeVertexRanges(const ShaderVertexInputInfo& vs_inpu
 
 // speculated: the prepare worker's lookups of the merged ranges, if it made them (count must
 // match).
-static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
-                                                  const ShaderVertexInputInfo& vs_input_info,
-                                                  std::span<const uint32_t>    speculated) {
+static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
+                                 std::span<const uint32_t> speculated,
+                                 PreparedVertexBuffers&    prepared) {
 	auto        merged        = MergeVertexRanges(vs_input_info);
 	const auto& sizes         = merged.sizes;
 	auto&       merged_ranges = merged.ranges;
@@ -754,7 +767,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
-	PreparedVertexBuffers prepared;
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
@@ -766,6 +778,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			}
 			prepared.buffers[i] = null_buffer;
 			prepared.offsets[i] = 0;
+			prepared.sizes[i]   = 0;
 			continue;
 		}
 
@@ -783,8 +796,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
 	}
-
-	return prepared;
 }
 
 static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
@@ -1175,12 +1186,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
-		vertex_bindings = AcquireVertexBuffers(
+		AcquireVertexBuffers(
 		    buffer, state.vertex_info[0],
 		    m_adopted_buffers != nullptr
 		        ? std::span<const uint32_t> {m_adopted_buffers->vertex_speculated.data(),
 		                                     m_adopted_buffers->vertex_count}
-		        : std::span<const uint32_t> {});
+		        : std::span<const uint32_t> {},
+		    vertex_bindings);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};

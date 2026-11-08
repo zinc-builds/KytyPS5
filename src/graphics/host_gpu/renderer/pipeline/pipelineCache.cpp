@@ -31,6 +31,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -947,6 +948,20 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor, m_compute_resources);
 }
 
+// Equality of two keys built by GetGraphicsPipeline, whose vertex bindings and attributes past
+// their counts stay zero: ~200 of the key's 516 bytes instead of all of them.
+static bool SameBuiltKey(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
+	const auto& va = a.vertex_input;
+	const auto& vb = b.vertex_input;
+	return std::memcmp(&a, &b, offsetof(GraphicsPipelineKey, vertex_input)) == 0 &&
+	       va.binding_count == vb.binding_count && va.attribute_count == vb.attribute_count &&
+	       std::memcmp(va.bindings.data(), vb.bindings.data(),
+	                   va.binding_count * sizeof(va.bindings[0])) == 0 &&
+	       std::memcmp(va.attributes.data(), vb.attributes.data(),
+	                   va.attribute_count * sizeof(va.attributes[0])) == 0 &&
+	       std::memcmp(&a.static_params, &b.static_params, sizeof(a.static_params)) == 0;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state) {
 	const auto* colors        = state.color_info.data();
@@ -1115,7 +1130,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
-	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+	if (m_last_graphics_pipeline != nullptr && SameBuiltKey(key, m_last_graphics_key)) {
 		return *m_last_graphics_pipeline;
 	}
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
