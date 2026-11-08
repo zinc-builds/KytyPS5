@@ -112,7 +112,7 @@ graphics labels ~196 times/s each. A second command processor for compute could 
 
 Structural changes, in order:
 
-1. **Buffer acquisition on the prepare worker (Track B4, now).** The worker runs FindBuffers and
+1. **Buffer acquisition on the prepare worker (Track B4): phase A merged, +3.9%** (clean lookups and FindBuffers; ~1.84M hits/s, ~1 stale/s; buffer stage 668 → 519 ns/draw; worker 2.57 µs/draw, 51% busy, so item 2 is not needed yet). Phase B, stream copies on the worker (~90 ns/draw of copies plus the stream path), is next. The worker runs FindBuffers and
    ObtainBuffer for the draw. The commit adopts the result after one buffer-registration
    generation check and one CPU-dirty generation check per draw; anything else falls back. Stream
    copies move too: the worker runs after the draw's PM4 position and before any later

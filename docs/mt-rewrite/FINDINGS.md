@@ -63,6 +63,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Guest reads inside one backing mapping copy without locks: a per-thread translation cache checked against a sequence count that backing-store writers make odd (same batch: ref `dev` 75f3eebc 38.97, worst_ms 33.7) | 39.56 | 208.0k | 33.5 (max 33.6) | 29.2 |
 | 2026-11-07 | Per-draw fences off the command thread: lookups of unchanged images skip the texture cache's lock (a per-image atomic "settled" state that CPU write faults clear), retired-operation checks skip the scheduler's mutex, recorder hand-offs skip the full fence, overlay counters are per thread (Track B; same batch: ref `dev` ab1429f1 39.21 / 39.52; before #55, on 75f3eebc +1.5% and on b4a91152 4 pairs +1.9%; samples right after a locked instruction 8.1% → 1.1% of the command thread; `KYTY_TC_SETTLED_VERIFY` 104M checks clean) | 39.98 / 39.78 | 209.3k / 209.9k | 33.5 (max 33.6) / 33.5 (max 33.7) | 28.7 / 28.6 |
 | 2026-11-08 | The last per-draw fences: the render context mutex is biased to the command thread (other threads force a `membarrier` and wait; `KYTY_RENDER_MUTEX_BIASED=0` turns it off), `FindDepthTarget` skips the texture cache lock for settled images, `ClampRangeSize` remembers answers per thread until the ranges change (Track B; same batches: ref `dev` ee714f06 40.70 / 40.83 / 40.68 / 40.46; settled verify 106M checks clean) | 40.78 / 41.06 / 41.01 / 40.99 | 214.2k / 215.1k / 215.8k / 215.6k | 33.5–35.7 (max 33.6–66.7) | 28.7 / 29.9 / – / – |
+| 2026-11-08 | The prepare worker looks up the draw's clean buffers too: storage buffer sources and vertex ranges, validated at the commit by the buffer registration sequence and a global CPU-dirty generation (Track B4 item 2; same batch: ref `dev` 1ed41724 40.55, worst_ms 33.5; buffer acquisition 668 → 519 ns/draw on ab1429f1, worker 2.33 → 2.57 µs/draw, 51% busy) | 42.13 | 221.0k | 33.5 (max 33.6) | 29.9 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1468,6 +1469,8 @@ What this means:
   efficiency cores but the recorder's), `KYTY_GUEST_PCORE_NAMES=<name,...>` (game threads kept
   on the performance cores, default `DrawThread`), `KYTY_RESERVE_CPUS=<list>` (performance CPUs
   the emulator leaves free, e.g. for `KYTY_RECORDER_CPU`).
+- Worker buffer lookups (Track B4 item 2): `KYTY_WORKER_BUFFERS=0` off, `=verify` checks every
+  answer against a full acquisition, `=stats` prints WORKERBUFFERS lines (hits, stale, unlisted).
 - Threaded draw preparation (Track B4): `KYTY_PREPARE_THREAD=0` draws at once on the command
   thread, `KYTY_PREPARE_DEPTH=<n>` queues up to n draws (default 4), `KYTY_PREPARE_CPU=<n>` pins
   the worker elsewhere, `KYTY_PREPARE_VERIFY=1` looks every adopted draw up again and exits on a
