@@ -66,6 +66,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | The prepare worker looks up the draw's clean buffers too: storage buffer sources and vertex ranges, validated at the commit by the buffer registration sequence and a global CPU-dirty generation (Track B4 item 2; same batch: ref `dev` 1ed41724 40.55, worst_ms 33.5; buffer acquisition 668 → 519 ns/draw on ab1429f1, worker 2.33 → 2.57 µs/draw, 51% busy) | 42.13 | 221.0k | 33.5 (max 33.6) | 29.9 |
 | 2026-11-08 | Texture resolves proposed by the prepare worker from its own resolve memo (one record per resource and T#, description precomputed there); the command thread keeps the registration check, LRU touch and color-clear work, and resolves misses with the worker's description (Track B; same binary, `KYTY_WORKER_TEXTURES=0`: 41.01 / 41.34; `KYTY_WORKER_TEXTURES_VERIFY` 84M checks clean) | 41.41 / 41.96 | 217.9k / 220.1k | 33.5 (max 33.5) / 33.5 (max 33.6) | – |
 | 2026-11-08 | The prepare worker's texture memo is a flat open-addressed table instead of `std::unordered_map` (Track B; same batch: ref `dev` 78fa7f97 41.03 / 41.29; worker 2.90 → 2.80 µs/draw, command thread's wait for it 316 → 223 ns/draw, `KYTY_PREPARE_STATS`; verify 81M checks clean) | 42.18 / 42.42 | – | – | – |
+| 2026-11-08 | Texture bindings keep the worker record's desc when the record has not changed instead of copying ~1.1 KB per binding; record generations refresh in place instead of a 3.7 KB copy (Track B; same batch: ref `dev` 4a7f63c4 42.76 / 42.88; worker verify 82M checks and `KYTY_DTC_VERIFY` clean) | 43.62 / 43.57 | 228.8k / 229.1k | 33.5 | – |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1432,6 +1433,16 @@ What this means:
   most of the command thread's saving waits for a second worker. A deeper queue
   (`KYTY_PREPARE_DEPTH=8`) does not help. Making the worker's memo a flat table (−0.1 µs/draw on
   the worker) gave +2.8%: the waits are bursty, so worker latency counts more than its average.
+
+- **Copies on the command thread (dev 4a7f63c4).** libc was 19.8% of the thread, nearly all
+  memcpy. LBR call stacks: guest data 7.9% (`TryReadFast`: stream copies, uploads); bookkeeping
+  structs ~8%: texture bindings' `ImageDesc` (1,134 B, 1.55%), records copied to refresh their
+  registration generation (3,688 B plus the allocation, ~1.4%), `RenderColorInfo` from the color
+  target memo (1,160 B, ~1.8%), `ExecutePreparedDraw` (772 B, 0.7%), `GetGraphicsPipeline`
+  (516 B, 0.9%), `PostQueuedDraw`'s registers (2,708 B, 0.4%). `ImageDesc` is most of a KB
+  because `ImageInfo::mip_layout` holds 16 mips. The texture side is fixed (+1.8%); the color
+  target copy goes away with render-target resolve on the worker, which builds the target in the
+  queued draw's own state.
 
 ## Remaining costs and candidate directions
 

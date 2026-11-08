@@ -781,7 +781,22 @@ RenderExecutor::TextureMemoSlots(const ShaderModule& module) {
 }
 
 // Assigns `from` but its mip views to `out`, emptying out's mip views and keeping their storage.
+// Like AssignWithoutMipViews, from a worker record, copying its desc only if `out` does not hold
+// it already.
+static void AssignFromRecord(TextureBinding& out, const WorkerTextureRecord& record) {
+	const auto& from = record.binding;
+	out.image_id     = from.image_id;
+	out.image_view   = from.image_view;
+	out.layout       = from.layout;
+	out.mip_views.clear();
+	if (out.source != record.serial) {
+		out.desc   = from.desc;
+		out.source = record.serial;
+	}
+}
+
 static void AssignWithoutMipViews(TextureBinding& out, const TextureBinding& from) {
+	out.source     = 0;
 	out.image_id   = from.image_id;
 	out.image_view = from.image_view;
 	out.desc       = from.desc;
@@ -841,14 +856,9 @@ void RenderExecutor::ResolveProposedTexture(const WorkerTextureRecord&          
 			    GetDrawStateCacheMode() == DrawStateCacheMode::Verify) {
 				VerifyTextureResolve(record.binding, resource, value);
 			}
-			AssignWithoutMipViews(out, record.binding);
-			if (generation != record.generation) {
-				// No image appeared over it since: the worker can propose it without the per-page
-				// check next time.
-				auto update        = std::make_unique<WorkerTextureRecord>(record);
-				update->generation = generation;
-				m_texture_updates.push_back({std::move(update)});
-			}
+			AssignFromRecord(out, record);
+			// No image appeared over it since: the next adoption skips the per-page check.
+			record.generation = generation;
 			return;
 		}
 	}
@@ -856,6 +866,7 @@ void RenderExecutor::ResolveProposedTexture(const WorkerTextureRecord&          
 	auto binding = ResolveTexture(resource, value, &trace, &record.description);
 	if (trace.reusable) {
 		auto update                 = std::make_unique<WorkerTextureRecord>();
+		update->serial              = m_command_texture_serial += 2;
 		update->inputs              = record.inputs;
 		update->value               = record.value;
 		update->description         = record.description;
@@ -950,6 +961,7 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
 			record->inputs      = inputs;
 			record->value       = value;
 			record->description = DescribeTexture(inputs, value, m_context.GetGraphics());
+			record->serial      = m_worker_texture_serial += 2;
 			out[i]              = {record.get()};
 			file(std::move(record));
 		}

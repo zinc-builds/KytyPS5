@@ -31,7 +31,10 @@ struct WorkerTextureRecord {
 	TextureBinding          binding; // without mip views
 	ImageId                 found_id;
 	GuestRange              data;
-	uint64_t                generation          = 0; // TextureCache registration generation
+	// TextureCache registration generation. Once proposed, only the command thread reads it, and it
+	// moves it forward when the registration check finds no image appeared over the record.
+	mutable uint64_t        generation          = 0;
+	uint64_t                serial              = 0; // unique per record (TextureBinding::source)
 	uint32_t                metadata_base_layer = 0;
 	bool                    color_clear         = false;
 	TextureCache::ImageDesc found; // with color_clear
