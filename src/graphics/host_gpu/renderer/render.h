@@ -336,7 +336,7 @@ private:
 		std::mutex                                                             retire_mutex;
 		std::deque<std::pair<uint64_t, std::unique_ptr<WorkerTextureRecord>>> retired_records;
 		std::deque<std::pair<uint64_t, std::unique_ptr<Table>>>               retired_tables;
-		std::atomic<uint64_t> oldest_retired {UINT64_MAX}; // a lower bound: UINT64_MAX when none
+		std::atomic<uint64_t> oldest_retired {UINT64_MAX}; // the queue heads' oldest tag: UINT64_MAX when none
 
 		[[nodiscard]] const WorkerTextureRecord* Find(
 		    uint64_t key, const ShaderRecompiler::IR::ImageResource& inputs,
