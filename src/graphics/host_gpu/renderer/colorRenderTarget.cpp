@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -42,45 +45,8 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
-                                              uint32_t rt_slot, bool ignore_target_mask,
-                                              bool exact_format) {
-	KYTY_PROFILER_FUNCTION();
-	const auto& hw = buffer.GetRegisters();
-
-	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
-	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
-		mask = 0x0f;
-	}
-
-	auto* memo = GetDrawStateCacheMode() != DrawStateCacheMode::Off &&
-	                     rt_slot < m_color_target_memo.size()
-	                 ? &m_color_target_memo[rt_slot]
-	                 : nullptr;
-	bool hit = false;
-	if (memo != nullptr && memo->generation != 0 && memo->mask == mask &&
-	    memo->ignore_target_mask == ignore_target_mask && memo->exact_format == exact_format &&
-	    std::memcmp(&memo->rt, &rt, sizeof(rt)) == 0) {
-		const auto& found      = memo->result.desc;
-		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
-		                         found.info.metadata.kind == ImageMetadataKind::Cmask;
-		hit = m_context.GetTextureCache().RefindExactImage(
-		    memo->result.image_id, found.info.data, color_clear ? &found : nullptr,
-		    memo->metadata_base_layer, memo->generation);
-		if (DrawStateCacheStats()) {
-			m_color_target_stats.lookups++;
-			m_color_target_stats.hits += hit ? 1 : 0;
-		}
-		if (hit && GetDrawStateCacheMode() != DrawStateCacheMode::Verify) {
-			// r may be unconstructed (DrawRenderState::color_info).
-			std::construct_at(&r, memo->result);
-			BindRenderTarget(r.image_id);
-			return;
-		}
-	} else if (memo != nullptr && DrawStateCacheStats()) {
-		m_color_target_stats.lookups++;
-	}
+bool DecodeColorTarget(const HW::Context& hw, uint32_t rt_slot, uint32_t mask, RenderColorInfo& r) {
+	const auto& rt = hw.GetRenderTarget(rt_slot);
 	std::construct_at(&r);
 	r.target_slot = rt_slot;
 
@@ -95,7 +61,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			}
 		}
 
-		return;
+		return false;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
@@ -284,13 +250,58 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
-	r.guest_mip_level          = mip;
-	r.guest_array_layer        = view.base_layer;
+	r.guest_mip_level   = mip;
+	r.guest_array_layer = view.base_layer;
+	r.export_mapping    = target_format.export_mapping;
+	return true;
+}
+
+void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
+                                              uint32_t rt_slot, bool ignore_target_mask,
+                                              bool exact_format) {
+	KYTY_PROFILER_FUNCTION();
+	const auto& hw = buffer.GetRegisters();
+
+	const auto& rt      = hw.GetRenderTarget(rt_slot);
+	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
+		mask = 0x0f;
+	}
+
+	auto* memo = GetDrawStateCacheMode() != DrawStateCacheMode::Off &&
+	                     rt_slot < m_color_target_memo.size()
+	                 ? &m_color_target_memo[rt_slot]
+	                 : nullptr;
+	bool hit = false;
+	if (memo != nullptr && memo->generation != 0 && memo->mask == mask &&
+	    memo->ignore_target_mask == ignore_target_mask && memo->exact_format == exact_format &&
+	    std::memcmp(&memo->rt, &rt, sizeof(rt)) == 0) {
+		const auto& found      = memo->result.desc;
+		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
+		                         found.info.metadata.kind == ImageMetadataKind::Cmask;
+		hit = m_context.GetTextureCache().RefindExactImage(
+		    memo->result.image_id, found.info.data, color_clear ? &found : nullptr,
+		    memo->metadata_base_layer, memo->generation);
+		if (DrawStateCacheStats()) {
+			m_color_target_stats.lookups++;
+			m_color_target_stats.hits += hit ? 1 : 0;
+		}
+		if (hit && GetDrawStateCacheMode() != DrawStateCacheMode::Verify) {
+			// r may be unconstructed (DrawRenderState::color_info).
+			std::construct_at(&r, memo->result);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+	} else if (memo != nullptr && DrawStateCacheStats()) {
+		m_color_target_stats.lookups++;
+	}
+	if (!DecodeColorTarget(hw, rt_slot, mask, r)) {
+		return;
+	}
+	auto&      texture_cache       = m_context.GetTextureCache();
 	const auto metadata_base_layer = r.desc.view_info.base_layer;
 	uint64_t   generation          = 0;
 	r.image_id = texture_cache.FindImage(r.desc, exact_format, memo != nullptr ? &generation : nullptr);
-	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 	if (memo == nullptr) {
 		return;
@@ -311,6 +322,170 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		memo->exact_format        = exact_format;
 		memo->metadata_base_layer = metadata_base_layer;
 		memo->result              = r;
+	}
+}
+
+
+// KYTY_WORKER_TARGETS=0 turns the worker's color target proposals off.
+static bool WorkerTargetsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WORKER_TARGETS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_WORKER_TARGETS_VERIFY=1: every adopted target is resolved again from the registers.
+static bool WorkerTargetsVerify() {
+	static const bool verify = std::getenv("KYTY_WORKER_TARGETS_VERIFY") != nullptr;
+	return verify;
+}
+
+void RenderExecutor::SpeculateTargets(QueuedDraw& queued, WorkerTargetMemo& memo) {
+	// A record replaced now may be proposed to queued draws until the ring comes round.
+	const auto retire_slots = m_queued_draws.size() + 1;
+	if (memo.retired.size() != retire_slots) {
+		memo.retired.resize(retire_slots);
+	}
+	auto& retired = memo.retired[memo.jobs++ % retire_slots];
+	retired.clear();
+	const auto file = [&](std::unique_ptr<WorkerColorTargetRecord> record) {
+		const auto slot = record->info.target_slot;
+		auto&      ways = memo.slots[slot];
+		auto*      way  = &ways[memo.next[slot]];
+		for (auto& candidate: ways) {
+			if (candidate != nullptr && candidate->mask == record->mask &&
+			    std::memcmp(&candidate->rt, &record->rt, sizeof(record->rt)) == 0) {
+				way = &candidate;
+				break;
+			}
+		}
+		if (way == &ways[memo.next[slot]]) {
+			memo.next[slot] = (memo.next[slot] + 1) % WorkerTargetMemo::Ways;
+		}
+		if (*way != nullptr) {
+			retired.push_back(std::move(*way));
+		}
+		*way = std::move(record);
+		return way->get();
+	};
+	for (auto& update: queued.target_updates) {
+		file(std::move(update));
+	}
+	queued.target_updates.clear();
+	auto& targets = queued.targets;
+	targets.ready = false;
+	auto& state   = queued.state;
+	if (!WorkerTargetsEnabled() || queued.log.failed ||
+	    GetDrawStateCacheMode() != DrawStateCacheMode::On ||
+	    state.vertex_info[0].stage.module == nullptr) {
+		return;
+	}
+	const auto& hw    = queued.registers;
+	uint32_t    count = 0;
+	if (state.mrt_mask == 0) {
+		state.color_info.Construct(0);
+	}
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((state.mrt_mask & (1u << slot)) == 0) {
+			continue;
+		}
+		const auto& rt   = hw.GetRenderTarget(slot);
+		const auto  mask = render_target_mask_slot(hw.GetRenderTargetMask(), slot);
+		if (rt.base.addr == 0 || mask == 0) {
+			state.color_info.Construct(count).target_slot = slot;
+			targets.color[count++] = nullptr;
+			continue;
+		}
+		const WorkerColorTargetRecord* found = nullptr;
+		for (const auto& candidate: memo.slots[slot]) {
+			if (candidate != nullptr && candidate->mask == mask &&
+			    std::memcmp(&candidate->rt, &rt, sizeof(rt)) == 0) {
+				found = candidate.get();
+				break;
+			}
+		}
+		if (found == nullptr) {
+			auto record = std::make_unique<WorkerColorTargetRecord>();
+			std::memcpy(&record->rt, &rt, sizeof(rt)); // With padding: compared as bytes.
+			record->mask = mask;
+			EXIT_IF(!DecodeColorTarget(hw, slot, mask, record->info));
+			found = file(std::move(record));
+		}
+		state.color_info.Construct(count, found->info);
+		targets.color[count++] = found;
+	}
+	targets.count = count;
+	targets.ready = true;
+}
+
+void RenderExecutor::ResolveProposedColorTarget(CommandBuffer&                 buffer,
+                                                const WorkerColorTargetRecord* record,
+                                                RenderColorInfo& r, uint32_t slot) {
+	if (record == nullptr) {
+		return; // no color output: r is unbound
+	}
+	auto& texture_cache = m_context.GetTextureCache();
+	if (record->resolved) {
+		const auto& found       = record->info.desc;
+		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
+		                         found.info.metadata.kind == ImageMetadataKind::Cmask;
+		if (texture_cache.RefindExactImage(record->info.image_id, found.info.data,
+		                                   color_clear ? &found : nullptr,
+		                                   record->metadata_base_layer, record->generation)) {
+			BindRenderTarget(r.image_id);
+		} else {
+			// An image appeared over it, or it was removed: resolve from the registers, and hand
+			// the result back.
+			ResolveRenderColorTarget(buffer, r, slot);
+			const auto& memo = m_color_target_memo[slot];
+			if (r.image_id && memo.generation != 0 && memo.result.image_id == r.image_id) {
+				auto update                 = std::make_unique<WorkerColorTargetRecord>(*record);
+				update->info                = memo.result;
+				update->metadata_base_layer = memo.metadata_base_layer;
+				update->generation          = memo.generation;
+				m_target_updates.push_back(std::move(update));
+			}
+		}
+	} else {
+		// r holds the worker's decode: find its image, and hand the result back.
+		const auto metadata_base_layer = r.desc.view_info.base_layer;
+		uint64_t   generation          = 0;
+		r.image_id = texture_cache.FindImage(r.desc, false, &generation);
+		BindRenderTarget(r.image_id);
+		if (r.image_id && generation != 0) {
+			auto update                 = std::make_unique<WorkerColorTargetRecord>();
+			std::memcpy(&update->rt, &record->rt, sizeof(record->rt));
+			update->mask                = record->mask;
+			update->info                = r;
+			update->resolved            = true;
+			update->metadata_base_layer = metadata_base_layer;
+			update->generation          = generation;
+			m_target_updates.push_back(std::move(update));
+		}
+	}
+	if (WorkerTargetsVerify()) {
+		const auto& hw   = buffer.GetRegisters();
+		const auto  mask = render_target_mask_slot(hw.GetRenderTargetMask(), slot);
+		RenderColorInfo check;
+		EXIT_IF(!DecodeColorTarget(hw, slot, mask, check));
+		check.image_id = texture_cache.FindImage(check.desc, false, nullptr);
+		if (check.image_id != r.image_id || !(check.desc.view_info == r.desc.view_info) ||
+		    check.desc.info.data != r.desc.info.data || check.target_slot != r.target_slot ||
+		    check.guest_mip_level != r.guest_mip_level ||
+		    check.guest_array_layer != r.guest_array_layer ||
+		    check.export_mapping.packed != r.export_mapping.packed ||
+		    check.desc.info.pixel_format != r.desc.info.pixel_format ||
+		    check.desc.info.samples != r.desc.info.samples) {
+			EXIT("KYTY_WORKER_TARGETS_VERIFY: proposal disagrees: slot %u image %u vs %u\n", slot,
+			     static_cast<uint32_t>(r.image_id.index),
+			     static_cast<uint32_t>(check.image_id.index));
+		}
+		static uint64_t checks = 0;
+		if (++checks % 1000000 == 0) {
+			std::printf("WORKER_TARGETS_VERIFY checks=%" PRIu64 "\n", checks);
+			std::fflush(stdout);
+		}
 	}
 }
 

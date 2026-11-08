@@ -897,17 +897,30 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	// Each resolve constructs its color_info entry; the logs and the sample count read entry 0.
+	// The worker's proposals are already there, one per resolved slot.
 	if (state.mrt_mask == 0) {
 		state.color_info.Construct(0);
 	}
+	const auto* targets  = m_adopted_targets;
+	uint32_t    proposal = 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
-			if (state.color_info[state.color_count].image_id) {
+			auto& r = state.color_info[state.color_count];
+			if (targets != nullptr) {
+				EXIT_IF(proposal >= targets->count);
+				if (proposal != state.color_count) {
+					state.color_info.Construct(state.color_count, state.color_info[proposal]);
+				}
+				ResolveProposedColorTarget(buffer, targets->color[proposal++], r, slot);
+			} else {
+				ResolveRenderColorTarget(buffer, r, slot);
+			}
+			if (r.image_id) {
 				state.color_count++;
 			}
 		}
 	}
+	EXIT_IF(targets != nullptr && proposal != targets->count);
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
@@ -1871,6 +1884,7 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	DrawPrepare::SetLog(nullptr);
 	self.SpeculateBuffers(queued);
 	self.SpeculateTextures(queued, lane.textures);
+	self.SpeculateTargets(queued, lane.targets);
 }
 
 const std::vector<TextureProposal>*
@@ -1959,6 +1973,10 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	}
 	m_adopted_buffers  = nullptr;
 	m_adopted_textures = nullptr;
+	m_adopted_targets  = nullptr;
+	// The worker files these in its records when it next uses the slot.
+	std::swap(queued.target_updates, m_target_updates);
+	m_target_updates.clear();
 	// The worker files these in its memo when it next uses the slot.
 	m_prepare_stat.texture_updates += m_texture_updates.size();
 	std::swap(queued.texture_updates, m_texture_updates);
@@ -2035,6 +2053,9 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 	}
 	if (queued.textures.ready) {
 		m_adopted_textures = &queued.textures;
+	}
+	if (queued.targets.ready) {
+		m_adopted_targets = &queued.targets;
 	}
 	if (m_prepare_verify) {
 		WaitPrepareIdle();
