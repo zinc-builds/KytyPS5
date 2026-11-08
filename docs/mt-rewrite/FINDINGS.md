@@ -1364,8 +1364,15 @@ the command thread in order (`=verify` prints `LATELABELS` lines).
 - Reference-clock labels keep the clock read at decode. Read at completion, Sky Garden runs 4%
   slower: the game sees its real GPU time and reacts (`Image::FindView` from `RebindImages`
   doubles).
-- Cost with it on: on `dev` 700d3924, same binary, 45.15 → 44.68 FPS (−1.0%); on 23191d32,
-  45.59 → 44.40 (−2.6%), about the experiment's: the deferral, the held
+- Cost with it on, after the cuts below: none measurable (same binary on `dev` c7bdab8f: off
+  47.45 / 47.25, on 47.42 / 47.42). Before them: −1.0% on 700d3924, −2.6% on 23191d32
+- Cuts: label stores (and stores held behind a passed wait) land between queued draws, so they
+  record their range (`DrawPrepare::NoteStoredRange`) and advance only the ranged
+  `GuestSyncEpoch`, as readbacks do, instead of dropping every queued draw (with them on,
+  draws dropped for the epoch went from ~1.3k/s to ~0); texture downloads publish ranged too
+  (~700/s of the drops with late labels off as well, though that alone moves FPS by less than
+  noise); RELEASE_MEM stores carry no closure; label records sit in one open-addressed table;
+  interrupts are raised once per drain, after its labels, exact repeats once, about the experiment's: the deferral, the held
   CP stores and the bookkeeping on the command thread. Labels reach the guest 5.6 ms after
   decode on average (max ~16 ms); flips, the game's sleep time and the command thread's blocked
   time do not change. With it off, behaviour is as before.
