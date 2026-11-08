@@ -1024,24 +1024,31 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		                       return stage->runtime == runtime;
 	                       })) {
 		const bool verify = BufferCache::WorkerBuffersVerify();
+		// Decoded together, as the worker did: sentinel writes clamp against every stage.
+		std::array<std::vector<PreparedBindings::BufferSource>, 4> fresh;
+		if (verify) {
+			std::array<std::vector<PreparedBindings::BufferSource>*, 4> outs {};
+			for (size_t i = 0; i < stages.size(); i++) {
+				outs[i] = &fresh[i];
+			}
+			DecodeBufferSources(
+			    m_context.GetGraphics(), std::span {adopted->runtimes.data(), stages.size()},
+			    std::span {outs.data(), stages.size()},
+			    [](void* context, uint64_t address, uint64_t size, uint32_t&) {
+				    return static_cast<BufferCache*>(context)->FindBuffer(address, size);
+			    },
+			    &cache);
+		}
 		for (size_t i = 0; i < stages.size(); i++) {
 			auto& sources = stages[i]->buffer_sources;
 			sources       = adopted->sources[i];
 			if (verify) {
-				std::vector<PreparedBindings::BufferSource> fresh;
-				const ShaderStageRuntime*                   runtime = stages[i]->runtime;
-				auto*                                       out     = &fresh;
-				DecodeBufferSources(
-				    m_context.GetGraphics(), std::span {&runtime, 1}, std::span {&out, 1},
-				    [](void* context, uint64_t address, uint64_t size, uint32_t&) {
-					    return static_cast<BufferCache*>(context)->FindBuffer(address, size);
-				    },
-				    &cache);
-				bool same = fresh.size() == sources.size();
-				for (size_t j = 0; same && j < fresh.size(); j++) {
-					same = fresh[j].address == sources[j].address && fresh[j].size == sources[j].size &&
+				bool same = fresh[i].size() == sources.size();
+				for (size_t j = 0; same && j < sources.size(); j++) {
+					same = fresh[i][j].address == sources[j].address &&
+					       fresh[i][j].size == sources[j].size &&
 					       (!sources[j].id || !cache.SpeculationValid(adopted->speculation) ||
-					        sources[j].id == fresh[j].id);
+					        sources[j].id == fresh[i][j].id);
 				}
 				if (!same) {
 					EXIT("KYTY_WORKER_BUFFERS=verify: the worker's buffer sources differ (stage %zu)\n",
