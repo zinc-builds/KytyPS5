@@ -67,6 +67,10 @@ public:
 	// store_size: bytes the store writes at vaddr (0: none), recorded as a stored range.
 	void DeferLateStore(uint64_t vaddr, uint64_t value, uint64_t size,
 	                    Common::UniqueFunction<void>&& store, uint64_t store_size = 0);
+	// The common case without a closure: `cp` stores `store_size` bytes of `value` at vaddr (none
+	// if 0) and then raises its interrupt if `interrupt`; `size`: tracked for waits as above.
+	void DeferLateLabel(CommandProcessor* cp, uint64_t vaddr, uint64_t value, uint64_t size,
+	                    uint64_t store_size, bool interrupt, int event_id, uint32_t context_id);
 	// GPU thread: whether a pending label store will satisfy a wait for this address, and so the
 	// wait may pass (also makes later CP stores wait for the labels deferred so far).
 	[[nodiscard]] bool LateLabelSatisfies(uint64_t vaddr, uint64_t ref, uint64_t mask,
@@ -128,8 +132,22 @@ private:
 		uint64_t                     store_size  = 0; // bytes stored at vaddr
 		uint64_t                     deferred_ns = 0;
 		LateLabel*                   label       = nullptr; // its record, if a tracked label
+		CommandProcessor*            cp          = nullptr; // a RELEASE_MEM label, else `store`
+		bool                         interrupt   = false;
+		int                          event_id    = 0;
+		uint32_t                     context_id  = 0;
 		Common::UniqueFunction<void> store;
 	};
+	// Label records in one open-addressed table (address 0: empty). It only grows or drops idle
+	// records when no store is in flight, so a deferred store's record pointer stays valid; when
+	// full meanwhile, new labels go untracked (their waits do not pass early).
+	struct LateLabelSlot {
+		uint64_t  vaddr = 0;
+		LateLabel label;
+	};
+	[[nodiscard]] LateLabel* FindLateLabel(uint64_t vaddr);
+	[[nodiscard]] LateLabel* AddLateLabel(uint64_t vaddr);
+	void                     MaintainLateLabels();
 	// GPU thread, before each submission: hands the stores deferred in the buffer to the priority
 	// queue, which posts them back once the buffer's work has finished.
 	void FlushLateBatch();
@@ -162,7 +180,14 @@ private:
 	uint64_t                                       m_late_applied  = 0; // sequences applied
 	uint64_t                                       m_late_fence    = 0; // CP stores wait for this
 	bool                                           m_late_applying = false; // running a store
-	std::unordered_map<uint64_t, LateLabel>        m_late_labels; // by address
+	std::vector<LateLabelSlot>                     m_late_labels = std::vector<LateLabelSlot>(1u << 16u);
+	size_t                                         m_late_label_count = 0;
+	// Interrupts of the stores run in this drain, raised after it in order (exact repeats once).
+	struct LateInterrupt {
+		int      event_id   = 0;
+		uint32_t context_id = 0;
+	};
+	std::vector<LateInterrupt>                     m_late_interrupts;
 	struct {
 		uint64_t deferred = 0, applied = 0, satisfied = 0, foreign = 0, foreign_zero = 0,
 		         refused = 0, fenced = 0, delay_ns = 0, max_delay_ns = 0, start_ns = 0;

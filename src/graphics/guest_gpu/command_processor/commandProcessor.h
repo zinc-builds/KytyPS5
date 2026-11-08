@@ -86,6 +86,8 @@ public:
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
+	// Stores a label the way RELEASE_MEM does (through the backing where the caches allow).
+	void StoreLabel(void* address, const void* value, uint64_t size);
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
 	                uint32_t interrupt_context_id);
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
