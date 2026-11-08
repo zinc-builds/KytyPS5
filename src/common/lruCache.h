@@ -2,12 +2,23 @@
 #define EMULATOR_SRC_COMMON_LRUCACHE_H_
 
 #include <cstddef>
+#include <cstdlib>
 #include <deque>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace Common {
+
+// KYTY_LRU_MIRROR=0: callers that mirror an item's tick (to skip touches within one tick, which
+// LeastRecentlyUsedCache::Touch ignores) touch every time instead.
+inline bool LruMirrorEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LRU_MIRROR");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 template <typename Object, typename Tick>
 class LeastRecentlyUsedCache {

@@ -270,6 +270,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	TouchRegistrations(image.info.data.address, image.info.data.size);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -339,7 +340,11 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	// lru_tick mirrors the LRU item's tick: an image touched in this GC tick would leave the
+	// LRU as it is (LeastRecentlyUsedCache::Touch), so the item is not read. KYTY_LRU_MIRROR=0
+	// always touches.
+	if (image.registered && (image.lru_tick != m_gc_tick || !Common::LruMirrorEnabled())) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }
@@ -2118,8 +2123,15 @@ bool TextureCache::IsMeta(uint64_t address) {
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
-	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
+	// m_surface_metas belongs to the GPU thread (this one, per draw): unmaps run on it too
+	// (RenderContext::UnmapMemory), and MaterializeColorClear and FindDepthTarget already use it
+	// unlocked. KYTY_META_LOCK=1 takes the lock anyway.
+	static const bool locked = std::getenv("KYTY_META_LOCK") != nullptr;
+	std::unique_lock  lock {m_lock, std::defer_lock};
+	if (locked) {
+		lock.lock();
+	}
+	const auto found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}

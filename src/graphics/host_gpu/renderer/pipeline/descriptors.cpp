@@ -1067,7 +1067,7 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued, WorkerTextureState& w
 			const auto& value  = snapshot.images[i];
 			const auto  key    = TextureDescriptionKey(inputs, value);
 			if (const auto* found = memo.Find(key, inputs, value); found != nullptr) {
-				out[i] = {found};
+				out[i] = ProposeRecord(found);
 				continue;
 			}
 			auto record         = std::make_unique<WorkerTextureRecord>();
@@ -1076,7 +1076,7 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued, WorkerTextureState& w
 			record->key         = key;
 			record->description = DescribeTexture(inputs, value, m_context.GetGraphics());
 			record->serial      = worker.serial += worker.serial_step;
-			out[i]              = {memo.File(sequence, std::move(record), false)};
+			out[i]              = ProposeRecord(memo.File(sequence, std::move(record), false));
 		}
 	}
 	textures.ready = true;
@@ -1249,9 +1249,9 @@ bool RenderExecutor::CanReuseBindings(const ShaderStageRuntime& runtime,
 		return false;
 	}
 	for (size_t i = 0; i < images; i++) {
-		const auto* record = (*proposals)[i].record;
+		const auto& proposal = (*proposals)[i];
 		if (!program.info.images[i].heap &&
-		    (record == nullptr || record->serial != reuse.serials[i])) {
+		    (proposal.record == nullptr || proposal.serial != reuse.serials[i])) {
 			return false;
 		}
 	}
@@ -1313,7 +1313,8 @@ void RenderExecutor::VerifyReusedBindings(const ShaderStageRuntime& runtime,
 		                   program.info.images[i].mip_mode ==
 		                       ShaderRecompiler::IR::ImageMipMode::Dynamic ||
 		                   texture_cache.FindTexture(check.image_id, check.desc) == kept.image_view;
-		if (check.image_id != kept.image_id || check.layout != kept.layout ||
+		// Layouts are not compared: CommitBindings sets the binding's from the image state.
+		if (check.image_id != kept.image_id ||
 		    check.desc.type != kept.desc.type || !(check.desc.view_info == kept.desc.view_info) ||
 		    check.desc.info.data != kept.desc.info.data || !views) {
 			EXIT("KYTY_BINDING_REUSE_VERIFY: stage %u image slot %u differs: image %u vs %u layout %u vs "
@@ -1369,13 +1370,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			if (program.info.images[i].heap) {
 				continue;
 			}
-			const auto& record = *(*proposals)[i].record;
-			if (!record.null && record.color_clear) {
+			// The record is read only for its color-clear step. binding.layout is left as the
+			// last commit set it: CommitBindings sets it again before any use.
+			if (const auto& proposal = (*proposals)[i]; proposal.color_clear) {
+				const auto& record = *proposal.record;
 				texture_cache.MaterializeColorClear(record.found_id, record.found,
 				                                    record.metadata_base_layer);
 			}
-			auto& binding  = prepared.images[i];
-			binding.layout = record.binding.layout; // as AssignFromRecord (commit sets the final one)
+			const auto& binding = prepared.images[i];
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		}
 		if (BindingReuseVerify()) {
