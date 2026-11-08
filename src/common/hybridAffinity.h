@@ -7,6 +7,8 @@
 // command thread's core both slowed the critical path. KYTY_NO_PIN=1 disables it.
 
 #if defined(__linux__)
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -54,13 +56,26 @@ struct Plan {
 	bool      active = false;
 	cpu_set_t process {};
 	int       gpu_cpu = -1;
-	// The draw prepare thread's CPU, or -1 for none chosen.
-	int       prepare_cpu = -1;
+	// Each draw prepare worker's CPU, or -1 for none chosen.
+	std::vector<int> prepare_cpus;
 };
 
 inline int EnvCpu(const char* name) {
 	const char* value = std::getenv(name);
 	return value != nullptr ? std::atoi(value) : -1;
+}
+
+// Draw prepare workers (KYTY_PREPARE_WORKERS, 1 to 4; 0 with KYTY_PREPARE_THREAD=0).
+inline uint32_t PrepareWorkerCount() {
+	static const uint32_t count = [] {
+		const char* thread = std::getenv("KYTY_PREPARE_THREAD");
+		if (thread != nullptr && thread[0] == '0') {
+			return 0u;
+		}
+		const char* value = std::getenv("KYTY_PREPARE_WORKERS");
+		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 4)) : 2u;
+	}();
+	return count;
 }
 
 inline Plan& GetPlan() {
@@ -84,31 +99,40 @@ inline Plan& GetPlan() {
 		const auto siblings = ReadCpuList("/sys/devices/system/cpu/cpu" + std::to_string(gpu) +
 		                                  "/topology/thread_siblings_list");
 		result.gpu_cpu = siblings.empty() ? gpu : *siblings.begin();
-		// The draw prepare thread (KYTY_PREPARE_THREAD) gets the first thread of the next
-		// performance core to itself; its SMT sibling stays with the emulator.
-		// KYTY_PREPARE_CPU=<n> picks another CPU, which the emulator keeps if it is not a
-		// performance core.
-		const char* prepare_env = std::getenv("KYTY_PREPARE_THREAD");
-		const bool  prepare_on  = prepare_env == nullptr || prepare_env[0] != '0';
-		int         prepare     = prepare_on ? EnvCpu("KYTY_PREPARE_CPU") : -1;
-		if (prepare_on && prepare < 0) {
-			for (auto it = performance.rbegin(); it != performance.rend(); ++it) {
-				if (siblings.count(*it) == 0 && *it != gpu) {
-					const auto core = ReadCpuList("/sys/devices/system/cpu/cpu" +
-					                              std::to_string(*it) +
-					                              "/topology/thread_siblings_list");
-					prepare = core.empty() ? *it : *core.begin();
-					break;
-				}
+		// Each draw prepare worker gets the first thread of the next performance core down to
+		// itself; its SMT sibling stays with the emulator. KYTY_PREPARE_CPU=<n> (the first
+		// worker) or KYTY_PREPARE_CPUS=<list> (in worker order) pick other CPUs, which the
+		// emulator keeps if they are not performance cores.
+		std::vector<int> prepare;
+		if (const char* list = std::getenv("KYTY_PREPARE_CPUS"); list != nullptr) {
+			std::stringstream stream(list);
+			for (std::string cpu; std::getline(stream, cpu, ',');) {
+				prepare.push_back(std::atoi(cpu.c_str()));
+			}
+		} else if (const int cpu = EnvCpu("KYTY_PREPARE_CPU"); cpu >= 0) {
+			prepare.push_back(cpu);
+		}
+		for (auto it = performance.rbegin();
+		     it != performance.rend() && prepare.size() < PrepareWorkerCount(); ++it) {
+			if (siblings.count(*it) != 0) {
+				continue;
+			}
+			const auto core  = ReadCpuList("/sys/devices/system/cpu/cpu" + std::to_string(*it) +
+			                                "/topology/thread_siblings_list");
+			const int  first = core.empty() ? *it : *core.begin();
+			if (*it == first && std::ranges::find(prepare, first) == prepare.end()) {
+				prepare.push_back(first);
 			}
 		}
-		result.prepare_cpu = prepare;
+		prepare.resize(std::min<size_t>(prepare.size(), PrepareWorkerCount()));
+		result.prepare_cpus = prepare;
 		// KYTY_RESERVE_CPUS=<list>: also keep the emulator off these (for a thread pinned there).
 		const char* reserve_env = std::getenv("KYTY_RESERVE_CPUS");
 		const auto  reserved    = reserve_env != nullptr ? ParseCpuList(reserve_env) : std::set<int> {};
 		CPU_ZERO(&result.process);
 		for (const int cpu: performance) {
-			if (siblings.count(cpu) == 0 && cpu != gpu && cpu != prepare &&
+			if (siblings.count(cpu) == 0 && cpu != gpu &&
+			    std::ranges::find(prepare, cpu) == prepare.end() &&
 			    reserved.count(cpu) == 0 && CPU_ISSET(cpu, &allowed)) {
 				CPU_SET(cpu, &result.process);
 			}
@@ -123,9 +147,13 @@ inline Plan& GetPlan() {
 inline void ApplyToProcess() {
 	auto& plan = GetPlan();
 	if (plan.active && sched_setaffinity(0, sizeof(plan.process), &plan.process) == 0) {
+		std::string prepare;
+		for (const int cpu: plan.prepare_cpus) {
+			prepare += (prepare.empty() ? "" : ",") + std::to_string(cpu);
+		}
 		std::printf("Hybrid CPU: emulator on %d performance threads, GPU command thread on CPU %d, "
-		            "draw prepare thread on CPU %d\n",
-		            CPU_COUNT(&plan.process), plan.gpu_cpu, plan.prepare_cpu);
+		            "draw prepare workers on CPUs %s\n",
+		            CPU_COUNT(&plan.process), plan.gpu_cpu, prepare.empty() ? "-" : prepare.c_str());
 	}
 }
 
@@ -141,11 +169,15 @@ inline void ApplyToGpuThread() {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
-// Call from the draw prepare thread: a performance core the emulator leaves to it (see GetPlan).
-inline void ApplyToPrepareThread() {
-	int cpu = EnvCpu("KYTY_PREPARE_CPU");
-	if (cpu < 0 && GetPlan().active) {
-		cpu = GetPlan().prepare_cpu;
+// Call from draw prepare worker `worker`: a performance core the emulator leaves to it (see
+// GetPlan).
+inline void ApplyToPrepareThread(uint32_t worker) {
+	const auto& plan = GetPlan();
+	int         cpu  = -1;
+	if (worker < plan.prepare_cpus.size()) {
+		cpu = plan.prepare_cpus[worker];
+	} else if (worker == 0) {
+		cpu = EnvCpu("KYTY_PREPARE_CPU");
 	}
 	if (cpu < 0) {
 		return;

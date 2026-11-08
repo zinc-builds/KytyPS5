@@ -468,6 +468,24 @@ void TestSrtAliasesShareReads() {
   Check(prepared_ok && plan.srt_scratch == command_scratch &&
             WalkedDescriptor(plan, 0, after) == known && (!known || after == before),
         "a prepare-thread walk failed or changed the command thread's walk results");
+  // Each prepare worker has its own scratch: a second worker's walk leaves the first's results.
+  Check(plan.prepare_scratch[0] != nullptr && plan.prepare_scratch[1] == nullptr,
+        "the first prepare worker's walk did not use its own scratch");
+  const auto first_scratch = plan.prepare_scratch[0]->srt;
+  bool second_ok = false;
+  std::thread second([&] {
+    SetSrtWalkPrepareThread(2);
+    Reads dirty{.dirty = true};
+    FakeGuestMemory local(read_memory, &dirty);
+    std::vector<uint32_t> prepared;
+    second_ok = WalkSrt(plan, {}, prepared, nullptr) &&
+                prepared == std::vector<uint32_t>{0u, 0x2222u, 0u};
+    SetSrtWalkPrepareThread(0);
+  });
+  second.join();
+  Check(second_ok && plan.prepare_scratch[1] != nullptr &&
+            plan.prepare_scratch[0]->srt == first_scratch && plan.srt_scratch == command_scratch,
+        "a second prepare worker's walk failed or changed another thread's walk results");
 }
 
 void TestUniformVectorDescriptorRead() {

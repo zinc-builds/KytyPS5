@@ -71,15 +71,17 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 // only evaluates the values, with every block reachable.
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 // The scratch a walk of plan on this thread uses: the plan's own on the command thread, its
-// prepare_scratch on the prepare thread. Walks of one plan on one thread must not overlap.
+// prepare_scratch of the prepare worker it is on. Walks of one plan on one thread must not
+// overlap.
 struct SrtWalkScratchRef {
 	std::vector<uint64_t>&                   srt;
 	std::vector<uint32_t>&                   material_keys;
 	std::vector<ResourcePlan::SelectorKeys>& selector_keys;
 };
 SrtWalkScratchRef SrtWalkScratch(const ResourcePlan& plan);
-// Marks the calling thread as the prepare thread, whose walks use separate scratch.
-void SetSrtWalkPrepareThread(bool prepare);
+// Marks the calling thread as prepare worker `worker` (1 to ResourcePlan::MaxPrepareWorkers),
+// whose walks use that worker's scratch, or as no prepare worker (0).
+void SetSrtWalkPrepareThread(uint32_t worker);
 // Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
 // one DWORD range per guest load. False when a reachable read is unknown.
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,

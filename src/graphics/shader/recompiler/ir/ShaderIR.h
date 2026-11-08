@@ -726,14 +726,15 @@ struct ResourcePlan {
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
-	// The same for walks on the prepare thread (see SetSrtWalkPrepareThread), made on its first
+	// The same for walks on each prepare worker (see SetSrtWalkPrepareThread), made on its first
 	// walk there. Each thread walks a plan only in its own scratch.
 	struct WalkScratch {
 		std::vector<uint64_t>     srt;
 		std::vector<uint32_t>     material_keys;
 		std::vector<SelectorKeys> selector_keys;
 	};
-	mutable std::unique_ptr<WalkScratch> prepare_scratch;
+	static constexpr uint32_t MaxPrepareWorkers = 4;
+	mutable std::array<std::unique_ptr<WalkScratch>, MaxPrepareWorkers> prepare_scratch;
 };
 
 struct Program: ResourcePlan {

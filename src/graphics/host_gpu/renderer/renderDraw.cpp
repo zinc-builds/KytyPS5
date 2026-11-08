@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/hybridAffinity.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -1745,18 +1746,31 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 	    !QueueableRegisters(buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders())) {
 		return nullptr;
 	}
-	if (m_prepare_worker == nullptr) {
+	if (m_prepare_lanes.empty()) {
 		const char* depth_text = std::getenv("KYTY_PREPARE_DEPTH");
 		const auto  depth = std::clamp(depth_text != nullptr ? std::atoi(depth_text) : 4, 1, 16);
-		m_queued_draws.resize(depth + 1);
+		const auto  workers = std::max(Common::HybridAffinity::PrepareWorkerCount(), 1u);
+		EXIT_IF(workers > ShaderRecompiler::IR::ResourcePlan::MaxPrepareWorkers);
+		// One more slot than the queue, rounded up to a multiple of the workers.
+		m_queued_draws.resize((depth + workers) / workers * workers);
 		for (auto& slot: m_queued_draws) {
 			slot = std::make_unique<QueuedDraw>();
 		}
 		m_prepare_verify = EnvFlag("KYTY_PREPARE_VERIFY", false);
 		m_prepare_stats  = EnvFlag("KYTY_PREPARE_STATS", false);
-		m_prepare_worker = std::make_unique<DrawPrepare::Worker>(&PrepareQueuedDraw, this);
-		Log::WriteToConsoleAndLog(fmt::format("Draw preparation thread on, {} draws ahead{}\n",
-		                                      depth, m_prepare_verify ? " (verifying)" : ""));
+		for (uint32_t i = 0; i < workers; i++) {
+			auto lane      = std::make_unique<PrepareLane>();
+			lane->executor = this;
+			lane->index    = i;
+			// Odd serials, distinct among the workers.
+			lane->textures.serial      = 1 + 2 * i;
+			lane->textures.serial_step = 2 * workers;
+			lane->worker   = std::make_unique<DrawPrepare::Worker>(&PrepareQueuedDraw, lane.get(), i);
+			m_prepare_lanes.push_back(std::move(lane));
+		}
+		Log::WriteToConsoleAndLog(fmt::format("Draw preparation on {} thread(s), {} draws ahead{}\n",
+		                                      workers, m_queued_draws.size() - 1,
+		                                      m_prepare_verify ? " (verifying)" : ""));
 	}
 	// The ring holds one more slot than the queue, so the next one is free.
 	EXIT_IF(m_queued_count >= m_queued_draws.size());
@@ -1770,10 +1784,10 @@ void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 	queued.hazard_generation = DrawPrepare::HazardGeneration();
 	queued.sync_epoch        = GuestSyncEpoch::CurrentUnranged();
 	queued.stored_sequence   = DrawPrepare::StoredSequence();
-	queued.sequence          = m_prepare_worker->Post();
+	queued.sequence          = ++m_queued_posted;
 	// The worker finds the slot from the sequence.
-	EXIT_IF(queued.sequence != ++m_queued_posted ||
-	        m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued);
+	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||
+	        PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence));
 	m_queued_count++;
 	m_prepare_stat.queued++;
 	while (m_queued_count + 1 > m_queued_draws.size()) {
@@ -1811,8 +1825,24 @@ void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& ar
 	PostQueuedDraw(buffer, *queued);
 }
 
-void RenderExecutor::PrepareQueuedDraw(void* executor, uint64_t sequence) {
-	auto& self   = *static_cast<RenderExecutor*>(executor);
+void RenderExecutor::WaitPrepareIdle() {
+	for (auto& lane: m_prepare_lanes) {
+		lane->worker->WaitIdle();
+	}
+}
+
+uint64_t RenderExecutor::PrepareBusyNs() const {
+	uint64_t busy = 0;
+	for (const auto& lane: m_prepare_lanes) {
+		busy += lane->worker->BusyNs();
+	}
+	return busy;
+}
+
+void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
+	auto& lane     = *static_cast<PrepareLane*>(prepare_lane);
+	auto& self     = *lane.executor;
+	const auto sequence = (job - 1) * self.m_prepare_lanes.size() + lane.index + 1;
 	auto& queued = *self.m_queued_draws[(sequence - 1) % self.m_queued_draws.size()];
 	queued.log.Reset();
 	DrawPrepare::SetLog(&queued.log);
@@ -1822,7 +1852,7 @@ void RenderExecutor::PrepareQueuedDraw(void* executor, uint64_t sequence) {
 	    queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
 	DrawPrepare::SetLog(nullptr);
 	self.SpeculateBuffers(queued);
-	self.SpeculateTextures(queued);
+	self.SpeculateTextures(queued, lane.textures);
 }
 
 const std::vector<TextureProposal>*
@@ -1895,7 +1925,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
 	EXIT_IF(m_queued_count == 0 || queued.sequence != sequence);
 	m_queued_count--;
-	if (const auto waited = m_prepare_worker->Wait(queued.sequence); waited != 0) {
+	if (const auto waited = PrepareWorker(sequence).Wait(PrepareJob(sequence)); waited != 0) {
 		m_prepare_stat.wait_ns += waited;
 		m_prepare_stat.waits++;
 	}
@@ -1922,21 +1952,23 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 		const auto now  = PrepareNowNs();
 		if (stat.start_ns == 0) {
 			stat.start_ns       = now;
-			stat.worker_busy_ns = m_prepare_worker->BusyNs();
+			stat.worker_busy_ns = PrepareBusyNs();
 		} else if (now - stat.start_ns >= 1'000'000'000ull) {
-			const auto busy  = m_prepare_worker->BusyNs();
+			const auto busy  = PrepareBusyNs();
 			const auto span  = static_cast<double>(now - stat.start_ns);
 			const auto draws = static_cast<double>(std::max<uint64_t>(stat.queued, 1));
 			std::printf("PREPARE queued=%" PRIu64 " direct=%" PRIu64 " adopted=%" PRIu64
 			            " failed=%" PRIu64 " hazard=%" PRIu64 " stored=%" PRIu64
 			            " gpu_written=%" PRIu64 " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
 			            " drains=%" PRIu64 ") worker_ns_per_draw=%.0f"
-			            " worker_busy=%.1f%%\n",
+			            " worker_busy=%.1f%% (workers=%zu)\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
 			            static_cast<double>(busy - stat.worker_busy_ns) / draws,
-			            100.0 * static_cast<double>(busy - stat.worker_busy_ns) / span);
+			            100.0 * static_cast<double>(busy - stat.worker_busy_ns) / span /
+			                static_cast<double>(m_prepare_lanes.size()),
+			            m_prepare_lanes.size());
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;
@@ -1968,7 +2000,7 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 	}
 	if (!usable) {
 		// The command thread may not look programs up while the worker does.
-		m_prepare_worker->WaitIdle();
+		WaitPrepareIdle();
 		ResetProgramState(state);
 		pipelines.GetGraphicsPrograms(queued.registers, queued.user_config, queued.shaders, state,
 		                              queued.resources);
@@ -1984,7 +2016,7 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		m_adopted_textures = &queued.textures;
 	}
 	if (m_prepare_verify) {
-		m_prepare_worker->WaitIdle();
+		WaitPrepareIdle();
 		static auto check = std::make_unique<std::pair<DrawRenderState, PipelineCache::GraphicsResources>>();
 		check->first = state;
 		ResetProgramState(check->first);

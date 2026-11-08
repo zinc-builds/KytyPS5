@@ -67,6 +67,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | Texture resolves proposed by the prepare worker from its own resolve memo (one record per resource and T#, description precomputed there); the command thread keeps the registration check, LRU touch and color-clear work, and resolves misses with the worker's description (Track B; same binary, `KYTY_WORKER_TEXTURES=0`: 41.01 / 41.34; `KYTY_WORKER_TEXTURES_VERIFY` 84M checks clean) | 41.41 / 41.96 | 217.9k / 220.1k | 33.5 (max 33.5) / 33.5 (max 33.6) | – |
 | 2026-11-08 | The prepare worker's texture memo is a flat open-addressed table instead of `std::unordered_map` (Track B; same batch: ref `dev` 78fa7f97 41.03 / 41.29; worker 2.90 → 2.80 µs/draw, command thread's wait for it 316 → 223 ns/draw, `KYTY_PREPARE_STATS`; verify 81M checks clean) | 42.18 / 42.42 | – | – | – |
 | 2026-11-08 | Texture bindings keep the worker record's desc when the record has not changed instead of copying ~1.1 KB per binding; record generations refresh in place instead of a 3.7 KB copy (Track B; same batch: ref `dev` 4a7f63c4 42.76 / 42.88; worker verify 82M checks and `KYTY_DTC_VERIFY` clean) | 43.62 / 43.57 | 228.8k / 229.1k | 33.5 | – |
+| 2026-11-08 | Two prepare workers, draws split alternately, the second on its own performance core (CPU 6, taken from the emulator's set); each keeps its own texture memo and SRT walk scratch (Track B4, plan item 2; same batch: ref `dev` 94c0492e 43.54 / 43.62; same binary with `KYTY_PREPARE_WORKERS=1` 43.17 → 44.66, command thread waiting for the worker 7.7% → 2.5%) | 44.92 / 44.41 | 235.7k / 233.5k | 33.5 (max 34.0) / 34.7 (max 50.0) | 27.2 / 27.3 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1443,6 +1444,22 @@ What this means:
   because `ImageInfo::mip_layout` holds 16 mips. The texture side is fixed (+1.8%); the color
   target copy goes away with render-target resolve on the worker, which builds the target in the
   queued draw's own state.
+- **Two prepare workers (Track B4, plan item 2).** Draw `n` goes to worker `(n - 1) % 2`; the ring's
+  size is a multiple of 2, so a slot always goes back to the same worker with the resolves the
+  command thread hands back for its memo. Each worker has its own SRT walk scratch per plan
+  (`ResourcePlan::prepare_scratch[worker]`), memo and record serials (odd, strided by worker).
+  The second worker gets CPU 6 to itself and the emulator keeps 8 performance threads (was 9).
+  Same binary on dev 94c0492e, `KYTY_PREPARE_WORKERS=1` vs 2 with `KYTY_STALL_DIAG`: the command
+  thread's wait for the worker fell from 6.6–8.8% to 2.5% (289–461 → ~84 ns/draw), and what is
+  left is at packet drains (waits ≈ drains, ~3.4k/s); FPS 43.17 → 44.66. Each worker's job costs
+  more (2.80 → 3.10 µs/draw: each memo and scratch sees half the draws), each worker is 36% busy.
+  Before the in-place generation refresh (#65), records refreshed through the slot reached one
+  worker only: generation refreshes on the command thread went 100k → 128k/s and two workers
+  gained under 1%; with it they are 48k/s (one worker) and 83k/s (two). Game threads do not lose
+  out: per-thread run-queue delay over 10 s windows is the same on both sides (`DrawThread`
+  ~0.1%, `tbb_thead` 23–26% on the efficiency cores, as before). A/B against dev 94c0492e
+  +3.2% / +1.8%. `KYTY_PREPARE_WORKERS=1` restores one worker and CPU 6 to the emulator;
+  `KYTY_PREPARE_CPUS=<list>` places them.
 
 ## Remaining costs and candidate directions
 
