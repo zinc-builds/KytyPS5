@@ -311,6 +311,12 @@ private:
 	const WorkerTextures* m_adopted_textures = nullptr;
 	// Prepare worker, after SpeculateBuffers: proposes the draw's texture resolves.
 	void SpeculateTextures(QueuedDraw& queued);
+	// Resolves made for the queued draw being committed, handed to its slot after the draw.
+	std::vector<TextureMemoRecord> m_texture_updates;
+	// Worker only: the resolve memo, and records replaced in the last jobs.
+	std::unordered_map<uint64_t, std::unique_ptr<WorkerTextureRecord>> m_worker_texture_memo;
+	std::vector<std::vector<std::unique_ptr<WorkerTextureRecord>>>    m_worker_texture_retired;
+	uint64_t                                                           m_worker_texture_jobs = 0;
 	// The worker's proposals for a stage being prepared, if it made them for this runtime.
 	[[nodiscard]] const std::vector<TextureProposal>* AdoptedTextureProposals(
 	    const ShaderStageRuntime& runtime) const;
@@ -363,7 +369,15 @@ private:
 	// ResolveTexture that records in `trace` whether and how its result can be reused.
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            TextureResolveMemo*                          trace);
+	                                            TextureResolveMemo*                          trace,
+	                                            const TextureDescription* known = nullptr);
+	void ResolveProposedTexture(const WorkerTextureRecord&                   record,
+	                            const ShaderRecompiler::IR::ImageResource&   resource,
+	                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                            TextureBinding&                              out);
+	void VerifyTextureResolve(const TextureBinding&                        adopted,
+	                          const ShaderRecompiler::IR::ImageResource&   resource,
+	                          const ShaderRecompiler::IR::DescriptorValue& value);
 	// The memo slots of a stage module's images.
 	[[nodiscard]] std::vector<TextureResolveMemo>& TextureMemoSlots(const ShaderModule& module);
 	// ResolveTexture for image `index` of a stage, through the stage's memo slots, into `out`.

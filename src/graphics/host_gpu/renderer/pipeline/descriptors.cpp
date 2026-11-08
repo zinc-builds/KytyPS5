@@ -691,12 +691,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
-                                              TextureResolveMemo*                          trace) {
+                                              TextureResolveMemo*                          trace,
+                                              const TextureDescription*                    known) {
 	if (trace != nullptr) {
 		trace->reusable = false;
 	}
 	// A copy: the cache lookups below must not depend on the memo's storage.
-	auto  described     = FindTextureDescription(resource, value);
+	auto  described     = known != nullptr ? *known : FindTextureDescription(resource, value);
 	auto& desc          = described.desc;
 	auto& texture_cache = m_context.GetTextureCache();
 	if (described.null) {
@@ -788,12 +789,176 @@ static void AssignWithoutMipViews(TextureBinding& out, const TextureBinding& fro
 	out.mip_views.clear();
 }
 
+static bool WorkerTexturesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WORKER_TEXTURES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_WORKER_TEXTURES_VERIFY=1: every adopted proposal is resolved again from scratch.
+static bool WorkerTexturesVerify() {
+	static const bool verify = std::getenv("KYTY_WORKER_TEXTURES_VERIFY") != nullptr;
+	return verify;
+}
+
+void RenderExecutor::VerifyTextureResolve(const TextureBinding&                        a,
+                                          const ShaderRecompiler::IR::ImageResource&   resource,
+                                          const ShaderRecompiler::IR::DescriptorValue& value) {
+	const auto b = ResolveTexture(resource, value);
+	if (a.image_id != b.image_id || a.layout != b.layout || a.desc.type != b.desc.type ||
+	    !(a.desc.view_info == b.desc.view_info) || a.desc.info.data != b.desc.info.data ||
+	    a.desc.info.pixel_format != b.desc.info.pixel_format ||
+	    a.desc.info.extent != b.desc.info.extent || a.desc.info.type != b.desc.info.type ||
+	    a.desc.info.metadata.kind != b.desc.info.metadata.kind) {
+		EXIT("KYTY_WORKER_TEXTURES_VERIFY: proposal disagrees: image %u vs %u at 0x%016" PRIx64
+		     "\n",
+		     static_cast<uint32_t>(a.image_id.index), static_cast<uint32_t>(b.image_id.index),
+		     b.desc.info.data.address);
+	}
+	static uint64_t checks = 0;
+	if (++checks % 1000000 == 0) {
+		std::printf("WORKER_TEXTURES_VERIFY checks=%" PRIu64 "\n", checks);
+		std::fflush(stdout);
+	}
+}
+
+// The worker's record for this resource and T#: its resolve if it still holds (the registration
+// check, LRU touch and color-clear materialization stay here, in order), else a resolve here
+// from the worker's description, handed back for the worker's memo.
+void RenderExecutor::ResolveProposedTexture(const WorkerTextureRecord&                   record,
+                                            const ShaderRecompiler::IR::ImageResource&   resource,
+                                            const ShaderRecompiler::IR::DescriptorValue& value,
+                                            TextureBinding&                              out) {
+	if (record.resolved) {
+		auto generation = record.generation;
+		if (record.null ||
+		    m_context.GetTextureCache().RefindExactImage(
+		        record.found_id, record.data, record.color_clear ? &record.found : nullptr,
+		        record.metadata_base_layer, generation)) {
+			if (WorkerTexturesVerify() ||
+			    GetDrawStateCacheMode() == DrawStateCacheMode::Verify) {
+				VerifyTextureResolve(record.binding, resource, value);
+			}
+			AssignWithoutMipViews(out, record.binding);
+			if (generation != record.generation) {
+				// No image appeared over it since: the worker can propose it without the per-page
+				// check next time.
+				auto update        = std::make_unique<WorkerTextureRecord>(record);
+				update->generation = generation;
+				m_texture_updates.push_back({std::move(update)});
+			}
+			return;
+		}
+	}
+	TextureResolveMemo trace;
+	auto binding = ResolveTexture(resource, value, &trace, &record.description);
+	if (trace.reusable) {
+		auto update                 = std::make_unique<WorkerTextureRecord>();
+		update->inputs              = record.inputs;
+		update->value               = record.value;
+		update->description         = record.description;
+		update->resolved            = true;
+		update->null                = trace.null;
+		update->found_id            = trace.found_id;
+		update->data                = trace.data;
+		update->generation          = trace.generation;
+		update->metadata_base_layer = trace.metadata_base_layer;
+		update->color_clear         = trace.color_clear;
+		update->found               = std::move(trace.found);
+		AssignWithoutMipViews(update->binding, binding);
+		m_texture_updates.push_back({std::move(update)});
+	}
+	AssignWithoutMipViews(out, binding);
+}
+
+// Prepare worker: files the resolves the command thread handed back through this slot, then
+// proposes each image binding's record in the worker's resolve memo (a new record, with only
+// the description, for a resource and T# it has not seen).
+void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
+	auto& memo = m_worker_texture_memo;
+	// A record replaced now may be proposed to queued draws until the ring comes round.
+	const auto retire_slots = m_queued_draws.size() + 1;
+	if (m_worker_texture_retired.size() != retire_slots) {
+		m_worker_texture_retired.resize(retire_slots);
+	}
+	auto& retired = m_worker_texture_retired[m_worker_texture_jobs++ % retire_slots];
+	retired.clear();
+	constexpr size_t MaxRecords = 16384;
+	const auto       file       = [&](std::unique_ptr<WorkerTextureRecord> record) {
+        if (memo.size() >= MaxRecords) {
+            for (auto& [key, old]: memo) {
+                retired.push_back(std::move(old));
+            }
+            memo.clear();
+        }
+        auto& slot = memo[TextureDescriptionKey(record->inputs, record->value)];
+        if (slot != nullptr) {
+            retired.push_back(std::move(slot));
+        }
+        slot = std::move(record);
+	};
+	for (auto& update: queued.texture_updates) {
+		file(std::move(update.record));
+	}
+	queued.texture_updates.clear();
+	auto& textures = queued.textures;
+	textures.ready = false;
+	auto& state    = queued.state;
+	if (!WorkerTexturesEnabled() || queued.log.failed || m_lod_stats ||
+	    GetDrawStateCacheMode() == DrawStateCacheMode::Off ||
+	    state.vertex_info[0].stage.module == nullptr) {
+		return;
+	}
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < state.vertex_stage_count; i++) {
+		textures.runtimes[count++] = &state.vertex_info[i].stage;
+	}
+	if (state.ps_active) {
+		textures.runtimes[count++] = &state.ps_input_info.stage;
+	}
+	textures.stage_count = count;
+	for (uint32_t s = 0; s < count; s++) {
+		const auto& runtime  = *textures.runtimes[s];
+		const auto& images   = runtime.module->info.info.images;
+		const auto& snapshot = *runtime.resources;
+		auto&       out      = textures.stages[s];
+		out.resize(images.size());
+		for (uint32_t i = 0; i < images.size(); i++) {
+			if (images[i].heap) {
+				out[i] = {};
+				continue;
+			}
+			const auto  inputs = TextureDescriptionInputs(images[i]);
+			const auto& value  = snapshot.images[i];
+			const auto  found  = memo.find(TextureDescriptionKey(inputs, value));
+			if (found != memo.end() && found->second->value == value &&
+			    found->second->inputs == inputs) {
+				out[i] = {found->second.get()};
+				continue;
+			}
+			auto record         = std::make_unique<WorkerTextureRecord>();
+			record->inputs      = inputs;
+			record->value       = value;
+			record->description = DescribeTexture(inputs, value, m_context.GetGraphics());
+			out[i]              = {record.get()};
+			file(std::move(record));
+		}
+	}
+	textures.ready = true;
+}
+
 void RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*             memo,
                                          uint32_t                                     index,
                                          const ShaderRecompiler::IR::ImageResource&   resource,
                                          const ShaderRecompiler::IR::DescriptorValue& value,
                                          TextureBinding&                              out,
-                                         const TextureProposal* /*proposal*/) {
+                                         const TextureProposal*                       proposal) {
+	if (proposal != nullptr && proposal->record != nullptr) {
+		ResolveProposedTexture(*proposal->record, resource, value, out);
+		return;
+	}
 	if (memo == nullptr) {
 		AssignWithoutMipViews(out, ResolveTexture(resource, value));
 		return;

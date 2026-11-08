@@ -64,6 +64,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Per-draw fences off the command thread: lookups of unchanged images skip the texture cache's lock (a per-image atomic "settled" state that CPU write faults clear), retired-operation checks skip the scheduler's mutex, recorder hand-offs skip the full fence, overlay counters are per thread (Track B; same batch: ref `dev` ab1429f1 39.21 / 39.52; before #55, on 75f3eebc +1.5% and on b4a91152 4 pairs +1.9%; samples right after a locked instruction 8.1% → 1.1% of the command thread; `KYTY_TC_SETTLED_VERIFY` 104M checks clean) | 39.98 / 39.78 | 209.3k / 209.9k | 33.5 (max 33.6) / 33.5 (max 33.7) | 28.7 / 28.6 |
 | 2026-11-08 | The last per-draw fences: the render context mutex is biased to the command thread (other threads force a `membarrier` and wait; `KYTY_RENDER_MUTEX_BIASED=0` turns it off), `FindDepthTarget` skips the texture cache lock for settled images, `ClampRangeSize` remembers answers per thread until the ranges change (Track B; same batches: ref `dev` ee714f06 40.70 / 40.83 / 40.68 / 40.46; settled verify 106M checks clean) | 40.78 / 41.06 / 41.01 / 40.99 | 214.2k / 215.1k / 215.8k / 215.6k | 33.5–35.7 (max 33.6–66.7) | 28.7 / 29.9 / – / – |
 | 2026-11-08 | The prepare worker looks up the draw's clean buffers too: storage buffer sources and vertex ranges, validated at the commit by the buffer registration sequence and a global CPU-dirty generation (Track B4 item 2; same batch: ref `dev` 1ed41724 40.55, worst_ms 33.5; buffer acquisition 668 → 519 ns/draw on ab1429f1, worker 2.33 → 2.57 µs/draw, 51% busy) | 42.13 | 221.0k | 33.5 (max 33.6) | 29.9 |
+| 2026-11-08 | Texture resolves proposed by the prepare worker from its own resolve memo (one record per resource and T#, description precomputed there); the command thread keeps the registration check, LRU touch and color-clear work, and resolves misses with the worker's description (Track B; same binary, `KYTY_WORKER_TEXTURES=0`: 41.01 / 41.34; `KYTY_WORKER_TEXTURES_VERIFY` 84M checks clean) | 41.41 / 41.96 | 217.9k / 220.1k | 33.5 (max 33.5) / 33.5 (max 33.6) | – |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1420,6 +1421,15 @@ What this means:
   38.69 / 38.59 on b4a91152 (+4.2% in all). Any one lock left absorbs the drain, so they pay
   only together. With the render context mutex, `FindDepthTarget`'s lock
   and `ClampRangeSize`'s mutex gone too, +0.7% more (4 pairs on ee714f06).
+
+- **Texture resolve on the prepare worker (dev 4cd7da6a).** The command thread's
+  `ResolveStageTexture` fell from 13.5% to 6.2% of its time (misses through `FindImage` and
+  `FindTextureDescription` were 7.7% of it; the worker's memo holds every resource and T# it has
+  seen, where the command thread's kept one per module slot). The worker pays for it: 2.53 →
+  2.94 µs/draw, busy 55% → 64%, and the command thread now waits for it 8.2% of the time
+  (2.6% before; 351 vs 107 ns/draw). FPS +1.2%: the worker co-limits the pipeline in bursts, so
+  most of the command thread's saving waits for a second worker. A deeper queue
+  (`KYTY_PREPARE_DEPTH=8`) does not help.
 
 ## Remaining costs and candidate directions
 
