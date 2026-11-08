@@ -4,6 +4,12 @@
 # KYTY_INSTALL: emulator install dir (default: this checkout's _Build/linux/install)
 # KYTY_GAME:    game dump (default: ~/Games/PS5/PPSA21567.zar)
 log=/tmp/bench-$1.log; shift
+# Set but empty usually means a failed `ref=$(refbuild.sh …)`: never fall back to this checkout.
+if [ -n "${KYTY_INSTALL+x}" ] && [ ! -x "$KYTY_INSTALL/kyty_emulator" ]; then
+	echo "run.sh: KYTY_INSTALL='$KYTY_INSTALL' has no kyty_emulator (did refbuild.sh fail?)" >&2
+	echo "EXIT STATUS: bad KYTY_INSTALL" > "$log"
+	exit 1
+fi
 . "$(dirname "$0")/benchlock.sh"
 benchlock_acquire x "run.sh $(basename "$log")" || exit 1
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
