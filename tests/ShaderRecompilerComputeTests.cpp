@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -1433,6 +1434,9 @@ constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
 constexpr ShaderProfile SrgbViewProfile{
     .maintenance8 = true, .r8_srgb_views = true, .r8g8_srgb_views = true};
 
+// SPIR-V words KYTY_BDA_STATS=access adds to get_bda_pointer (one access mark, 66 words).
+constexpr size_t kBdaAccessSpirvAllowance = 96u;
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1480,6 +1484,9 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
+  // KYTY_BDA_STATS=access: a guest address the shader reads through BDA, whose page bit must be
+  // set in the access bitmap after the fault bitmap.
+  std::optional<uint64_t> bda_accessed_address;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -1903,9 +1910,13 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   CheckSpirvEmission(test, result.spirv);
   if (test.max_spirv_words != 0u) {
     const auto words = SpirvCodeWords(result.spirv);
-    Require(test.name, "emitted shader size", words <= test.max_spirv_words,
+    // KYTY_BDA_STATS=access adds a fixed access mark to get_bda_pointer; the limit stays the
+    // uninstrumented one otherwise.
+    const size_t allowance =
+        Libs::Graphics::MemDiag::BdaStatsMode() == 2 ? kBdaAccessSpirvAllowance : 0u;
+    Require(test.name, "emitted shader size", words <= test.max_spirv_words + allowance,
             "SPIR-V words=" + std::to_string(words) +
-                ", limit=" + std::to_string(test.max_spirv_words));
+                ", limit=" + std::to_string(test.max_spirv_words + allowance));
     std::printf("[compute] %s wave=%u SPIR-V words=%zu\n", test.name,
                 result.program.wave_size, words);
   }
@@ -20026,27 +20037,46 @@ public:
                           &barrier, 0, nullptr);
     }
     Buffer fault_result;
-    if (test.fault_free_address) {
+    const bool check_access = test.bda_accessed_address.has_value() &&
+                              Libs::Graphics::MemDiag::BdaStatsMode() == 2;
+    if (test.fault_free_address || check_access) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
-      fault_result = CreateHostBuffer(test.name, sizeof(u32),
+      fault_result = CreateHostBuffer(test.name, 2 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
       const vk::MemoryBarrier ready{
           .srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
           .dstAccessMask = vk::AccessFlagBits::eTransferRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
-      const vk::BufferCopy region{(BufferCache::PageIndex(*test.fault_free_address) >> 5u) * sizeof(u32),
-                                   0, sizeof(u32)};
-      cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
+      if (test.fault_free_address) {
+        const vk::BufferCopy region{
+            (BufferCache::PageIndex(*test.fault_free_address) >> 5u) * sizeof(u32), 0, sizeof(u32)};
+        cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
+      }
+      if (check_access) {
+        const vk::BufferCopy region{
+            BufferCache::CACHING_NUMPAGES / 8 +
+                (BufferCache::PageIndex(*test.bda_accessed_address) >> 5u) * sizeof(u32),
+            sizeof(u32), sizeof(u32)};
+        cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
+      }
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                                         .dstAccessMask = vk::AccessFlagBits::eHostRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
                           {}, 1, &readable, 0, nullptr, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
-    if (test.fault_free_address) {
-      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == 0u,
-              "suppressed formatted access touched an unmapped page");
+    if (test.fault_free_address || check_access) {
+      const auto words = ReadBuffer(test.name, fault_result, 2);
+      if (test.fault_free_address) {
+        Require(test.name, "fault check", words[0] == 0u,
+                "suppressed formatted access touched an unmapped page");
+      }
+      if (check_access) {
+        const auto page = BufferCache::PageIndex(*test.bda_accessed_address);
+        Require(test.name, "access check", ((words[1] >> (page & 31u)) & 1u) != 0u,
+                "a BDA read did not mark its page in the access bitmap");
+      }
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -24180,8 +24210,10 @@ private:
                        vk::BufferUsageFlagBits::eTransferDst;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
-    m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage | vk::BufferUsageFlagBits::eTransferSrc);
+    // KYTY_BDA_STATS=access: the access bitmap follows the fault bitmap.
+    const auto bitmaps = Libs::Graphics::MemDiag::BdaStatsMode() == 2 ? 2u : 1u;
+    m_fault_buffer = CreateDeviceBuffer(shader_name, bitmaps * BufferCache::CACHING_NUMPAGES / 8,
+                                        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -36343,6 +36375,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 0}};
   test.fault_free_address = GuestBase + 0x100000u;
+  test.bda_accessed_address = GuestBase + payload_base;
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;

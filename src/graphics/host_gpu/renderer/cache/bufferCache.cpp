@@ -1651,6 +1651,9 @@ struct Totals {
 	// Uploads a bind (ObtainBuffer*) later covered, and uploads replaced by another upload of the
 	// page with no bind in between: those a lazy sync would not have made.
 	uint64_t consumed_bytes = 0, superseded_bytes = 0;
+	// Unresolved uploads dropped when the tracking map hit its cap: neither consumed nor
+	// superseded (the classification restarts after a nonzero value).
+	uint64_t unknown_bytes = 0;
 };
 Totals                                                     g_totals;
 std::unordered_map<uint64_t, PageState>                    g_pages; // 4 KiB page
@@ -1819,8 +1822,9 @@ void Print(double seconds, uint64_t frames) {
 	            static_cast<unsigned long long>(t.line_hist[3]),
 	            static_cast<unsigned long long>(t.line_hist[4]),
 	            static_cast<unsigned long long>(t.line_hist[5]));
-	std::printf(" | consumed_kb_s=%.0f superseded_kb_s=%.0f unconsumed_pages=%zu", kb(t.consumed_bytes),
-	            kb(t.superseded_bytes), g_unconsumed.size());
+	std::printf(" | consumed_kb_s=%.0f superseded_kb_s=%.0f unknown_kb=%llu unconsumed_pages=%zu",
+	            kb(t.consumed_bytes), kb(t.superseded_bytes),
+	            static_cast<unsigned long long>(t.unknown_bytes / 1024), g_unconsumed.size());
 	if (MemDiag::BdaStatsMode() == 2) {
 		std::printf(" | shaders=%llu bits=%llu", static_cast<unsigned long long>(MemDiag::g_bda_access_shaders.load()),
 		            static_cast<unsigned long long>(t.access_bits));
@@ -1866,17 +1870,22 @@ void BufferCache::BdaStatsTick() {
 	const double seconds = std::chrono::duration<double>(now - last).count();
 	const auto   frames  = MemDiag::g_flips.load(std::memory_order_relaxed);
 	last                 = now;
+	{
+		// Cap the tracking map; its unresolved bytes are reported as unknown in this line.
+		std::lock_guard lock(BdaStats::g_unconsumed_mutex);
+		if (BdaStats::g_unconsumed.size() > (1u << 22u)) {
+			for (const auto& [page, bytes]: BdaStats::g_unconsumed) {
+				(void)page;
+				BdaStats::g_totals.unknown_bytes += bytes;
+			}
+			BdaStats::g_unconsumed.clear();
+		}
+	}
 	BdaStats::Print(seconds, frames - last_frames);
 	last_frames       = frames;
 	BdaStats::g_totals = {};
 	if (BdaStats::g_pages.size() > (1u << 22u)) {
 		BdaStats::g_pages.clear();
-	}
-	{
-		std::lock_guard lock(BdaStats::g_unconsumed_mutex);
-		if (BdaStats::g_unconsumed.size() > (1u << 22u)) {
-			BdaStats::g_unconsumed.clear();
-		}
 	}
 	if (MemDiag::BdaStatsMode() != 2 || BdaStats::g_access_pending) {
 		return;
