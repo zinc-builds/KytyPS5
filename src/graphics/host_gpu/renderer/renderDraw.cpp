@@ -1482,7 +1482,9 @@ void RenderExecutor::FlushAtomicWrites(CommandBuffer& buffer) {
 	}
 	buffer.EndRendering();
 	ShaderWriteBarrier(buffer.Handle(), m_atomic_batch.stages);
-	m_atomic_batch = {};
+	m_atomic_batch.stages = {};
+	m_atomic_batch.atomic.Clear(); // keeping their capacity
+	m_atomic_batch.plain.Clear();
 }
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
