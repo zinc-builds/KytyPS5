@@ -100,6 +100,13 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
+	// The oldest pending operation's tick, UINT64_MAX when none; written under m_operation_mutex.
+	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
+	void                         NotePendingFront() noexcept {
+		m_pending_front_tick.store(m_pending_operations.empty() ? UINT64_MAX
+		                                                        : m_pending_operations.front().tick,
+		                           std::memory_order_release);
+	}
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;

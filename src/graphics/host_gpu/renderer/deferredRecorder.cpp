@@ -53,11 +53,17 @@ void DeferredRecorder::Publish() {
 		return;
 	}
 	m_last_published = m_write;
-	m_published.store(m_write, std::memory_order_seq_cst);
-	if (m_sleeping.load(std::memory_order_seq_cst)) {
-		m_sleeping.store(false, std::memory_order_seq_cst);
-		m_sleeping.notify_one();
+	// No fence per draw: if the recorder starts to sleep just now, this check can miss it. It
+	// then sleeps until the next Publish sees it, or until WaitDone wakes it for certain.
+	m_published.store(m_write, std::memory_order_release);
+	if (m_sleeping.load(std::memory_order_relaxed)) {
+		Wake();
 	}
+}
+
+void DeferredRecorder::Wake() {
+	m_sleeping.store(false, std::memory_order_seq_cst);
+	m_sleeping.notify_one();
 }
 
 void DeferredRecorder::WaitDone(uint64_t position) {
@@ -66,6 +72,12 @@ void DeferredRecorder::WaitDone(uint64_t position) {
 	}
 	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdRecorder);
 	Publish();
+	// Pairs with the recorder's seq_cst sleeping store and published load: either it sees what
+	// was published, or this sees it asleep.
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	if (m_sleeping.load(std::memory_order_relaxed)) {
+		Wake();
+	}
 	for (uint32_t spins = 0; m_done.load(std::memory_order_acquire) < position; spins++) {
 		if (spins < 4096) {
 			KYTY_RECORDER_PAUSE();

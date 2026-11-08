@@ -1,6 +1,7 @@
 #ifndef KYTY_COMMON_DEBUG_COUNTERS_H_
 #define KYTY_COMMON_DEBUG_COUNTERS_H_
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -71,8 +72,35 @@ inline void SetEnabled(bool enabled) noexcept {
 	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
 }
 
+namespace Detail {
+// One shard of counters per thread (the first ShardCount threads to count), each written only by
+// its thread: counting needs no locked instruction. Get sums the shards.
+inline constexpr int ShardCount = 64;
+struct alignas(64) Shard {
+	std::atomic<uint64_t> values[static_cast<int>(Counter::Count)] {};
+};
+inline Shard                g_shards[ShardCount];
+inline std::atomic<int>     g_shards_used {0};
+inline thread_local Shard*  t_shard = nullptr;
+inline thread_local bool    t_shard_taken = false;
+
+[[nodiscard]] inline Shard* ThreadShard() noexcept {
+	if (!t_shard_taken) {
+		t_shard_taken    = true;
+		const auto index = g_shards_used.fetch_add(1, std::memory_order_relaxed);
+		t_shard          = index < ShardCount ? &g_shards[index] : nullptr;
+	}
+	return t_shard;
+}
+} // namespace Detail
+
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	if (!Enabled()) {
+		return;
+	}
+	if (auto* shard = Detail::ThreadShard(); shard != nullptr) {
+		auto& slot = shard->values[static_cast<int>(counter)];
+		slot.store(slot.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
 		return;
 	}
 	Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -116,7 +144,14 @@ private:
 };
 
 [[nodiscard]] inline uint64_t Get(Counter counter) noexcept {
-	return Detail::g_counters[static_cast<int>(counter)].load(std::memory_order_relaxed);
+	const auto index = static_cast<int>(counter);
+	auto       total = Detail::g_counters[index].load(std::memory_order_relaxed);
+	const auto used  = std::min(Detail::g_shards_used.load(std::memory_order_relaxed),
+	                            Detail::ShardCount);
+	for (int shard = 0; shard < used; shard++) {
+		total += Detail::g_shards[shard].values[index].load(std::memory_order_relaxed);
+	}
+	return total;
 }
 
 [[nodiscard]] inline uint64_t Get(Peak peak) noexcept {

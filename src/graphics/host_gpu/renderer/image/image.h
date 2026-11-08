@@ -73,6 +73,7 @@ public:
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void MarkCpuDirty() {
+		Unsettle();
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
 		HeapChanged();
@@ -83,6 +84,7 @@ public:
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
 	void               MarkMaybeCpuDirty() {
 		if (!IsCpuDirty()) {
+			Unsettle();
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
 			HeapChanged();
@@ -100,10 +102,14 @@ public:
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               ClearGpuModified() noexcept {
+		Unsettle();
+		m_gpu_modified = false;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
+		Unsettle();
 		m_buffer_modified = true;
 		HeapChanged();
 	}
@@ -131,6 +137,18 @@ public:
 			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
 		}
 	}
+
+	// What the texture cache's lock-free lookups may skip for this image (TextureCache::Settle).
+	// Set by the GPU thread under the cache lock; cleared, also under it, by every change that
+	// would make a refresh or GPU-write commit do work, including CPU write faults on other
+	// threads.
+	enum Settled : uint8_t {
+		SettledRefresh = 1u, // RefreshImage would do nothing
+		SettledWrite   = 2u, // nor would CommitGpuWrite
+		SettledTarget  = 4u, // and it is already a render target
+	};
+	std::atomic<uint8_t> settled {0};
+	void                 Unsettle() noexcept { settled.store(0, std::memory_order_release); }
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
 	static inline std::atomic<uint64_t> serials {0};

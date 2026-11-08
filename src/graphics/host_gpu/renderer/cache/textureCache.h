@@ -184,6 +184,10 @@ private:
 	[[nodiscard]] bool RegistrationsSince(uint64_t address, uint64_t size,
 	                                      uint64_t generation) const;
 
+	// Caller holds m_lock: what a lock-free lookup of the image may skip.
+	[[nodiscard]] Image::Settled SettledState(const Image& image) const;
+	void                         Settle(Image& image);
+	void                         VerifySettled(const Image& image, uint8_t need);
 	// Caller holds m_lock; it also serializes Image::picked.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
