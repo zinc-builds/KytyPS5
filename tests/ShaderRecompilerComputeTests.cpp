@@ -3291,6 +3291,59 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // C1 stage 1, late labels: a RELEASE_MEM label is stored once the host GPU has finished the
+  // work before it; a WAIT_REG_MEM that the pending label satisfies passes at once; a WRITE_DATA
+  // decoded after that wait is stored after the label.
+  void CheckLateLabels() {
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    GuestGpu::SetLateLabelsModeForTests(2);
+    alignas(8) uint32_t label = 0;
+    alignas(8) uint32_t after = 0;
+    const auto address = [](const void *value) {
+      return reinterpret_cast<uint64_t>(value);
+    };
+    std::array<uint32_t, 20> commands{};
+    commands[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+    commands[1] = 0x28u | (5u << 8u);
+    commands[2] = 1u << 29u; // 32-bit immediate, no interrupt
+    commands[3] = static_cast<uint32_t>(address(&label));
+    commands[4] = static_cast<uint32_t>(address(&label) >> 32u);
+    commands[5] = 7;
+    commands[6] = 0;
+    commands[7] = 0x123u;
+    commands[8] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+    commands[9] = 0x10u | 3u; // memory, equal
+    commands[10] = static_cast<uint32_t>(address(&label));
+    commands[11] = static_cast<uint32_t>(address(&label) >> 32u);
+    commands[12] = 7;
+    commands[13] = UINT32_MAX;
+    commands[15] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+    commands[16] = 0;
+    commands[17] = static_cast<uint32_t>(address(&after));
+    commands[18] = static_cast<uint32_t>(address(&after) >> 32u);
+    commands[19] = 22;
+    bool deferred_at_decode = false;
+    auto processor = std::make_unique<CommandProcessor>(context, 0);
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      Pm4Execution execution;
+      const auto result = processor->Process(execution, commands);
+      deferred_at_decode =
+          result == Pm4ProcessResult::Complete && label == 0 && after == 0;
+      processor->BufferFlush();
+    });
+    gpu.WaitForIdle();
+    const bool stored = label == 7 && after == 22;
+    GuestGpu::SetLateLabelsModeForTests(-1);
+    Require("LateLabels", "deferred stores",
+            deferred_at_decode && stored,
+            "the label was stored at decode, the wait did not pass on its pending "
+            "value, the write after it was not held, or the stores never landed");
+  }
+
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
     auto &context = Renderer();
@@ -56897,6 +56950,7 @@ int main(int argc, char **argv) {
   }
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
+  vulkan.CheckLateLabels();
   vulkan.CheckScalarLeafCall();
   if (skipped_device_checks) {
     std::printf(

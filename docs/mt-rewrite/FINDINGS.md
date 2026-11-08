@@ -77,6 +77,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | Small cuts on the command thread: the texture proposal carries its record's serial and color-clear flag, so a reused stage reads no record (nor restores the layout `CommitBindings` sets); `IsMetaCleared` reads the GPU-thread-only metadata map without the cache lock (`KYTY_META_LOCK=1` restores it); images and buffers mirror their LRU tick and skip `Touch` when already touched this GC tick (`KYTY_LRU_MIRROR=0` disables; `Touch` was already a no-op then, so eviction order is unchanged); the vertex-range merge runs on the prepare worker (`KYTY_WORKER_BUFFERS=verify` merges again and compares) (Track B4; same batch: ref `dev` f1386607 48.43 / 49.27; `KYTY_DTC_VERIFY` + `KYTY_PREPARE_VERIFY` and the buffer, texture and binding-reuse verify modes clean) | 48.53 / 49.83 | 256.5k / 261.7k | 33.5 (max 33.6) / 33.4 (max 33.5) | 29.9 / 29.9 |
 | 2026-11-08 | Pipeline key on the prepare worker: the worker builds the graphics pipeline key and its hash from its programs, proposed targets and the queued registers; the command thread checks the final targets (formats, samples, slots, export mappings, depth, topology, restart) and looks the pipeline up with the worker's hash (hash first on the last-pipeline check, last key kept as a pointer, keys hash only their used bytes). Command thread `GetGraphicsPipeline` 4.1% → 2.4% (~162 → ~95 ns/draw); 99.6% of draws use the worker's key, 0 target mismatches, `KYTY_WORKER_PIPELINE_KEY_VERIFY` 8M checks clean. Worker time counts: a first version without the used-bytes hash and the prefetch was −0.5% (the same binary building the key but ignoring it, −2.4%) (Track B5; same batch, 2 pairs: ref `dev` 93ac4f97 49.48 / 50.00; +0.9%, both pairs up; earlier bases +0.7% on f1386607, +1.4% on c7bdab8f) | 50.07 / 50.33 | 263.1k / 259.1k | 33.4 (max 33.5) / 38.5 (max 99.5) | 29.9 / 26.9 |
 | 2026-11-08 | `KYTY_BDA_STATS` diagnostic for `PrepareBda`'s uploads, off by default (Track B; findings under "Buffer uploads": the bytes are real, DMA shaders read almost none of them and 56% are replaced before any overlapping bind, so pointing the BDA page table at guest memory (C1) could remove the eager copy, with the binds' share to be measured on the prototype; with the diagnostic off, same binary after an access run 45.28, `dev` 23191d32 45.30) | 45.28 | 238.0k | 37.0 (max 83.4) | 27.3 |
+| 2026-11-08 | Late labels, C1 stage 1, off by default (`KYTY_LATE_LABELS=1`): end-of-pipe labels and interrupts stored once the host GPU has finished the work before them; a WAIT_REG_MEM that this processor's pending label will satisfy passes at once (Track B; same binary: off 45.59, on 44.40, verify 44.26; labels land 5.6 ms after decode on average; ~10.8k waits/s pass on pending values, none refused; ~7.4k CP stores/s held behind them) | 44.40 | 232.5k | 33.5 (max 33.9) | 29.8 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1337,6 +1338,33 @@ a DMA shader reads is only known on the GPU. Pointing the BDA page table at the 
 memory for CPU-written pages (C1) would make the upload unnecessary for DMA reads. How much of
 the copy then moves to the binds' own syncs and stream copies is not measured here; the
 coverage figures above bound neither side, so C1's saving has to be measured on its prototype.
+### Late labels: labels at host GPU completion (C1 stage 1, Track B, 2026-11-08)
+
+Reading guest memory in place (C1) needs the guest to see a label only once the host GPU has
+finished the work before it; until now labels were stored when the command thread decoded the
+packet. `KYTY_LATE_LABELS=1` stores RELEASE_MEM labels (and raises their interrupts) from a
+priority operation at the completion of the command buffer they were recorded in, posted back to
+the command thread in order (`=verify` prints `LATELABELS` lines).
+
+- Naive (experiment `exp/trackB-late-labels`): 43.6 → 9.7 FPS. The command processor issues
+  ~11k WAIT_REG_MEM/s on its own labels, so every one became a CPU → GPU → CPU round trip
+  (command thread 33% blocked) and the game paced itself at 100 ms.
+- A wait that the newest pending value of this processor's label satisfies passes at once: every
+  guest queue records into the one host queue, so the work after the wait runs after the work
+  before the label. CP stores decoded after such a wait (WRITE_DATA, semaphore signals) are held
+  behind the labels deferred so far.
+- Only when the processor is the only writer seen to store a value that releases the wait. Each
+  label store first compares the label with the processor's last store to it: in Sky Garden
+  something else stores to ~40k label addresses (~12k stores/s), always 0 (the game resets its
+  labels), which releases none of the waits. Refusing every label something else touches
+  (the first version) left ~40 waits/s passing and 11 FPS.
+- Reference-clock labels keep the clock read at decode. Read at completion, Sky Garden runs 4%
+  slower: the game sees its real GPU time and reacts (`Image::FindView` from `RebindImages`
+  doubles).
+- Cost with it on: 45.59 → 44.40 FPS (−2.6%), about the experiment's: the deferral, the held
+  CP stores and the bookkeeping on the command thread. Labels reach the guest 5.6 ms after
+  decode on average (max ~16 ms); flips, the game's sleep time and the command thread's blocked
+  time do not change. With it off, behaviour is as before.
 
 ### Tooling notes
 
@@ -1577,6 +1605,9 @@ What this means:
   uploaded bytes that no DMA shader read (`read_kb` / `unread_kb`; "unread" means the page was
   not marked in the access window of the upload or the next one); its shaders are kept apart
   in the shader store. Both modes halve FPS; the A/B figures in a run with them are not FPS.
+- Late labels (Track B, C1 stage 1): `KYTY_LATE_LABELS=1` stores RELEASE_MEM labels at host
+  GPU completion; `=verify` also prints `LATELABELS` lines (deferred, applied, waits passed on
+  pending values and refused, CP stores held, labels something else stored, delay).
 - Dispatch chains (Track G3): `KYTY_DISPATCH_CHAIN=0` records every dispatch's barriers again,
   `KYTY_DISPATCH_CHAIN=stats` prints `DISPCHAIN` lines (dispatches and chained dispatches per second).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every

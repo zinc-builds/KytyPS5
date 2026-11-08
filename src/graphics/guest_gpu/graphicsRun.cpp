@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <atomic>
 #include <cstdio>
@@ -46,6 +47,8 @@ static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_late_link->gpu = this;
+	renderer.GetCommandScheduler().SetBeforeSubmit([this] { FlushLateBatch(); });
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_thread = std::jthread(ThreadRun, this);
 }
@@ -87,6 +90,177 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
+}
+
+static uint64_t LateNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+static int LateLabelsEnvMode() {
+	const char* value = std::getenv("KYTY_LATE_LABELS");
+	if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+		return 0;
+	}
+	return std::strcmp(value, "verify") == 0 ? 2 : 1;
+}
+
+static std::atomic<int> g_late_labels_mode {LateLabelsEnvMode()};
+
+int GuestGpu::LateLabelsMode() noexcept {
+	return g_late_labels_mode.load(std::memory_order_relaxed);
+}
+
+void GuestGpu::SetLateLabelsModeForTests(int mode) noexcept {
+	g_late_labels_mode.store(mode < 0 ? LateLabelsEnvMode() : mode, std::memory_order_relaxed);
+}
+
+void GuestGpu::DeferLateStore(uint64_t vaddr, uint64_t value, uint64_t size,
+                              Common::UniqueFunction<void>&& store) {
+	EXIT_IF(!IsGpuThread());
+	LateLabel* label = nullptr;
+	if (size != 0) {
+		label = &m_late_labels[vaddr];
+		label->pending++;
+		label->value = value;
+	}
+	m_late_in_flight.fetch_add(1, std::memory_order_relaxed);
+	m_late_stats.deferred++;
+	m_late_batch.push_back(
+	    {++m_late_deferred, vaddr, value, size, LateNowNs(), label, std::move(store)});
+}
+
+void GuestGpu::FlushLateBatch() {
+	if (m_late_batch.empty() || !IsGpuThread()) {
+		return;
+	}
+	// The priority queue runs in tick order, after each tick's work finished on the host GPU.
+	m_renderer.GetCommandScheduler().DeferPriorityOperation(
+	    [link = m_late_link, batch = std::move(m_late_batch)]() mutable {
+		    std::lock_guard lock(link->mutex);
+		    if (link->gpu != nullptr) {
+			    link->gpu->PostLateBatch(std::move(batch));
+		    }
+	    });
+	m_late_batch.clear();
+}
+
+void GuestGpu::PostLateBatch(std::vector<LateStore>&& batch) {
+	Common::LockGuard lock(m_queue_mutex);
+	m_late_posted.push_back(std::move(batch));
+	m_late_posted_count.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+}
+
+bool GuestGpu::ProcessLateLabels() {
+	if (m_late_posted_count.load(std::memory_order_acquire) == 0) {
+		return false;
+	}
+	std::vector<std::vector<LateStore>> batches;
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		batches.swap(m_late_posted);
+		m_late_posted_count.store(0, std::memory_order_relaxed);
+	}
+	for (auto& batch: batches) {
+		for (auto& item: batch) {
+			ApplyLateStore(item);
+		}
+	}
+	return !batches.empty();
+}
+
+void GuestGpu::ApplyLateStore(LateStore& item) {
+	// Stores reach the guest in the order the packets were decoded.
+	if (item.sequence != m_late_applied + 1) {
+		EXIT("late labels: store %" PRIu64 " applied after %" PRIu64 "\n", item.sequence,
+		     m_late_applied);
+	}
+	// The record stays put while it has stores pending (only idle ones are erased).
+	LateLabel* label = item.label;
+	uint64_t   mask  = 0;
+	if (label != nullptr) {
+		mask  = item.size >= sizeof(uint64_t) ? ~uint64_t {0} : (uint64_t {1} << (item.size * 8u)) - 1u;
+		// Something else stored to the label since this processor did: remember the value, so
+		// that a wait it would release does not pass on a pending store.
+		uint64_t current = 0;
+		if (label->has_written && LibKernel::Memory::TryReadBacking(item.vaddr, &current, item.size) &&
+		    (current & mask) != label->written) {
+			current &= mask;
+			const auto end = label->foreign.begin() + label->foreign_count;
+			if (!label->foreign_any && std::find(label->foreign.begin(), end, current) == end) {
+				if (label->foreign_count == label->foreign.size()) {
+					label->foreign_any = true;
+				} else {
+					label->foreign[label->foreign_count++] = current;
+				}
+			}
+			m_late_stats.foreign++;
+			m_late_stats.foreign_zero += current == 0 ? 1 : 0;
+		}
+	}
+	m_late_applying = true;
+	item.store();
+	m_late_applying = false;
+	m_late_applied  = item.sequence;
+	if (label != nullptr) {
+		label->written     = item.value & mask;
+		label->has_written = true;
+		EXIT_IF(label->pending == 0);
+		label->pending--;
+	}
+	m_late_in_flight.fetch_sub(1, std::memory_order_release);
+	// Bounded: forget addresses with nothing pending and no other writer seen.
+	if ((item.sequence & 0xffffu) == 0 && m_late_labels.size() > (1u << 20u)) {
+		std::erase_if(m_late_labels, [](const auto& entry) {
+			const auto& l = entry.second;
+			return l.pending == 0 && l.foreign_count == 0 && !l.foreign_any;
+		});
+	}
+	const auto now   = LateNowNs();
+	auto&      stats = m_late_stats;
+	stats.applied++;
+	stats.delay_ns += now - item.deferred_ns;
+	stats.max_delay_ns = std::max(stats.max_delay_ns, now - item.deferred_ns);
+	if (LateLabelsMode() == 2) {
+		ReportLateLabels(now);
+	}
+}
+
+void GuestGpu::ReportLateLabels(uint64_t now_ns) {
+	auto& stats = m_late_stats;
+	if (stats.start_ns == 0) {
+		stats.start_ns = now_ns;
+		return;
+	}
+	if (now_ns - stats.start_ns < 1'000'000'000ull) {
+		return;
+	}
+	const auto seconds = static_cast<double>(now_ns - stats.start_ns) / 1e9;
+	size_t foreign = 0, any_value = 0, pending = 0;
+	for (const auto& [address, label]: m_late_labels) {
+		(void)address;
+		foreign += label.foreign_count != 0 || label.foreign_any ? 1 : 0;
+		any_value += label.foreign_any ? 1 : 0;
+		pending += label.pending != 0 ? 1 : 0;
+	}
+	std::printf("LATELABELS deferred_s=%.0f applied_s=%.0f satisfied_s=%.0f refused_s=%.0f "
+	            "fenced_s=%.0f foreign_labels=%zu (any value %zu; stores seen %" PRIu64 ", zero %" PRIu64
+	            ") delay_us=%.1f max_us=%.1f pending=%zu\n",
+	            static_cast<double>(stats.deferred) / seconds,
+	            static_cast<double>(stats.applied) / seconds,
+	            static_cast<double>(stats.satisfied) / seconds,
+	            static_cast<double>(stats.refused) / seconds,
+	            static_cast<double>(stats.fenced) / seconds, foreign, any_value,
+	            stats.foreign, stats.foreign_zero,
+	            stats.applied != 0 ? static_cast<double>(stats.delay_ns) / 1000.0 /
+	                                     static_cast<double>(stats.applied)
+	                               : 0.0,
+	            static_cast<double>(stats.max_delay_ns) / 1000.0, pending);
+	std::fflush(stdout);
+	stats          = {};
+	stats.start_ns = now_ns;
 }
 
 void GuestGpu::ProcessCommands() {
@@ -250,6 +424,29 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+bool GuestGpu::LateLabelSatisfies(uint64_t vaddr, uint64_t ref, uint64_t mask, uint32_t func) {
+	const auto it = m_late_labels.find(vaddr);
+	if (it == m_late_labels.end() || it->second.pending == 0 ||
+	    !TestWaitRegMemValue(it->second.value, ref, mask, func)) {
+		return false;
+	}
+	// Only if this processor is the only writer seen to store a value that releases the wait:
+	// otherwise the guest may be waiting for the other writer.
+	const auto& label            = it->second;
+	bool        released_by_other = label.foreign_any;
+	for (uint32_t i = 0; i < label.foreign_count && !released_by_other; i++) {
+		released_by_other = TestWaitRegMemValue(label.foreign[i], ref, mask, func);
+	}
+	if (released_by_other) {
+		m_late_stats.refused++;
+		return false;
+	}
+	// The wait passes before its label is stored: CP stores after it wait for that label.
+	m_late_fence = m_late_deferred;
+	m_late_stats.satisfied++;
+	return true;
+}
+
 
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op) {
@@ -260,6 +457,13 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	const T value = *addr;
 	if (!TestWaitRegMemValue(value, ref, mask, func)) {
+		// A label this processor will store once the work before it is done: the host queue runs
+		// the work after this wait after that work anyway.
+		if (GuestGpu::LateLabelsMode() != 0 && g_gpu_state != nullptr &&
+		    g_gpu_state->LateLabelSatisfies(reinterpret_cast<uint64_t>(addr), ref, mask, func)) {
+			MemDiag::Add(MemDiag::WaitOnCpLabel);
+			return;
+		}
 		SuspendPm4();
 		return;
 	}
@@ -281,6 +485,15 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
                                                      uint32_t);
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	if (signal && GuestGpu::LateLabelsMode() != 0 && g_gpu_state != nullptr &&
+	    g_gpu_state->LateStoresFenced()) {
+		// After a wait passed on a pending label: signal after that label, as the console would.
+		g_gpu_state->m_late_stats.fenced++;
+		g_gpu_state->DeferLateStore(0, 0, 0, [this, counter, write] {
+			MemSemaphore(counter, true, write);
+		});
+		return;
+	}
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 		m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
@@ -307,6 +520,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
 	if (dw_num == 0) {
+		return;
+	}
+	if (GuestGpu::LateLabelsMode() != 0 && g_gpu_state != nullptr &&
+	    g_gpu_state->LateStoresFenced()) {
+		// After a wait passed on a pending label: store after that label, as the console would.
+		g_gpu_state->m_late_stats.fenced++;
+		std::vector<uint32_t> values(src, src + dw_num);
+		g_gpu_state->DeferLateStore(0, 0, 0, [this, dst, values = std::move(values), write_control] {
+			WriteData(dst, values.data(), static_cast<uint32_t>(values.size()), write_control);
+		});
 		return;
 	}
 
@@ -424,7 +647,8 @@ void GuestGpu::Enqueue(Submission submission) {
 void GuestGpu::WaitForIdle() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
-	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+	while (m_processing || !m_commands.empty() || m_submission_count != 0 ||
+	       m_late_in_flight.load(std::memory_order_acquire) != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
 }
@@ -442,16 +666,32 @@ void GuestGpu::ThreadRun(void* data) {
 
 	for (;;) {
 		Common::StallDiag::Report();
+		if (gpu->ProcessLateLabels()) {
+			// A label may satisfy a blocked queue's wait.
+			Common::LockGuard lock(gpu->m_queue_mutex);
+			for (auto& queue: gpu->m_queues) {
+				if (!queue.empty()) {
+					queue.front().blocked = false;
+				}
+			}
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         should_stop = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping &&
+			       gpu->m_late_posted.empty()) {
 				gpu->m_processing = false;
-				gpu->m_idle.Signal();
+				// Idle only once the late labels behind the finished work are stored too.
+				if (gpu->m_late_in_flight.load(std::memory_order_acquire) == 0) {
+					gpu->m_idle.Signal();
+				}
 				Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdNoWork);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+			}
+			if (!gpu->m_late_posted.empty()) {
+				continue;
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -494,6 +734,16 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
+			// Late stores behind that work are posted by the priority operations: run them.
+			while (gpu->m_late_in_flight.load(std::memory_order_acquire) != 0) {
+				gpu->m_renderer.GetCommandScheduler().DrainPriorityOperations();
+				(void)gpu->ProcessLateLabels();
+			}
+			gpu->m_renderer.GetCommandScheduler().SetBeforeSubmit({});
+			{
+				std::lock_guard link(gpu->m_late_link->mutex);
+				gpu->m_late_link->gpu = nullptr;
+			}
 			g_gpu_state = nullptr;
 			return;
 		}
@@ -736,6 +986,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				executor.FinishQueuedDraws(CurrentBuffer());
 			}
 			g_gpu_state->ProcessCommands();
+			(void)g_gpu_state->ProcessLateLabels();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		if (cursor.offset_dw == cursor.commands.size()) {
@@ -1144,6 +1395,35 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		std::memcpy(address, value, size);
 		m_renderer.NoteGpuWrite(vaddr, size);
 	};
+	if (GuestGpu::LateLabelsMode() != 0 && g_gpu_state != nullptr && data_sel <= 3) {
+		// Late labels: store the label, then raise the interrupt, once the host GPU has finished
+		// the work before them. A reference-clock label keeps the clock at decode, as without
+		// late labels: read at completion it makes Sky Garden 4% slower (the game reacts to its
+		// GPU time; Image::FindView doubles). Waits never pass on it.
+		const auto     vaddr = reinterpret_cast<uint64_t>(address);
+		const uint64_t size  = data_sel == 0 ? 0 : data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
+		if (data_sel == 3) {
+			data = Sync::ReadReferenceClock();
+		}
+		g_gpu_state->DeferLateStore(
+		    vaddr, data_sel == 1 ? (data & 0xffffffffu) : data, data_sel == 3 ? 0 : size,
+		    [this, write_label, data, size, interrupt,
+		     event_id = m_interrupt_event_id, interrupt_context_id] {
+			    if (size != 0) {
+				    MemDiag::NoteLabel();
+				    if (size == sizeof(uint32_t)) {
+					    const auto value32 = static_cast<uint32_t>(data);
+					    write_label(&value32, size);
+				    } else {
+					    write_label(&data, size);
+				    }
+			    }
+			    if (interrupt) {
+				    m_renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    }
+		    });
+		return;
+	}
 	if (data_sel != 0) {
 		MemDiag::NoteLabel();
 	}
@@ -1159,6 +1439,12 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 2: write_label(&data, sizeof(data)); break;
 		case 5: {
 			GetScheduler().Finish();
+			// Late labels before this one reach the guest first.
+			while (GuestGpu::LateLabelsMode() != 0 && g_gpu_state != nullptr &&
+			       g_gpu_state->m_late_in_flight.load(std::memory_order_acquire) != 0) {
+				GetScheduler().DrainPriorityOperations();
+				(void)g_gpu_state->ProcessLateLabels();
+			}
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
 			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);

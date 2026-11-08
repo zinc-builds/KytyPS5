@@ -35,6 +35,9 @@ public:
 	// The next submission waits (at the transfer stage) until semaphore reaches value: work the
 	// current command buffer consumes from another queue.
 	void           WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t value);
+	// Runs at the start of every Submit, while CurrentTick() is still the submitted buffer's
+	// (late labels queue their batch for it then).
+	void           SetBeforeSubmit(Common::UniqueFunction<void>&& hook) { m_before_submit = std::move(hook); }
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -116,6 +119,7 @@ private:
 	OperationState               m_operation_state      = OperationState::Open;
 	vk::Semaphore                m_next_wait_semaphore  = nullptr;
 	uint64_t                     m_next_wait_value      = 0;
+	Common::UniqueFunction<void> m_before_submit;
 };
 
 } // namespace Libs::Graphics
