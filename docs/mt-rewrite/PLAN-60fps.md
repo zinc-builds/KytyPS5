@@ -129,8 +129,48 @@ Structural changes, in order:
    and the worker integration. Starts once B's fence unit and item 1 have landed. Estimate −0.9 to
    −1.2 µs/draw. Risk: high.
 
-Also: a TSC split of ExecutePreparedDraw's own 0.42 µs/draw (unexplained); after the above,
-deferring RELEASE_MEM/EVENT_WRITE in queue order instead of draining (~0.15 µs/draw).
+Status of the above (2026-11-08): item 1 phase B (stream copies on the worker) is paused, since
+Track B's C1 (in-place guest reads) may make it obsolete. Item 2 is merged. Item 3 is merged in
+parts: texture resolves (#62, #67) and render targets (#69 color, #71 depth).
+
+### Budget refresh (2026-11-08, `dev` f465f33, after #72)
+
+At 47.55 FPS and 249k draws/s the command thread costs **4.01 µs per draw** against ~3.17 for 60
+FPS, so ~0.84 µs/draw must still come off. It is ~94% busy; `KYTY_STALL_DIAG` waits: prepare
+workers 3.5%, synchronous commands 1.0%, recorder 0.6%, scheduler 0.6%. The two prepare workers
+take 3.34 µs per draw each and are 40% busy, so they have room for more. Same method as above
+(LBR call stacks, innermost stage); the 2026-11-07 figures for comparison:
+
+| Stage | ns/draw | 2026-11-07 | Main parts |
+|---|---|---|---|
+| Draw flow, other | 957 | 715 | ExecutePreparedDraw's own code 331, PrepareBindings' own 262, DrawIndex 131, PostQueuedDraw 93 (35 the register copy), PrepareDrawRenderState 72 |
+| Texture and render-target resolve | 771 | 1,647 | RefindExactImage 96, GetSampler 82, MaterializeColorClear 80, FindView 72, TouchImage 52, FindTexture 51 |
+| Buffer acquisition | 564 | 668 | ObtainBuffer 273, RebindBuffers 72, HasGpuDirtyBytes 47, TouchBuffer 40 |
+| CommitBindings | 302 | 274 | |
+| Pipeline and program lookups | 280 | 274 | GetGraphicsPipeline 170, WalkSrt 52 (dispatches) |
+| PrepareBda guest copy | 268 | 229 | 93% on the dispatch path |
+| Prepare hand-off | 247 | 253 | Worker::Wait 178, almost all at packet drains (~3.5k/s) |
+| PM4 decode and registers | 174 | 182 | |
+| Image transitions, recorder, labels, scheduler | 88 / 87 / 85 / 83 | 86 / 106 / 76 / 198 | |
+| Compute other, PrepareBda rest, other | 104 | 72 | |
+
+Across stages, guest-memory copies (`TryReadFast`'s memcpy: `PrepareBda` and the stream
+copies) are 374 ns/draw (9.3%).
+
+A temporary counter showed that **76% of stage binding sets equal the previous draw's for the
+same stage** (same module, worker texture records and sampler values): 69% of images, at 5.3
+images per stage.
+
+Next moves:
+
+| Move | Owner | Estimate | Notes |
+|---|---|---|---|
+| A. Stage binding-set reuse: a repeated set reuses the previous draw's images, samplers and views, checked by record identity and one global binding epoch (bumped by every image registration or unregistration, image recreate, sampler-cache eviction and view destroy); each image is still marked bound per draw and pending clears still apply | B4 | −350 to −420 ns/draw, up to −50 more if CommitBindings also skips building repeated sets | verify mode re-resolves everything and reports the first mismatch; kill switch |
+| B. Pipeline key built on the worker from the programs, the proposed targets and the registers; the command thread checks the final target formats | B5 | ~−120 ns/draw | adds a key/hash field to the prepared draw |
+| Drain deferral: RELEASE_MEM/EVENT_WRITE run from the queue in PM4 order instead of draining it | B4, after #70 | ~−150 ns/draw | agreed with Track B: the event runs when FinishQueuedDraw reaches it; waits and other guest-visible packets still drain |
+| Guest copies (C1, in-place guest reads) | Track B | up to ~−370 ns/draw | the stage 2 prototype was flat on FPS; a hybrid is in progress |
+
+A, B and the deferral would bring the thread to ~3.3 µs/draw; 3.2 also needs part of C1.
 
 ## Shared rules (all tracks)
 
