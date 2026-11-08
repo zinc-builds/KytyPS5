@@ -26,6 +26,16 @@ struct RenderColorInfo {
 	}
 };
 
+namespace HW {
+class Context;
+} // namespace HW
+
+// The register side of color target slot rt_slot with target mask `mask`: r constructed with the
+// guest description and view (before the texture cache finds or remaps an image), mip, layer and
+// export mapping. False, with only target_slot set, when the slot has no color output. Register
+// work only, so any thread.
+bool DecodeColorTarget(const HW::Context& hw, uint32_t rt_slot, uint32_t mask, RenderColorInfo& r);
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COLORRENDERTARGET_H_

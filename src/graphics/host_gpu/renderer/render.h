@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/workerTargets.h"
 #include "graphics/host_gpu/renderer/workerTextures.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -306,7 +307,23 @@ private:
 		// TextureMemoRecord): appended while the command thread owns the slot, applied and
 		// cleared by the worker before its next job on it.
 		std::vector<TextureMemoRecord> texture_updates;
+		WorkerTargets                  targets;
+		// Color targets the command thread resolved for this draw, for the worker's records:
+		// handed over like texture_updates.
+		std::vector<std::unique_ptr<WorkerColorTargetRecord>> target_updates;
 	};
+	// The worker's color targets for the queued draw being committed, while they may be used.
+	const WorkerTargets* m_adopted_targets = nullptr;
+	// Color target resolves made for the queued draw being committed, handed to its slot after.
+	std::vector<std::unique_ptr<WorkerColorTargetRecord>> m_target_updates;
+	// Prepare worker, after the program lookup: proposes the draw's color targets and writes
+	// them into its state.color_info.
+	void SpeculateTargets(QueuedDraw& queued, WorkerTargetMemo& memo);
+	// Command thread: color_info entry r of render target slot `slot` as the worker proposed it
+	// (record null: no output); the texture cache side, or the whole resolve if the record's image
+	// no longer holds.
+	void ResolveProposedColorTarget(CommandBuffer& buffer, const WorkerColorTargetRecord* record,
+	                                RenderColorInfo& r, uint32_t slot);
 	// The worker's buffer side for the queued draw being committed, while it may be used.
 	const WorkerBuffers* m_adopted_buffers = nullptr;
 	void                 SpeculateBuffers(QueuedDraw& queued);
@@ -546,6 +563,7 @@ private:
 		RenderExecutor*                      executor = nullptr;
 		uint32_t                             index    = 0;
 		WorkerTextureState                   textures;
+		WorkerTargetMemo                     targets;
 		std::unique_ptr<DrawPrepare::Worker> worker;
 	};
 	std::vector<std::unique_ptr<PrepareLane>>        m_prepare_lanes;
