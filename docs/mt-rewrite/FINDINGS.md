@@ -76,6 +76,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | Stage binding-set reuse: a stage whose module, worker texture records (by serial) and sampler values equal the last draw's keeps its images, views and samplers while the texture cache's binding epoch and GC tick hold; the color-clear step, the image refresh and tracking (`AcquireTexture`, `FindTexture` without the view) and the per-draw bound marking still run (~75% of stage sets) (Track B4; same batch: ref `dev` c7bdab8f 48.08 / 48.18; `KYTY_BINDING_REUSE_VERIFY` 12M stages clean) | 49.90 / 49.62 | 261.3k / 261.1k | 33.5 (max 33.6) / 33.5 (max 33.6) | 29.9 / 29.9 |
 | 2026-11-08 | Small cuts on the command thread: the texture proposal carries its record's serial and color-clear flag, so a reused stage reads no record (nor restores the layout `CommitBindings` sets); `IsMetaCleared` reads the GPU-thread-only metadata map without the cache lock (`KYTY_META_LOCK=1` restores it); images and buffers mirror their LRU tick and skip `Touch` when already touched this GC tick (`KYTY_LRU_MIRROR=0` disables; `Touch` was already a no-op then, so eviction order is unchanged); the vertex-range merge runs on the prepare worker (`KYTY_WORKER_BUFFERS=verify` merges again and compares) (Track B4; same batch: ref `dev` f1386607 48.43 / 49.27; `KYTY_DTC_VERIFY` + `KYTY_PREPARE_VERIFY` and the buffer, texture and binding-reuse verify modes clean) | 48.53 / 49.83 | 256.5k / 261.7k | 33.5 (max 33.6) / 33.4 (max 33.5) | 29.9 / 29.9 |
 | 2026-11-08 | Pipeline key on the prepare worker: the worker builds the graphics pipeline key and its hash from its programs, proposed targets and the queued registers; the command thread checks the final targets (formats, samples, slots, export mappings, depth, topology, restart) and looks the pipeline up with the worker's hash (hash first on the last-pipeline check, last key kept as a pointer, keys hash only their used bytes). Command thread `GetGraphicsPipeline` 4.1% → 2.4% (~162 → ~95 ns/draw); 99.6% of draws use the worker's key, 0 target mismatches, `KYTY_WORKER_PIPELINE_KEY_VERIFY` 8M checks clean. Worker time counts: a first version without the used-bytes hash and the prefetch was −0.5% (the same binary building the key but ignoring it, −2.4%) (Track B5; same batch, 2 pairs: ref `dev` 93ac4f97 49.48 / 50.00; +0.9%, both pairs up; earlier bases +0.7% on f1386607, +1.4% on c7bdab8f) | 50.07 / 50.33 | 263.1k / 259.1k | 33.4 (max 33.5) / 38.5 (max 99.5) | 29.9 / 26.9 |
+| 2026-11-08 | `KYTY_BDA_STATS` diagnostic for `PrepareBda`'s uploads, off by default (Track B; findings under "Buffer uploads": the bytes are real, DMA shaders read almost none of them and 56% are replaced before any bind, so pointing the BDA page table at guest memory (C1) would remove most of the copy; with the diagnostic off, same binary after an access run 45.28, `dev` 23191d32 45.30) | 45.28 | 238.0k | 37.0 (max 83.4) | 27.3 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1305,6 +1306,35 @@ Two attempts on that memcpy (~200 uploads/s of ~3.4 MB, ~41 ms/s of the command 
   (~32 GB/s with three threads, ~17 GB/s alone). FPS: same binary, helpers off 38.99 → on 39.21;
   against `dev` ab1429f1, 39.93 → 39.87. Not merged (branch `trackB/upload-helper`).
 
+**What `PrepareBda` uploads, and who reads it (Track B, `KYTY_BDA_STATS`, 2026-11-08).**
+On `dev` 23191d32, about 580 MB/s while measuring (145k 4 KiB pages/s, ~4.7k a frame; the
+diagnostic halves FPS, so per frame is the comparable figure):
+
+- Source: all but ~0.1 MB/s was queued by `InvalidateMemory` (write faults, collected
+  asynchronous writes, CPU label stores). New buffers add ~0.1 MB/s; CPU-write readbacks and
+  `MapMemory` are about 0.
+- Pages uploaded again within the same frame: 0.6%.
+- Over-copy from 4 KiB granularity: a 1-in-8 sample of pages, compared as staged with their
+  previous staging, has 2.83 KB of 4 KB changed over a 3.7 KB span, and 57 of 64 cache lines
+  changed (87% of pages have 49–64 lines changed, 6% none). Copying only changed lines would
+  save ~11% at best and need a second read of each page to find them.
+- Read by DMA shaders: with `KYTY_BDA_STATS=access`, every `get_bda_pointer` call marks its
+  16 KiB page in a bitmap. The 22 `uses_dma` shaders read **one 16 KiB page per second**, so
+  almost none of the upload is read through the BDA page table. `uses_dma` is set for any
+  address or GPU-selected buffer load, and in Sky Garden those paths rarely run.
+- Consumed by binds: of the uploaded bytes, ~258 MB/s (44%) are covered by an `ObtainBuffer` or
+  `ObtainBufferForImage` before the page is uploaded again; **~325 MB/s (56%) are replaced by the
+  next upload of the page with no bind in between**. A sync made only when a bind (or a DMA
+  read) needs the page would not copy those.
+
+So sub-page copies and in-frame de-duplication are ruled out, but the PrepareBda sync itself is
+mostly early: the guest rewrites more than half of what it uploads before anything binds it,
+and DMA shaders, the reason for the sync, read almost none of it. The sync cannot simply be
+dropped, because a DMA read of a page that is not current would see stale bytes, and which pages
+a DMA shader reads is only known on the GPU. Pointing the BDA page table at the guest's own
+memory for CPU-written pages (C1) would make the upload unnecessary for DMA reads, leaving the
+binds' own copies (the 44%).
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
@@ -1534,6 +1564,14 @@ What this means:
   thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
   GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)
   and the prepare worker's and recorder's busy, spinning and sleeping shares.
+- BDA uploads (Track B): `KYTY_BDA_STATS=1` prints a `BDASTATS` line once per second for
+  `PrepareBda`'s uploads: KB/s by what queued them (invalidate, CPU write, new buffer, map),
+  pages uploaded again within one frame, changed bytes and 64-byte lines per page for a 1-in-8
+  sample against its previous staging, and the uploads a bind later covered (`consumed_kb_s`)
+  or that the next upload of the page replaced with no bind in between (`superseded_kb_s`).
+  `=access` also makes DMA shaders mark the 16 KiB pages they read (atomics; slow) and reports
+  uploaded bytes that no DMA shader read (`read_kb` / `unread_kb`); its shaders are kept apart
+  in the shader store. Both modes halve FPS; the A/B figures in a run with them are not FPS.
 - Dispatch chains (Track G3): `KYTY_DISPATCH_CHAIN=0` records every dispatch's barriers again,
   `KYTY_DISPATCH_CHAIN=stats` prints `DISPCHAIN` lines (dispatches and chained dispatches per second).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every

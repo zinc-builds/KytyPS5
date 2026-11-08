@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/memDiag.h"
 
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
@@ -69,8 +70,10 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 		return {};
 	}
 	Writer header;
+	// KYTY_BDA_STATS=access instruments DMA shaders: their modules must not meet other runs.
+	const uint32_t bda_access = MemDiag::BdaStatsMode() == 2 ? 1u : 0u;
 	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize, bda_access);
 	return std::move(header.bytes);
 }
 

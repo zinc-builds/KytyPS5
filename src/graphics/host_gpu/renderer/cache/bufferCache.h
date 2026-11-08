@@ -97,8 +97,13 @@ public:
 	void               BeginUploadBatch();
 	void               EndUploadBatch();
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	// What made a range need a BDA sync (KYTY_BDA_STATS splits uploads by it). Invalidate: any
+	// InvalidateMemory (write faults, collected asynchronous writes, CPU label stores).
+	enum class BdaSource : uint8_t { Invalidate, CpuWrite, NewBuffer, Map, Count };
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	// KYTY_BDA_STATS: per-second report; with `access`, also reads back the DMA access bitmap.
+	void                   BdaStatsTick();
 	void               RunGarbageCollector();
 
 	// Buffer lookups made ahead on the draw prepare worker (KYTY_WORKER_BUFFERS=0|verify|stats).
@@ -238,6 +243,7 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	AsyncUploader                                     m_async_uploader;
+	std::unique_ptr<Buffer>                           m_bda_access_download; // KYTY_BDA_STATS=access
 	bool                                              m_last_upload_async = false;
 	struct UploadBatch {
 		bool active = false; // between BeginUploadBatch and EndUploadBatch

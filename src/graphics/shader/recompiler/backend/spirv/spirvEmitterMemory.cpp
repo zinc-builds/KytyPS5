@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
@@ -165,6 +166,37 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
 	                          state.fault_buffer_variable, ConstantU32(state, 0), index);
 	return pointer;
+}
+
+// KYTY_BDA_STATS=access: sets the page's bit in the access bitmap after the fault bitmap.
+void RecordBdaAccess(EmitterState& state, uint32_t page) {
+	const auto word = Binary(
+	    state, spv::OpIAdd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
+	    ConstantU32(state, static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32)));
+	const auto bit =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	const auto pointer = FaultElementPointer(state, word);
+	// Atomic: other invocations may set bits of the same word meanwhile.
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+	const auto unset = Binary(state, spv::OpIEqual, TypeBool(state),
+	                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, bit),
+	                          ConstantU32(state, 0));
+	const auto set_label   = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, unset, set_label, merge_label);
+	EmitLabel(state, set_label);
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
 }
 
 void RecordBdaFault(EmitterState& state, uint32_t page) {
@@ -1381,6 +1413,11 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                          page);
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	if (MemDiag::BdaStatsMode() == 2) {
+		// Before the branch below: its phi names available_label as the incoming block.
+		RecordBdaAccess(state, page);
+		MemDiag::g_bda_access_shaders.fetch_add(1, std::memory_order_relaxed);
+	}
 	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();
