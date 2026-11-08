@@ -17,6 +17,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
+#include <mutex>
 #include <array>
 #include <memory>
 #include <shared_mutex>
@@ -32,6 +34,29 @@ namespace Libs::Graphics {
 
 class GuestGpu;
 
+// The render context's lock. The GPU command thread takes it for every draw and dispatch, the
+// window and RenderDoc threads only at shutdown and capture boundaries. The command thread's side
+// is two plain stores: another thread announces itself, forces a memory barrier on every thread
+// of the process (membarrier), and waits until the command thread is outside its section, which
+// then takes the real mutex while the other thread holds it. Recursive, like Common::Mutex.
+class RenderContextMutex {
+public:
+	RenderContextMutex();
+	KYTY_CLASS_NO_COPY(RenderContextMutex);
+
+	void Lock();
+	void Unlock();
+
+private:
+	std::recursive_mutex m_mutex;
+	bool                 m_biased = false; // the platform can force a barrier on other threads
+	alignas(64) std::atomic<bool> m_owner_active {false};
+	alignas(64) std::atomic<bool> m_external {false};
+	uint32_t m_owner_depth    = 0; // command thread only
+	bool     m_owner_mutex    = false;
+	uint32_t m_external_depth = 0; // under m_mutex
+};
+
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext&              graphics,
@@ -45,7 +70,7 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&      GetMutex() { return m_mutex; }
+	RenderContextMutex& GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
@@ -114,7 +139,7 @@ private:
 	};
 
 	GraphicContext&           m_graphics;
-	Common::Mutex             m_mutex;
+	RenderContextMutex        m_mutex;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;

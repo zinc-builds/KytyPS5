@@ -77,9 +77,11 @@ private:
 #endif
 };
 
+// Any mutex with Lock() and Unlock().
+template <typename M = Mutex>
 class LockGuard {
 public:
-	using mutex_type = Mutex;
+	using mutex_type = M;
 
 	// NOLINTNEXTLINE(google-runtime-references)
 	explicit LockGuard(mutex_type& m): m_mutex(m) { m_mutex.Lock(); }
