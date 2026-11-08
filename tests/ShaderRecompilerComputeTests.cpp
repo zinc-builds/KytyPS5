@@ -81,6 +81,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -3300,48 +3301,115 @@ public:
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
     GuestGpu::SetLateLabelsModeForTests(2);
-    alignas(8) uint32_t label = 0;
-    alignas(8) uint32_t after = 0;
+    struct RestoreLateLabels {
+      ~RestoreLateLabels() { GuestGpu::SetLateLabelsModeForTests(-1); }
+    } restore_late_labels;
     const auto address = [](const void *value) {
       return reinterpret_cast<uint64_t>(value);
     };
-    std::array<uint32_t, 20> commands{};
-    commands[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
-    commands[1] = 0x28u | (5u << 8u);
-    commands[2] = 1u << 29u; // 32-bit immediate, no interrupt
-    commands[3] = static_cast<uint32_t>(address(&label));
-    commands[4] = static_cast<uint32_t>(address(&label) >> 32u);
-    commands[5] = 7;
-    commands[6] = 0;
-    commands[7] = 0x123u;
-    commands[8] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
-    commands[9] = 0x10u | 3u; // memory, equal
-    commands[10] = static_cast<uint32_t>(address(&label));
-    commands[11] = static_cast<uint32_t>(address(&label) >> 32u);
-    commands[12] = 7;
-    commands[13] = UINT32_MAX;
-    commands[15] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
-    commands[16] = 0;
-    commands[17] = static_cast<uint32_t>(address(&after));
-    commands[18] = static_cast<uint32_t>(address(&after) >> 32u);
-    commands[19] = 22;
-    bool deferred_at_decode = false;
-    auto processor = std::make_unique<CommandProcessor>(context, 0);
-    gpu.SendCommandSync([&] {
-      processor->BufferInit();
-      Pm4Execution execution;
-      const auto result = processor->Process(execution, commands);
-      deferred_at_decode =
-          result == Pm4ProcessResult::Complete && label == 0 && after == 0;
-      processor->BufferFlush();
-    });
-    gpu.WaitForIdle();
-    const bool stored = label == 7 && after == 22;
-    GuestGpu::SetLateLabelsModeForTests(-1);
-    Require("LateLabels", "deferred stores",
-            deferred_at_decode && stored,
-            "the label was stored at decode, the wait did not pass on its pending "
-            "value, the write after it was not held, or the stores never landed");
+    using Packets = std::vector<uint32_t>;
+    // data_sel 1: 32-bit immediate, 2: 64-bit, 3: reference clock.
+    const auto release_mem = [&](Packets *out, const void *label, uint32_t data_sel,
+                                 uint64_t value) {
+      out->insert(out->end(),
+                  {KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0), 0x28u | (5u << 8u), data_sel << 29u,
+                   static_cast<uint32_t>(address(label)),
+                   static_cast<uint32_t>(address(label) >> 32u),
+                   static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u), 0x123u});
+    };
+    const auto wait_equal = [&](Packets *out, const void *label, uint32_t ref) {
+      out->insert(out->end(),
+                  {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u,
+                   static_cast<uint32_t>(address(label)),
+                   static_cast<uint32_t>(address(label) >> 32u), ref, UINT32_MAX, 0u});
+    };
+    const auto wait_equal64 = [&](Packets *out, const void *label, uint64_t ref, uint64_t mask) {
+      out->insert(out->end(),
+                  {KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0), 0x10u | 3u,
+                   static_cast<uint32_t>(address(label)),
+                   static_cast<uint32_t>(address(label) >> 32u), static_cast<uint32_t>(ref),
+                   static_cast<uint32_t>(ref >> 32u), static_cast<uint32_t>(mask),
+                   static_cast<uint32_t>(mask >> 32u), 0u});
+    };
+    const auto write_data = [&](Packets *out, const void *destination, uint32_t value) {
+      out->insert(out->end(), {KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0u,
+                               static_cast<uint32_t>(address(destination)),
+                               static_cast<uint32_t>(address(destination) >> 32u), value});
+    };
+    // Runs the packets on a fresh processor; `at_decode` sees memory right after decoding them.
+    const auto run = [&](const Packets &commands, const std::function<void(bool)> &at_decode) {
+      auto processor = std::make_unique<CommandProcessor>(context, 0);
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        Pm4Execution execution;
+        const auto result = processor->Process(execution, commands);
+        at_decode(result == Pm4ProcessResult::Complete);
+        processor->BufferFlush();
+      });
+      gpu.WaitForIdle();
+    };
+
+    // The label lands after decode; a wait on its pending value passes; the reference clock
+    // keeps its decode-time value.
+    {
+      alignas(8) uint32_t label = 0;
+      alignas(8) uint64_t clock = 0;
+      uint64_t clock_after_decode = 0;
+      bool deferred = false;
+      Packets commands;
+      release_mem(&commands, &label, 1, 7);
+      release_mem(&commands, &clock, 3, 0);
+      wait_equal(&commands, &label, 7);
+      run(commands, [&](bool complete) {
+        clock_after_decode = Sync::ReadReferenceClock();
+        deferred = complete && label == 0 && clock == 0;
+      });
+      Require("LateLabels", "deferred stores",
+              deferred && label == 7 && clock != 0 && clock <= clock_after_decode,
+              "the label was stored at decode, the wait did not pass on its pending value, the "
+              "stores never landed, or the clock was not read at decode");
+    }
+    // A CP write after a wait passed early is held behind the label (outside tracked buffers).
+    {
+      alignas(8) uint32_t label = 0;
+      alignas(8) uint32_t after = 0;
+      bool held = false;
+      Packets commands;
+      release_mem(&commands, &label, 1, 7);
+      wait_equal(&commands, &label, 7);
+      write_data(&commands, &after, 22);
+      run(commands, [&](bool complete) { held = complete && label == 0 && after == 0; });
+      Require("LateLabels", "write after an early wait", held && label == 7 && after == 22,
+              "the write after a wait passed early was not held behind its label, or never "
+              "landed");
+    }
+    // RELEASE L=1, WAIT L==1, WRITE_DATA L=0, WAIT L==1: the second wait blocks, as in order.
+    {
+      alignas(8) uint32_t label = 0;
+      bool blocked = false;
+      Packets commands;
+      release_mem(&commands, &label, 1, 1);
+      wait_equal(&commands, &label, 1);
+      write_data(&commands, &label, 0);
+      wait_equal(&commands, &label, 1);
+      run(commands, [&](bool complete) { blocked = !complete; });
+      Require("LateLabels", "label reset", blocked && label == 0,
+              "a wait passed on a label value a later write had replaced");
+    }
+    // A 32-bit label store predicts only its own bytes: memory 0x1'00000000 and a pending 7
+    // make 0x1'00000007, so a 64-bit wait for 7 must block, and one masked to 32 bits passes.
+    for (const bool masked : {false, true}) {
+      alignas(8) uint64_t label = uint64_t{1} << 32u;
+      bool complete_at_decode = false;
+      Packets commands;
+      release_mem(&commands, &label, 1, 7);
+      wait_equal64(&commands, &label, 7, masked ? UINT32_MAX : UINT64_MAX);
+      run(commands, [&](bool complete) { complete_at_decode = complete; });
+      Require("LateLabels", masked ? "masked 64-bit wait" : "64-bit wait on a 32-bit label",
+              complete_at_decode == masked && label == ((uint64_t{1} << 32u) | 7u),
+              "a wait was predicted on bytes the pending store does not write, or a masked "
+              "one was not");
+    }
   }
 
   void CheckGpuCommandLane() {

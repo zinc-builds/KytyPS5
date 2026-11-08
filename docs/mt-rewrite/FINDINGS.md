@@ -1351,8 +1351,19 @@ the command thread in order (`=verify` prints `LATELABELS` lines).
   (command thread 33% blocked) and the game paced itself at 100 ms.
 - A wait that the newest pending value of this processor's label satisfies passes at once: every
   guest queue records into the one host queue, so the work after the wait runs after the work
-  before the label. CP stores decoded after such a wait (WRITE_DATA, semaphore signals) are held
-  behind the labels deferred so far.
+  before the label. Effects the command processor performs on the CPU after such a wait follow
+  the labels deferred so far, as on the console: WRITE_DATA and semaphore signals are deferred
+  behind them, in order (each later effect waits for the earlier ones too, and a label one of
+  them overwrites is not predicted until it lands, so RELEASE L=1, WAIT L==1, WRITE_DATA L=0,
+  WAIT L==1 blocks at the second wait); DMA_DATA (CPU fills and copies) waits for those labels to
+  land instead (`drained_s`).
+- A wait is predicted only from bytes the newest pending store writes (a 32-bit label store does
+  not satisfy a 64-bit wait that looks at the upper half), and not while an overlapping store is
+  pending.
+- Not ordered: a later packet that reads a pending label's or a deferred write's bytes as data
+  at decode reads them before they land. `=verify` counts buffer binds that do
+  (`read_unlanded`). Refusing waits on labels inside cached buffers instead, and draining for
+  WRITE_DATA into them, blocked about half of the early waits and ran at 18.5 FPS (off 46.6).
 - Only when the processor is the only writer seen to store a value that releases the wait. Each
   label store first compares the label with the processor's last store to it: in Sky Garden
   something else stores to ~40k label addresses (~12k stores/s), always 0 (the game resets its
@@ -1372,8 +1383,7 @@ the command thread in order (`=verify` prints `LATELABELS` lines).
   draws dropped for the epoch went from ~1.3k/s to ~0); texture downloads publish ranged too
   (~700/s of the drops with late labels off as well, though that alone moves FPS by less than
   noise); RELEASE_MEM stores carry no closure; label records sit in one open-addressed table;
-  interrupts are raised once per drain, after its labels, exact repeats once, about the experiment's: the deferral, the held
-  CP stores and the bookkeeping on the command thread. Labels reach the guest 5.6 ms after
+  interrupts are raised once per drain, after its labels, exact repeats once. Labels reach the guest 5.6 ms after
   decode on average (max ~16 ms); flips, the game's sleep time and the command thread's blocked
   time do not change. With it off, behaviour is as before.
 

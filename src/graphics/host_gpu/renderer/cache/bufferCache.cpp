@@ -1328,6 +1328,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (MemDiag::BdaStatsMode() != 0) {
 		BdaStats::NoteBound(vaddr, size);
 	}
+	if (GuestGpu::s_late_read_checks.load(std::memory_order_relaxed)) {
+		GuestGpu::NoteLateRead(vaddr, size);
+	}
 	if (speculated != UINT32_MAX && m_speculation != nullptr && !is_written && !is_texel_buffer) {
 		const auto& ranges = m_speculation->ranges;
 		if (speculated >= ranges.size() || ranges[speculated].vaddr != vaddr ||
@@ -1432,6 +1435,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (MemDiag::BdaStatsMode() != 0) {
 		BdaStats::NoteBound(vaddr, size);
+	}
+	if (GuestGpu::s_late_read_checks.load(std::memory_order_relaxed)) {
+		GuestGpu::NoteLateRead(vaddr, size);
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
