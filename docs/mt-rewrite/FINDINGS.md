@@ -71,6 +71,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | One texture memo for both prepare workers instead of one each: lock-free lookups, records filed by compare-and-swap, a replaced record or table freed two rings later (Track B; same batch: ref `dev` 26c29910 44.64; same binary with `KYTY_PREPARE_STATS=1`, `KYTY_SHARED_TEXTURE_MEMO=0` 43.64 / 43.86 → 45.49 / 45.11; the command thread's per-page re-checks of adopted records 84k → 51k/s (one worker: 48k/s), worker 3.2 µs/draw unchanged; `KYTY_WORKER_TEXTURES_VERIFY=1` 83M checks clean) | 45.30 | 238.4k | 38.2 (max 83.4) | 27.9 |
 | 2026-11-08 | Per-draw struct zeroing and copies on the command thread: vertex bindings (772 B zeroed, then copied from a return value) are filled in place, the merged vertex ranges are no longer zeroed (~2.8 KB per draw on the command thread and again on the worker), and the last-pipeline check compares the key's used bytes (~200 of 516) (Track B4; same batch, 4 pairs: ref `dev` 23191d32 45.93 / 45.25 / 45.53 / 45.25, mean 45.49; +0.5%, at the noise floor, 3 of 4 pairs up) | 45.48 / 45.67 / 45.97 / 45.80 | 238.4k / 239.3k / 241.4k / 240.4k | 35.9 (max 66.6) / 33.4 (max 33.5) / 33.5 (max 33.7) / 33.5 (max 34.1) | 27.3 / 29.9 / 28.6 / 28.8 |
 | 2026-11-08 | Color targets proposed by the prepare worker: it decodes each target from the queued draw's registers (or reuses a per-slot record) and writes it into the draw's state, so the command thread no longer copies the ~1 KB `RenderColorInfo` per target; it keeps the registration check (generation refreshed in place), binding, and `FindImage` for targets it has not resolved yet (Track B4; same batch: ref `dev` 23191d32 46.12 / 45.95; `KYTY_WORKER_TARGETS_VERIFY` 22M checks clean) | 46.47 / 46.72 | 244.2k / 244.4k | 33.5 (max 34.0) / 34.8 (max 50.0) | 29.8 / 29.1 |
+| 2026-11-08 | Late labels, C1 stage 1, off by default (`KYTY_LATE_LABELS=1`): end-of-pipe labels and interrupts stored once the host GPU has finished the work before them; a WAIT_REG_MEM that this processor's pending label will satisfy passes at once (Track B; same binary: off 45.59, on 44.40, verify 44.26; labels land 5.6 ms after decode on average; ~10.8k waits/s pass on pending values, none refused; ~7.4k CP stores/s held behind them) | 44.40 | 232.5k | 33.5 (max 33.9) | 29.8 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1300,6 +1301,34 @@ Two attempts on that memcpy (~200 uploads/s of ~3.4 MB, ~41 ms/s of the command 
   (~32 GB/s with three threads, ~17 GB/s alone). FPS: same binary, helpers off 38.99 → on 39.21;
   against `dev` ab1429f1, 39.93 → 39.87. Not merged (branch `trackB/upload-helper`).
 
+### Late labels: labels at host GPU completion (C1 stage 1, Track B, 2026-11-08)
+
+Reading guest memory in place (C1) needs the guest to see a label only once the host GPU has
+finished the work before it; until now labels were stored when the command thread decoded the
+packet. `KYTY_LATE_LABELS=1` stores RELEASE_MEM labels (and raises their interrupts) from a
+priority operation at the completion of the command buffer they were recorded in, posted back to
+the command thread in order (`=verify` prints `LATELABELS` lines).
+
+- Naive (experiment `exp/trackB-late-labels`): 43.6 → 9.7 FPS. The command processor issues
+  ~11k WAIT_REG_MEM/s on its own labels, so every one became a CPU → GPU → CPU round trip
+  (command thread 33% blocked) and the game paced itself at 100 ms.
+- A wait that the newest pending value of this processor's label satisfies passes at once: every
+  guest queue records into the one host queue, so the work after the wait runs after the work
+  before the label. CP stores decoded after such a wait (WRITE_DATA, semaphore signals) are held
+  behind the labels deferred so far.
+- Only when the processor is the only writer seen to store a value that releases the wait. Each
+  label store first compares the label with the processor's last store to it: in Sky Garden
+  something else stores to ~40k label addresses (~12k stores/s), always 0 (the game resets its
+  labels), which releases none of the waits. Refusing every label something else touches
+  (the first version) left ~40 waits/s passing and 11 FPS.
+- Reference-clock labels keep the clock read at decode. Read at completion, Sky Garden runs 4%
+  slower: the game sees its real GPU time and reacts (`Image::FindView` from `RebindImages`
+  doubles).
+- Cost with it on: 45.59 → 44.40 FPS (−2.6%), about the experiment's: the deferral, the held
+  CP stores and the bookkeeping on the command thread. Labels reach the guest 5.6 ms after
+  decode on average (max ~16 ms); flips, the game's sleep time and the command thread's blocked
+  time do not change. With it off, behaviour is as before.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
@@ -1525,6 +1554,9 @@ What this means:
   thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
   GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)
   and the prepare worker's and recorder's busy, spinning and sleeping shares.
+- Late labels (Track B, C1 stage 1): `KYTY_LATE_LABELS=1` stores RELEASE_MEM labels at host
+  GPU completion; `=verify` also prints `LATELABELS` lines (deferred, applied, waits passed on
+  pending values and refused, CP stores held, labels something else stored, delay).
 - Dispatch chains (Track G3): `KYTY_DISPATCH_CHAIN=0` records every dispatch's barriers again,
   `KYTY_DISPATCH_CHAIN=stats` prints `DISPCHAIN` lines (dispatches and chained dispatches per second).
 - Draw state caches (Track B): `KYTY_DTC=0` turns them off, `KYTY_DTC_VERIFY=1` recomputes every
