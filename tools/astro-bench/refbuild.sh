@@ -40,11 +40,13 @@ git -C "$src" submodule update --init --recursive -q >&2
 # unpacked copy per package version in the cache, seeded from any checkout that already has it.
 fsha=$(git -C "$src/3rdparty/ffmpeg-core" rev-parse --short=12 HEAD)
 ff=$root/ffmpeg-$fsha
+# Publish a copy atomically; a concurrent refbuild of another commit may publish the same package.
+ff_publish() { local t=$ff.tmp.$$; rm -rf "$t"; cp -a "$1" "$t" && mv -T "$t" "$ff" 2>/dev/null || rm -rf "$t"; }
 if [ ! -f "$ff/include/libavcodec/avcodec.h" ]; then
 	git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p' | while read -r wt; do
 		c=$wt/_Build/linux/externals/ffmpeg-$fsha
 		[ -f "$c/include/libavcodec/avcodec.h" ] || continue
-		rm -rf "$ff.tmp" && cp -a "$c" "$ff.tmp" && mv -T "$ff.tmp" "$ff" && break
+		ff_publish "$c"; break
 	done
 fi
 ffopt=()
@@ -52,7 +54,7 @@ ffopt=()
 cmake -S "$src" -B "$src/_Build/linux" -G Ninja -DCMAKE_BUILD_TYPE=Release \
 	-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "${ffopt[@]}" >&2
 if [ ${#ffopt[@]} = 0 ] && [ -f "$src/_Build/linux/externals/ffmpeg-$fsha/include/libavcodec/avcodec.h" ]; then
-	rm -rf "$ff.tmp" && cp -a "$src/_Build/linux/externals/ffmpeg-$fsha" "$ff.tmp" && mv -T "$ff.tmp" "$ff"
+	ff_publish "$src/_Build/linux/externals/ffmpeg-$fsha"
 fi
 cmake --build "$src/_Build/linux" --target kyty_emulator -j 8 >&2
 # The install's last step (the Qt launcher's plugin dependencies) fails; kyty_emulator is in by then.
