@@ -392,7 +392,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 	if constexpr (insert) {
 		m_buffers.emplace(buffer.CpuAddress(), id);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_id   = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_tick = m_gc_tick;
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -412,7 +413,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
-	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+	// As TextureCache::TouchImage: a buffer touched in this GC tick leaves the LRU as it is.
+	if (buffer.lru_tick != m_gc_tick || !Common::LruMirrorEnabled()) {
+		buffer.lru_tick = m_gc_tick;
+		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+	}
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {

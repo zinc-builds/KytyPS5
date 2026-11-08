@@ -659,44 +659,6 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 	return size;
 }
 
-// Trivially constructible: arrays of these are set only up to their counts, never zeroed.
-struct VertexBufferRange {
-	struct Binding {
-		Buffer*  first;
-		uint64_t second;
-		Binding& operator=(const std::pair<Buffer*, uint64_t>& value) {
-			first  = value.first;
-			second = value.second;
-			return *this;
-		}
-	};
-	uint64_t base_address;
-	uint64_t requested_end;
-	uint64_t acquired_end;
-	Binding  binding;
-
-	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
-};
-static_assert(std::is_trivially_default_constructible_v<VertexBufferRange>);
-
-// Only the first `count` entries are set (772 bytes in all: not zeroed or copied per draw).
-struct PreparedVertexBuffers {
-	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
-
-	std::array<vk::Buffer, MaxBuffers>     buffers;
-	std::array<vk::DeviceSize, MaxBuffers> offsets;
-	std::array<vk::DeviceSize, MaxBuffers> sizes;
-	uint32_t                               count = 0;
-};
-
-// The vertex buffers' guest ranges, merged where they overlap or touch and clamped to mapped
-// memory, as AcquireVertexBuffers acquires them. Any thread.
-struct MergedVertexRanges {
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;  // up to buffers_num
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges; // up to count
-	uint32_t                                                      count = 0;
-};
-
 static MergedVertexRanges MergeVertexRanges(const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
@@ -750,17 +712,44 @@ static MergedVertexRanges MergeVertexRanges(const ShaderVertexInputInfo& vs_inpu
 }
 
 // speculated: the prepare worker's lookups of the merged ranges, if it made them (count must
-// match).
+// match). precomputed: the worker's MergeVertexRanges of the same stage, if it made it; only
+// the clamp to mapped memory is done again (KYTY_WORKER_BUFFERS=verify merges again and compares).
 static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
                                  std::span<const uint32_t> speculated,
-                                 PreparedVertexBuffers&    prepared) {
-	auto        merged        = MergeVertexRanges(vs_input_info);
-	const auto& sizes         = merged.sizes;
-	auto&       merged_ranges = merged.ranges;
-	const auto  merged_count  = merged.count;
+                                 PreparedVertexBuffers&    prepared,
+                                 const MergedVertexRanges* precomputed) {
+	std::optional<MergedVertexRanges> own;
+	if (precomputed == nullptr) {
+		own.emplace(MergeVertexRanges(vs_input_info));
+	} else if (BufferCache::WorkerBuffersVerify()) {
+		const auto fresh = MergeVertexRanges(vs_input_info);
+		bool same = fresh.count == precomputed->count;
+		for (int i = 0; same && i < vs_input_info.buffers_num; i++) {
+			same = fresh.sizes[i] == precomputed->sizes[i];
+		}
+		for (uint32_t i = 0; same && i < fresh.count; i++) {
+			same = fresh.ranges[i].base_address == precomputed->ranges[i].base_address &&
+			       fresh.ranges[i].requested_end == precomputed->ranges[i].requested_end &&
+			       fresh.ranges[i].acquired_end == precomputed->ranges[i].acquired_end;
+		}
+		if (!same) {
+			EXIT("KYTY_WORKER_BUFFERS=verify: the worker's merged vertex ranges differ\n");
+		}
+	}
+	const auto& merged       = precomputed != nullptr ? *precomputed : *own;
+	const auto& sizes        = merged.sizes;
+	const auto  merged_count = merged.count;
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges;
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
-		auto& range   = merged_ranges[i];
+		auto& range = merged_ranges[i];
+		range       = merged.ranges[i];
+		if (precomputed != nullptr) {
+			// The worker clamped before the commit's PM4 position: mappings may have changed.
+			range.acquired_end = range.base_address +
+			                     Libs::LibKernel::Memory::ClampRangeSize(range.base_address,
+			                                                             range.RequestedSize());
+		}
 		range.binding = cache.ObtainBuffer(
 		    range.base_address, range.acquired_end - range.base_address, false, false, {},
 		    speculated.size() == merged_count ? speculated[i] : UINT32_MAX);
@@ -1209,7 +1198,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		        ? std::span<const uint32_t> {m_adopted_buffers->vertex_speculated.data(),
 		                                     m_adopted_buffers->vertex_count}
 		        : std::span<const uint32_t> {},
-		    vertex_bindings);
+		    vertex_bindings,
+		    m_adopted_buffers != nullptr ? &m_adopted_buffers->vertex_ranges : nullptr);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
@@ -1946,7 +1936,8 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued) {
 	    &context);
 	buffers.vertex_count = 0;
 	if (state.vertex_info[0].stage.module->info.stage != ShaderType::Mesh) {
-		const auto merged = MergeVertexRanges(state.vertex_info[0]);
+		buffers.vertex_ranges = MergeVertexRanges(state.vertex_info[0]);
+		const auto& merged    = buffers.vertex_ranges;
 		for (uint32_t i = 0; i < merged.count; i++) {
 			const auto& range = merged.ranges[i];
 			buffers.vertex_speculated[i] = cache.SpeculateLookup(

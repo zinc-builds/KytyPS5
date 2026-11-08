@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <type_traits>
 #include <mutex>
 #include <deque>
 #include <atomic>
@@ -208,6 +209,44 @@ namespace Pssr {
 struct Request;
 }
 
+// Trivially constructible: arrays of these are set only up to their counts, never zeroed.
+struct VertexBufferRange {
+	struct Binding {
+		Buffer*  first;
+		uint64_t second;
+		Binding& operator=(const std::pair<Buffer*, uint64_t>& value) {
+			first  = value.first;
+			second = value.second;
+			return *this;
+		}
+	};
+	uint64_t base_address;
+	uint64_t requested_end;
+	uint64_t acquired_end;
+	Binding  binding;
+
+	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
+};
+static_assert(std::is_trivially_default_constructible_v<VertexBufferRange>);
+
+// Only the first `count` entries are set (772 bytes in all: not zeroed or copied per draw).
+struct PreparedVertexBuffers {
+	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
+
+	std::array<vk::Buffer, MaxBuffers>     buffers;
+	std::array<vk::DeviceSize, MaxBuffers> offsets;
+	std::array<vk::DeviceSize, MaxBuffers> sizes;
+	uint32_t                               count = 0;
+};
+
+// The vertex buffers' guest ranges, merged where they overlap or touch and clamped to mapped
+// memory, as AcquireVertexBuffers acquires them. Any thread.
+struct MergedVertexRanges {
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;  // up to buffers_num
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges; // up to count
+	uint32_t                                                      count = 0;
+};
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -281,6 +320,9 @@ private:
 		// Speculation index of each merged vertex range (AcquireVertexBuffers' order).
 		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> vertex_speculated {};
 		uint32_t                                             vertex_count = 0;
+		// MergeVertexRanges of the draw's vertex stage (vertex_count of them), reused at commit
+		// but for the clamp to mapped memory.
+		MergedVertexRanges                                   vertex_ranges;
 		BufferCache::Speculation                             speculation;
 	};
 

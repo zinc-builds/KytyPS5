@@ -43,7 +43,14 @@ struct WorkerTextureRecord {
 
 struct TextureProposal {
 	const WorkerTextureRecord* record = nullptr; // null: resolve on the command thread
+	// Copies of the record's serial, and whether a hit runs its color-clear step (resolved, not
+	// null, color_clear), so binding-set reuse need not read the record.
+	uint64_t serial      = 0;
+	bool     color_clear = false;
 };
+[[nodiscard]] inline TextureProposal ProposeRecord(const WorkerTextureRecord* record) {
+	return {record, record->serial, record->resolved && !record->null && record->color_clear};
+}
 
 // A resolve the command thread made for a queued draw, handed back to the worker's memo
 // through the draw's slot (applied when the worker next runs a job on it).
