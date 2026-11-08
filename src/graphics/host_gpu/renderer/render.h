@@ -311,11 +311,16 @@ private:
 		// Color targets the command thread resolved for this draw, for the worker's records:
 		// handed over like texture_updates.
 		std::vector<std::unique_ptr<WorkerColorTargetRecord>> target_updates;
+		std::vector<std::unique_ptr<WorkerDepthTargetRecord>> depth_updates;
 	};
 	// The worker's color targets for the queued draw being committed, while they may be used.
 	const WorkerTargets* m_adopted_targets = nullptr;
 	// Color target resolves made for the queued draw being committed, handed to its slot after.
 	std::vector<std::unique_ptr<WorkerColorTargetRecord>> m_target_updates;
+	std::vector<std::unique_ptr<WorkerDepthTargetRecord>> m_depth_updates;
+	// Command thread: depth_info as the worker proposed it (record null: no attachment).
+	void ResolveProposedDepthTarget(CommandBuffer& buffer, const WorkerDepthTargetRecord* record,
+	                                RenderDepthInfo& r);
 	// Prepare worker, after the program lookup: proposes the draw's color targets and writes
 	// them into its state.color_info.
 	void SpeculateTargets(QueuedDraw& queued, WorkerTargetMemo& memo);

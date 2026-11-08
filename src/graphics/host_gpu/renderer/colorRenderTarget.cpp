@@ -346,9 +346,37 @@ void RenderExecutor::SpeculateTargets(QueuedDraw& queued, WorkerTargetMemo& memo
 	const auto retire_slots = m_queued_draws.size() + 1;
 	if (memo.retired.size() != retire_slots) {
 		memo.retired.resize(retire_slots);
+		memo.depth_retired.resize(retire_slots);
 	}
-	auto& retired = memo.retired[memo.jobs++ % retire_slots];
+	const auto job           = memo.jobs++ % retire_slots;
+	auto&      retired       = memo.retired[job];
+	auto&      depth_retired = memo.depth_retired[job];
 	retired.clear();
+	depth_retired.clear();
+	const auto file_depth = [&](std::unique_ptr<WorkerDepthTargetRecord> record) {
+		auto* way     = &memo.depth[memo.depth_next];
+		bool  matched = false;
+		for (auto& candidate: memo.depth) {
+			if (candidate != nullptr &&
+			    std::memcmp(&candidate->z, &record->z, sizeof(record->z)) == 0) {
+				way     = &candidate;
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) {
+			memo.depth_next = (memo.depth_next + 1) % WorkerTargetMemo::Ways;
+		}
+		if (*way != nullptr) {
+			depth_retired.push_back(std::move(*way));
+		}
+		*way = std::move(record);
+		return way->get();
+	};
+	for (auto& update: queued.depth_updates) {
+		file_depth(std::move(update));
+	}
+	queued.depth_updates.clear();
 	const auto file = [&](std::unique_ptr<WorkerColorTargetRecord> record) {
 		const auto slot = record->info.target_slot;
 		auto&      ways = memo.slots[slot];
@@ -416,7 +444,92 @@ void RenderExecutor::SpeculateTargets(QueuedDraw& queued, WorkerTargetMemo& memo
 		targets.color[count++] = found;
 	}
 	targets.count = count;
+	targets.depth = nullptr;
+	if (auto& r = state.depth_info; DecodeDepthTargetState(hw, r)) {
+		const auto&                    z     = hw.GetDepthRenderTarget();
+		const WorkerDepthTargetRecord* found = nullptr;
+		for (const auto& candidate: memo.depth) {
+			if (candidate != nullptr && std::memcmp(&candidate->z, &z, sizeof(z)) == 0) {
+				found = candidate.get();
+				break;
+			}
+		}
+		if (found == nullptr) {
+			auto record = std::make_unique<WorkerDepthTargetRecord>();
+			std::memcpy(&record->z, &z, sizeof(z)); // With padding: compared as bytes.
+			record->desc = MakeDepthTargetDesc(m_context.GetGraphics(), z);
+			found        = file_depth(std::move(record));
+		}
+		r.desc        = found->desc;
+		r.image_id    = found->resolved ? found->image_id : ImageId {};
+		targets.depth = found;
+	}
 	targets.ready = true;
+}
+
+void RenderExecutor::ResolveProposedDepthTarget(CommandBuffer&                 buffer,
+                                                const WorkerDepthTargetRecord* record,
+                                                RenderDepthInfo&               r) {
+	if (record == nullptr) {
+		return; // no depth or stencil attachment
+	}
+	auto& texture_cache = m_context.GetTextureCache();
+	if (record->resolved) {
+		const auto& found       = record->desc;
+		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
+		                         found.info.metadata.kind == ImageMetadataKind::Cmask;
+		if (texture_cache.RefindExactImage(record->image_id, found.info.data,
+		                                   color_clear ? &found : nullptr,
+		                                   record->metadata_base_layer, record->generation)) {
+			BindRenderTarget(r.image_id);
+		} else {
+			ResolveRenderDepthTarget(buffer, r);
+			const auto& memo = m_depth_target_memo;
+			if (r.image_id && memo.generation != 0 && memo.image_id == r.image_id) {
+				auto update                 = std::make_unique<WorkerDepthTargetRecord>(*record);
+				update->desc                = memo.desc;
+				update->image_id            = memo.image_id;
+				update->metadata_base_layer = memo.metadata_base_layer;
+				update->generation          = memo.generation;
+				m_depth_updates.push_back(std::move(update));
+			}
+		}
+	} else {
+		const auto metadata_base_layer = r.desc.view_info.base_layer;
+		uint64_t   generation          = 0;
+		r.image_id = texture_cache.FindImage(r.desc, false, &generation);
+		BindRenderTarget(r.image_id);
+		if (r.image_id && generation != 0) {
+			auto update = std::make_unique<WorkerDepthTargetRecord>();
+			std::memcpy(&update->z, &record->z, sizeof(record->z));
+			update->desc                = r.desc;
+			update->image_id            = r.image_id;
+			update->resolved            = true;
+			update->metadata_base_layer = metadata_base_layer;
+			update->generation          = generation;
+			m_depth_updates.push_back(std::move(update));
+		}
+	}
+	if (WorkerTargetsVerify()) {
+		const auto&     hw = buffer.GetRegisters();
+		RenderDepthInfo check;
+		EXIT_IF(!DecodeDepthTargetState(hw, check));
+		check.desc     = MakeDepthTargetDesc(m_context.GetGraphics(), hw.GetDepthRenderTarget());
+		check.image_id = texture_cache.FindImage(check.desc, false, nullptr);
+		if (check.image_id != r.image_id || !(check.desc.view_info == r.desc.view_info) ||
+		    check.desc.info.data != r.desc.info.data ||
+		    check.desc.info.stencil != r.desc.info.stencil ||
+		    check.depth_test_enable != r.depth_test_enable ||
+		    check.depth_write_enable != r.depth_write_enable ||
+		    check.depth_compare_op != r.depth_compare_op ||
+		    check.depth_clear_enable != r.depth_clear_enable ||
+		    check.stencil_test_enable != r.stencil_test_enable ||
+		    check.stencil_clear_enable != r.stencil_clear_enable) {
+			EXIT("KYTY_WORKER_TARGETS_VERIFY: depth proposal disagrees: image %u vs %u\n",
+			     static_cast<uint32_t>(r.image_id.index),
+			     static_cast<uint32_t>(check.image_id.index));
+		}
+	}
 }
 
 void RenderExecutor::ResolveProposedColorTarget(CommandBuffer&                 buffer,

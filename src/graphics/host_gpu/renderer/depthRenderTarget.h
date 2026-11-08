@@ -32,6 +32,22 @@ struct RenderDepthInfo {
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };
 
+struct GraphicContext;
+namespace HW {
+class Context;
+struct DepthRenderTarget;
+} // namespace HW
+
+// The register side of the depth target, without its description: false (r untouched) when the
+// draw uses no depth or stencil attachment, else r's clear, test and stencil state. Register work
+// only, so any thread (the prepare worker proposes depth targets with it).
+bool DecodeDepthTargetState(const HW::Context& hw, RenderDepthInfo& r);
+// The depth target's guest description and view, before the texture cache finds or remaps an
+// image. Any thread.
+TextureCache::ImageDesc MakeDepthTargetDesc(const GraphicContext&        graphics,
+                                            const HW::DepthRenderTarget& z,
+                                            bool                         write_buffer = false);
+
 inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,
                                                  const ImageViewInfo& target,
                                                  const ImageViewInfo& sampled) {
