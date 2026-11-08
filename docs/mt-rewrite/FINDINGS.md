@@ -62,6 +62,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-07 | Guest read faults on GPU-written memory no longer stall the command thread: it records and submits the download in PM4 order and moves on, the faulting thread waits (Track B; same batch: ref `dev` c7600e89 36.40 / 36.11; `KYTY_STALL_DIAG` command-thread time in readbacks 9.4–10.2% → 0.8%, of it on the GPU 8.4–9.3% → 0.0%; a single longer frame per run, max 50–83 ms vs 33.8) | 38.99 / 38.90 | 204.3k / 204.8k | 35.6 (max 66.7) / 35.6 (max 50.0) | 27.8 / 28.7 |
 | 2026-11-07 | Guest reads inside one backing mapping copy without locks: a per-thread translation cache checked against a sequence count that backing-store writers make odd (same batch: ref `dev` 75f3eebc 38.97, worst_ms 33.7) | 39.56 | 208.0k | 33.5 (max 33.6) | 29.2 |
 | 2026-11-07 | Per-draw fences off the command thread: lookups of unchanged images skip the texture cache's lock (a per-image atomic "settled" state that CPU write faults clear), retired-operation checks skip the scheduler's mutex, recorder hand-offs skip the full fence, overlay counters are per thread (Track B; same batch: ref `dev` ab1429f1 39.21 / 39.52; before #55, on 75f3eebc +1.5% and on b4a91152 4 pairs +1.9%; samples right after a locked instruction 8.1% → 1.1% of the command thread; `KYTY_TC_SETTLED_VERIFY` 104M checks clean) | 39.98 / 39.78 | 209.3k / 209.9k | 33.5 (max 33.6) / 33.5 (max 33.7) | 28.7 / 28.6 |
+| 2026-11-08 | The last per-draw fences: the render context mutex is biased to the command thread (other threads force a `membarrier` and wait; `KYTY_RENDER_MUTEX_BIASED=0` turns it off), `FindDepthTarget` skips the texture cache lock for settled images, `ClampRangeSize` remembers answers per thread until the ranges change (Track B; same batches: ref `dev` ee714f06 40.70 / 40.83 / 40.68 / 40.46; settled verify 106M checks clean) | 40.78 / 41.06 / 41.01 / 40.99 | 214.2k / 215.1k / 215.8k / 215.6k | 33.5–35.7 (max 33.6–66.7) | 28.7 / 29.9 / – / – |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1416,7 +1417,8 @@ What this means:
   guest-memory rwlocks (now gone, #55) and the render context mutex `DrawIndex`/`DrawAuto` take
   per draw (~2.5%). A local experiment without those as well measured 40.18 / 40.33 against
   38.69 / 38.59 on b4a91152 (+4.2% in all). Any one lock left absorbs the drain, so they pay
-  only together.
+  only together. With the render context mutex, `FindDepthTarget`'s lock
+  and `ClampRangeSize`'s mutex gone too, +0.7% more (4 pairs on ee714f06).
 
 ## Remaining costs and candidate directions
 

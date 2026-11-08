@@ -244,6 +244,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -274,6 +275,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -303,6 +305,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
@@ -316,6 +319,7 @@ public:
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -362,6 +366,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -374,6 +379,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -434,8 +440,29 @@ public:
 		return false;
 	}
 
+	// The GPU thread asks for the same ranges every draw: remember answers per thread until the
+	// ranges change, so the common case takes no lock.
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+		struct Memo {
+			const VirtualRanges* owner  = nullptr;
+			uint64_t             addr   = 0;
+			uint64_t             size   = 0;
+			uint64_t             gen    = 0;
+			uint64_t             result = 0;
+		};
+		static thread_local std::array<Memo, 64> memos {};
+		auto& memo = memos[(virtual_addr >> 6u ^ size) & (memos.size() - 1)];
+		if (memo.owner == this && memo.addr == virtual_addr && memo.size == size &&
+		    memo.gen == m_generation.load(std::memory_order_acquire)) {
+			return memo.result;
+		}
 		Common::LockGuard lock(m_mutex);
+		const auto result = ClampRangeSizeUnlocked(virtual_addr, size);
+		memo = {this, virtual_addr, size, m_generation.load(std::memory_order_relaxed), result};
+		return result;
+	}
+
+	uint64_t ClampRangeSizeUnlocked(uint64_t virtual_addr, uint64_t size) {
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
@@ -640,6 +667,9 @@ private:
 
 	RangeMap      m_ranges;
 	Common::Mutex m_mutex;
+	// Bumped under m_mutex by every change to m_ranges that can change ClampRangeSize.
+	std::atomic<uint64_t> m_generation {1};
+	void Changed() { m_generation.store(m_generation.load(std::memory_order_relaxed) + 1, std::memory_order_release); }
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
 };

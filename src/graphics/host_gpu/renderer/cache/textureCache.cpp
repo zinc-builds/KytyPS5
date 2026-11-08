@@ -1650,8 +1650,25 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+	auto& image = m_slot_images[id];
+	if (!desc.info.HasStencil() &&
+	    (image.settled.load(std::memory_order_acquire) & Image::SettledWrite) != 0 &&
+	    image.registered && !image.depth_id && !image.binding.needs_rebind) {
+		VerifySettled(image, Image::SettledWrite);
+		TouchImage(image);
+		// Metadata and its clear state belong to the GPU thread.
+		image.info.stencil  = desc.info.stencil;
+		image.info.metadata = desc.info.metadata;
+		if (desc.info.HasMetadata()) {
+			const auto [metadata, inserted] =
+			    m_surface_metas.try_emplace(desc.info.metadata.range.address);
+			if (inserted && image.info.htile_initial_clear) {
+				metadata->second.clear_mask.set();
+			}
+		}
+		return image.FindView(desc.view_info);
+	}
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
@@ -1680,6 +1697,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
+	} else {
+		Settle(image);
 	}
 	return image.FindView(desc.view_info);
 }

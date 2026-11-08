@@ -18,8 +18,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <xxhash.h>
+
+#if defined(__linux__)
+#include <linux/membarrier.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -98,6 +110,76 @@ void RenderContext::ShutdownGpu() {
 		m_command_scheduler.DrainPriorityOperations();
 		m_video_out = nullptr;
 	}
+}
+
+RenderContextMutex::RenderContextMutex() {
+#if defined(__linux__)
+	m_biased = syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	m_biased = true;
+#endif
+	static const char* off = std::getenv("KYTY_RENDER_MUTEX_BIASED");
+	if (off != nullptr && off[0] == '0') {
+		m_biased = false;
+	}
+}
+
+void RenderContextMutex::Lock() {
+	if (!GuestGpu::IsGpuThread()) {
+		m_mutex.lock();
+		if (m_biased && m_external_depth++ == 0) {
+			m_external.store(true, std::memory_order_relaxed);
+			// Every thread's earlier stores are visible after this, so either the command thread
+			// shows itself active below, or it sees m_external and takes m_mutex.
+#if defined(__linux__)
+			EXIT_IF(syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) != 0);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			FlushProcessWriteBuffers();
+#endif
+			while (m_owner_active.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+				_mm_pause();
+#else
+				std::this_thread::yield();
+#endif
+			}
+		}
+		return;
+	}
+	if (m_owner_depth++ != 0) {
+		return;
+	}
+	if (m_biased) {
+		m_owner_active.store(true, std::memory_order_relaxed);
+		// Only the compiler must keep the store before the load: the other side's membarrier
+		// orders them on the CPU.
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+		if (!m_external.load(std::memory_order_acquire)) {
+			return;
+		}
+		m_owner_active.store(false, std::memory_order_release);
+	}
+	m_mutex.lock();
+	m_owner_mutex = true;
+}
+
+void RenderContextMutex::Unlock() {
+	if (!GuestGpu::IsGpuThread()) {
+		if (m_biased && --m_external_depth == 0) {
+			m_external.store(false, std::memory_order_release);
+		}
+		m_mutex.unlock();
+		return;
+	}
+	if (--m_owner_depth != 0) {
+		return;
+	}
+	if (m_owner_mutex) {
+		m_owner_mutex = false;
+		m_mutex.unlock();
+		return;
+	}
+	m_owner_active.store(false, std::memory_order_release);
 }
 
 GuestGpu& RenderContext::GetGpu() const {
