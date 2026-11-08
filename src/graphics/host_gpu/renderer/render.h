@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/workerTextures.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -297,10 +298,22 @@ private:
 		uint64_t                         sync_epoch        = 0;
 		uint64_t                         stored_sequence   = 0;
 		WorkerBuffers                    buffers;
+		WorkerTextures                   textures;
+		// Resolves the command thread made for this draw, for the worker's memo (see
+		// TextureMemoRecord): appended while the command thread owns the slot, applied and
+		// cleared by the worker before its next job on it.
+		std::vector<TextureMemoRecord> texture_updates;
 	};
 	// The worker's buffer side for the queued draw being committed, while it may be used.
 	const WorkerBuffers* m_adopted_buffers = nullptr;
 	void                 SpeculateBuffers(QueuedDraw& queued);
+	// The worker's texture side for the queued draw being committed, while it may be used.
+	const WorkerTextures* m_adopted_textures = nullptr;
+	// Prepare worker, after SpeculateBuffers: proposes the draw's texture resolves.
+	void SpeculateTextures(QueuedDraw& queued);
+	// The worker's proposals for a stage being prepared, if it made them for this runtime.
+	[[nodiscard]] const std::vector<TextureProposal>* AdoptedTextureProposals(
+	    const ShaderStageRuntime& runtime) const;
 
 	// False, with nothing drawn, when the draw's indirect records need CPU counts. A queued draw
 	// brings its registers (bound to `buffer`) and the worker's lookup.
@@ -355,9 +368,11 @@ private:
 	[[nodiscard]] std::vector<TextureResolveMemo>& TextureMemoSlots(const ShaderModule& module);
 	// ResolveTexture for image `index` of a stage, through the stage's memo slots, into `out`.
 	// out keeps its mip view storage, emptied.
+	// proposal: the prepare worker's for this binding, or null.
 	void ResolveStageTexture(std::vector<TextureResolveMemo>*             memo, uint32_t index,
 	                         const ShaderRecompiler::IR::ImageResource&   resource,
-	                         const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& out);
+	                         const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& out,
+	                         const TextureProposal*                       proposal = nullptr);
 
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);

@@ -792,7 +792,8 @@ void RenderExecutor::ResolveStageTexture(std::vector<TextureResolveMemo>*       
                                          uint32_t                                     index,
                                          const ShaderRecompiler::IR::ImageResource&   resource,
                                          const ShaderRecompiler::IR::DescriptorValue& value,
-                                         TextureBinding&                              out) {
+                                         TextureBinding&                              out,
+                                         const TextureProposal* /*proposal*/) {
 	if (memo == nullptr) {
 		AssignWithoutMipViews(out, ResolveTexture(resource, value));
 		return;
@@ -925,6 +926,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	const auto* proposals = AdoptedTextureProposals(runtime);
 	std::vector<TextureResolveMemo>* memo = nullptr;
 	if (GetDrawStateCacheMode() != DrawStateCacheMode::Off && !program.info.images.empty()) {
 		memo = &TextureMemoSlots(*runtime.module);
@@ -935,7 +937,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			continue;
 		}
 		auto& binding = prepared.images[i];
-		ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i], binding);
+		ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i], binding,
+		                    proposals != nullptr && i < proposals->size() ? &(*proposals)[i]
+		                                                                 : nullptr);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
