@@ -341,6 +341,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	if (m_before_submit) {
+		m_before_submit();
+	}
 
 	// The command pool and buffer are the recording thread's until it is done.
 	(void)m_command.Handle();
