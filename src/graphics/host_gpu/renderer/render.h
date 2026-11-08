@@ -15,6 +15,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <mutex>
+#include <deque>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <span>
@@ -309,36 +312,49 @@ private:
 	void                 SpeculateBuffers(QueuedDraw& queued);
 	// The worker's texture side for the queued draw being committed, while it may be used.
 	const WorkerTextures* m_adopted_textures = nullptr;
-	// A prepare worker's resolve memo. Open addressing by TextureDescriptionKey (a mixed hash),
-	// linear probing, at most half full; records are only replaced or all dropped, so no
-	// tombstones.
-	struct WorkerTextureMemo {
-		struct Entry {
-			uint64_t                             key = 0;
-			std::unique_ptr<WorkerTextureRecord> record; // null: empty
+	// The prepare workers' texture resolve memo, one for all of them (KYTY_SHARED_TEXTURE_MEMO=0:
+	// one per worker). Open addressing by TextureDescriptionKey (a mixed hash), linear probing, at
+	// most about half full. A slot only goes from empty to a record or from one record to another
+	// until the whole table is replaced, so there are no tombstones and lookups take no lock.
+	// Records are immutable once filed (WorkerTextureRecord::generation is the command thread's).
+	// A replaced record or table may still be proposed to a queued draw: it is freed only after
+	// every draw that could have seen it was committed (Collect).
+	struct SharedTextureMemo {
+		struct Table {
+			explicit Table(size_t capacity);
+			~Table(); // deletes the records it holds
+			KYTY_CLASS_NO_COPY(Table);
+			std::unique_ptr<std::atomic<WorkerTextureRecord*>[]> slots;
+			size_t                                               mask = 0;
+			std::atomic<size_t>                                  size {0};
 		};
-		std::vector<Entry> entries;
-		size_t             size = 0;
-		// The entry holding `key`, or the empty one it would go to.
-		[[nodiscard]] Entry& Slot(uint64_t key) {
-			const auto mask = entries.size() - 1;
-			for (auto index = (key ^ (key >> 29u)) & mask;; index = (index + 1) & mask) {
-				auto& entry = entries[index];
-				if (entry.record == nullptr || entry.key == key) {
-					return entry;
-				}
-			}
-		}
+		SharedTextureMemo();
+		~SharedTextureMemo();
+		KYTY_CLASS_NO_COPY(SharedTextureMemo);
+		std::atomic<Table*> table {nullptr};
+		// Replaced records and tables, with the sequence of the job that replaced them.
+		std::mutex                                                             retire_mutex;
+		std::deque<std::pair<uint64_t, std::unique_ptr<WorkerTextureRecord>>> retired_records;
+		std::deque<std::pair<uint64_t, std::unique_ptr<Table>>>               retired_tables;
+		std::atomic<uint64_t> oldest_retired {UINT64_MAX}; // a lower bound: UINT64_MAX when none
+
+		[[nodiscard]] const WorkerTextureRecord* Find(
+		    uint64_t key, const ShaderRecompiler::IR::ImageResource& inputs,
+		    const ShaderRecompiler::IR::DescriptorValue& value) const;
+		const WorkerTextureRecord* File(uint64_t sequence, std::unique_ptr<WorkerTextureRecord> record,
+		                                bool replace);
+		void Collect(uint64_t sequence, uint64_t window);
+		void Retire(uint64_t sequence, std::unique_ptr<WorkerTextureRecord> record,
+		            std::unique_ptr<Table> table);
 	};
-	// One prepare worker's texture side: its memo, records it replaced in its last jobs, and
-	// the next serial of its records (odd, unique among workers: see PrepareLane).
+	// One prepare worker's texture side: the memo it uses and the next serial of its records
+	// (odd, unique among workers: see PrepareLane).
 	struct WorkerTextureState {
-		WorkerTextureMemo                                              records;
-		std::vector<std::vector<std::unique_ptr<WorkerTextureRecord>>> retired;
-		uint64_t                                                       jobs   = 0;
-		uint64_t                                                       serial = 1;
-		uint64_t                                                       serial_step = 2;
+		SharedTextureMemo* memo        = nullptr;
+		uint64_t           serial      = 1;
+		uint64_t           serial_step = 2;
 	};
+	std::vector<std::unique_ptr<SharedTextureMemo>> m_texture_memos;
 	// Prepare worker, after SpeculateBuffers: proposes the draw's texture resolves from its memo.
 	void SpeculateTextures(QueuedDraw& queued, WorkerTextureState& state);
 	// Resolves made for the queued draw being committed, handed to its slot after the draw.
@@ -543,6 +559,8 @@ private:
 		uint64_t stored = 0;
 		uint64_t wait_ns = 0, verified = 0, worker_busy_ns = 0, start_ns = 0;
 		uint64_t drains = 0, waits = 0; // drains: FinishQueuedDraws with draws queued
+		uint64_t texture_updates = 0; // resolves handed back for the workers' memo
+		uint64_t texture_generation_refreshes = 0; // adopted records whose page check ran again
 	} m_prepare_stat;
 
 	friend class CommandProcessor;

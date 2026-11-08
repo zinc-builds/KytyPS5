@@ -68,6 +68,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | The prepare worker's texture memo is a flat open-addressed table instead of `std::unordered_map` (Track B; same batch: ref `dev` 78fa7f97 41.03 / 41.29; worker 2.90 → 2.80 µs/draw, command thread's wait for it 316 → 223 ns/draw, `KYTY_PREPARE_STATS`; verify 81M checks clean) | 42.18 / 42.42 | – | – | – |
 | 2026-11-08 | Texture bindings keep the worker record's desc when the record has not changed instead of copying ~1.1 KB per binding; record generations refresh in place instead of a 3.7 KB copy (Track B; same batch: ref `dev` 4a7f63c4 42.76 / 42.88; worker verify 82M checks and `KYTY_DTC_VERIFY` clean) | 43.62 / 43.57 | 228.8k / 229.1k | 33.5 | – |
 | 2026-11-08 | Two prepare workers, draws split alternately, the second on its own performance core (CPU 6, taken from the emulator's set); each keeps its own texture memo and SRT walk scratch (Track B4, plan item 2; same batch: ref `dev` 94c0492e 43.54 / 43.62; same binary with `KYTY_PREPARE_WORKERS=1` 43.17 → 44.66, command thread waiting for the worker 7.7% → 2.5%) | 44.92 / 44.41 | 235.7k / 233.5k | 33.5 (max 34.0) / 34.7 (max 50.0) | 27.2 / 27.3 |
+| 2026-11-08 | One texture memo for both prepare workers instead of one each: lock-free lookups, records filed by compare-and-swap, a replaced record or table freed two rings later (Track B; same batch: ref `dev` 26c29910 44.64; same binary with `KYTY_PREPARE_STATS=1`, `KYTY_SHARED_TEXTURE_MEMO=0` 43.64 / 43.86 → 45.49 / 45.11; the command thread's per-page re-checks of adopted records 84k → 51k/s (one worker: 48k/s), worker 3.2 µs/draw unchanged; `KYTY_WORKER_TEXTURES_VERIFY=1` 83M checks clean) | 45.30 | 238.4k | 38.2 (max 83.4) | 27.9 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1515,7 +1516,9 @@ What this means:
   thread, `KYTY_PREPARE_DEPTH=<n>` queues up to n draws (default 4), `KYTY_PREPARE_CPU=<n>` pins
   the worker elsewhere, `KYTY_PREPARE_VERIFY=1` looks every adopted draw up again and exits on a
   difference, `KYTY_PREPARE_STATS=1` prints `PREPARE` lines once per second (adopted and rejected
-  draws, drains, the command thread's wait and the worker's time per draw).
+  draws, drains, the command thread's wait and the worker's time per draw, texture resolves handed
+  back to the workers' memo and adopted records whose page check ran again). `KYTY_SHARED_TEXTURE_MEMO=0`
+  gives each worker its own texture memo again.
 - Critical path: `KYTY_STALL_DIAG=1` prints a `STALL` line once per second with the GPU command
   thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
   GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)

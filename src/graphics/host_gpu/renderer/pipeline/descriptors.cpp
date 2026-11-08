@@ -39,6 +39,7 @@
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -858,6 +859,9 @@ void RenderExecutor::ResolveProposedTexture(const WorkerTextureRecord&          
 			}
 			AssignFromRecord(out, record);
 			// No image appeared over it since: the next adoption skips the per-page check.
+			if (record.generation != generation) {
+				m_prepare_stat.texture_generation_refreshes++;
+			}
 			record.generation = generation;
 			return;
 		}
@@ -867,6 +871,7 @@ void RenderExecutor::ResolveProposedTexture(const WorkerTextureRecord&          
 	if (trace.reusable) {
 		auto update                 = std::make_unique<WorkerTextureRecord>();
 		update->serial              = m_command_texture_serial += 2;
+		update->key                 = record.key;
 		update->inputs              = record.inputs;
 		update->value               = record.value;
 		update->description         = record.description;
@@ -884,44 +889,151 @@ void RenderExecutor::ResolveProposedTexture(const WorkerTextureRecord&          
 	AssignWithoutMipViews(out, binding);
 }
 
-// Prepare worker: files the resolves the command thread handed back through this slot, then
-// proposes each image binding's record in the worker's resolve memo (a new record, with only
-// the description, for a resource and T# it has not seen).
-void RenderExecutor::SpeculateTextures(QueuedDraw& queued, WorkerTextureState& worker_memo) {
-	auto& memo = worker_memo.records;
-	// A record replaced now may be proposed to queued draws until the ring comes round (in
-	// this worker's jobs, every N-th draw: sooner).
-	const auto retire_slots = m_queued_draws.size() + 1;
-	if (worker_memo.retired.size() != retire_slots) {
-		worker_memo.retired.resize(retire_slots);
+static constexpr size_t MaxTextureRecords = 16384;
+
+static size_t TextureMemoIndex(uint64_t key) {
+	return key ^ (key >> 29u);
+}
+
+
+void RenderExecutor::SharedTextureMemo::Retire(uint64_t sequence, std::unique_ptr<WorkerTextureRecord> record,
+                         std::unique_ptr<Table> table) {
+	auto&           memo = *this;
+	std::lock_guard lock(memo.retire_mutex);
+	if (record != nullptr) {
+		memo.retired_records.emplace_back(sequence, std::move(record));
 	}
-	auto& retired = worker_memo.retired[worker_memo.jobs++ % retire_slots];
-	retired.clear();
-	constexpr size_t MaxRecords = 16384;
-	if (memo.entries.empty()) {
-		memo.entries.resize(MaxRecords * 2);
+	if (table != nullptr) {
+		memo.retired_tables.emplace_back(sequence, std::move(table));
 	}
-	const auto file = [&](std::unique_ptr<WorkerTextureRecord> record) {
-		if (memo.size >= MaxRecords) {
-			for (auto& entry: memo.entries) {
-				if (entry.record != nullptr) {
-					retired.push_back(std::move(entry.record));
-				}
+	if (sequence < memo.oldest_retired.load(std::memory_order_relaxed)) {
+		memo.oldest_retired.store(sequence, std::memory_order_relaxed);
+	}
+}
+
+// Frees what was replaced during job q once job `sequence` >= q + window starts, window being
+// twice the ring. When job q replaced it, at most ring - 1 draws were posted and not committed,
+// all of them before q + ring, so only those can hold it; and job `sequence` starts only after
+// draw sequence - ring, which used the same slot, was committed.
+void RenderExecutor::SharedTextureMemo::Collect(uint64_t sequence, uint64_t window) {
+	auto&      memo   = *this;
+	const auto oldest = memo.oldest_retired.load(std::memory_order_relaxed);
+	if (oldest == UINT64_MAX || sequence < oldest + window) {
+		return;
+	}
+	std::vector<std::unique_ptr<WorkerTextureRecord>> records;
+	std::vector<std::unique_ptr<Table>>                tables;
+	{
+		std::lock_guard lock(memo.retire_mutex);
+		auto& retired_records = memo.retired_records;
+		auto& retired_tables  = memo.retired_tables;
+		// Two workers retire, so the queues are only roughly in order: stop at the first entry
+		// that is too young (it is freed later, never early).
+		while (!retired_records.empty() && retired_records.front().first + window <= sequence) {
+			records.push_back(std::move(retired_records.front().second));
+			retired_records.pop_front();
+		}
+		while (!retired_tables.empty() && retired_tables.front().first + window <= sequence) {
+			tables.push_back(std::move(retired_tables.front().second));
+			retired_tables.pop_front();
+		}
+		auto next = UINT64_MAX;
+		if (!retired_records.empty()) next = std::min(next, retired_records.front().first);
+		if (!retired_tables.empty()) next = std::min(next, retired_tables.front().first);
+		memo.oldest_retired.store(next, std::memory_order_relaxed);
+	}
+}
+
+const WorkerTextureRecord* RenderExecutor::SharedTextureMemo::Find(uint64_t key,
+                                             const ShaderRecompiler::IR::ImageResource&   inputs,
+                                             const ShaderRecompiler::IR::DescriptorValue& value) const {
+	const auto& table = *this->table.load(std::memory_order_acquire);
+	for (auto index = TextureMemoIndex(key) & table.mask;; index = (index + 1) & table.mask) {
+		const auto* record = table.slots[index].load(std::memory_order_acquire);
+		if (record == nullptr) {
+			return nullptr;
+		}
+		if (record->key == key) {
+			return record->value == value && record->inputs == inputs ? record : nullptr;
+		}
+	}
+}
+
+// Files `record` (its key set) and returns the record now filed for its key. `replace`: a
+// record already there is replaced (a command-thread resolve). Otherwise an equal record another
+// worker filed meanwhile is kept and `record` dropped; an unequal one (a key collision) is
+// replaced.
+const WorkerTextureRecord* RenderExecutor::SharedTextureMemo::File(uint64_t sequence,
+                                             std::unique_ptr<WorkerTextureRecord> record,
+                                             bool                                 replace) {
+	auto&      memo = *this;
+	const auto key  = record->key;
+	for (;;) {
+		auto* table = memo.table.load(std::memory_order_acquire);
+		if (table->size.load(std::memory_order_relaxed) >= MaxTextureRecords) {
+			// Full: start over with an empty table (one worker wins; the old one is retired).
+			auto  fresh    = std::make_unique<Table>(MaxTextureRecords * 2);
+			auto* expected = table;
+			if (memo.table.compare_exchange_strong(expected, fresh.get(),
+			                                       std::memory_order_acq_rel)) {
+				(void)fresh.release();
+				Retire(sequence, nullptr, std::unique_ptr<Table>(table));
 			}
-			memo.size = 0;
+			continue;
 		}
-		const auto key  = TextureDescriptionKey(record->inputs, record->value);
-		auto&      slot = memo.Slot(key);
-		if (slot.record != nullptr) {
-			retired.push_back(std::move(slot.record));
-		} else {
-			memo.size++;
+		for (auto index = TextureMemoIndex(key) & table->mask;; index = (index + 1) & table->mask) {
+			auto& slot    = table->slots[index];
+			auto* current = slot.load(std::memory_order_acquire);
+			if (current == nullptr) {
+				if (slot.compare_exchange_strong(current, record.get(), std::memory_order_acq_rel,
+				                                 std::memory_order_acquire)) {
+					table->size.fetch_add(1, std::memory_order_relaxed);
+					return record.release();
+				}
+				// Another worker filled the slot: look at what it put there.
+			}
+			if (current->key != key) {
+				continue;
+			}
+			if (!replace && current->value == record->value && current->inputs == record->inputs) {
+				return current;
+			}
+			while (!slot.compare_exchange_weak(current, record.get(), std::memory_order_acq_rel,
+			                                   std::memory_order_acquire)) {
+			}
+			Retire(sequence, std::unique_ptr<WorkerTextureRecord>(current), nullptr);
+			return record.release();
 		}
-		slot.key    = key;
-		slot.record = std::move(record);
-	};
+	}
+}
+
+RenderExecutor::SharedTextureMemo::Table::Table(size_t capacity)
+    : slots(std::make_unique<std::atomic<WorkerTextureRecord*>[]>(capacity)), mask(capacity - 1) {
+	EXIT_IF(capacity == 0 || (capacity & (capacity - 1)) != 0);
+}
+
+RenderExecutor::SharedTextureMemo::Table::~Table() {
+	for (size_t index = 0; index <= mask; index++) {
+		delete slots[index].load(std::memory_order_relaxed);
+	}
+}
+
+RenderExecutor::SharedTextureMemo::SharedTextureMemo()
+    : table(new Table(MaxTextureRecords * 2)) {}
+
+RenderExecutor::SharedTextureMemo::~SharedTextureMemo() {
+	delete table.load(std::memory_order_relaxed);
+}
+
+// Prepare worker: files the resolves the command thread handed back through this slot, then
+// proposes each image binding's record in the workers' resolve memo (a new record, with only the
+// description, for a resource and T# no worker has filed).
+void RenderExecutor::SpeculateTextures(QueuedDraw& queued, WorkerTextureState& worker) {
+	auto&      memo     = *worker.memo;
+	const auto sequence = queued.sequence;
+	memo.Collect(sequence, 2 * m_queued_draws.size());
 	for (auto& update: queued.texture_updates) {
-		file(std::move(update.record));
+		(void)memo.File(sequence, std::move(update.record), true);
 	}
 	queued.texture_updates.clear();
 	auto& textures = queued.textures;
@@ -953,18 +1065,18 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued, WorkerTextureState& w
 			}
 			const auto  inputs = TextureDescriptionInputs(images[i]);
 			const auto& value  = snapshot.images[i];
-			const auto* found = memo.Slot(TextureDescriptionKey(inputs, value)).record.get();
-			if (found != nullptr && found->value == value && found->inputs == inputs) {
+			const auto  key    = TextureDescriptionKey(inputs, value);
+			if (const auto* found = memo.Find(key, inputs, value); found != nullptr) {
 				out[i] = {found};
 				continue;
 			}
 			auto record         = std::make_unique<WorkerTextureRecord>();
 			record->inputs      = inputs;
 			record->value       = value;
+			record->key         = key;
 			record->description = DescribeTexture(inputs, value, m_context.GetGraphics());
-			record->serial      = worker_memo.serial += worker_memo.serial_step;
-			out[i]              = {record.get()};
-			file(std::move(record));
+			record->serial      = worker.serial += worker.serial_step;
+			out[i]              = {memo.File(sequence, std::move(record), false)};
 		}
 	}
 	textures.ready = true;
