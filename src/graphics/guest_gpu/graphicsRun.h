@@ -64,8 +64,9 @@ public:
 	static void SetLateLabelsModeForTests(int mode) noexcept;
 	// GPU thread: defers `store` (writing `size` bytes of `value` at `vaddr`; size 0: no label)
 	// behind the work recorded so far.
+	// store_size: bytes the store writes at vaddr (0: none), recorded as a stored range.
 	void DeferLateStore(uint64_t vaddr, uint64_t value, uint64_t size,
-	                    Common::UniqueFunction<void>&& store);
+	                    Common::UniqueFunction<void>&& store, uint64_t store_size = 0);
 	// GPU thread: whether a pending label store will satisfy a wait for this address, and so the
 	// wait may pass (also makes later CP stores wait for the labels deferred so far).
 	[[nodiscard]] bool LateLabelSatisfies(uint64_t vaddr, uint64_t ref, uint64_t mask,
@@ -124,6 +125,7 @@ private:
 		uint64_t                     vaddr       = 0;
 		uint64_t                     value       = 0;
 		uint64_t                     size        = 0; // 0: not a tracked label
+		uint64_t                     store_size  = 0; // bytes stored at vaddr
 		uint64_t                     deferred_ns = 0;
 		LateLabel*                   label       = nullptr; // its record, if a tracked label
 		Common::UniqueFunction<void> store;

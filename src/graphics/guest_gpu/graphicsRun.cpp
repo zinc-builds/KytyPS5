@@ -120,7 +120,7 @@ void GuestGpu::SetLateLabelsModeForTests(int mode) noexcept {
 }
 
 void GuestGpu::DeferLateStore(uint64_t vaddr, uint64_t value, uint64_t size,
-                              Common::UniqueFunction<void>&& store) {
+                              Common::UniqueFunction<void>&& store, uint64_t store_size) {
 	EXIT_IF(!IsGpuThread());
 	LateLabel* label = nullptr;
 	if (size != 0) {
@@ -130,8 +130,8 @@ void GuestGpu::DeferLateStore(uint64_t vaddr, uint64_t value, uint64_t size,
 	}
 	m_late_in_flight.fetch_add(1, std::memory_order_relaxed);
 	m_late_stats.deferred++;
-	m_late_batch.push_back(
-	    {++m_late_deferred, vaddr, value, size, LateNowNs(), label, std::move(store)});
+	m_late_batch.push_back({++m_late_deferred, vaddr, value, size, std::max(size, store_size),
+	                        LateNowNs(), label, std::move(store)});
 }
 
 void GuestGpu::FlushLateBatch() {
@@ -222,9 +222,9 @@ void GuestGpu::ApplyLateStore(LateStore& item) {
 	}
 	// Queued draws prepared meanwhile are checked against the label's range, not dropped: a
 	// late store lands between them, unlike a store at decode, which drains them first.
-	const bool ranged = item.size != 0;
+	const bool ranged = item.store_size != 0;
 	if (ranged) {
-		DrawPrepare::NoteStoredRange(item.vaddr, item.size);
+		DrawPrepare::NoteStoredRange(item.vaddr, item.store_size);
 		GuestSyncEpoch::g_label_stores_ranged = true;
 	}
 	m_late_applying = true;
@@ -232,7 +232,7 @@ void GuestGpu::ApplyLateStore(LateStore& item) {
 	m_late_applying = false;
 	if (ranged) {
 		GuestSyncEpoch::g_label_stores_ranged = false;
-		DrawPrepare::NoteStoredRange(item.vaddr, item.size);
+		DrawPrepare::NoteStoredRange(item.vaddr, item.store_size);
 	}
 	m_late_applied  = item.sequence;
 	if (label != nullptr) {
@@ -1465,7 +1465,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			    if (interrupt) {
 				    m_renderer.TriggerInterrupt(event_id, interrupt_context_id);
 			    }
-		    });
+		    },
+		    size);
 		return;
 	}
 	if (data_sel != 0) {
