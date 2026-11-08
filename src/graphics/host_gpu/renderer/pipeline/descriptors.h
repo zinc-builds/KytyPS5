@@ -24,6 +24,9 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// The WorkerTextureRecord whose desc this holds, 0 if none: assigning that record again skips
+	// copying its ~1 KB desc. Every other assignment replaces the whole binding, resetting it.
+	uint64_t                   source = 0;
 };
 
 // The part of a texture binding decided by its resource and descriptor alone.

@@ -335,6 +335,9 @@ private:
 		}
 	};
 	WorkerTextureMemo m_worker_texture_memo;
+	// WorkerTextureRecord serials: odd from the worker, even from the command thread.
+	uint64_t m_worker_texture_serial  = 1;
+	uint64_t m_command_texture_serial = 0;
 	std::vector<std::vector<std::unique_ptr<WorkerTextureRecord>>>    m_worker_texture_retired;
 	uint64_t                                                           m_worker_texture_jobs = 0;
 	// The worker's proposals for a stage being prepared, if it made them for this runtime.
