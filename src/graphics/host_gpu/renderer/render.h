@@ -354,7 +354,13 @@ private:
 		// handed over like texture_updates.
 		std::vector<std::unique_ptr<WorkerColorTargetRecord>> target_updates;
 		std::vector<std::unique_ptr<WorkerDepthTargetRecord>> depth_updates;
+		// The pipeline key the worker built from its programs and proposed targets.
+		WorkerPipelineKey pipeline_key;
 	};
+	// The worker's pipeline key for the queued draw being committed, if its programs were adopted.
+	const WorkerPipelineKey* m_adopted_pipeline_key = nullptr;
+	// Prepare worker, after SpeculateTargets: builds the queued draw's pipeline key.
+	void ProposePipelineKey(QueuedDraw& queued);
 	// The worker's color targets for the queued draw being committed, while they may be used.
 	const WorkerTargets* m_adopted_targets = nullptr;
 	// Color target resolves made for the queued draw being committed, handed to its slot after.

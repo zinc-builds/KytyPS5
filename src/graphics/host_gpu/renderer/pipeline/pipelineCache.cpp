@@ -29,14 +29,17 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cinttypes>
 #include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <spirv-tools/libspirv.hpp>
 #include <utility>
 #include <vector>
@@ -283,8 +286,16 @@ bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+// Hashes the bytes SameBuiltKey compares: equal keys have equal bytes there.
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
-	return XXH3_64bits(&key, sizeof(key));
+	const auto& vertex = key.vertex_input;
+	auto        hash   = XXH3_64bits(&key, offsetof(GraphicsPipelineKey, vertex_input));
+	hash = XXH3_64bits_withSeed(&key.static_params, sizeof(key.static_params), hash);
+	hash = XXH3_64bits_withSeed(vertex.bindings.data(), vertex.binding_count * sizeof(vertex.bindings[0]),
+	                            hash ^ vertex.binding_count);
+	return XXH3_64bits_withSeed(vertex.attributes.data(),
+	                            vertex.attribute_count * sizeof(vertex.attributes[0]),
+	                            hash ^ (static_cast<uint64_t>(vertex.attribute_count) << 8u));
 }
 
 std::span<const uint32_t> PipelineCache::Program::FunctionCode() const {
@@ -948,87 +959,220 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor, m_compute_resources);
 }
 
-// Equality of two keys built by GetGraphicsPipeline, whose vertex bindings and attributes past
-// their counts stay zero: ~200 of the key's 516 bytes instead of all of them.
-static bool SameBuiltKey(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
-	const auto& va = a.vertex_input;
-	const auto& vb = b.vertex_input;
-	return std::memcmp(&a, &b, offsetof(GraphicsPipelineKey, vertex_input)) == 0 &&
-	       va.binding_count == vb.binding_count && va.attribute_count == vb.attribute_count &&
-	       std::memcmp(va.bindings.data(), vb.bindings.data(),
-	                   va.binding_count * sizeof(va.bindings[0])) == 0 &&
-	       std::memcmp(va.attributes.data(), vb.attributes.data(),
-	                   va.attribute_count * sizeof(va.attributes[0])) == 0 &&
-	       std::memcmp(&a.static_params, &b.static_params, sizeof(a.static_params)) == 0;
+bool GraphicsPipelineTargets::Same(const GraphicsPipelineTargets& other) const {
+	return color_count == other.color_count && depth_format == other.depth_format &&
+	       depth_samples == other.depth_samples && topology == other.topology &&
+	       primitive_restart_enable == other.primitive_restart_enable &&
+	       std::memcmp(colors.data(), other.colors.data(), color_count * sizeof(colors[0])) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
-	const auto* colors        = state.color_info.data();
-	const auto& depth         = state.depth_info;
+GraphicsPipelineTargets PipelineCache::FinalTargets(const DrawRenderState& state) {
+	GraphicsPipelineTargets targets;
+	const auto*             colors = state.color_info.data();
+	targets.color_count            = state.color_count;
+	EXIT_IF(state.color_count > RENDER_COLOR_ATTACHMENTS_MAX);
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& color = colors[i];
+		EXIT_IF(color.target_slot >= RENDER_COLOR_ATTACHMENTS_MAX || !color.image_id ||
+		        color.desc.view_info.format == vk::Format::eUndefined);
+		targets.colors[i] = {
+		    .format         = color.desc.view_info.format,
+		    .samples        = color.desc.info.samples,
+		    .slot           = static_cast<uint8_t>(color.target_slot),
+		    .export_mapping = color.export_mapping.packed,
+		    .unorm_11_11_10 = static_cast<uint8_t>(color.desc.info.guest_format ==
+		                                           Prospero::BufferFormat::k11_11_10UNorm),
+		};
+	}
+	const auto& depth = state.depth_info;
+	if (depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id)) {
+		targets.depth_format  = depth.desc.view_info.format;
+		targets.depth_samples = depth.desc.info.samples;
+	}
+	targets.topology                 = state.topology;
+	targets.primitive_restart_enable = state.primitive_restart_enable ? 1u : 0u;
+	return targets;
+}
+
+bool PipelineCache::WorkerPipelineKeysEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WORKER_PIPELINE_KEY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+namespace {
+
+bool WorkerPipelineKeyVerify() {
+	static const bool verify = [] {
+		const char* value = std::getenv("KYTY_WORKER_PIPELINE_KEY_VERIFY");
+		return value != nullptr && value[0] != '0';
+	}();
+	return verify;
+}
+
+bool WorkerPipelineKeyStats() {
+	static const bool stats = [] {
+		const char* value = std::getenv("KYTY_WORKER_PIPELINE_KEY");
+		return value != nullptr && std::strcmp(value, "stats") == 0;
+	}();
+	return stats;
+}
+
+// ResolvePolygonMode without its exits: nothing where it would exit.
+std::optional<vk::PolygonMode> TryResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
+                                                     bool cull_back) {
+	if (mode.poly_mode == 0 || (mode.poly_mode == 1 && cull_front && cull_back)) {
+		return vk::PolygonMode::eFill;
+	}
+	if (mode.poly_mode != 1 ||
+	    (!cull_front && !cull_back && mode.polymode_front_ptype != mode.polymode_back_ptype)) {
+		return std::nullopt;
+	}
+	const auto polygon_mode = cull_front ? mode.polymode_back_ptype : mode.polymode_front_ptype;
+	if (polygon_mode > 2) {
+		return std::nullopt;
+	}
+	return ResolvePolygonMode(mode, cull_front, cull_back);
+}
+
+// The first field where two keys differ, by name; empty if they are equal.
+std::string FirstKeyDifference(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
+	std::string diff;
+	const auto  field = [&](const char* name, int index, const auto& x, const auto& y) {
+        if (diff.empty() && std::memcmp(&x, &y, sizeof(x)) != 0) {
+            diff = index < 0 ? std::string(name) : fmt::format("{}[{}]", name, index);
+        }
+	};
+	for (int i = 0; i < 4; i++) {
+		field("stage_ids", i, a.stage_ids[i], b.stage_ids[i]);
+	}
+	const auto& ra = a.rendering;
+	const auto& rb = b.rendering;
+	for (int i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+		field("rendering.color_formats", i, ra.color_formats[i], rb.color_formats[i]);
+	}
+	field("rendering.depth_format", -1, ra.depth_format, rb.depth_format);
+	field("rendering.stencil_format", -1, ra.stencil_format, rb.stencil_format);
+	field("rendering.color_count", -1, ra.color_count, rb.color_count);
+	const auto& va = a.vertex_input;
+	const auto& vb = b.vertex_input;
+	field("vertex_input.binding_count", -1, va.binding_count, vb.binding_count);
+	field("vertex_input.attribute_count", -1, va.attribute_count, vb.attribute_count);
+	for (int i = 0; i < ShaderVertexInputInfo::RES_MAX; i++) {
+		field("vertex_input.bindings.stride", i, va.bindings[i].stride, vb.bindings[i].stride);
+		field("vertex_input.bindings.instance", i, va.bindings[i].instance, vb.bindings[i].instance);
+		field("vertex_input.attributes.offset", i, va.attributes[i].offset, vb.attributes[i].offset);
+		field("vertex_input.attributes.binding", i, va.attributes[i].binding,
+		      vb.attributes[i].binding);
+	}
+	const auto& sa = a.static_params;
+	const auto& sb = b.static_params;
+#define KYTY_KEY_FIELD(name) field("static_params." #name, -1, sa.name, sb.name)
+#define KYTY_KEY_SLOTS(name)                                                                       \
+	for (int i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {                                       \
+		field("static_params." #name, i, sa.name[i], sb.name[i]);                                  \
+	}
+	KYTY_KEY_FIELD(negative_one_to_one);
+	KYTY_KEY_FIELD(depth_clip_enable);
+	KYTY_KEY_FIELD(topology);
+	KYTY_KEY_FIELD(patch_control_points);
+	KYTY_KEY_FIELD(primitive_restart_enable);
+	KYTY_KEY_FIELD(samples);
+	KYTY_KEY_FIELD(sample_shading_enable);
+	KYTY_KEY_FIELD(alpha_to_coverage_enable);
+	KYTY_KEY_SLOTS(color_mask);
+	KYTY_KEY_FIELD(provoking_vtx_last);
+	KYTY_KEY_FIELD(polygon_mode);
+	KYTY_KEY_SLOTS(color_srcblend);
+	KYTY_KEY_SLOTS(color_comb_fcn);
+	KYTY_KEY_SLOTS(color_destblend);
+	KYTY_KEY_SLOTS(alpha_srcblend);
+	KYTY_KEY_SLOTS(alpha_comb_fcn);
+	KYTY_KEY_SLOTS(alpha_destblend);
+	KYTY_KEY_SLOTS(separate_alpha_blend);
+	KYTY_KEY_SLOTS(blend_enable);
+#undef KYTY_KEY_SLOTS
+#undef KYTY_KEY_FIELD
+	if (diff.empty() && !(a == b)) {
+		diff = "padding";
+	}
+	return diff;
+}
+
+} // namespace
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+bool PipelineCache::BuildGraphicsPipelineKey(const HW::Context&             ctx,
+                                             const HW::UserConfig&          user_config,
+                                             const DrawRenderState&         state,
+                                             const GraphicsPipelineTargets& targets, bool worker,
+                                             GraphicsPipelineKey& key) const {
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	const bool ps_active    = state.ps_active;
 	const bool tessellation = vertex_info.size() == 3;
-	std::array<const ShaderModule*, 4> stages {};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
-		stages[i] = vertex_info[i].stage.module;
+		if (const auto* module = vertex_info[i].stage.module; module != nullptr) {
+			key.stage_ids[i] = module->id;
+		}
 	}
-	if (ps_active) {
-		stages[3] = ps_input_info.stage.module;
+	if (ps_active && ps_input_info.stage.module != nullptr) {
+		key.stage_ids[3] = ps_input_info.stage.module->id;
 	}
-	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
-	const auto color_count = state.color_count;
-
-	auto&             ctx = command.GetRegisters();
+	const bool mesh = vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
-	GraphicsPipelineKey key {};
-	for (uint32_t i = 0; i < stages.size(); i++) {
-		if (stages[i] != nullptr) {
-			key.stage_ids[i] = stages[i]->id;
-		}
-	}
 	auto&    static_params      = key.static_params;
 	auto&    rendering          = key.rendering;
 	uint32_t attachment_samples = 0;
-	for (uint32_t i = 0; i < color_count; i++) {
-		const auto slot = colors[i].target_slot;
-		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		const auto& color = targets.colors[i];
+		const auto  slot  = static_cast<uint32_t>(color.slot);
+		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX || color.format == vk::Format::eUndefined) {
+			if (worker) {
+				return false;
+			}
+			EXIT("invalid color attachment: slot %u format %u\n", slot,
+			     static_cast<uint32_t>(color.format));
+		}
+		const Prospero::ColorComponentMapping export_mapping {.packed = color.export_mapping};
 		rendering.color_count = std::max(rendering.color_count, slot + 1);
-		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
-		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
-		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
-		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+		static_params.color_mask[slot] =
+		    export_mapping.ApplyMask(render_target_mask_slot(ctx.GetRenderTargetMask(), slot));
+		if (color.unorm_11_11_10 != 0) {
 			static_params.color_mask[slot] = 1u;
 		}
-		rendering.color_formats[slot] = colors[i].desc.view_info.format;
+		rendering.color_formats[slot] = color.format;
 		if (attachment_samples == 0) {
-			attachment_samples = colors[i].desc.info.samples;
-		} else if (attachment_samples != colors[i].desc.info.samples) {
+			attachment_samples = color.samples;
+		} else if (attachment_samples != color.samples) {
+			if (worker) {
+				return false;
+			}
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, colors[i].desc.info.samples);
+			     attachment_samples, color.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		const auto& rt                        = ctx.GetRenderTarget(slot);
+		const auto& bc                        = ctx.GetBlendControl(slot);
 		auto alpha_source = ShaderAlphaBlendSource::None;
 		if (slot == 0 && ps_active) {
 			alpha_source = ps_input_info.alpha_blend_source;
 		}
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
 		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
-		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
+		    ClassifyBlendMapping(bc, export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "Warning: blending disabled for unsupported color mapping "
 				    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
-				    slot, colors[i].export_mapping.packed, bc.color_srcblend, bc.color_destblend,
+				    slot, export_mapping.packed, bc.color_srcblend, bc.color_destblend,
 				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
 			}
 		}
@@ -1061,45 +1205,65 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			}
 		}
 	}
-	const bool with_depth =
-	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	const bool with_depth = targets.depth_format != vk::Format::eUndefined;
 	if (with_depth) {
-		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+		const auto aspects       = ImageViewOps::DepthAspectMask(targets.depth_format);
 		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
-		                               ? depth.desc.view_info.format
+		                               ? targets.depth_format
 		                               : vk::Format::eUndefined;
 		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
-		                               ? depth.desc.view_info.format
+		                               ? targets.depth_format
 		                               : vk::Format::eUndefined;
 		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
+			attachment_samples = targets.depth_samples;
+		} else if (attachment_samples != targets.depth_samples) {
+			if (worker) {
+				return false;
+			}
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
+			     targets.depth_samples);
 		}
 	}
-	if (color_count == 0 && !with_depth) {
+	if (targets.color_count == 0 && !with_depth) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
-		EXIT_IF(!static_cast<bool>(
+		const bool supported = static_cast<bool>(
 		    m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
-		    vulkan_sample_count(attachment_samples)));
+		    vulkan_sample_count(attachment_samples));
+		if (worker && !supported) {
+			return false;
+		}
+		EXIT_IF(!supported);
 	}
-	EXIT_IF(attachment_samples == 0 ||
-	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
+	if (attachment_samples == 0 ||
+	    vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {}) {
+		if (worker) {
+			return false;
+		}
+		EXIT("unsupported attachment sample count: %u\n", attachment_samples);
+	}
 
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology                 = state.topology;
-	static_params.primitive_restart_enable = state.primitive_restart_enable;
+	static_params.topology                 = targets.topology;
+	static_params.primitive_restart_enable = targets.primitive_restart_enable != 0;
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	const bool rect_list = Prospero::IsRectList(user_config.GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
-	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
+	const bool cull_front            = !rect_list && mc.cull_front;
+	const bool cull_back             = !rect_list && mc.cull_back;
+	if (worker) {
+		const auto polygon_mode = TryResolvePolygonMode(mc, cull_front, cull_back);
+		if (!polygon_mode) {
+			return false;
+		}
+		static_params.polygon_mode = *polygon_mode;
+	} else {
+		static_params.polygon_mode = ResolvePolygonMode(mc, cull_front, cull_back);
+	}
 	if (tessellation) {
 		static_params.patch_control_points = vs_input_info.tess.input_control_points;
 	} else if (!mesh && static_params.topology == vk::PrimitiveTopology::ePatchList) {
@@ -1108,10 +1272,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 
 	if (!mesh) {
-		EXIT_IF(vs_input_info.buffers_num < 0 ||
-		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
-		        vs_input_info.resources_num < 0 ||
-		        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
+		const bool counts_valid = vs_input_info.buffers_num >= 0 &&
+		                          vs_input_info.buffers_num <= ShaderVertexInputInfo::RES_MAX &&
+		                          vs_input_info.resources_num >= 0 &&
+		                          vs_input_info.resources_num <= ShaderVertexInputInfo::RES_MAX;
+		if (worker && !counts_valid) {
+			return false;
+		}
+		EXIT_IF(!counts_valid);
 		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
 		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
 		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
@@ -1121,7 +1289,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 		for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
 			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
-			EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
+			const bool valid   = binding >= 0 && binding < vs_input_info.buffers_num;
+			if (worker && !valid) {
+				return false;
+			}
+			EXIT_IF(!valid);
 			key.vertex_input.attributes[attribute] = {
 			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
 			                                    vs_input_info.buffers[binding].addr),
@@ -1129,20 +1301,143 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			};
 		}
 	}
+	return true;
+}
 
-	if (m_last_graphics_pipeline != nullptr && SameBuiltKey(key, m_last_graphics_key)) {
+void PipelineCache::ProposeGraphicsPipelineKey(const HW::Context&             registers,
+                                               const HW::UserConfig&          user_config,
+                                               const DrawRenderState&         state,
+                                               const GraphicsPipelineTargets& targets,
+                                               WorkerPipelineKey&             proposal) const {
+	proposal.ready   = false;
+	proposal.targets = targets;
+	// Value-initialized: keys are compared and hashed as bytes.
+	std::construct_at(&proposal.key);
+	if (!BuildGraphicsPipelineKey(registers, user_config, state, targets, true, proposal.key)) {
+		return;
+	}
+	proposal.hash  = GraphicsPipelineKeyHash {}(proposal.key);
+	proposal.ready = true;
+}
+
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+                                                            const DrawRenderState& state) {
+	return GetGraphicsPipeline(command, state, nullptr);
+}
+
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&     command,
+                                                            const DrawRenderState&   state,
+                                                            const WorkerPipelineKey* proposal) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	const auto targets = FinalTargets(state);
+	auto&      stats   = m_worker_key_stats;
+	stats.draws++;
+	if (proposal != nullptr && proposal->ready && proposal->targets.Same(targets)) {
+		stats.adopted++;
+		if (WorkerPipelineKeyVerify()) {
+			GraphicsPipelineKey check {};
+			BuildGraphicsPipelineKey(command.GetRegisters(), command.GetUserConfig(), state,
+			                         targets, false, check);
+			auto diff = FirstKeyDifference(proposal->key, check);
+			if (diff.empty() && proposal->hash != GraphicsPipelineKeyHash {}(check)) {
+				diff = "hash";
+			}
+			if (!diff.empty()) {
+				EXIT("KYTY_WORKER_PIPELINE_KEY_VERIFY: the worker's pipeline key differs in %s\n",
+				     diff.c_str());
+			}
+			if (++stats.verified % 1000000 == 0) {
+				std::printf("WORKER_PIPELINE_KEY_VERIFY checks=%" PRIu64 "\n", stats.verified);
+				std::fflush(stdout);
+			}
+		}
+		PrintWorkerKeyStats();
+		return FindGraphicsPipeline(proposal->key, proposal->hash, state);
+	}
+	if (proposal == nullptr || !proposal->ready) {
+		stats.none++;
+	} else {
+		stats.mismatched++;
+	}
+	PrintWorkerKeyStats();
+	GraphicsPipelineKey key {};
+	BuildGraphicsPipelineKey(command.GetRegisters(), command.GetUserConfig(), state, targets, false,
+	                         key);
+	return FindGraphicsPipeline(key, 0, state);
+}
+
+void PipelineCache::PrintWorkerKeyStats() {
+	if (!WorkerPipelineKeyStats()) {
+		return;
+	}
+	auto&      stats = m_worker_key_stats;
+	const auto now   = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+	if (stats.start_ns == 0) {
+		stats.start_ns = now;
+	} else if (now - stats.start_ns >= 1'000'000'000ull) {
+		std::printf("WORKERPIPELINEKEY draws=%" PRIu64 " adopted=%" PRIu64 " none=%" PRIu64
+		            " mismatched=%" PRIu64 "\n",
+		            stats.draws, stats.adopted, stats.none, stats.mismatched);
+		const auto verified = stats.verified;
+		stats               = {};
+		stats.start_ns      = now;
+		stats.verified      = verified;
+	}
+}
+
+// Equality of two keys built by BuildGraphicsPipelineKey, whose vertex bindings and attributes
+// past their counts stay zero: ~200 of the key's 516 bytes instead of all of them.
+static bool SameBuiltKey(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
+	const auto& va = a.vertex_input;
+	const auto& vb = b.vertex_input;
+	return std::memcmp(&a, &b, offsetof(GraphicsPipelineKey, vertex_input)) == 0 &&
+	       va.binding_count == vb.binding_count && va.attribute_count == vb.attribute_count &&
+	       std::memcmp(va.bindings.data(), vb.bindings.data(),
+	                   va.binding_count * sizeof(va.bindings[0])) == 0 &&
+	       std::memcmp(va.attributes.data(), vb.attributes.data(),
+	                   va.attribute_count * sizeof(va.attributes[0])) == 0 &&
+	       std::memcmp(&a.static_params, &b.static_params, sizeof(a.static_params)) == 0;
+}
+
+// hash: the key's, or 0 to compute it if needed (a hash of 0 is then computed again).
+PipelineCache::Pipeline& PipelineCache::FindGraphicsPipeline(const GraphicsPipelineKey& key,
+                                                             uint64_t                   hash,
+                                                             const DrawRenderState&     state) {
+	if (m_last_graphics_pipeline != nullptr && (hash == 0 || hash == m_last_graphics_hash) &&
+	    SameBuiltKey(key, *m_last_graphics_key)) {
 		return *m_last_graphics_pipeline;
 	}
-	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
-	auto& pipeline        = iter->second;
-	m_last_graphics_key      = key;
-	m_last_graphics_pipeline = &pipeline;
-	if (!inserted) {
-		return pipeline;
+	if (hash == 0) {
+		hash = GraphicsPipelineKeyHash {}(key);
 	}
+	auto iter = m_graphics_pipelines.find(HashedGraphicsPipelineKey {key, hash});
+	if (iter != m_graphics_pipelines.end()) {
+		m_last_graphics_key      = &iter->first;
+		m_last_graphics_pipeline = &iter->second;
+		m_last_graphics_hash     = hash;
+		return iter->second;
+	}
+	iter                     = m_graphics_pipelines.try_emplace(key).first;
+	auto& pipeline           = iter->second;
+	m_last_graphics_key      = &iter->first;
+	m_last_graphics_pipeline = &pipeline;
+	m_last_graphics_hash     = hash;
 
+	const auto  vertex_info   = state.VertexStages();
+	const auto& ps_input_info = state.ps_input_info;
+	const bool  ps_active     = state.ps_active;
+	std::array<const ShaderModule*, 4> stages {};
+	for (uint32_t i = 0; i < vertex_info.size(); i++) {
+		stages[i] = vertex_info[i].stage.module;
+	}
+	if (ps_active) {
+		stages[3] = ps_input_info.stage.module;
+	}
 	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(vs_input_info);
+		ShaderDbgDumpInputInfo(vertex_info.front());
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(ps_input_info);
 		}

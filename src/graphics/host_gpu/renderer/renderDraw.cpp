@@ -833,31 +833,54 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 	return true;
 }
 
-static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
-                                    const DrawIndexBufferSource& source) {
-	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
-	EXIT_NOT_IMPLEMENTED((control & ~0x3u) != 0);
-	if ((control & 0x1u) == 0) {
-		return false;
+// The register side of ResolvePrimitiveRestart.
+enum class PrimitiveRestartMode {
+	Off,
+	On,
+	// On only if the index data holds the reset index, which is unsupported: off or an exit.
+	Scan,
+	Unsupported,
+};
+
+static PrimitiveRestartMode PrimitiveRestartFromRegisters(const HW::UserConfig& ucfg,
+                                                          const HW::Context&    hw,
+                                                          uint32_t              element_size) {
+	const auto control = ucfg.GetPrimitiveResetControl();
+	if ((control & ~0x3u) != 0) {
+		return PrimitiveRestartMode::Unsupported;
 	}
-	switch (buffer.GetUserConfig().GetPrimType()) {
+	if ((control & 0x1u) == 0) {
+		return PrimitiveRestartMode::Off;
+	}
+	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kLineStrip:
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip: break;
-		default: return false;
+		default: return PrimitiveRestartMode::Off;
 	}
 
-	const auto element_size = source.guest_element_size;
-	const auto index_mask   = UINT32_MAX >> ((4 - element_size) * 8);
-	const auto reset_index  = buffer.GetRegisters().GetPrimitiveResetIndex();
+	const auto index_mask  = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto reset_index = hw.GetPrimitiveResetIndex();
 	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
-		return false;
+		return PrimitiveRestartMode::Off;
 	}
-	const auto restart_index = reset_index & index_mask;
-	if (restart_index == index_mask) {
-		// Use native restart; the 8-bit path widens its marker to 0xffff.
-		return true;
+	// Native restart; the 8-bit path widens its marker to 0xffff.
+	return (reset_index & index_mask) == index_mask ? PrimitiveRestartMode::On
+	                                                : PrimitiveRestartMode::Scan;
+}
+
+static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
+                                    const DrawIndexBufferSource& source) {
+	const auto element_size = source.guest_element_size;
+	switch (PrimitiveRestartFromRegisters(buffer.GetUserConfig(), buffer.GetRegisters(),
+	                                      element_size)) {
+		case PrimitiveRestartMode::Off: return false;
+		case PrimitiveRestartMode::On: return true;
+		case PrimitiveRestartMode::Scan: break;
+		case PrimitiveRestartMode::Unsupported: EXIT_NOT_IMPLEMENTED(true); return false;
 	}
+	const auto index_mask    = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto restart_index = buffer.GetRegisters().GetPrimitiveResetIndex() & index_mask;
 
 	// A game can set a custom reset value without using it in the index buffer.
 	// Keep restart off in that case; fail if we actually find the value.
@@ -1210,7 +1233,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	auto& pipeline =
+	    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_adopted_pipeline_key);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info.data(), state.color_count, state.depth_info,
@@ -1881,6 +1905,71 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	self.SpeculateBuffers(queued);
 	self.SpeculateTextures(queued, lane.textures);
 	self.SpeculateTargets(queued, lane.targets);
+	self.ProposePipelineKey(queued);
+}
+
+// Prepare worker: the pipeline key GetGraphicsPipeline would build for the queued draw if the
+// command thread finds the targets the worker proposed, with the topology and primitive restart
+// the draw path will set from the registers.
+void RenderExecutor::ProposePipelineKey(QueuedDraw& queued) {
+	auto& proposal    = queued.pipeline_key;
+	proposal.ready    = false;
+	const auto& state = queued.state;
+	const auto& proposed = queued.targets;
+	if (!PipelineCache::WorkerPipelineKeysEnabled() || !proposed.ready || queued.log.failed ||
+	    state.vertex_info[0].stage.module == nullptr) {
+		return;
+	}
+	GraphicsPipelineTargets targets;
+	if (!GetDrawTopology(queued.user_config, targets.topology)) {
+		return;
+	}
+	if (queued.indexed) {
+		uint32_t element_size = 0;
+		switch (static_cast<Prospero::IndexType>(queued.index_args.index_type_and_size)) {
+			case Prospero::IndexType::kIndex16: element_size = 2; break;
+			case Prospero::IndexType::kIndex32: element_size = 4; break;
+			case Prospero::IndexType::kIndex8: element_size = 1; break;
+			default: return;
+		}
+		switch (PrimitiveRestartFromRegisters(queued.user_config, queued.registers, element_size)) {
+			case PrimitiveRestartMode::On: targets.primitive_restart_enable = 1; break;
+			case PrimitiveRestartMode::Off:
+			case PrimitiveRestartMode::Scan: break;
+			case PrimitiveRestartMode::Unsupported: return;
+		}
+	}
+	// Every proposed target is assumed found; GetGraphicsPipeline checks the final ones.
+	for (uint32_t i = 0; i < proposed.count; i++) {
+		if (proposed.color[i] == nullptr) {
+			continue;
+		}
+		const auto& color = state.color_info[i];
+		targets.colors[targets.color_count++] = {
+		    .format         = color.desc.view_info.format,
+		    .samples        = color.desc.info.samples,
+		    .slot           = static_cast<uint8_t>(color.target_slot),
+		    .export_mapping = color.export_mapping.packed,
+		    .unorm_11_11_10 = static_cast<uint8_t>(color.desc.info.guest_format ==
+		                                           Prospero::BufferFormat::k11_11_10UNorm),
+		};
+	}
+	if (proposed.depth != nullptr &&
+	    state.depth_info.desc.view_info.format != vk::Format::eUndefined) {
+		targets.depth_format  = state.depth_info.desc.view_info.format;
+		targets.depth_samples = state.depth_info.desc.info.samples;
+	}
+	// Attachments with another sample count than the pass are dropped (PrepareDrawRenderState).
+	const auto pass_samples = targets.depth_format != vk::Format::eUndefined
+	                              ? targets.depth_samples
+	                              : targets.colors[0].samples;
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		if (targets.colors[i].samples != pass_samples) {
+			return;
+		}
+	}
+	m_context.GetPipelineCache().ProposeGraphicsPipelineKey(queued.registers, queued.user_config,
+	                                                        state, targets, proposal);
 }
 
 const std::vector<TextureProposal>*
@@ -1971,6 +2060,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	m_adopted_buffers  = nullptr;
 	m_adopted_textures = nullptr;
 	m_adopted_targets  = nullptr;
+	m_adopted_pipeline_key = nullptr;
 	// The worker files these in its records when it next uses the slot.
 	std::swap(queued.target_updates, m_target_updates);
 	m_target_updates.clear();
@@ -2057,6 +2147,14 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 	}
 	if (queued.targets.ready) {
 		m_adopted_targets = &queued.targets;
+	}
+	if (queued.pipeline_key.ready) {
+		m_adopted_pipeline_key = &queued.pipeline_key;
+		// Worker-written: fetch it while the targets and buffers are resolved.
+		const auto* bytes = reinterpret_cast<const char*>(m_adopted_pipeline_key);
+		for (size_t offset = 0; offset < sizeof(WorkerPipelineKey); offset += 64) {
+			__builtin_prefetch(bytes + offset);
+		}
 	}
 	if (m_prepare_verify) {
 		WaitPrepareIdle();

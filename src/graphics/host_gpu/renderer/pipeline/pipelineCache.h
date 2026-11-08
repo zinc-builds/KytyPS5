@@ -121,6 +121,42 @@ struct alignas(4) GraphicsPipelineKey {
 // Keys are compared and hashed as bytes.
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
+// What a graphics pipeline key takes from a draw besides its registers and programs: the
+// attachments it renders to (DrawRenderState's color_info up to color_count, and depth_info)
+// and its primitive assembly. Built from a final state, or by the prepare worker from its
+// proposed targets; compared to check the worker's assumption.
+struct GraphicsPipelineTargets {
+	struct Color {
+		vk::Format format  = vk::Format::eUndefined;
+		uint32_t   samples = 0;
+		uint8_t    slot    = 0;
+		// ColorComponentMapping::packed.
+		uint8_t    export_mapping = 0;
+		// The guest format is k11_11_10UNorm.
+		uint8_t    unorm_11_11_10 = 0;
+		uint8_t    reserved       = 0;
+	};
+	std::array<Color, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+	uint32_t                                        color_count = 0;
+	// Undefined: no depth or stencil attachment.
+	vk::Format                                      depth_format  = vk::Format::eUndefined;
+	uint32_t                                        depth_samples = 0;
+	vk::PrimitiveTopology                           topology = vk::PrimitiveTopology::ePointList;
+	uint32_t                                        primitive_restart_enable = 0;
+
+	// Equal for the key: the colors past color_count are not compared.
+	[[nodiscard]] bool Same(const GraphicsPipelineTargets& other) const;
+};
+
+// A graphics pipeline key the prepare worker built for a queued draw, valid for the draw if its
+// programs are adopted and its final targets equal `targets`.
+struct alignas(64) WorkerPipelineKey {
+	uint64_t                hash  = 0;
+	bool                    ready = false;
+	GraphicsPipelineTargets targets;
+	GraphicsPipelineKey     key;
+};
+
 // A compiled stage with what pipeline creation needs from it besides the key.
 struct ShaderModule {
 	uint64_t                                     id     = 0;
@@ -263,7 +299,24 @@ public:
 	                                      ShaderComputeInputInfo&      input_info);
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	// The same with the prepare worker's key for the draw (null: none). The key is used if the
+	// state's final targets are those it assumed (KYTY_WORKER_PIPELINE_KEY_VERIFY=1 also builds
+	// the key here and exits on a difference); else the key is built here.
+	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                              const WorkerPipelineKey* proposal);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+
+	// Prepare worker: builds `proposal` for a queued draw whose programs (`state`) it looked up,
+	// with the targets it proposed (`targets`, see GraphicsPipelineTargets) and its registers.
+	// Leaves proposal.ready false where the command thread would stop or exit instead.
+	// KYTY_WORKER_PIPELINE_KEY=0 turns worker keys off, =stats prints WORKERPIPELINEKEY lines.
+	void ProposeGraphicsPipelineKey(const HW::Context& registers, const HW::UserConfig& user_config,
+	                                const DrawRenderState&         state,
+	                                const GraphicsPipelineTargets& targets,
+	                                WorkerPipelineKey&             proposal) const;
+	[[nodiscard]] static bool WorkerPipelineKeysEnabled();
+	// The targets of a draw's final state.
+	[[nodiscard]] static GraphicsPipelineTargets FinalTargets(const DrawRenderState& state);
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -296,8 +349,27 @@ private:
 		std::size_t operator()(const ProgramKey& key) const { return key.hash; }
 	};
 
+	// A key with its hash, for lookups that have the hash already.
+	struct HashedGraphicsPipelineKey {
+		const GraphicsPipelineKey& key;
+		uint64_t                   hash;
+	};
 	struct GraphicsPipelineKeyHash {
+		using is_transparent = void;
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
+		std::size_t operator()(const HashedGraphicsPipelineKey& key) const { return key.hash; }
+	};
+	struct GraphicsPipelineKeyEqual {
+		using is_transparent = void;
+		bool operator()(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) const {
+			return a == b;
+		}
+		bool operator()(const HashedGraphicsPipelineKey& a, const GraphicsPipelineKey& b) const {
+			return a.key == b;
+		}
+		bool operator()(const GraphicsPipelineKey& a, const HashedGraphicsPipelineKey& b) const {
+			return a == b.key;
+		}
 	};
 
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
@@ -315,16 +387,34 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
-	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
-	// The last graphics lookup: most draws repeat it, and comparing the key is cheaper than
-	// hashing it. Map nodes keep their address, and entries are only erased before the first
-	// lookup (warm-up) and in the destructor.
-	GraphicsPipelineKey m_last_graphics_key {};
-	Pipeline*           m_last_graphics_pipeline = nullptr;
+	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash,
+	                   GraphicsPipelineKeyEqual>
+	    m_graphics_pipelines;
+	// The last graphics lookup's map entry and key hash: most draws repeat it, and comparing the
+	// key is cheaper than hashing it. Map nodes keep their address, and entries are only erased
+	// before the first lookup (warm-up) and in the destructor.
+	const GraphicsPipelineKey* m_last_graphics_key      = nullptr;
+	Pipeline*                  m_last_graphics_pipeline = nullptr;
+	uint64_t                   m_last_graphics_hash     = 0;
+	// Command thread: how GetGraphicsPipeline found its key, for KYTY_WORKER_PIPELINE_KEY=stats.
+	struct WorkerKeyStats {
+		uint64_t draws = 0, adopted = 0, none = 0, mismatched = 0, verified = 0, start_ns = 0;
+	} m_worker_key_stats;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
+
+	// The key of a draw with `targets` (FinalTargets, or the worker's proposal). False, on the
+	// worker only, where the command thread would exit.
+	bool BuildGraphicsPipelineKey(const HW::Context& registers, const HW::UserConfig& user_config,
+	                              const DrawRenderState&         state,
+	                              const GraphicsPipelineTargets& targets, bool worker,
+	                              GraphicsPipelineKey& key) const;
+	// The pipeline of a built key, created if new.
+	Pipeline& FindGraphicsPipeline(const GraphicsPipelineKey& key, uint64_t hash,
+	                               const DrawRenderState& state);
+	void      PrintWorkerKeyStats();
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
