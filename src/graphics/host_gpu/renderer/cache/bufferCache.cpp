@@ -381,8 +381,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		if constexpr (insert) {
 			m_page_table[page] = id;
+			SetShadowOwner(page, id.index + 1);
 		} else {
 			m_page_table[page] = {};
+			SetShadowOwner(page, 0);
 		}
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
@@ -536,6 +538,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_async_uploader(graphics, scheduler),
       m_texture_cache(texture_cache) {
+	m_shadow_pages = std::make_unique<std::atomic<std::atomic<uint32_t>*>[]>(SHADOW_BUCKETS);
 	m_extent_begin = std::make_unique<std::atomic<uint64_t>[]>(EXTENT_CAPACITY);
 	m_extent_end   = std::make_unique<std::atomic<uint64_t>[]>(EXTENT_CAPACITY);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
@@ -565,6 +568,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (m_shadow_pages != nullptr) {
+		for (size_t i = 0; i < SHADOW_BUCKETS; i++) {
+			delete[] m_shadow_pages[i].load(std::memory_order_relaxed);
+		}
+	}
 	// A guest thread can stop waiting for its read only by exiting; its download has landed.
 	while (!m_pending_reads.empty() &&
 	       m_pending_reads.front()->published.load(std::memory_order_acquire)) {
@@ -1240,11 +1248,11 @@ uint32_t BufferCache::SpeculateLookup(Speculation& speculation, uint64_t vaddr,
 	if ((seq & 1u) != 0 || size == 0 || !(GuestRange {vaddr, size}.Valid())) {
 		return UINT32_MAX;
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	if (owner == nullptr || !*owner || owner->index >= EXTENT_CAPACITY) {
+	const auto owner = ShadowOwner(vaddr >> PageTable::kPageBits);
+	if (owner == 0 || owner - 1 >= EXTENT_CAPACITY) {
 		return UINT32_MAX;
 	}
-	const BufferId id    = *owner;
+	const BufferId id {owner - 1};
 	const auto     begin = m_extent_begin[id.index].load(std::memory_order_relaxed);
 	const auto     end   = m_extent_end[id.index].load(std::memory_order_relaxed);
 	if (vaddr < begin || vaddr + size > end ||
@@ -1257,6 +1265,30 @@ uint32_t BufferCache::SpeculateLookup(Speculation& speculation, uint64_t vaddr,
 	}
 	speculation.ranges.push_back({vaddr, size, vaddr - begin, id});
 	return static_cast<uint32_t>(speculation.ranges.size() - 1);
+}
+
+void BufferCache::SetShadowOwner(size_t page, uint32_t value) {
+	auto& slot   = m_shadow_pages[page >> SHADOW_BUCKET_BITS];
+	auto* bucket = slot.load(std::memory_order_acquire);
+	if (bucket == nullptr) {
+		if (value == 0) {
+			return;
+		}
+		// Value-initialized: every entry 0. Published after initialization.
+		bucket = new std::atomic<uint32_t>[size_t {1} << SHADOW_BUCKET_BITS]();
+		slot.store(bucket, std::memory_order_release);
+	}
+	bucket[page & ((size_t {1} << SHADOW_BUCKET_BITS) - 1)].store(value, std::memory_order_relaxed);
+}
+
+uint32_t BufferCache::ShadowOwner(size_t page) const {
+	if (page >= PageTable::kPageCount) {
+		return 0;
+	}
+	const auto* bucket = m_shadow_pages[page >> SHADOW_BUCKET_BITS].load(std::memory_order_acquire);
+	return bucket == nullptr
+	           ? 0
+	           : bucket[page & ((size_t {1} << SHADOW_BUCKET_BITS) - 1)].load(std::memory_order_relaxed);
 }
 
 bool BufferCache::SpeculationValid(const Speculation& speculation) const {

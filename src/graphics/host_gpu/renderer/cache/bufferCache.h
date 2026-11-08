@@ -251,6 +251,14 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 
+	// The page table's owners again, readable by the prepare worker: atomic bucket pointers and
+	// entries (owner index + 1, 0 for none), written next to m_page_table. Buckets live as long
+	// as the cache.
+	static constexpr size_t SHADOW_BUCKET_BITS = 10;
+	static constexpr size_t SHADOW_BUCKETS     = PageTable::kPageCount >> SHADOW_BUCKET_BITS;
+	std::unique_ptr<std::atomic<std::atomic<uint32_t>*>[]> m_shadow_pages;
+	void                     SetShadowOwner(size_t page, uint32_t value);
+	[[nodiscard]] uint32_t   ShadowOwner(size_t page) const;
 	// Worker-readable buffer extents, set and cleared under an odd m_registration_seq.
 	static constexpr size_t                    EXTENT_CAPACITY = size_t {1} << 18u;
 	std::atomic<uint64_t>                      m_registration_seq {0};
