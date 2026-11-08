@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <vector>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -48,6 +49,12 @@ public:
 		return m_pending_commands.load(std::memory_order_acquire) != 0;
 	}
 
+	// KYTY_LATE_LABELS=1 (experiment): end-of-pipe label stores posted from GPU completion, run
+	// on this thread between packets and when idle, without draining the prepare queue.
+	void PostLateLabel(Common::UniqueFunction<void>&& store);
+	// GPU thread: runs posted label stores; true if any ran.
+	bool ProcessLateLabels();
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
@@ -80,6 +87,8 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::vector<Common::UniqueFunction<void>>      m_late_labels; // under m_queue_mutex
+	std::atomic_uint32_t                           m_pending_late_labels {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
