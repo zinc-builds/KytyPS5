@@ -1825,12 +1825,6 @@ void RenderExecutor::PrepareQueuedDraw(void* executor, uint64_t sequence) {
 	self.SpeculateTextures(queued);
 }
 
-void RenderExecutor::SpeculateTextures(QueuedDraw& queued) {
-	// Track B: apply and clear queued.texture_updates, then propose queued.textures.
-	queued.texture_updates.clear();
-	queued.textures.ready = false;
-}
-
 const std::vector<TextureProposal>*
 RenderExecutor::AdoptedTextureProposals(const ShaderStageRuntime& runtime) const {
 	const auto* adopted = m_adopted_textures;
@@ -1917,6 +1911,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	}
 	m_adopted_buffers  = nullptr;
 	m_adopted_textures = nullptr;
+	// The worker files these in its memo when it next uses the slot.
+	std::swap(queued.texture_updates, m_texture_updates);
+	m_texture_updates.clear();
 	m_context.GetBufferCache().SetSpeculation(nullptr);
 	buffer.Bind(registers, user_config, shaders);
 
