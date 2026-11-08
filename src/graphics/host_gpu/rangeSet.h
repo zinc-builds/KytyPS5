@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -106,6 +108,74 @@ private:
 	}
 
 	std::map<uint64_t, uint64_t> m_ranges;
+};
+
+// RangeSet's Add, Intersects and Contains over a sorted vector: lookups are a binary search over
+// contiguous memory and Clear keeps the capacity, for sets rebuilt often and mostly queried or
+// grown by ranges they already cover (the draw atomic-write batch).
+class FlatRangeSet final {
+public:
+	void Add(uint64_t address, uint64_t size) {
+		const auto end = End(address, size);
+		// The first range starting after address, and the one before it if it reaches address.
+		auto it = std::upper_bound(m_ranges.begin(), m_ranges.end(), address,
+		                           [](uint64_t value, const Range& range) { return value < range.first; });
+		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
+			it = std::prev(it);
+			if (it->second >= end) {
+				return;
+			}
+			it->second = end;
+		} else {
+			it = m_ranges.insert(it, {address, end});
+		}
+		// Absorb the ranges the grown one now reaches.
+		auto last = std::next(it);
+		while (last != m_ranges.end() && last->first <= it->second) {
+			it->second = std::max(it->second, last->second);
+			++last;
+		}
+		m_ranges.erase(std::next(it), last);
+	}
+
+	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
+		const auto end = End(address, size);
+		auto it = std::upper_bound(m_ranges.begin(), m_ranges.end(), address,
+		                           [](uint64_t value, const Range& range) { return value < range.first; });
+		if (it != m_ranges.begin() && std::prev(it)->second > address) {
+			return true;
+		}
+		return it != m_ranges.end() && it->first < end;
+	}
+
+	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
+		const auto end = End(address, size);
+		auto it = std::upper_bound(m_ranges.begin(), m_ranges.end(), address,
+		                           [](uint64_t value, const Range& range) { return value < range.first; });
+		return it != m_ranges.begin() && std::prev(it)->second >= end;
+	}
+
+	template <typename Func>
+	void ForEach(Func&& func) const {
+		for (const auto& [begin, end]: m_ranges) {
+			func(begin, end);
+		}
+	}
+
+	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
+	void               Clear() { m_ranges.clear(); }
+
+private:
+	using Range = std::pair<uint64_t, uint64_t>; // [first, second)
+
+	static uint64_t End(uint64_t address, uint64_t size) {
+		if (size == 0 || size > UINT64_MAX - address) {
+			EXIT("invalid range-set address or size\n");
+		}
+		return address + size;
+	}
+
+	std::vector<Range> m_ranges; // sorted, disjoint and not touching
 };
 
 } // namespace Libs::Graphics

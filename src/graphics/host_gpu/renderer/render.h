@@ -505,8 +505,8 @@ private:
 	// other ways by draws between them.
 	struct AtomicWriteBatch {
 		vk::PipelineStageFlags stages;
-		RangeSet               atomic;
-		RangeSet               plain;
+		FlatRangeSet           atomic;
+		FlatRangeSet           plain;
 	};
 
 	RenderContext&                        m_context;

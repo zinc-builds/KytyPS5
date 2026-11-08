@@ -42,6 +42,7 @@ namespace {
 using Libs::Graphics::GuestRange;
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
+using Libs::Graphics::FlatRangeSet;
 using Libs::Graphics::RangeSet;
 using Libs::Graphics::TRACKER_ADDRESS_SIZE;
 
@@ -311,6 +312,39 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+}
+
+// FlatRangeSet answers every query like RangeSet, for random adds and clears.
+void TestFlatRangeSet() {
+  uint64_t seed = 0x9e3779b97f4a7c15ull;
+  const auto next = [&] {
+    seed ^= seed << 13u;
+    seed ^= seed >> 7u;
+    seed ^= seed << 17u;
+    return seed;
+  };
+  for (int round = 0; round < 50; round++) {
+    RangeSet     reference;
+    FlatRangeSet flat;
+    for (int i = 0; i < 400; i++) {
+      const uint64_t address = 0x10000 + (next() % 4096) * 16;
+      const uint64_t size    = 1 + next() % 512;
+      if (next() % 3 == 0) {
+        reference.Add(address, size);
+        flat.Add(address, size);
+      }
+      Check(reference.Intersects(address, size) == flat.Intersects(address, size) &&
+                reference.Contains(address, size) == flat.Contains(address, size),
+            "flat range set query differs from the range set");
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> a, b;
+    reference.ForEach([&](uint64_t x, uint64_t y) { a.emplace_back(x, y); });
+    flat.ForEach([&](uint64_t x, uint64_t y) { b.emplace_back(x, y); });
+    Check(a == b, "flat range set ranges differ from the range set");
+    flat.Clear();
+    Check(flat.Empty() && !flat.Intersects(0x10000, 0x100000),
+          "flat range set did not clear");
+  }
 }
 
 void TestGuestRange() {
@@ -1266,6 +1300,7 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestFlatRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
