@@ -3349,6 +3349,12 @@ public:
     auto &context = Renderer();
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
+    // These cases check the decode-time label contract; CheckLateLabels covers
+    // KYTY_LATE_LABELS.
+    GuestGpu::SetLateLabelsModeForTests(0);
+    struct RestoreLateLabels {
+      ~RestoreLateLabels() { GuestGpu::SetLateLabelsModeForTests(-1); }
+    } restore_late_labels;
 
     const auto caller_thread = std::this_thread::get_id();
     std::thread::id gpu_thread;
