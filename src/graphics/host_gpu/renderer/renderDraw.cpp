@@ -1758,10 +1758,16 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		}
 		m_prepare_verify = EnvFlag("KYTY_PREPARE_VERIFY", false);
 		m_prepare_stats  = EnvFlag("KYTY_PREPARE_STATS", false);
+		// KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo.
+		const bool shared_memo = EnvFlag("KYTY_SHARED_TEXTURE_MEMO", true);
 		for (uint32_t i = 0; i < workers; i++) {
 			auto lane      = std::make_unique<PrepareLane>();
 			lane->executor = this;
 			lane->index    = i;
+			if (i == 0 || !shared_memo) {
+				m_texture_memos.push_back(std::make_unique<SharedTextureMemo>());
+			}
+			lane->textures.memo = m_texture_memos.back().get();
 			// Odd serials, distinct among the workers.
 			lane->textures.serial      = 1 + 2 * i;
 			lane->textures.serial_step = 2 * workers;
@@ -1942,6 +1948,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	m_adopted_buffers  = nullptr;
 	m_adopted_textures = nullptr;
 	// The worker files these in its memo when it next uses the slot.
+	m_prepare_stat.texture_updates += m_texture_updates.size();
 	std::swap(queued.texture_updates, m_texture_updates);
 	m_texture_updates.clear();
 	m_context.GetBufferCache().SetSpeculation(nullptr);
@@ -1961,14 +1968,16 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " failed=%" PRIu64 " hazard=%" PRIu64 " stored=%" PRIu64
 			            " gpu_written=%" PRIu64 " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
 			            " drains=%" PRIu64 ") worker_ns_per_draw=%.0f"
-			            " worker_busy=%.1f%% (workers=%zu)\n",
+			            " worker_busy=%.1f%% (workers=%zu) texture_resolves=%" PRIu64
+			            " texture_refreshes=%" PRIu64 "\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
 			            static_cast<double>(busy - stat.worker_busy_ns) / draws,
 			            100.0 * static_cast<double>(busy - stat.worker_busy_ns) / span /
 			                static_cast<double>(m_prepare_lanes.size()),
-			            m_prepare_lanes.size());
+			            m_prepare_lanes.size(), stat.texture_updates,
+			            stat.texture_generation_refreshes);
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;

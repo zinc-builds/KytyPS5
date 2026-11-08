@@ -18,7 +18,7 @@ struct ShaderStageRuntime;
 // in PLAN-60fps.md). The command thread adopts a proposal only while what it depends on holds,
 // and resolves as before otherwise.
 //
-// A record of the worker's resolve memo: one resource's description of a T#, and the image the
+// A record of the workers' resolve memo: one resource's description of a T#, and the image the
 // command thread last resolved it to. Immutable once a job proposes it; a replaced record lives
 // until no queued draw can still refer to it.
 struct WorkerTextureRecord {
@@ -35,6 +35,7 @@ struct WorkerTextureRecord {
 	// moves it forward when the registration check finds no image appeared over the record.
 	mutable uint64_t        generation          = 0;
 	uint64_t                serial              = 0; // unique per record (TextureBinding::source)
+	uint64_t                key                 = 0; // TextureDescriptionKey(inputs, value)
 	uint32_t                metadata_base_layer = 0;
 	bool                    color_clear         = false;
 	TextureCache::ImageDesc found; // with color_clear
