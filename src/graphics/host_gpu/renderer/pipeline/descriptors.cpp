@@ -1210,6 +1210,140 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// KYTY_BINDING_REUSE=0 turns stage binding-set reuse off.
+static bool BindingReuseEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDING_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_BINDING_REUSE_VERIFY=1: every reused stage is resolved again from scratch and compared.
+bool RenderExecutor::BindingReuseVerify() {
+	static const bool verify = std::getenv("KYTY_BINDING_REUSE_VERIFY") != nullptr;
+	return verify;
+}
+
+// Whether this draw's stage may keep `prepared`'s images, views and samplers from the last draw
+// of the stage: the same module, the same worker texture records (by serial: a record's
+// resource and T# never change) and sampler values, and neither the texture cache's binding
+// epoch nor its GC tick moved since they were resolved.
+bool RenderExecutor::CanReuseBindings(const ShaderStageRuntime& runtime,
+                                      const PreparedBindings&   prepared,
+                                      const std::vector<TextureProposal>* proposals) const {
+	const auto& reuse = prepared.reuse;
+	if (!BindingReuseEnabled() || proposals == nullptr || !reuse.valid ||
+	    reuse.module != runtime.module) {
+		return false;
+	}
+	const auto& texture_cache = m_context.GetTextureCache();
+	if (reuse.epoch != texture_cache.BindingEpoch() || reuse.tick != texture_cache.GcTick()) {
+		return false;
+	}
+	const auto& program  = runtime.module->info;
+	const auto& snapshot = *runtime.resources;
+	const auto  images   = program.info.images.size();
+	if (proposals->size() < images || reuse.serials.size() != images ||
+	    reuse.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < images; i++) {
+		const auto* record = (*proposals)[i].record;
+		if (!program.info.images[i].heap &&
+		    (record == nullptr || record->serial != reuse.serials[i])) {
+			return false;
+		}
+	}
+	for (size_t i = 0; i < reuse.samplers.size(); i++) {
+		if (!(reuse.samplers[i] == snapshot.samplers[program.info.samplers[i].snapshot_index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// After a full resolve of the stage: what it may be reused for (RebindImages makes it valid once
+// the views are set and nothing was resolved again).
+void RenderExecutor::NoteReusableBindings(const ShaderStageRuntime& runtime,
+                                          PreparedBindings&         prepared,
+                                          const std::vector<TextureProposal>* proposals) {
+	auto&       reuse    = prepared.reuse;
+	const auto& program  = runtime.module->info;
+	const auto& snapshot = *runtime.resources;
+	reuse.module         = runtime.module;
+	reuse.serials.resize(program.info.images.size());
+	reuse.samplers.resize(program.info.samplers.size());
+	bool candidate = BindingReuseEnabled() && proposals != nullptr &&
+	                 proposals->size() >= program.info.images.size();
+	for (size_t i = 0; candidate && i < program.info.images.size(); i++) {
+		reuse.serials[i] = 0;
+		if (program.info.images[i].heap) {
+			continue;
+		}
+		// Only bindings taken from their record (RefindExactImage held): a reuse repeats that
+		// record's color-clear step.
+		const auto* record = (*proposals)[i].record;
+		candidate = record != nullptr && record->resolved && prepared.images[i].source == record->serial;
+		if (candidate) {
+			reuse.serials[i] = record->serial;
+		}
+	}
+	for (size_t i = 0; candidate && i < program.info.samplers.size(); i++) {
+		reuse.samplers[i] = snapshot.samplers[program.info.samplers[i].snapshot_index];
+	}
+	reuse.tick  = m_context.GetTextureCache().GcTick();
+	reuse.valid = false;
+	prepared.reuse_candidate = candidate;
+}
+
+// KYTY_BINDING_REUSE_VERIFY: resolves the reused stage from scratch.
+void RenderExecutor::VerifyReusedBindings(const ShaderStageRuntime& runtime,
+                                          const PreparedBindings&   prepared) {
+	const auto& program  = runtime.module->info;
+	const auto& snapshot = *runtime.resources;
+	auto&       texture_cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].heap) {
+			continue;
+		}
+		const auto  check = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		const auto& kept  = prepared.images[i];
+		const bool  views = !kept.image_id ||
+		                   program.info.images[i].mip_mode ==
+		                       ShaderRecompiler::IR::ImageMipMode::Dynamic ||
+		                   texture_cache.FindTexture(check.image_id, check.desc) == kept.image_view;
+		if (check.image_id != kept.image_id || check.layout != kept.layout ||
+		    check.desc.type != kept.desc.type || !(check.desc.view_info == kept.desc.view_info) ||
+		    check.desc.info.data != kept.desc.info.data || !views) {
+			EXIT("KYTY_BINDING_REUSE_VERIFY: stage %u image slot %u differs: image %u vs %u layout %u vs "
+			     "%u type %u vs %u view_info %d data %d view %d (level %u/%u layer %u/%u fmt %u/%u)\n",
+			     static_cast<uint32_t>(program.stage), i, static_cast<uint32_t>(kept.image_id.index),
+			     static_cast<uint32_t>(check.image_id.index), static_cast<uint32_t>(kept.layout),
+			     static_cast<uint32_t>(check.layout), static_cast<uint32_t>(kept.desc.type),
+			     static_cast<uint32_t>(check.desc.type), check.desc.view_info == kept.desc.view_info,
+			     check.desc.info.data == kept.desc.info.data, views,
+			     kept.desc.view_info.base_level, check.desc.view_info.base_level,
+			     kept.desc.view_info.base_layer, check.desc.view_info.base_layer,
+			     static_cast<uint32_t>(kept.desc.view_info.format),
+			     static_cast<uint32_t>(check.desc.view_info.format));
+		}
+	}
+	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+		const auto check = NativeSampler(m_context, program, i,
+		                                 snapshot.samplers[program.info.samplers[i].snapshot_index]);
+		if (check != prepared.samplers[i]) {
+			EXIT("KYTY_BINDING_REUSE_VERIFY: stage %u sampler slot %u differs\n",
+			     static_cast<uint32_t>(program.stage), i);
+		}
+	}
+	static uint64_t checks = 0;
+	if (++checks % 100000 == 0) {
+		std::printf("BINDING_REUSE_VERIFY stages=%" PRIu64 "\n", checks);
+		std::fflush(stdout);
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -1221,29 +1355,58 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
-	prepared.images.resize(program.info.images.size());
-	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	const auto* proposals = AdoptedTextureProposals(runtime);
-	std::vector<TextureResolveMemo>* memo = nullptr;
-	if (GetDrawStateCacheMode() != DrawStateCacheMode::Off && !program.info.images.empty()) {
-		memo = &TextureMemoSlots(*runtime.module);
-	}
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		if (program.info.images[i].heap) {
-			prepared.images[i] = {};
-			continue;
+	auto&       texture_cache = m_context.GetTextureCache();
+	auto&       reuse         = prepared.reuse;
+	m_prepare_stat.binding_sets += proposals != nullptr ? 1 : 0;
+	prepared.reused = CanReuseBindings(runtime, prepared, proposals);
+	if (prepared.reused) {
+		// The same images, views and samplers as the last draw of this stage: only the per-draw
+		// steps of a resolve run (RefindExactImage's color-clear step; BindImage).
+		m_prepare_stat.binding_reuses++;
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (program.info.images[i].heap) {
+				continue;
+			}
+			const auto& record = *(*proposals)[i].record;
+			if (!record.null && record.color_clear) {
+				texture_cache.MaterializeColorClear(record.found_id, record.found,
+				                                    record.metadata_base_layer);
+			}
+			auto& binding  = prepared.images[i];
+			binding.layout = record.binding.layout; // as AssignFromRecord (commit sets the final one)
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		}
-		auto& binding = prepared.images[i];
-		ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i], binding,
-		                    proposals != nullptr && i < proposals->size() ? &(*proposals)[i]
-		                                                                 : nullptr);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-	}
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		if (BindingReuseVerify()) {
+			VerifyReusedBindings(runtime, prepared);
+		}
+	} else {
+		reuse.valid = false;
+		reuse.epoch = texture_cache.BindingEpoch();
+		prepared.images.resize(program.info.images.size());
+		prepared.samplers.clear();
+		std::vector<TextureResolveMemo>* memo = nullptr;
+		if (GetDrawStateCacheMode() != DrawStateCacheMode::Off && !program.info.images.empty()) {
+			memo = &TextureMemoSlots(*runtime.module);
+		}
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (program.info.images[i].heap) {
+				prepared.images[i] = {};
+				continue;
+			}
+			auto& binding = prepared.images[i];
+			ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i], binding,
+			                    proposals != nullptr && i < proposals->size() ? &(*proposals)[i]
+			                                                                 : nullptr);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		}
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(
+			    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		}
+		NoteReusableBindings(runtime, prepared, proposals);
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
@@ -1422,6 +1585,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto& snapshot      = *prepared.runtime->resources;
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
+	bool        resolved      = false;
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
@@ -1431,6 +1595,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
+			resolved = true;
+		} else if (prepared.reused) {
+			// Its views are the last draw's; the image is still refreshed and tracked for this
+			// draw like a view lookup would (CPU writes since, storage downloads).
+			texture_cache.AcquireTexture(images[i].image_id, images[i].desc);
+			continue;
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();
@@ -1452,6 +1622,15 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
 	}
+	// Reusable by a later draw if nothing was resolved again and no image was registered or
+	// unregistered since the stage's resolve began.
+	auto& reuse = prepared.reuse;
+	if (resolved) {
+		reuse.valid = false;
+	} else if (!prepared.reused) {
+		reuse.valid = prepared.reuse_candidate && reuse.epoch == texture_cache.BindingEpoch();
+	}
+	prepared.reuse_candidate = false;
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,

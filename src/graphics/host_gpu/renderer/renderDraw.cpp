@@ -2007,7 +2007,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " gpu_written=%" PRIu64 " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
 			            " drains=%" PRIu64 ") worker_ns_per_draw=%.0f"
 			            " worker_busy=%.1f%% (workers=%zu) texture_resolves=%" PRIu64
-			            " texture_refreshes=%" PRIu64 "\n",
+			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
@@ -2015,7 +2015,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            100.0 * static_cast<double>(busy - stat.worker_busy_ns) / span /
 			                static_cast<double>(m_prepare_lanes.size()),
 			            m_prepare_lanes.size(), stat.texture_updates,
-			            stat.texture_generation_refreshes);
+			            stat.texture_generation_refreshes,
+			            100.0 * static_cast<double>(stat.binding_reuses) /
+			                static_cast<double>(std::max<uint64_t>(stat.binding_sets, 1)));
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;

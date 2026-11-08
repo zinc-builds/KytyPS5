@@ -61,12 +61,20 @@ public:
 	// unregistered on those pages since. Advances generation and touches the image like FindImage,
 	// including the color-clear step for `found`, the description as FindImage left it (null when
 	// it has no color metadata) and its view's base layer before FindImage.
+	// Advanced by every image registration and unregistration, so by every image deletion and
+	// recreation (an image's views are destroyed only with the image, after it is unregistered;
+	// the sampler cache never evicts). Image bindings resolved at one epoch, and touched at one
+	// GcTick, are what a resolve would give again while both hold (stage binding-set reuse).
+	[[nodiscard]] uint64_t BindingEpoch() const { return m_registration_generation; }
+	[[nodiscard]] uint64_t GcTick() const { return m_gc_tick; }
 	[[nodiscard]] bool RefindExactImage(ImageId id, GuestRange data, const ImageDesc* found,
 	                                    uint32_t metadata_base_layer, uint64_t& generation);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// FindTexture without the view: refreshes, settles and tracks the image for this draw's use.
+	void AcquireTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
