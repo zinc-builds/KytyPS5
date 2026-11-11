@@ -677,6 +677,12 @@ private:
 	void                        PrintDrainStats();
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		// Adopted although an emulator store came after the post (the unranged epoch would have
+		// dropped them), and the walker page log's distinct pages per draw (buckets 0, 1, 2-3,
+		// 4-7, ... 64+).
+		uint64_t kept_by_ranged = 0, walker_pages = 0;
+		uint64_t hazard_gpu = 0, hazard_epoch = 0; // of `hazard`: new GPU writes, unranged epoch
+		std::array<uint64_t, 8> page_buckets {};
 		uint64_t stored = 0;
 		uint64_t wait_ns = 0, verified = 0, worker_busy_ns = 0, start_ns = 0;
 		uint64_t drains = 0, waits = 0; // drains: FinishQueuedDraws with draws queued

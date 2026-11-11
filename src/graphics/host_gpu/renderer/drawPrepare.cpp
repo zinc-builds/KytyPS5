@@ -55,6 +55,10 @@ Log* CurrentLog() noexcept {
 
 void SetLog(Log* log) noexcept {
 	t_log = log;
+	static const bool pages = ShaderRecompiler::IR::SrtWalkerPageLogEnabled();
+	if (pages) {
+		ShaderRecompiler::IR::SetSrtWalkerPageLog(log != nullptr ? &log->pages : nullptr);
+	}
 }
 
 void NoteHazard() noexcept {
@@ -67,7 +71,9 @@ uint64_t HazardGeneration() noexcept {
 
 RangedStore::RangedStore(uint64_t vaddr, uint64_t size) noexcept
     : m_vaddr(vaddr), m_size(size), m_outer(GuestSyncEpoch::g_stores_ranged),
-      m_ranged(ShaderRecompiler::IR::SrtWalkerReadsLogged(vaddr, size)) {
+      // With the walker's page log, every worker read of guest memory is logged.
+      m_ranged(ShaderRecompiler::IR::SrtWalkerPageLogEnabled() ||
+               ShaderRecompiler::IR::SrtWalkerReadsLogged(vaddr, size)) {
 	if (m_ranged) {
 		NoteStoredRange(vaddr, size);
 	}
@@ -105,6 +111,32 @@ bool StoredSince(uint64_t sequence, const std::vector<std::pair<uint64_t, uint64
 	for (auto it = g_stored.rbegin(); it != g_stored.rend() && it->sequence > sequence; ++it) {
 		for (const auto& [address, size]: reads) {
 			if (address < it->end && it->begin < address + size) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool StoredSince(uint64_t sequence, const Log& log) {
+	if (StoredSequence() == sequence) {
+		return false;
+	}
+	if (StoredSince(sequence, log.reads)) {
+		return true;
+	}
+	if (log.pages.empty()) {
+		return false;
+	}
+	std::scoped_lock lock(g_stored_mutex);
+	if (g_stored.empty() || g_stored.front().sequence > sequence + 1) {
+		return true;
+	}
+	for (auto it = g_stored.rbegin(); it != g_stored.rend() && it->sequence > sequence; ++it) {
+		const auto first = it->begin >> 12u;
+		const auto last  = (it->end - 1) >> 12u;
+		for (const auto page: log.pages) {
+			if (page >= first && page <= last) {
 				return true;
 			}
 		}
