@@ -70,7 +70,11 @@ if [ "$(bm "$ref_install")" != "$(bm "$new_install")" ]; then
 	exit 1
 fi
 # The env string garden.sh records: KYTY_* settings, sorted (minus the bench's own).
-norm_env() { tr ' ' '\n' <<<"$*" | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' | sort | tr '\n' ' ' | sed 's/ $//'; }
+# Later assignments win, as in `env A=1 A=0`.
+norm_env() {
+	tr ' ' '\n' <<<"$*" | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' |
+		awk -F= '{v[$1] = $0} END {for (k in v) print v[k]}' | sort | tr '\n' ' ' | sed 's/ $//'
+}
 inherited=$(env | grep -E '^KYTY_' | tr '\n' ' ')
 ref_key=$(norm_env "$inherited $env $ref_env")
 exe_hash() { sha256sum "$1/kyty_emulator" | cut -c1-16; }
@@ -78,7 +82,7 @@ ref_exe=$(exe_hash "$ref_install")
 reuse=0
 if [ "$pair" = 0 ] && [ -n "$ref_sha" ]; then
 	count=$(python3 -I "$dir/results.py" ref "$ref_sha" --window "$window" --env "$ref_key" --flags=--amd-cpu \
-		--exe "$ref_exe" --max-age "$max_age" --count 2>/dev/null)
+		--exe "$ref_exe" --route "${GARDEN_ROUTE:-lvl}" --max-age "$max_age" --count 2>/dev/null)
 	[ "${count:-0}" -ge 3 ] && reuse=1
 fi
 lines=()
@@ -96,18 +100,27 @@ fi
 echo "ab.sh: ${#lines[@]} runs (window $window, reference ${ref_sha:0:12}$([ "$reuse" = 1 ] && echo ": stored runs reused"))" >&2
 for i in $(seq "$n"); do rm -f "/tmp/garden-$label-ref$i.json" "/tmp/garden-$label-new$i.json"; done
 printf '%s\n' "${lines[@]}" | "$dir/batch.sh" || exit 1
-news=() refs=()
+news=() refs=() failed=()
 for i in $(seq "$n"); do
-	head -1 "/tmp/garden-$label-new$i.out" >&2
-	[ -f "/tmp/garden-$label-new$i.json" ] && news+=("/tmp/garden-$label-new$i.json")
-	if [ "$reuse" = 0 ]; then
-		head -1 "/tmp/garden-$label-ref$i.out" >&2
-		[ -f "/tmp/garden-$label-ref$i.json" ] && refs+=("/tmp/garden-$label-ref$i.json")
-	fi
+	for side in ref new; do
+		[ "$side" = ref ] && [ "$reuse" = 1 ] && continue
+		head -1 "/tmp/garden-$label-$side$i.out" >&2
+		if [ -f "/tmp/garden-$label-$side$i.json" ]; then
+			[ "$side" = ref ] && refs+=("/tmp/garden-$label-$side$i.json") || news+=("/tmp/garden-$label-$side$i.json")
+		else
+			failed+=("$label-$side$i")
+		fi
+	done
 done
+# A run that failed (or a binary without METRICS lines) leaves no JSON: no verdict on a partial batch.
+if [ ${#failed[@]} != 0 ]; then
+	echo "ab.sh: no result from ${failed[*]} (see /tmp/garden-<label>.out); no verdict" >&2
+	exit 1
+fi
 if [ "$reuse" = 1 ]; then
 	python3 -I "$dir/results.py" verdict --label "$label" --reused --new "${news[@]}" \
-		--ref-stored "$ref_sha" --window "$window" --env "$ref_key" --flags=--amd-cpu --exe "$ref_exe" --max-age "$max_age"
+		--ref-stored "$ref_sha" --window "$window" --env "$ref_key" --flags=--amd-cpu --exe "$ref_exe" \
+		--route "${GARDEN_ROUTE:-lvl}" --max-age "$max_age"
 else
 	python3 -I "$dir/results.py" verdict --label "$label" --ref "${refs[@]}" --new "${news[@]}"
 fi

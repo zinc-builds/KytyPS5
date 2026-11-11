@@ -130,7 +130,7 @@ def select(selectors):
     return out
 
 
-def references(sha, window=None, env=None, flags=None, max_age=None, exe=None, mode=None):
+def references(sha, window=None, env=None, flags=None, max_age=None, exe=None, mode=None, route=None):
     """Stored clean runs of commit <sha>: no -dirty build, same window, env, flags, build mode."""
     out = []
     for r in load():
@@ -145,6 +145,8 @@ def references(sha, window=None, env=None, flags=None, max_age=None, exe=None, m
         if exe is not None and r.get("exe") != exe:
             continue
         if mode is not None and r.get("build_mode", "plain") != mode:
+            continue
+        if route is not None and r.get("route", "lvl") != route:
             continue
         if max_age is not None and age_hours(r) > max_age:
             continue
@@ -209,10 +211,11 @@ def main():
         p.add_argument("--flags", default=None)
         p.add_argument("--exe", default=None)
         p.add_argument("--mode", default=None)
+        p.add_argument("--route", default=None)
         p.add_argument("--max-age", type=float, default=None)
         p.add_argument("--count", action="store_true", help="print only the number of runs")
         a = p.parse_args(args)
-        rs = references(a.sha, a.window, a.env, a.flags, a.max_age, a.exe, a.mode)
+        rs = references(a.sha, a.window, a.env, a.flags, a.max_age, a.exe, a.mode, a.route)
         if a.count:
             print(len(rs))
             return 0
@@ -239,11 +242,12 @@ def main():
         p.add_argument("--env", default=None)
         p.add_argument("--flags", default=None)
         p.add_argument("--exe", default=None)
+        p.add_argument("--route", default=None)
         p.add_argument("--max-age", type=float, default=None)
         a = p.parse_args(args)
         news = select(a.new)
         if a.ref_stored:
-            refs = references(a.ref_stored, a.window, a.env, a.flags, a.max_age, a.exe)
+            refs = references(a.ref_stored, a.window, a.env, a.flags, a.max_age, a.exe, route=a.route)
             a.reused = True
         else:
             refs = select(a.ref)
