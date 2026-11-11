@@ -1339,6 +1339,81 @@ memory for CPU-written pages (C1) would make the upload unnecessary for DMA read
 the copy then moves to the binds' own syncs and stream copies is not measured here; the
 coverage figures above bound neither side, so C1's saving has to be measured on its prototype.
 
+### C1 (in-place guest reads): parked (Track B, 2026-11-11)
+
+C1 had two stages:
+- **Stage 1, late labels:** labels at host GPU completion.
+- **Stage 2, in-place reads:** the BDA page table points at the guest's own memory.
+
+Stage 2 needs stage 1, because the guest must not see a label, and reuse the memory behind it,
+before the GPU has read that memory. **A correct stage 1 costs 15%, and stage 2 recovers almost
+none of it, so C1 is parked.** The code stays on unmerged branches: `trackB/late-labels` (draft
+PR #70) and `trackB/bda-inplace`.
+
+**Late labels.** `KYTY_LATE_LABELS=1` stores RELEASE_MEM labels, and raises their interrupts,
+when the command buffer they were recorded in completes.
+
+| Version | FPS | Note |
+|---|---|---|
+| Naive | 43.6 → 9.7 | every own-label wait becomes a GPU round trip |
+| Pass waits on pending values (on `dev` c7bdab8f) | off 47.45 / 47.25, on 47.42 / 47.42 | had an ordering bug (below) |
+| Correct (on `dev` e0999e89, same binary) | off 49.2, on 41.6 (−15%) | |
+| Correct, bind waits skipped (unsafe test) | 45.5 | |
+
+How waits pass:
+- A WAIT_REG_MEM that this processor's own pending label satisfies passes at once. All guest
+  queues record into one host queue, so the work after the wait runs after the work before the
+  label.
+- This happens only while no other writer was seen storing a value that would release the wait.
+- Reference-clock labels keep the clock read at decode. Read at completion instead, the game
+  sees its real GPU time and runs 4% slower.
+
+**The ordering bug.** A `=verify` counter (`read_unlanded`) showed that **later packets read
+pending bytes as data at decode**, 12–130 times a second:
+- 256-byte WRITE_DATA or DMA_DATA blocks, written after an early-passed wait, read by 512-byte
+  binds;
+- 4- and 8-byte labels and sync words read by binds, the same addresses again and again (for
+  example a 4-byte bind of `0x5707e6020`).
+
+The version that measured free deferred those writes and uploaded stale bytes.
+
+**The correct version** (`trackB/late-labels` @ 8ea2e78d):
+- After an early wait, only CP writes of 8 bytes or less (WRITE_DATA, semaphore signals, CPU
+  fills and copies) are deferred, in order. Larger writes are data and run at decode.
+- A bind that would copy unlanded bytes waits for them: a GPU round trip, ~55–60 a second.
+- A wait is predicted only from the bytes the pending store writes, and not while an
+  overlapping deferred write is pending.
+
+**Where the 15% goes:**
+- About 8% is the bind waits.
+- About 7% is not found. The flat profile has +3.5% in a libc memcpy. Per frame,
+  `KYTY_MEM_DIAG` shows stream and BDA bytes equal with late labels on and off,
+  wait-triggered async collects ~3× higher, and fewer stream reuses.
+
+**In-place reads (stage 2 prototype, with late labels on).** `KYTY_BDA_INPLACE=1|verify`:
+- **Mechanism:** the guest backing memfd is imported in 2 MiB chunks (~1.1 GB pinned, 545
+  chunks). Page-table entries of CPU-dirty, whole, not GPU-written 16 KiB pages point at it, and
+  are restored before GPU writes, on (un)registration and remap, and for dispatches that store
+  through addresses.
+- **Copies:** PrepareBda uploads went from 830 MB/s to 0. Stream copies rose from 300 to
+  433 MB/s, and bind syncs from 0.7 to 58 MB/s. Total copied bytes fell 57%.
+- **Result:** GPU time fell ~0.7 ms/frame, but FPS was flat. The upload's share is ~270 ns/draw,
+  and pages the binds then copy themselves give part of it back. Verify (page-granular, not
+  narrowed to pages a DMA shader read) found 2.3% of redirected pages changed between record and
+  completion.
+
+**What reviving C1 would need:**
+- Late labels near free and still ordered. Binds would get a pending label's or a deferred
+  write's known value written into the bound GPU buffer, instead of waiting for it to land; the
+  buffer cache would have to keep that consistent until the guest store lands.
+- The unexplained ~7% found.
+- A stage 2 that also avoids the bind-time copies it causes; the planned hybrid kept eager
+  uploads for pages that binds read.
+
+**For other work that orders label stores:** queued draws do read label bytes as data, so any
+change that moves a label store between queued draws must check the draws' read ranges against
+it.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
