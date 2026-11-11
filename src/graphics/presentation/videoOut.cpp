@@ -1538,6 +1538,15 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
+int VideoOutDriver::PendingFlips(int handle) {
+	auto* cfg = m_impl->Get(handle);
+	if (cfg == nullptr) {
+		return 0;
+	}
+	Common::LockGuard lock(cfg->mutex);
+	return cfg->flip_status.flipPendingNum;
+}
+
 void VideoOutDriver::WaitFlipDone(int handle, int index) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);

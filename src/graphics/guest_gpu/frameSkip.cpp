@@ -27,7 +27,6 @@ bool g_auto  = false; // adaptive mode
 uint64_t          g_frame = 0;
 Clock::time_point g_last_flip {};
 double            g_debt_ms = 0.0;
-bool              g_skip_next = false;
 
 // Reporter counters.
 std::atomic<uint64_t> g_flips {0};
@@ -36,6 +35,7 @@ std::atomic<uint64_t> g_skipped_draws {0};
 std::atomic<uint64_t> g_frame_us_rendered {0};
 std::atomic<uint64_t> g_frame_us_skipped {0};
 std::atomic<double>   g_debt_report {0.0};
+std::atomic<uint64_t> g_pending_sum {0};
 
 void Reporter() {
 	for (;;) {
@@ -45,9 +45,10 @@ void Reporter() {
 		const auto draws   = g_skipped_draws.exchange(0);
 		const auto us_r    = g_frame_us_rendered.exchange(0);
 		const auto us_s    = g_frame_us_skipped.exchange(0);
+		const auto pending = g_pending_sum.exchange(0);
 		const auto rendered = flips - std::min(flips, skipped);
 		std::printf("FRAMESKIP flips_s=%llu rendered_s=%llu skipped_s=%llu skipped_draws_s=%llu "
-		            "cmd_ms_rendered=%.2f cmd_ms_skipped=%.2f debt_ms=%.1f\n",
+		            "cmd_ms_rendered=%.2f cmd_ms_skipped=%.2f debt_ms=%.1f pending=%.2f\n",
 		            static_cast<unsigned long long>(flips),
 		            static_cast<unsigned long long>(rendered),
 		            static_cast<unsigned long long>(skipped),
@@ -56,7 +57,8 @@ void Reporter() {
 		                          : 0.0,
 		            skipped != 0 ? static_cast<double>(us_s) / 1000.0 / static_cast<double>(skipped)
 		                         : 0.0,
-		            g_debt_report.load());
+		            g_debt_report.load(),
+		            flips != 0 ? static_cast<double>(pending) / static_cast<double>(flips) : 0.0);
 		std::fflush(stdout);
 	}
 }
@@ -88,7 +90,7 @@ void NoteSkippedDraw() {
 	g_skipped_draws.fetch_add(1, std::memory_order_relaxed);
 }
 
-void OnFlip() {
+void OnFlip(int pending_flips) {
 	const auto now        = Clock::now();
 	const bool was_skip   = Detail::g_skipping.load(std::memory_order_relaxed);
 	const auto elapsed_ms = g_frame == 0 ? BUDGET_MS
@@ -107,18 +109,19 @@ void OnFlip() {
 	if (g_every != 0) {
 		skip = (g_frame + 1) % static_cast<uint64_t>(g_every) == 0;
 	} else {
-		// A frame far over budget is a stall (loading, shader compiles): skipping the next one
-		// would not win the time back, so forget the debt instead.
+		// Reported only: how far the command thread runs over the 60 Hz budget.
 		if (elapsed_ms > 4.0 * BUDGET_MS) {
 			g_debt_ms = 0.0;
 		} else {
 			g_debt_ms = std::clamp(g_debt_ms + elapsed_ms - BUDGET_MS, 0.0, 3.0 * BUDGET_MS);
 		}
-		// Behind by more than a quarter frame, and the last frame was drawn.
-		skip = !was_skip && g_debt_ms > 0.25 * BUDGET_MS;
+		// Nothing banked behind this flip, and the last frame was drawn. A long stall (loading,
+		// shader compiles) is not won back by skipping one frame.
+		skip = !was_skip && pending_flips <= 1 && elapsed_ms <= 4.0 * BUDGET_MS;
 	}
+	g_pending_sum.fetch_add(static_cast<uint64_t>(std::max(pending_flips, 0)),
+	                        std::memory_order_relaxed);
 	g_debt_report.store(g_debt_ms, std::memory_order_relaxed);
-	g_skip_next = skip;
 	Detail::g_skipping.store(skip, std::memory_order_relaxed);
 }
 
