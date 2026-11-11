@@ -615,6 +615,7 @@ private:
 	};
 	RunState m_run;
 	bool     m_run_ok     = false; // the draw being committed continues the run
+	uint64_t m_run_verified = 0;   // KYTY_RUN_STATE=verify: run target paths checked
 	uint64_t m_committing = 0;     // its queue sequence (0: a direct draw)
 	[[nodiscard]] static int RunStateMode();
 	[[nodiscard]] RunEpochs  CurrentRunEpochs() const;

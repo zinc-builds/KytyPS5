@@ -1802,7 +1802,8 @@ bool TextureCache::DepthTargetSettled(ImageId id, const ImageDesc& desc) {
 	}
 	if (StencilTargetFastMode() == 0 ||
 	    (image.target_settled.load(std::memory_order_acquire) & 1u) == 0 ||
-	    image.info.stencil != desc.info.stencil) {
+	    image.info.stencil != desc.info.stencil ||
+	    image.info.metadata.stencil_compressed != desc.info.metadata.stencil_compressed) {
 		return false;
 	}
 	const auto*           stencil = m_slot_images.try_get(image.target_stencil_id);

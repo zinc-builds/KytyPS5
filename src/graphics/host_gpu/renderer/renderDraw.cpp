@@ -452,6 +452,10 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// Draws whose target resolves a run skipped but whose AcquireRenderTargets took the full path
+// (a stage resolved its bindings again), and run draws verified (KYTY_RUN_STATE=verify).
+static uint64_t g_run_late_full = 0;
+
 int RenderExecutor::RunStateMode() {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_RUN_STATE");
@@ -551,18 +555,61 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (TryRunTargets(colors, color_count, depth, feedback_aspects, stages, run)) {
 			m_prepare_stat.run_targets++;
 			if (RunStateMode() == 2) {
-				const auto            depth_before = depth;
-				vk::ImageAspectFlags  feedback;
-				const auto            full = AcquireRenderTargetsFull(buffer, colors, color_count, depth,
-				                                                      feedback, stages);
-				if (!(full == run) || feedback != feedback_aspects ||
-				    depth.load_clear_aspects != depth_before.load_clear_aspects) {
-					EXIT("KYTY_RUN_STATE=verify: the previous draw's render targets differ\n");
+				// The full path must find the same targets and change nothing: no refresh or
+				// GPU-write commit (settled flags), no barrier (image state), no registration.
+				struct Snapshot {
+					ImageId          id;
+					vk::ImageLayout  layout, attachment_layout;
+					vk::AccessFlags2 access, attachment_access;
+					uint8_t          settled, target_settled;
+					size_t           subresources;
+				};
+				auto&                 cache = m_context.GetTextureCache();
+				std::vector<Snapshot> before;
+				const auto            snap = [&](ImageId id) {
+                    const auto& image = cache.GetImage(id);
+                    return Snapshot {id,
+                                     image.backing.state.layout,
+                                     image.binding.attachment_layout,
+                                     image.backing.state.access_mask,
+                                     image.binding.attachment_access,
+                                     image.settled.load(),
+                                     image.target_settled.load(),
+                                     image.backing.subresource_states.size()};
+				};
+				for (uint32_t i = 0; i < color_count; i++) {
+					before.push_back(snap(colors[i].image_id));
 				}
+				if (depth.image_id) {
+					before.push_back(snap(depth.image_id));
+				}
+				const auto           epoch        = cache.BindingEpoch();
+				const auto           depth_before = depth;
+				vk::ImageAspectFlags feedback;
+				const auto full = AcquireRenderTargetsFull(buffer, colors, color_count, depth, feedback,
+				                                           stages);
+				bool unchanged = epoch == cache.BindingEpoch();
+				for (const auto& was: before) {
+					const auto now = snap(was.id);
+					unchanged = unchanged && now.layout == was.layout && now.access == was.access &&
+					            now.attachment_layout == was.attachment_layout &&
+					            now.attachment_access == was.attachment_access &&
+					            now.settled == was.settled && now.target_settled == was.target_settled &&
+					            now.subresources == was.subresources;
+				}
+				if (!(full == run) || feedback != feedback_aspects ||
+				    depth.load_clear_aspects != depth_before.load_clear_aspects || !unchanged) {
+					EXIT("KYTY_RUN_STATE=verify: the previous draw's render targets differ, or the "
+					     "full path changed them\n");
+				}
+				m_run_verified++;
 			}
 			m_run.targets.sequence = m_committing;
 			return run;
 		}
+	}
+	if (RunTargetsValid()) {
+		g_run_late_full++;
 	}
 	return AcquireRenderTargetsFull(buffer, colors, color_count, depth, feedback_aspects, stages);
 }
@@ -2297,6 +2344,10 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            stat.page_buckets[6], stat.page_buckets[7],
 			            100.0 * static_cast<double>(stat.run_draws) / draws,
 			            100.0 * static_cast<double>(stat.run_targets) / draws);
+			if (RunStateMode() == 2) {
+				std::printf("RUNSTATE verified=%" PRIu64 " resolves_skipped_then_full=%" PRIu64 "\n",
+				            m_run_verified, g_run_late_full);
+			}
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;
