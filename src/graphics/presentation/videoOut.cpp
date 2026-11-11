@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1004,7 +1005,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		return;
 	}
 	Graphics::Presenter::Frame* frame = nullptr;
-	if (special) {
+	if (Graphics::FrameSkip::SkippingDraws()) {
+		// A skipped frame drew nothing: its flip completes on time but keeps the last image.
+	} else if (special) {
 		frame = &m_presenter.PrepareBlankFrame(m_width, m_height,
 		                                       index == VIDEO_OUT_BUFFER_INDEX_BLACK, &buffer);
 	} else {
@@ -1118,7 +1121,7 @@ bool FlipQueue::Flip() {
 		if (r.cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN &&
 		    g_headset_mirror.load(std::memory_order_relaxed)) {
 			hidden = r.frame;
-		} else {
+		} else if (r.frame != nullptr) {
 			const bool headset    = r.cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
 			layers[layer_count++] = {r.frame, headset ? VIDEO_OUT_BUS_TYPE_MAIN : r.cfg->bus,
 			                         r.premultiplied_alpha};
