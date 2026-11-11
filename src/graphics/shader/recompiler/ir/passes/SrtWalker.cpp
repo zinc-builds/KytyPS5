@@ -1549,22 +1549,26 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 			reads->emplace_back(*read, sizeof(uint32_t));
 	}
 	if (auto* pages = t_page_log; pages != nullptr) {
-		uint64_t last = pages->empty() ? UINT64_MAX : pages->back();
-		for (auto* read = first; read != end; ++read) {
-			// A DWORD load at most 4 bytes past a page start spans two pages only if unaligned.
-			const uint64_t page = *read >> 12u;
-			const uint64_t tail = (*read + sizeof(uint32_t) - 1u) >> 12u;
+		// Walker loads are DWORD-aligned DWORDs (LoadAddressU32 clears the low address bits), so
+		// none crosses a page today; AppendSrtLoadPages covers one that would.
+		AppendSrtLoadPages(std::span<const uint64_t>(first, end), sizeof(uint32_t), *pages);
+	}
+	return true;
+}
+
+void AppendSrtLoadPages(std::span<const uint64_t> addresses, uint64_t bytes,
+                        std::vector<uint64_t>& pages) {
+	uint64_t last = pages.empty() ? UINT64_MAX : pages.back();
+	for (const auto address: addresses) {
+		const uint64_t first_page = address >> 12u;
+		const uint64_t last_page  = (address + std::max<uint64_t>(bytes, 1u) - 1u) >> 12u;
+		for (auto page = first_page; page <= last_page; page++) {
 			if (page != last) {
-				pages->push_back(page);
+				pages.push_back(page);
 				last = page;
-			}
-			if (tail != last) {
-				pages->push_back(tail);
-				last = tail;
 			}
 		}
 	}
-	return true;
 }
 
 void SetSrtWalkerPageLog(std::vector<uint64_t>* pages) {
