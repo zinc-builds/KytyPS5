@@ -56,13 +56,15 @@ def window_edges(path, start, f0, f1):
             if n <= start:
                 continue
             if pending is not None:
-                # The METRICS line directly follows its PERF line.
+                # The METRICS line follows its PERF line (other lines may come between).
                 if line.startswith("METRICS ") and parse_kv(line).get("frames") == pending[0]["frames"]:
                     pending[1] = parse_kv(line)
                     edges.append(pending)
                     pending = None
                     if len(edges) == 2:
                         break
+                    continue
+                if not line.startswith("PERF "):
                     continue
                 edges.append(pending)
                 pending = None

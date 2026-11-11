@@ -104,8 +104,9 @@ struct GroupRead {
 	uint64_t values[2] {};
 };
 
-// Cycles and instructions summed over the PMUs; running/enabled tells whether the counters
-// were multiplexed (below 1: scaled).
+// Cycles and instructions summed over the PMUs. Each hybrid group runs only while the thread is
+// on its core type, so the groups' running times add up to the enabled time unless the counters
+// were multiplexed: running/enabled below 1 means the sums are scaled up to cover the gap.
 bool ReadCounters(const ThreadSlot& slot, uint64_t& cycles, uint64_t& instructions,
                   double& running_share) {
 	cycles = instructions = 0;
@@ -120,16 +121,16 @@ bool ReadCounters(const ThreadSlot& slot, uint64_t& cycles, uint64_t& instructio
 			continue;
 		}
 		any = true;
-		// Scale a multiplexed group to its enabled time.
-		const double scale = r.running != 0 && r.running < r.enabled
-		                         ? static_cast<double>(r.enabled) / static_cast<double>(r.running)
-		                         : 1.0;
-		cycles += static_cast<uint64_t>(static_cast<double>(r.values[0]) * scale);
-		instructions += static_cast<uint64_t>(static_cast<double>(r.values[1]) * scale);
+		cycles += r.values[0];
+		instructions += r.values[1];
 		enabled = std::max(enabled, r.enabled);
 		running += r.running;
 	}
 	running_share = enabled != 0 ? static_cast<double>(running) / static_cast<double>(enabled) : 0.0;
+	if (running_share > 0.0 && running_share < 1.0) {
+		cycles       = static_cast<uint64_t>(static_cast<double>(cycles) / running_share);
+		instructions = static_cast<uint64_t>(static_cast<double>(instructions) / running_share);
+	}
 	return any;
 }
 
