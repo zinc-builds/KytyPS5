@@ -636,6 +636,139 @@ struct PreparedIndexBuffer {
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
+// KYTY_RUN_STATS=1 (research diagnostic, command thread only): how much of each draw repeats the
+// draw before it or draws of earlier frames, how many draws are empty, and what a draw's commit
+// costs when it continues a run. One RUNSTAT line per second.
+namespace RunStats {
+static bool Enabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_RUN_STATS");
+		return v != nullptr && v[0] != '0';
+	}();
+	return enabled;
+}
+static inline uint64_t Tsc() { return __builtin_ia32_rdtsc(); }
+static inline uint64_t Mix(uint64_t h, uint64_t v) {
+	h ^= v + 0x9e3779b97f4a7c15ull + (h << 6u) + (h >> 2u);
+	h *= 0xbf58476d1ce4e5b9ull;
+	return h ^ (h >> 31u);
+}
+// Draws since a key was last seen: next draw, this frame, the frame before, 2-5 frames, never.
+struct Seen {
+	static constexpr size_t Size = size_t {1} << 21u;
+	std::vector<std::pair<uint64_t, uint64_t>> table = std::vector<std::pair<uint64_t, uint64_t>>(Size);
+	uint64_t                                   dist[5] {};
+	void Note(uint64_t key, uint64_t seq) {
+		auto& e = table[key & (Size - 1)];
+		int   b = 4;
+		if (e.first == key && e.second != 0) {
+			const auto d = seq - e.second;
+			b = d <= 16 ? 0 : d <= 2600 ? 1 : d <= 7800 ? 2 : d <= 26000 ? 3 : 4;
+		}
+		dist[b]++;
+		e = {key, seq};
+	}
+};
+enum Phase { RenderState, Textures, Buffers, VertexIndex, Pipeline, Targets, Commit, Record, PhaseCount };
+struct State {
+	const void*              pipeline = nullptr;
+	uint64_t                 targets = 0, images = 0, vbuf = 0;
+	std::vector<std::byte>   ctx;
+	uint64_t                 seq = 0;
+	uint64_t                 draws = 0, same_pipeline = 0, same_targets = 0, tex_reused = 0, same_vb = 0;
+	uint64_t                 same_ctx = 0, run = 0, run_ctx = 0, run_vb = 0;
+	uint64_t                 null_draws = 0, null_drains = 0, direct = 0, early = 0, noemit = 0;
+	uint64_t                 one_instance = 0, instances = 0, indices = 0, small = 0;
+	Seen                     seen_state, seen_geom, seen_full;
+	int                      cls = -1;
+	uint64_t                 marks[PhaseCount + 1] {};
+	uint64_t                 n_cls[2] {}, tsc_cls[2] {}, tsc_phase[2][PhaseCount] {};
+	uint64_t                 start_ns = 0, start_tsc = 0;
+};
+static State& S() {
+	static State s;
+	return s;
+}
+static uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+static void Print() {
+	auto&      s   = S();
+	const auto now = NowNs();
+	if (s.start_ns == 0) {
+		s.start_ns  = now;
+		s.start_tsc = Tsc();
+		return;
+	}
+	if (now - s.start_ns < 1'000'000'000ull) {
+		return;
+	}
+	const double ns_per_tsc = static_cast<double>(now - s.start_ns) / static_cast<double>(Tsc() - s.start_tsc);
+	const double d          = static_cast<double>(std::max<uint64_t>(s.draws, 1));
+	auto pct = [&](uint64_t v) { return 100.0 * static_cast<double>(v) / d; };
+	std::printf("RUNSTAT draws=%" PRIu64 " null=%" PRIu64 " null_drains=%" PRIu64 " direct=%" PRIu64
+	            " early=%" PRIu64 " noemit=%" PRIu64 " | same_pipeline=%.1f%% same_targets=%.1f%% tex_reused=%.1f%%"
+	            " same_vb=%.1f%% same_ctx=%.1f%% run=%.1f%% run+ctx=%.1f%% run+vb=%.1f%% | inst1=%.1f%%"
+	            " inst_avg=%.2f idx_avg=%.0f small=%.1f%%",
+	            s.draws, s.null_draws, s.null_drains, s.direct, s.early, s.noemit, pct(s.same_pipeline),
+	            pct(s.same_targets), pct(s.tex_reused), pct(s.same_vb), pct(s.same_ctx), pct(s.run),
+	            pct(s.run_ctx), pct(s.run_vb), pct(s.one_instance), static_cast<double>(s.instances) / d,
+	            static_cast<double>(s.indices) / d, pct(s.small));
+	const char* names[3] = {"state", "geom", "full"};
+	Seen*       seen[3]  = {&s.seen_state, &s.seen_geom, &s.seen_full};
+	for (int i = 0; i < 3; i++) {
+		std::printf(" | %s next/frame/prev/2-5/new=%.1f/%.1f/%.1f/%.1f/%.1f%%", names[i],
+		            pct(seen[i]->dist[0]), pct(seen[i]->dist[1]), pct(seen[i]->dist[2]),
+		            pct(seen[i]->dist[3]), pct(seen[i]->dist[4]));
+		std::fill(std::begin(seen[i]->dist), std::end(seen[i]->dist), 0);
+	}
+	for (int c = 0; c < 2; c++) {
+		const double n = static_cast<double>(std::max<uint64_t>(s.n_cls[c], 1));
+		std::printf(" | %s n=%" PRIu64 " ns=%.0f [", c == 1 ? "RUN" : "OTHER", s.n_cls[c],
+		            static_cast<double>(s.tsc_cls[c]) * ns_per_tsc / n);
+		for (int p = 0; p < PhaseCount; p++) {
+			std::printf("%s%.0f", p == 0 ? "" : " ", static_cast<double>(s.tsc_phase[c][p]) * ns_per_tsc / n);
+		}
+		std::printf("]");
+	}
+	std::printf("\n");
+	s.draws = s.same_pipeline = s.same_targets = s.tex_reused = s.same_vb = s.same_ctx = 0;
+	s.run = s.run_ctx = s.run_vb = s.null_draws = s.null_drains = s.direct = s.early = s.noemit = 0;
+	s.one_instance = s.instances = s.indices = s.small = 0;
+	std::memset(s.n_cls, 0, sizeof(s.n_cls));
+	std::memset(s.tsc_cls, 0, sizeof(s.tsc_cls));
+	std::memset(s.tsc_phase, 0, sizeof(s.tsc_phase));
+	s.start_ns  = now;
+	s.start_tsc = Tsc();
+}
+static inline void Mark(int i) {
+	if (Enabled()) {
+		S().marks[i] = Tsc();
+	}
+}
+// After a draw's commit: t0 is the TSC at its DrawIndex/DrawAuto entry, t1/t2 around
+// PrepareDrawRenderState. cls < 0: the draw recorded nothing.
+static void EndDraw(uint64_t t0, uint64_t t1, uint64_t t2) {
+	auto& s = S();
+	if (s.cls < 0) {
+		s.early++;
+		return;
+	}
+	const auto end = Tsc();
+	const int  c   = s.cls;
+	s.cls          = -1;
+	s.n_cls[c]++;
+	s.tsc_cls[c] += end - t0;
+	s.tsc_phase[c][RenderState] += t2 - t1;
+	for (int p = Textures; p < PhaseCount; p++) {
+		s.tsc_phase[c][p] += s.marks[p] - s.marks[p - 1];
+	}
+	Print();
+}
+} // namespace RunStats
+
 static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputInfo& info) {
 	const auto& buffer = info.buffers[binding];
 	if (buffer.stride != 0 || buffer.num_records == 0) {
@@ -1199,6 +1332,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	RunStats::Mark(RunStats::RenderState);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1211,7 +1345,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	RunStats::Mark(RunStats::Textures);
 	PrepareGraphicsBindings(stages, std::span {state.color_info.data(), state.color_count});
+	RunStats::Mark(RunStats::Buffers);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1233,12 +1369,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
+	RunStats::Mark(RunStats::VertexIndex);
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_adopted_pipeline_key);
+	RunStats::Mark(RunStats::Pipeline);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info.data(), state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	RunStats::Mark(RunStats::Targets);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {
@@ -1265,6 +1404,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	auto& bound         = dynamic_state.bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	RunStats::Mark(RunStats::Commit);
 	if (!mesh_active) {
 		CommitVertexBuffers(buffer, vertex_bindings);
 		CommitIndexBuffer(buffer, index_binding);
@@ -1449,6 +1589,89 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	buffer.Publish();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	if (RunStats::Enabled()) {
+		auto& rs = RunStats::S();
+		using RunStats::Mix;
+		uint64_t targets = state.color_count;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			targets = Mix(targets, (uint64_t {state.color_info[i].image_id.index} << 8u) |
+			                           state.color_info[i].target_slot);
+			targets = Mix(targets, (uint64_t {state.color_info[i].desc.view_info.base_level} << 32u) |
+			                           state.color_info[i].desc.view_info.base_layer);
+		}
+		targets = Mix(targets, state.depth_info.image_id.index);
+		uint64_t images = stage_count;
+		uint64_t inputs = 0;
+		bool     reused = true;
+		for (const auto* stage: stages) {
+			images = Mix(images, reinterpret_cast<uint64_t>(stage->runtime->module));
+			reused = reused && (stage->reused || stage->images.empty());
+			for (const auto& image: stage->images) {
+				images = Mix(images, image.image_id.index);
+				images = Mix(images, reinterpret_cast<uint64_t>(static_cast<VkImageView>(image.image_view)));
+			}
+			for (const auto& sampler: stage->samplers) {
+				images = Mix(images, reinterpret_cast<uint64_t>(static_cast<VkSampler>(sampler)));
+			}
+			for (const auto& source: stage->buffer_sources) {
+				inputs = Mix(Mix(inputs, source.address), source.size);
+			}
+			const auto& program = stage->runtime->module->info;
+			for (size_t i = 0; i < program.info.user_data_registers.size() && i < stage->shader_data.size(); i++) {
+				inputs = Mix(inputs, stage->shader_data[i]);
+			}
+			for (const auto dword: stage->runtime->resources->flattened_srt) {
+				inputs = Mix(inputs, dword);
+			}
+		}
+		uint64_t vbuf = vertex_bindings.count;
+		for (uint32_t i = 0; i < vertex_bindings.count; i++) {
+			vbuf = Mix(vbuf, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(vertex_bindings.buffers[i])));
+			vbuf = Mix(vbuf, vertex_bindings.offsets[i]);
+		}
+		vbuf = Mix(vbuf, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(index_binding.buffer)));
+		uint64_t geom = Mix(Mix(Mix(draw.index_count, draw.instance_count), index_source.address),
+		                    static_cast<uint32_t>(emit.vertex_offset));
+		if (!mesh_active) {
+			const auto& vs = state.vertex_info[0];
+			for (int i = 0; i < vs.buffers_num; i++) {
+				geom = Mix(geom, vs.buffers[i].addr);
+			}
+		}
+		const auto& ctx      = buffer.GetRegisters();
+		const bool  same_ctx = rs.ctx.size() == sizeof(ctx) && std::memcmp(rs.ctx.data(), &ctx, sizeof(ctx)) == 0;
+		rs.ctx.resize(sizeof(ctx));
+		std::memcpy(rs.ctx.data(), &ctx, sizeof(ctx));
+		const bool same_pipeline = rs.pipeline == &pipeline;
+		const bool same_targets  = rs.targets == targets;
+		const bool same_vb       = rs.vbuf == vbuf;
+		const bool run           = same_pipeline && same_targets && reused;
+		rs.draws++;
+		rs.seq++;
+		rs.same_pipeline += same_pipeline;
+		rs.same_targets += same_targets;
+		rs.tex_reused += reused;
+		rs.same_vb += same_vb;
+		rs.same_ctx += same_ctx;
+		rs.run += run;
+		rs.run_ctx += run && same_ctx;
+		rs.run_vb += run && same_vb;
+		rs.one_instance += draw.instance_count == 1;
+		rs.instances += draw.instance_count;
+		rs.indices += draw.index_count;
+		rs.small += uint64_t {draw.index_count} * draw.instance_count <= 96;
+		const auto k_state = Mix(Mix(reinterpret_cast<uint64_t>(&pipeline), targets), images);
+		const auto k_geom  = Mix(k_state, geom);
+		rs.seen_state.Note(k_state, rs.seq);
+		rs.seen_geom.Note(k_geom, rs.seq);
+		rs.seen_full.Note(Mix(k_geom, inputs), rs.seq);
+		rs.pipeline = &pipeline;
+		rs.targets  = targets;
+		rs.images   = images;
+		rs.vbuf     = vbuf;
+		rs.cls      = run ? 1 : 0;
+		rs.marks[RunStats::Record] = RunStats::Tsc();
+	}
 
 	if (shader_write_stages) {
 		buffer.EndRendering();
@@ -1506,6 +1729,10 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	const bool     run_stats = RunStats::Enabled();
+	const uint64_t rs_t0     = run_stats ? RunStats::Tsc() : 0;
+	uint64_t       rs_t1     = 0;
+	uint64_t       rs_t2     = 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1582,10 +1809,15 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
 	}
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count};
+	rs_t1 = run_stats ? RunStats::Tsc() : 0;
 	if (!PrepareDrawRenderState(buffer, draw, state, queued)) {
 		ResetBindings();
+		if (run_stats) {
+			RunStats::S().early++;
+		}
 		return true;
 	}
+	rs_t2 = run_stats ? RunStats::Tsc() : 0;
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
@@ -1593,8 +1825,13 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
 	                                  args.base_vertex, args.first_instance, args.indirect);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, index_source);
+	} else if (run_stats) {
+		RunStats::S().noemit++;
 	}
 	ResetBindings();
+	if (run_stats && emit) {
+		RunStats::EndDraw(rs_t0, rs_t1, rs_t2);
+	}
 	return emit.has_value();
 }
 
@@ -1677,6 +1914,9 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args,
 	                                  args.indirect);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, {});
+		if (RunStats::Enabled()) {
+			RunStats::S().cls = -1; // counted, not timed
+		}
 	}
 	ResetBindings();
 	return emit.has_value();
@@ -1852,6 +2092,15 @@ void RenderExecutor::QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& 
 	                   ? NextQueuedDraw(buffer)
 	                   : nullptr;
 	if (queued == nullptr) {
+		if (RunStats::Enabled()) {
+			auto& rs = RunStats::S();
+			if (args.indirect.address == 0 && (args.index_count == 0 || args.instance_count == 0)) {
+				rs.null_draws++;
+				rs.null_drains += m_queued_count != 0;
+			} else {
+				rs.direct++;
+			}
+		}
 		FinishQueuedDraws(buffer);
 		m_prepare_stat.direct++;
 		(void)DrawIndex(buffer, args);
@@ -1867,6 +2116,15 @@ void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& ar
 	                   ? NextQueuedDraw(buffer)
 	                   : nullptr;
 	if (queued == nullptr) {
+		if (RunStats::Enabled()) {
+			auto& rs = RunStats::S();
+			if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
+				rs.null_draws++;
+				rs.null_drains += m_queued_count != 0;
+			} else {
+				rs.direct++;
+			}
+		}
 		FinishQueuedDraws(buffer);
 		m_prepare_stat.direct++;
 		(void)DrawAuto(buffer, args);

@@ -472,7 +472,37 @@ int wmain(int argc, wchar_t* argv[]) {
 
 #else
 
+// Research (PGO training): the benchmark harness kills the emulator, so an instrumented build
+// never reaches the profile runtime's exit hook. With KYTY_PGO_DUMP=<prefix> a thread writes the
+// counters every 10 s, alternately to <prefix>.a.profraw and <prefix>.b.profraw (a kill during
+// one write leaves the other file whole). The symbols exist only in -fprofile-generate builds.
+extern "C" __attribute__((weak)) int  __llvm_profile_write_file(void);
+extern "C" __attribute__((weak)) void __llvm_profile_set_filename(const char*);
+
+#include <cstdlib>
+#include <string>
+#include <thread>
+#include <unistd.h>
+
+static void StartPgoDumper() {
+    const char* prefix = std::getenv("KYTY_PGO_DUMP");
+    if (prefix == nullptr || __llvm_profile_write_file == nullptr || __llvm_profile_set_filename == nullptr) {
+        return;
+    }
+    std::thread([p = std::string(prefix)] {
+        static std::string names[2];
+        names[0] = p + ".a.profraw";
+        names[1] = p + ".b.profraw";
+        for (int i = 0;; i++) {
+            sleep(10);
+            __llvm_profile_set_filename(names[i & 1].c_str());
+            __llvm_profile_write_file();
+        }
+    }).detach();
+}
+
 int main(int argc, char* argv[]) {
+    StartPgoDumper();
     return Main(argc, argv);
 }
 
