@@ -1421,8 +1421,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 #endif
 		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
 			// A draw prepared on the worker may have read these bytes before they became
-			// GPU-written.
-			DrawPrepare::NoteHazard();
+			// GPU-written (the pages are read-watched from SynchronizeBuffer above).
+			DrawPrepare::NoteGpuWrite(vaddr, size);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);

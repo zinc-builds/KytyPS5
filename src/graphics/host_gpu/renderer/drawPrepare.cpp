@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -33,55 +35,96 @@ struct StoredRange {
 	uint64_t begin;
 	uint64_t end;
 };
-// Enough for every store between a draw's post and its adoption at any realistic rate.
-constexpr size_t           StoredHistory = 4096;
-std::mutex                 g_stored_mutex;
-std::deque<StoredRange>    g_stored;
-uint64_t                   g_stored_last = 0; // under g_stored_mutex
-std::atomic<uint64_t>      g_stored_sequence {0};
-// Stores between their opening and closing records (keyed by the opening sequence): a draw posted
-// after the opening record may have read the bytes before the store and is adopted before the
-// closing record, so the sequence alone does not show it.
-std::vector<StoredRange>   g_stored_open; // under g_stored_mutex
-std::atomic<uint32_t>      g_stored_open_count {0};
 
-// Under g_stored_mutex.
-uint64_t RecordStoredRange(uint64_t vaddr, uint64_t size) {
-	g_stored.push_back({++g_stored_last, vaddr, vaddr + size});
-	if (g_stored.size() > StoredHistory) {
-		g_stored.pop_front();
+// Ranges recorded with a sequence number, any thread. A range may stay open (a store between its
+// opening and closing records, keyed by the opening sequence): a draw posted after the opening
+// record may have read the bytes before the store and be adopted before the closing record, so
+// the sequence alone does not show it.
+class RangeHistory {
+public:
+	// Enough for every record between a draw's post and its adoption at any realistic rate.
+	static constexpr size_t Capacity = 4096;
+
+	uint64_t Record(uint64_t vaddr, uint64_t size) {
+		std::scoped_lock lock(m_mutex);
+		const auto sequence = Push(vaddr, size);
+		m_sequence.store(sequence, std::memory_order_seq_cst);
+		return sequence;
 	}
-	return g_stored_last;
-}
 
-// Whether no store can have changed what the result posted at `sequence` read: the count is read
-// before the sequence, a store raises it before its opening record and lowers it after its
-// closing one.
-bool NothingStoredSince(uint64_t sequence) {
-	return g_stored_open_count.load(std::memory_order_seq_cst) == 0 &&
-	       g_stored_sequence.load(std::memory_order_seq_cst) == sequence;
-}
+	uint64_t Open(uint64_t vaddr, uint64_t size) {
+		std::scoped_lock lock(m_mutex);
+		m_open_count.fetch_add(1, std::memory_order_seq_cst);
+		const auto open = Push(vaddr, size);
+		m_open.push_back({open, vaddr, vaddr + size});
+		m_sequence.store(open, std::memory_order_seq_cst);
+		return open;
+	}
 
-template <typename Hit>
-bool StoredSinceLocked(uint64_t sequence, Hit hit) {
-	for (const auto& open: g_stored_open) {
-		if (hit(open)) {
+	void Close(uint64_t open) {
+		std::scoped_lock lock(m_mutex);
+		const auto it = std::ranges::find(m_open, open, &StoredRange::sequence);
+		EXIT_IF(it == m_open.end());
+		Push(it->begin, it->end - it->begin);
+		m_open.erase(it);
+		m_sequence.store(m_last, std::memory_order_seq_cst);
+		m_open_count.fetch_sub(1, std::memory_order_seq_cst);
+	}
+
+	[[nodiscard]] uint64_t Sequence() const noexcept {
+		return m_sequence.load(std::memory_order_seq_cst);
+	}
+
+	// Whether a range recorded after `sequence`, or one still open, satisfies `hit`; also true when
+	// the history no longer reaches back that far.
+	template <typename Hit>
+	[[nodiscard]] bool Since(uint64_t sequence, Hit hit) {
+		// The count is read before the sequence: an open range raises it before its opening
+		// record and lowers it after its closing one.
+		if (m_open_count.load(std::memory_order_seq_cst) == 0 &&
+		    m_sequence.load(std::memory_order_seq_cst) == sequence) {
+			return false;
+		}
+		std::scoped_lock lock(m_mutex);
+		for (const auto& open: m_open) {
+			if (hit(open)) {
+				return true;
+			}
+		}
+		if (m_last == sequence) {
+			return false;
+		}
+		if (m_ranges.empty() || m_ranges.front().sequence > sequence + 1) {
 			return true;
 		}
-	}
-	if (g_stored_last == sequence) {
+		for (auto it = m_ranges.rbegin(); it != m_ranges.rend() && it->sequence > sequence; ++it) {
+			if (hit(*it)) {
+				return true;
+			}
+		}
 		return false;
 	}
-	if (g_stored.empty() || g_stored.front().sequence > sequence + 1) {
-		return true;
-	}
-	for (auto it = g_stored.rbegin(); it != g_stored.rend() && it->sequence > sequence; ++it) {
-		if (hit(*it)) {
-			return true;
+
+private:
+	// Under m_mutex.
+	uint64_t Push(uint64_t vaddr, uint64_t size) {
+		m_ranges.push_back({++m_last, vaddr, vaddr + size});
+		if (m_ranges.size() > Capacity) {
+			m_ranges.pop_front();
 		}
+		return m_last;
 	}
-	return false;
-}
+
+	std::mutex               m_mutex;
+	std::deque<StoredRange>  m_ranges;
+	uint64_t                 m_last = 0; // under m_mutex
+	std::atomic<uint64_t>    m_sequence {0};
+	std::vector<StoredRange> m_open; // under m_mutex
+	std::atomic<uint32_t>    m_open_count {0};
+};
+
+RangeHistory g_stored;      // emulator stores into guest memory
+RangeHistory g_gpu_written; // guest ranges newly marked GPU-written
 
 bool ReadsHit(const std::vector<std::pair<uint64_t, uint64_t>>& reads, const StoredRange& range) {
 	return std::ranges::any_of(reads, [&](const auto& read) {
@@ -93,6 +136,10 @@ bool PagesHit(const std::vector<uint64_t>& pages, const StoredRange& range) {
 	const auto first = range.begin >> 12u;
 	const auto last  = (range.end - 1) >> 12u;
 	return std::ranges::any_of(pages, [&](uint64_t page) { return page >= first && page <= last; });
+}
+
+bool LogHit(const Log& log, const StoredRange& range) {
+	return ReadsHit(log.reads, range) || PagesHit(log.pages, range);
 }
 
 uint64_t NowNs() {
@@ -126,6 +173,31 @@ uint64_t HazardGeneration() noexcept {
 	return g_hazard_generation.load(std::memory_order_relaxed);
 }
 
+bool RangedGpuWritesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RANGED_GPU_HAZARD");
+		// Pages are needed: without them the walker's raw loads are not logged.
+		return (value == nullptr || std::strcmp(value, "0") != 0) &&
+		       ShaderRecompiler::IR::SrtWalkerPageLogEnabled();
+	}();
+	return enabled;
+}
+
+void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	NoteHazard();
+	if (RangedGpuWritesEnabled()) {
+		(void)g_gpu_written.Record(vaddr, size);
+	}
+}
+
+uint64_t GpuWriteSequence() noexcept {
+	return g_gpu_written.Sequence();
+}
+
+bool GpuWrittenSince(uint64_t sequence, const Log& log) {
+	return g_gpu_written.Since(sequence, [&](const StoredRange& range) { return LogHit(log, range); });
+}
+
 RangedStore::RangedStore(uint64_t vaddr, uint64_t size) noexcept
     : m_outer(GuestSyncEpoch::g_stores_ranged),
       // With the walker's page log, every worker read of guest memory is logged.
@@ -145,44 +217,23 @@ RangedStore::~RangedStore() {
 }
 
 uint64_t OpenStoredRange(uint64_t vaddr, uint64_t size) {
-	std::scoped_lock lock(g_stored_mutex);
-	g_stored_open_count.fetch_add(1, std::memory_order_seq_cst);
-	const auto open = RecordStoredRange(vaddr, size);
-	g_stored_open.push_back({open, vaddr, vaddr + size});
-	g_stored_sequence.store(open, std::memory_order_seq_cst);
-	return open;
+	return g_stored.Open(vaddr, size);
 }
 
 void CloseStoredRange(uint64_t open) {
-	std::scoped_lock lock(g_stored_mutex);
-	const auto it = std::ranges::find(g_stored_open, open, &StoredRange::sequence);
-	EXIT_IF(it == g_stored_open.end());
-	RecordStoredRange(it->begin, it->end - it->begin);
-	g_stored_open.erase(it);
-	g_stored_sequence.store(g_stored_last, std::memory_order_seq_cst);
-	g_stored_open_count.fetch_sub(1, std::memory_order_seq_cst);
+	g_stored.Close(open);
 }
 
 uint64_t StoredSequence() noexcept {
-	return g_stored_sequence.load(std::memory_order_seq_cst);
+	return g_stored.Sequence();
 }
 
 bool StoredSince(uint64_t sequence, const std::vector<std::pair<uint64_t, uint64_t>>& reads) {
-	if (NothingStoredSince(sequence)) {
-		return false;
-	}
-	std::scoped_lock lock(g_stored_mutex);
-	return StoredSinceLocked(sequence, [&](const StoredRange& range) { return ReadsHit(reads, range); });
+	return g_stored.Since(sequence, [&](const StoredRange& range) { return ReadsHit(reads, range); });
 }
 
 bool StoredSince(uint64_t sequence, const Log& log) {
-	if (NothingStoredSince(sequence)) {
-		return false;
-	}
-	std::scoped_lock lock(g_stored_mutex);
-	return StoredSinceLocked(sequence, [&](const StoredRange& range) {
-		return ReadsHit(log.reads, range) || PagesHit(log.pages, range);
-	});
+	return g_stored.Since(sequence, [&](const StoredRange& range) { return LogHit(log, range); });
 }
 
 Worker::Worker(Run run, void* context, uint32_t index)

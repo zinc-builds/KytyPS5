@@ -64,6 +64,16 @@ inline void Fail() {
 void               NoteHazard() noexcept;
 [[nodiscard]] uint64_t HazardGeneration() noexcept;
 
+// Guest bytes newly marked GPU-written, by range (KYTY_RANGED_GPU_HAZARD, default on with the
+// walker's page log): a result whose logged reads and walker pages miss every range marked since
+// its post is still current, so the hazard generation (also advanced) is not checked. The mark
+// happens on the command thread after the pages turn read-watched, so a worker that reads them
+// later logs the read (and HasGpuDirtyBytes rejects it at adoption).
+[[nodiscard]] bool     RangedGpuWritesEnabled();
+void                   NoteGpuWrite(uint64_t vaddr, uint64_t size);
+[[nodiscard]] uint64_t GpuWriteSequence() noexcept;
+[[nodiscard]] bool     GpuWrittenSince(uint64_t sequence, const Log& log);
+
 // Emulator stores through the backing into pages that stay read-watched until after the store
 // (buffer readbacks publish before their pages are released), recorded instead of advancing
 // GuestSyncEpoch's unranged epoch. A preparation read such bytes only through a logging reader,

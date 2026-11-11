@@ -359,11 +359,12 @@ private:
 		PipelineCache::GraphicsResources resources;
 		DrawPrepare::Log                 log;
 		uint64_t                         sequence = 0;
-		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged and
-		// DrawPrepare::StoredSequence when it was queued.
-		uint64_t                         hazard_generation = 0;
-		uint64_t                         sync_epoch        = 0;
-		uint64_t                         stored_sequence   = 0;
+		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged,
+		// DrawPrepare::StoredSequence and DrawPrepare::GpuWriteSequence when it was queued.
+		uint64_t                         hazard_generation  = 0;
+		uint64_t                         sync_epoch         = 0;
+		uint64_t                         stored_sequence    = 0;
+		uint64_t                         gpu_write_sequence = 0;
 		WorkerBuffers                    buffers;
 		WorkerTextures                   textures;
 		// Resolves the command thread made for this draw, for the worker's memo (see
@@ -680,7 +681,7 @@ private:
 		// Adopted although an emulator store came after the post (the unranged epoch would have
 		// dropped them), and the walker page log's distinct pages per draw (buckets 0, 1, 2-3,
 		// 4-7, ... 64+).
-		uint64_t kept_by_ranged = 0, walker_pages = 0;
+		uint64_t kept_by_ranged = 0, kept_by_gpu_range = 0, walker_pages = 0;
 		uint64_t hazard_gpu = 0, hazard_epoch = 0; // of `hazard`: new GPU writes, unranged epoch
 		std::array<uint64_t, 8> page_buckets {};
 		uint64_t stored = 0;
