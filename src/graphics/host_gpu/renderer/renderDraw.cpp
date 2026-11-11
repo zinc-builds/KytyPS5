@@ -1826,20 +1826,48 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 	}
 	// The ring holds one more slot than the queue, so the next one is free.
 	EXIT_IF(m_queued_count >= m_queued_draws.size());
-	return m_queued_draws[m_queued_posted % m_queued_draws.size()].get();
+	return m_queued_draws[m_post_slot].get();
 }
 
 void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
-	queued.registers         = buffer.GetRegisters();
+	// The slot's copies from its previous draw stay while their registers' generation holds.
+	// KYTY_POST_COPY=all: always copy; =verify: also compare a kept copy with the registers.
+	static const int copy_mode = [] {
+		const char* value = std::getenv("KYTY_POST_COPY");
+		if (value == nullptr) return 0;
+		return std::string_view(value) == "all" ? 1 : std::string_view(value) == "verify" ? 2 : 0;
+	}();
+	const auto ctx_generation = queued.indexed ? queued.index_args.ctx_generation
+	                                           : queued.auto_args.ctx_generation;
+	const auto sh_generation  = queued.indexed ? queued.index_args.sh_generation
+	                                           : queued.auto_args.sh_generation;
+	if (copy_mode == 1 || ctx_generation == 0 || ctx_generation != queued.ctx_generation) {
+		queued.registers      = buffer.GetRegisters();
+		queued.ctx_generation = ctx_generation;
+		m_prepare_stat.register_copies++;
+	} else if (copy_mode == 2 &&
+	           std::memcmp(&queued.registers, &buffer.GetRegisters(), sizeof(HW::Context)) != 0) {
+		EXIT("KYTY_POST_COPY=verify: a kept context copy differs from the registers\n");
+	}
+	if (copy_mode == 1 || sh_generation == 0 || sh_generation != queued.sh_generation) {
+		queued.shaders       = buffer.GetShaders();
+		queued.sh_generation = sh_generation;
+		m_prepare_stat.shader_copies++;
+	} else if (copy_mode == 2 &&
+	           std::memcmp(&queued.shaders, &buffer.GetShaders(), sizeof(HW::Shader)) != 0) {
+		EXIT("KYTY_POST_COPY=verify: a kept shader-register copy differs from the registers\n");
+	}
 	queued.user_config       = buffer.GetUserConfig();
-	queued.shaders           = buffer.GetShaders();
 	queued.hazard_generation = DrawPrepare::HazardGeneration();
 	queued.sync_epoch        = GuestSyncEpoch::CurrentUnranged();
 	queued.stored_sequence   = DrawPrepare::StoredSequence();
 	queued.sequence          = ++m_queued_posted;
-	// The worker finds the slot from the sequence.
-	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||
-	        PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence));
+	// The worker finds the slot from the sequence: job j of lane l is sequence
+	// (j - 1) * lanes + l + 1.
+	const auto job = m_prepare_lanes[m_post_lane]->worker->Post();
+	EXIT_IF(m_queued_draws[m_post_slot].get() != &queued ||
+	        (job - 1) * m_prepare_lanes.size() + m_post_lane + 1 != queued.sequence);
+	AdvanceCursor(m_post_slot, m_post_lane);
 	m_queued_count++;
 	m_prepare_stat.queued++;
 	while (m_queued_count + 1 > m_queued_draws.size()) {
@@ -1878,9 +1906,11 @@ void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& ar
 }
 
 void RenderExecutor::WaitPrepareIdle() {
+	uint64_t waited = 0;
 	for (auto& lane: m_prepare_lanes) {
-		lane->worker->WaitIdle();
+		waited += lane->worker->WaitIdle();
 	}
+	m_prepare_stat.idle_wait_ns += waited;
 }
 
 uint64_t RenderExecutor::PrepareBusyNs() const {
@@ -2041,10 +2071,13 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued) {
 void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const auto sequence = m_queued_posted - m_queued_count + 1;
-	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
+	auto&      queued   = *m_queued_draws[m_finish_slot];
+	auto&      lane     = *m_prepare_lanes[m_finish_lane];
 	EXIT_IF(m_queued_count == 0 || queued.sequence != sequence);
+	AdvanceCursor(m_finish_slot, m_finish_lane);
 	m_queued_count--;
-	if (const auto waited = PrepareWorker(sequence).Wait(PrepareJob(sequence)); waited != 0) {
+	// The lane's jobs are its draws, in order.
+	if (const auto waited = lane.worker->Wait(++lane.finished_jobs); waited != 0) {
 		m_prepare_stat.wait_ns += waited;
 		m_prepare_stat.waits++;
 		if (m_drain_stats) {
@@ -2101,7 +2134,8 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " gpu_written=%" PRIu64 " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
 			            " drains=%" PRIu64 ") worker_ns_per_draw=%.0f"
 			            " worker_busy=%.1f%% (workers=%zu) texture_resolves=%" PRIu64
-			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%\n",
+			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%"
+			            " idle_wait_ns_per_draw=%.0f register_copies=%.1f%% shader_copies=%.1f%%\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
@@ -2111,7 +2145,10 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            m_prepare_lanes.size(), stat.texture_updates,
 			            stat.texture_generation_refreshes,
 			            100.0 * static_cast<double>(stat.binding_reuses) /
-			                static_cast<double>(std::max<uint64_t>(stat.binding_sets, 1)));
+			                static_cast<double>(std::max<uint64_t>(stat.binding_sets, 1)),
+			            static_cast<double>(stat.idle_wait_ns) / draws,
+			            100.0 * static_cast<double>(stat.register_copies) / draws,
+			            100.0 * static_cast<double>(stat.shader_copies) / draws);
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;

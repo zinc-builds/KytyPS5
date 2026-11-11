@@ -65,6 +65,9 @@ struct DrawIndexArgs {
 	DrawOffsetSource offset_source       = DrawOffsetSource::DrawState;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
+	// CommandProcessor::CtxGeneration and ShGeneration at the draw (0: unknown, copy them).
+	uint64_t         ctx_generation = 0;
+	uint64_t         sh_generation  = 0;
 };
 
 struct DrawAutoArgs {
@@ -74,6 +77,8 @@ struct DrawAutoArgs {
 	uint32_t         first_instance = 0;
 	DrawOffsetSource offset_source  = DrawOffsetSource::DrawState;
 	DrawIndirectArgs indirect;
+	uint64_t         ctx_generation = 0; // as in DrawIndexArgs
+	uint64_t         sh_generation  = 0;
 };
 
 struct SubmitInfo {
@@ -356,6 +361,9 @@ private:
 		PipelineCache::GraphicsResources resources;
 		DrawPrepare::Log                 log;
 		uint64_t                         sequence = 0;
+		// Register generations `registers` and `shaders` were copied at (0: none).
+		uint64_t                         ctx_generation = 0;
+		uint64_t                         sh_generation  = 0;
 		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged and
 		// DrawPrepare::StoredSequence when it was queued.
 		uint64_t                         hazard_generation = 0;
@@ -484,6 +492,18 @@ private:
 	}
 	[[nodiscard]] uint64_t PrepareJob(uint64_t sequence) const {
 		return (sequence - 1) / m_prepare_lanes.size() + 1;
+	}
+	// The slot and lane of the next draw posted and of the next committed, kept as cursors so
+	// the per-draw path divides nothing (slot = (sequence - 1) % slots, lane = slot % lanes,
+	// since the slots are a multiple of the lanes).
+	uint32_t m_post_slot = 0, m_post_lane = 0, m_finish_slot = 0, m_finish_lane = 0;
+	void     AdvanceCursor(uint32_t& slot, uint32_t& lane) const {
+		if (++slot == m_queued_draws.size()) {
+			slot = 0;
+		}
+		if (++lane == m_prepare_lanes.size()) {
+			lane = 0;
+		}
 	}
 	// Waits until every worker has finished its posted jobs.
 	void WaitPrepareIdle();
@@ -639,6 +659,7 @@ private:
 	// as its job (sequence - 1) / N + 1; the ring's size is a multiple of N, so a slot always
 	// goes to the same worker (its texture_updates are for that worker's memo).
 	struct PrepareLane {
+		uint64_t                             finished_jobs = 0; // committed by the command thread
 		RenderExecutor*                      executor = nullptr;
 		uint32_t                             index    = 0;
 		WorkerTextureState                   textures;
@@ -666,6 +687,8 @@ private:
 	void                        PrintDrainStats();
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t register_copies = 0, shader_copies = 0;
+		uint64_t idle_wait_ns = 0; // WaitPrepareIdle (a rejected draw's lookup, verify)
 		uint64_t stored = 0;
 		uint64_t wait_ns = 0, verified = 0, worker_busy_ns = 0, start_ns = 0;
 		uint64_t drains = 0, waits = 0; // drains: FinishQueuedDraws with draws queued

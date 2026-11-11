@@ -65,9 +65,15 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferWait();
-	HW::Context&    GetCtx() { return m_ctx; }
+	// Every write to the context or shader registers goes through these (or Reset and the
+	// context-state operations), which advance the register generations: a queued draw keeps its
+	// earlier copy of registers whose generation did not move (RenderExecutor::PostQueuedDraw).
+	HW::Context&    GetCtx() { m_ctx_generation++; return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
-	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	HW::Shader&     GetShCtx() { m_sh_generation++; return m_sh_ctx; }
+	// Unique among command processors (the processor's id in the top 16 bits); never 0.
+	[[nodiscard]] uint64_t CtxGeneration() const { return m_ctx_generation; }
+	[[nodiscard]] uint64_t ShGeneration() const { return m_sh_generation; }
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
@@ -128,6 +134,9 @@ private:
 
 	RenderContext& m_renderer;
 	bool           m_in_dispatch_packet = false; // ProcessPm4 runs a dispatch packet's handler
+	uint64_t       m_ctx_generation = NewGenerationBase();
+	uint64_t       m_sh_generation  = m_ctx_generation;
+	static uint64_t NewGenerationBase();
 	HW::Context    m_ctx;
 	std::optional<HW::Context> m_saved_ctx;
 	HW::UserConfig m_ucfg;
