@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
+#include "common/benchMetrics.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -1878,8 +1879,13 @@ void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& ar
 }
 
 void RenderExecutor::WaitPrepareIdle() {
+	uint64_t waited = 0;
 	for (auto& lane: m_prepare_lanes) {
-		lane->worker->WaitIdle();
+		waited += lane->worker->WaitIdle();
+	}
+	if (waited != 0) {
+		Common::BenchMetrics::Add(Common::BenchMetrics::Counter::IdleWaitNs, waited);
+		Common::BenchMetrics::Add(Common::BenchMetrics::Counter::PrepareWaits);
 	}
 }
 
@@ -2047,6 +2053,12 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	if (const auto waited = PrepareWorker(sequence).Wait(PrepareJob(sequence)); waited != 0) {
 		m_prepare_stat.wait_ns += waited;
 		m_prepare_stat.waits++;
+		using Common::BenchMetrics::Counter;
+		Common::BenchMetrics::Add(m_draining                  ? Counter::DrainWaitNs
+		                          : sequence <= m_refill_until ? Counter::RefillWaitNs
+		                                                       : Counter::SteadyWaitNs,
+		                          waited);
+		Common::BenchMetrics::Add(Counter::PrepareWaits);
 		if (m_drain_stats) {
 			if (m_draining) {
 				m_drain_stat.drain_wait[m_drain_reason] += waited;
@@ -2182,6 +2194,7 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		usable = true;
 	}
 	if (!usable) {
+		Common::BenchMetrics::Add(Common::BenchMetrics::Counter::Rejected);
 		// The command thread may not look programs up while the worker does.
 		WaitPrepareIdle();
 		ResetProgramState(state);

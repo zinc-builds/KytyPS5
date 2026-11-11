@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/deferredRecorder.h"
 
+#include "common/benchMetrics.h"
 #include "common/hybridAffinity.h"
 #include "common/kernelStats.h"
 #include "common/profiler.h"
@@ -74,6 +75,7 @@ void DeferredRecorder::WaitDone(uint64_t position) {
 	}
 	Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdRecorder);
 	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::RecorderWait);
+	const auto wait_start = Common::BenchMetrics::Stamp();
 	Publish();
 	// Pairs with the recorder's seq_cst sleeping store and published load: either it sees what
 	// was published, or this sees it asleep.
@@ -89,6 +91,8 @@ void DeferredRecorder::WaitDone(uint64_t position) {
 			std::this_thread::yield();
 		}
 	}
+	Common::BenchMetrics::Add(Common::BenchMetrics::Counter::RecorderWaits);
+	Common::BenchMetrics::AddSince(Common::BenchMetrics::Counter::RecorderWaitNs, wait_start);
 }
 
 void DeferredRecorder::DrainSlow() {
@@ -102,6 +106,7 @@ void DeferredRecorder::Run() {
 	pthread_setname_np(pthread_self(), "KytyGpuRec");
 	Common::HybridAffinity::ApplyToRecorderThread();
 #endif
+	Common::BenchMetrics::RegisterThread(Common::BenchMetrics::Role::Rec);
 	uint64_t done = 0;
 	for (;;) {
 		auto published = m_published.load(std::memory_order_acquire);

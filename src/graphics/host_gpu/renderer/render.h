@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/benchMetrics.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/deferredRecorder.h"
@@ -303,6 +304,7 @@ public:
 			return;
 		}
 		m_prepare_stat.drains++;
+		Common::BenchMetrics::Add(Common::BenchMetrics::Counter::Drains);
 		m_drain_reason = reason < DrainReasons ? reason : DrainDirectDraw;
 		m_draining     = true;
 		while (m_queued_count != 0) {
