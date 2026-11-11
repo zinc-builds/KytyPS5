@@ -1599,6 +1599,38 @@ void SetSrtWalkerGuestAccess(const void* const* regions, uint64_t pages_offset,
 	g_walker_access.regions      = regions;
 }
 
+void GetSrtWalkerGuestAccess(const void* const** regions, uint64_t* pages_offset,
+                             SrtWalkerReader* read) {
+	*regions      = g_walker_access.regions;
+	*pages_offset = g_walker_access.pages_offset;
+	*read         = g_walker_access.read;
+}
+
+bool SrtWalkerReadsLogged(uint64_t address, uint64_t size) {
+	// The same checks as the load stub (EmitWalkerLoad's `raw` cases), per page.
+	const auto* const* regions = g_walker_access.regions;
+	if (regions == nullptr || size == 0 || g_walker_access.read == nullptr) {
+		return false;
+	}
+	const auto last = address + size - 1;
+	if (last < address || (last >> SrtWalkerTrackedAddressBits) != 0) {
+		return false;
+	}
+	for (auto page = address >> SrtWalkerPageBits; page <= last >> SrtWalkerPageBits; page++) {
+		const auto  page_address = page << SrtWalkerPageBits;
+		const auto* region =
+		    static_cast<const uint8_t*>(regions[page_address >> SrtWalkerRegionBits]);
+		if (region == nullptr) {
+			return false;
+		}
+		const auto index = page & ((uint64_t {1} << (SrtWalkerRegionBits - SrtWalkerPageBits)) - 1u);
+		if ((region[g_walker_access.pages_offset + index] & SrtWalkerReadWatchedBit) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 SrtWalkerUnknownGpuWrites::SrtWalkerUnknownGpuWrites(): m_previous(t_unknown_gpu_writes) {
 	t_unknown_gpu_writes      = true;
 	t_unknown_gpu_writes_seen = false;

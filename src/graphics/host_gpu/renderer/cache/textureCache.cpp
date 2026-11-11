@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -1236,6 +1237,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, bytes.size());
+			// Ranged where worker reads are logged: a queued draw is dropped only if it read these
+			// bytes.
+			DrawPrepare::RangedStore ranged(address, bytes.size());
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
@@ -2068,6 +2072,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
+		// Unranged: this runs on the priority thread, where the read watches a ranged store relies
+		// on may be removed (BufferCache::FinishRead) while it writes.
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;

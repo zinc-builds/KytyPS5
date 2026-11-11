@@ -104,6 +104,10 @@ public:
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
+	// Stores `size` bytes of a label as RELEASE_MEM does: through the backing store beside
+	// GPU-written bytes or in asynchronously tracked pages, else through the guest mapping. An
+	// ordered queue item wraps it in DrawPrepare::RangedStore.
+	void StoreLabel(void* address, const void* value, uint64_t size);
 	void GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset);
 	// A packet handler stored into guest memory through its mapping (see RenderContext).
 	void NoteGuestWrite(const volatile void* address, uint64_t size);
