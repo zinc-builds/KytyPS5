@@ -336,7 +336,10 @@ public:
 		if (size > m_size) {
 			if (m_buffer != nullptr) {
 				vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_allocation);
-				m_buffer = nullptr;
+				m_buffer     = VK_NULL_HANDLE;
+				m_allocation = nullptr;
+				m_mapped     = nullptr;
+				m_size       = 0;
 			}
 			vk::BufferCreateInfo buffer {};
 			buffer.size  = size;

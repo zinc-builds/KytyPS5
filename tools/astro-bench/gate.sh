@@ -9,9 +9,14 @@
 #   3. screenshots: run 1 of each side saves level frame $GATE_SHOT_FRAME (default 600, before
 #      the perf window) in-emulator; gate.sh makes a side-by-side image to compare by eye (two
 #      runs of one build differ a little at the same frame, so there is no pixel threshold).
-# Options: -n N (runs per side), --verify-env "K=V ...", --no-verify, and ab.sh's --ref,
+# Options: -n N (runs per side), --verify-env "K=V ..." (only verifiers that exit the emulator on
+#   a difference, so that reaching the last frame means clean: see EXITING_VERIFY), --no-verify,
+#   and ab.sh's --ref,
 #   --ref-install, --new-install, --env, --ref-env, --new-env. Takes ~7 min (5 runs + 2 warm-ups).
 VERIFY_ENV="KYTY_PREPARE_VERIFY=1 KYTY_BINDING_REUSE_VERIFY=1 KYTY_WORKER_TARGETS_VERIFY=1 KYTY_WORKER_PIPELINE_KEY_VERIFY=1"
+# Verifiers that exit on a difference. Others (KYTY_STREAM_VERIFY, KYTY_TILER_VERIFY, ...) only
+# print, so a run that reaches its last frame proves nothing for them: run those by hand.
+EXITING_VERIFY="KYTY_PREPARE_VERIFY KYTY_BINDING_REUSE_VERIFY KYTY_WORKER_TARGETS_VERIFY KYTY_WORKER_PIPELINE_KEY_VERIFY KYTY_WORKER_BUFFERS"
 dir=$(dirname "$0")
 repo=$(git -C "$dir" rev-parse --show-toplevel)
 label=$1
@@ -31,11 +36,17 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
+for kv in $verify_env; do
+	[[ " $EXITING_VERIFY " == *" ${kv%%=*} "* ]] || {
+		echo "gate.sh: --verify-env ${kv%%=*}: not a verifier that exits on a difference ($EXITING_VERIFY); check it in its own run" >&2
+		exit 2
+	}
+done
 new_install=${new_install:-$repo/_Build/linux/install}
 shot=${GATE_SHOT_FRAME:-600}
 vframes=${GATE_VERIFY_FRAMES:-600}
 extra=()
-[ "$verify" = 1 ] && extra=(--extra "$label-verify KYTY_INSTALL=$new_install GARDEN_FRAMES=0-$vframes $VERIFY_ENV $verify_env $env $new_env -- --amd-cpu")
+[ "$verify" = 1 ] && extra=(--extra "$label-verify KYTY_INSTALL=$new_install GARDEN_FRAMES=0-$vframes $env $new_env $VERIFY_ENV $verify_env -- --amd-cpu")
 rm -f "/tmp/garden-$label-verify.out"
 verdict=$("$dir/ab.sh" "$label" --pair -n "$n" --window 1000-1600 --shot "$shot" --new-install "$new_install" \
 	"${pass[@]}" "${extra[@]}") || { echo "gate.sh: ab.sh failed" >&2; exit 1; }
@@ -69,8 +80,12 @@ ref_png=/tmp/garden-$label-ref1-shot.png new_png=/tmp/garden-$label-new1-shot.pn
 if [ -f "$new_png" ]; then
 	if [ -f "$ref_png" ]; then
 		side=/tmp/garden-$label-shots.jpg
-		magick "$ref_png" "$new_png" +append -resize 3840x "$side" 2>/dev/null
-		echo "**Screenshots** (level frame $shot, ref | new; compare by eye): $side"
+		rm -f "$side"
+		if magick "$ref_png" "$new_png" +append -resize 3840x "$side" 2>/dev/null; then
+			echo "**Screenshots** (level frame $shot, ref | new; compare by eye): $side"
+		else
+			echo "**Screenshots** (level frame $shot; side-by-side failed, compare by eye):"
+		fi
 		echo "(full size: $ref_png, $new_png. Two runs of one build differ a little at the same frame:"
 		echo "camera, particles, birds; look for missing or wrong geometry, textures or colors.)"
 	else
