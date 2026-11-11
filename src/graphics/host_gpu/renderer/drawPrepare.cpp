@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
+#include "common/benchMetrics.h"
 #include "common/hybridAffinity.h"
 #include "common/kernelStats.h"
 #include "common/profiler.h"
@@ -158,6 +159,12 @@ void Worker::Loop() {
 #endif
 	t_worker = true;
 	ShaderRecompiler::IR::SetSrtWalkPrepareThread(m_index + 1);
+	if (m_index < 3) {
+		using Common::BenchMetrics::Role;
+		Common::BenchMetrics::RegisterThread(
+		    static_cast<Role>(static_cast<int>(Role::Prep0) + static_cast<int>(m_index)));
+	}
+	Common::BenchMetrics::RegisterPrepareWorker(m_index, &m_busy_ns, &m_done);
 	uint64_t done = 0;
 	for (;;) {
 		auto posted = m_posted.load(std::memory_order_acquire);

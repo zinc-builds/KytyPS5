@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include "graphics/presentation/performanceOverlay.h"
 
+#include "common/benchMetrics.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
@@ -858,6 +859,19 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			            Rate(shown, Counter::GpuFaults), Rate(shown, Counter::Dispatches) / fps,
 			            Rate(shown, Counter::EmulatedInstructions),
 			            static_cast<unsigned long long>(total_flips), last_flip_s, thrds.c_str());
+			// Cumulative per-thread costs for the bench scripts' per-draw numbers (benchMetrics.h).
+			static bool build_printed = false;
+			if (!build_printed) {
+				build_printed = true;
+				if (const auto build = Common::BenchMetrics::BuildLine(); !build.empty()) {
+					std::printf("%s\n", build.c_str());
+				}
+			}
+			if (const auto metrics = Common::BenchMetrics::Line(
+			        total_flips, last_flip_s, Common::DebugCounters::Get(Counter::Draws));
+			    !metrics.empty()) {
+				std::printf("%s\n", metrics.c_str());
+			}
 			std::fflush(stdout);
 		}
 	}

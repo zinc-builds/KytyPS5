@@ -2,7 +2,14 @@
 # Benchmark Astro Bot's Sky Garden: get into the level, then record KYTY_PERF_LOG lines for a
 # fixed window once it is running.
 # Usage: garden.sh <label> [extra kyty_emulator flags...]
-# Result: /tmp/bench-<label>.log and a summary line on stdout.
+# Result: /tmp/bench-<label>.log and a summary line on stdout. With a binary that prints METRICS
+#   lines (benchMetrics.h), the summary line ends with per-draw costs over the same frame window
+#   and the full set goes to /tmp/garden-<label>.json (metrics.py documents every field):
+#   cmd_ipd/cmd_cpd  command-thread user-mode instructions/cycles per draw (the tightest numbers)
+#   cmd_ns = cmd_uns + cmd_sns  its CPU ns per draw, user + sys
+#   wait_prep/wait_rec  its ns per draw waiting for the prepare workers / the recorder
+#   prep_ns  mean worker time per prepared draw; rej_f  rejected prepared draws per frame;
+#   drains_kd  queue drains per 1,000 draws
 # GARDEN_ROUTE=lvl (default): boot straight into the level. The game's own "-lvl <level>" boot
 #   argument is added to /app0/args.txt through KYTY_APP0_OVERLAY (needs an emulator with it).
 # GARDEN_ROUTE=menu: the original route (title, save 1, galaxy map, fly to Sky Garden, dive in)
@@ -103,8 +110,16 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 		inwin { print }
 		fr >= f1 { printf "FRAMEFPS %.4f\n", (fr - a) / (t - ta); exit }' > "/tmp/garden-$label.window"
 	fw=$(grep -m1 '^FRAMEFPS' "/tmp/garden-$label.window" | cut -d' ' -f2)
+	# Per-draw costs over the same window (metrics.py; needs a binary with METRICS lines), as
+	# fields appended to the summary line and as /tmp/garden-<label>.json.
+	rm -f "/tmp/garden-$label.json"
+	install=${KYTY_INSTALL:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/_Build/linux/install}
+	kenv=$(env | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|APP0_OVERLAY|INSTALL)=' | sort | tr '\n' ' ')
+	extra=$(python3 -I "$(dirname "$0")/metrics.py" "$log" "$start" "$f0" "$f1" "/tmp/garden-$label.json" \
+		label="$label" window="$window" route="$route" install="$install" flags="$*" env="${kenv% }" \
+		time="$(date -Iseconds)")
 	grep '^PERF' "/tmp/garden-$label.window" | fields |
-		awk -v l="$label" -v fw="$fw" -v note=" frames=$window" "$summary"
+		awk -v l="$label" -v fw="$fw" -v note=" frames=$window$extra" "$summary"
 else
 	wait_s "${GARDEN_SETTLE:-25}"       # opening flight / shader warm-up
 	from=$(wc -l < "$log")

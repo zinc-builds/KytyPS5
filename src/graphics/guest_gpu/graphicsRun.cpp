@@ -8,6 +8,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/benchMetrics.h"
 #include "common/kernelStats.h"
 #include "common/stallDiag.h"
 #include "common/logging/log.h"
@@ -442,6 +443,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state = gpu;
 	Common::StallDiag::SetCommandThread();
 	Common::KernelStats::SetCommandThread();
+	Common::BenchMetrics::RegisterThread(Common::BenchMetrics::Role::Cmd);
 
 	for (;;) {
 		Common::StallDiag::Report();
