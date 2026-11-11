@@ -9462,6 +9462,9 @@ public:
             texture_cache, scheduler.Current(), reused_color_id,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
         std::memset(memory + 0x28000, 0, 0x1000);
+        // A guest store between two uses of the image arrives with a new submission, which
+        // advances the guest-sync epoch (GuestGpu::Process).
+        Libs::Graphics::GuestSyncEpoch::Advance();
         Require(name, "CPU metadata rediscovery",
                 texture_cache.FindImage(reused_color) == reused_color_id,
                 "metadata writes replaced the live expanded image");

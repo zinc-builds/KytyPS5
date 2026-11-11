@@ -1554,7 +1554,10 @@ bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t
 
 void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 	for (auto& checked: m_checked_color_metadata) {
-		checked.Subtract(vaddr, size);
+		if (checked.Intersects(vaddr, size)) {
+			checked.Subtract(vaddr, size);
+			m_color_checks_generation++;
+		}
 	}
 }
 

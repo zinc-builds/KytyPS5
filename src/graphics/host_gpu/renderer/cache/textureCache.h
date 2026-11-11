@@ -206,6 +206,9 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	[[nodiscard]] bool StencilTargetSettled(const Image& depth, ImageId stencil_id);
+	[[nodiscard]] bool MaterializeColorClearSlices(ImageId id, const ImageDesc& desc,
+	                                              uint32_t metadata_base_layer, bool& memoizable);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);

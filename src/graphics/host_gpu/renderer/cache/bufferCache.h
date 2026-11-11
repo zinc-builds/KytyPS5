@@ -89,6 +89,8 @@ public:
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	// Advances whenever a color-metadata check is forgotten (GPU thread).
+	[[nodiscard]] uint64_t ColorChecksGeneration() const noexcept { return m_color_checks_generation; }
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Uploads between these two share one barrier pair (global barriers before the first copy and
@@ -235,6 +237,7 @@ private:
 #endif
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	uint64_t                                          m_color_checks_generation = 0;
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;

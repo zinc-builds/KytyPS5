@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -1077,6 +1078,22 @@ void TextureCache::InitializeImage(ImageId id) {
 	image.RefreshComplete();
 }
 
+// KYTY_COLOR_CLEAR_MEMO: 0 off, 1 on (default), verify (runs anyway and checks a remembered
+// "nothing to do").
+static int ColorClearMemoMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_COLOR_CLEAR_MEMO");
+		if (value == nullptr || value[0] == '\0') {
+			return 1;
+		}
+		if (std::strcmp(value, "verify") == 0) {
+			return 2;
+		}
+		return value[0] == '0' ? 0 : 1;
+	}();
+	return mode;
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
@@ -1096,6 +1113,66 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			return;
 		}
 	}
+	const int  mode = ColorClearMemoMode();
+	const auto key  = [&](const Image::ColorClearMemo& memo) {
+		return memo.metadata == desc.info.metadata && memo.view == view &&
+		       memo.extent == desc.info.extent && memo.guest_format == desc.info.guest_format &&
+		       memo.tile_mode == desc.info.tile_mode && memo.type == desc.info.type &&
+		       memo.levels == desc.info.resources.levels &&
+		       memo.layers == desc.info.resources.layers &&
+		       memo.bytes_per_block == desc.info.bytes_per_block &&
+		       memo.base_layer == metadata_base_layer &&
+		       memo.binding == static_cast<uint8_t>(desc.type);
+	};
+	bool hit = false;
+	if (mode != 0) {
+		const auto& memo = m_slot_images[id].color_clear_memo;
+		hit = memo.valid && memo.epoch == GuestSyncEpoch::g_epoch.load(std::memory_order_acquire) &&
+		      memo.hazard == DrawPrepare::HazardGeneration() &&
+		      memo.checks == m_buffer_cache.ColorChecksGeneration() && key(memo);
+		if (hit && mode == 1) {
+			return;
+		}
+	}
+	bool       memoizable = false;
+	const bool idle       = MaterializeColorClearSlices(id, desc, metadata_base_layer, memoizable);
+	if (hit && !idle) {
+		EXIT("KYTY_COLOR_CLEAR_MEMO=verify: a remembered color clear of 0x%016" PRIx64
+		     " had work to do\n",
+		     range.address);
+	}
+	if (mode != 0) {
+		auto& memo = m_slot_images[id].color_clear_memo;
+		memo.valid = idle && memoizable;
+		if (memo.valid) {
+			memo.metadata        = desc.info.metadata;
+			memo.view            = view;
+			memo.extent          = desc.info.extent;
+			memo.guest_format    = desc.info.guest_format;
+			memo.tile_mode       = desc.info.tile_mode;
+			memo.type            = desc.info.type;
+			memo.levels          = desc.info.resources.levels;
+			memo.layers          = desc.info.resources.layers;
+			memo.bytes_per_block = desc.info.bytes_per_block;
+			memo.base_layer      = metadata_base_layer;
+			memo.binding         = static_cast<uint8_t>(desc.type);
+			memo.epoch           = GuestSyncEpoch::g_epoch.load(std::memory_order_acquire);
+			memo.hazard          = DrawPrepare::HazardGeneration();
+			memo.checks          = m_buffer_cache.ColorChecksGeneration();
+		}
+	}
+}
+
+// The part of MaterializeColorClear that reads the metadata; true if it had nothing to do.
+// memoizable: whether MaterializeColorClear may remember it. Guest stores to the metadata come
+// with a guest-sync epoch advance (a new submission, or a packet that synchronizes with the
+// guest), as for every draw-state cache; GPU writes advance the prepare hazard generation or
+// forget metadata checks.
+bool TextureCache::MaterializeColorClearSlices(ImageId id, const ImageDesc& desc,
+                                               uint32_t metadata_base_layer, bool& memoizable) {
+	const auto  range = desc.info.metadata.range;
+	const auto& view  = desc.view_info;
+	bool        work  = false;
 	const auto layers = desc.info.TransferLayers();
 	// Color metadata slices consist of complete 4 KiB blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
@@ -1124,7 +1201,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		mip = mips[view.base_level];
 	}
 	if (mip.size == 0) {
-		return;
+		return true;
 	}
 	const GuestRange viewed {range.address + slice_size * first + mip.offset,
 	                         slice_size * (count - 1) + mip.size};
@@ -1145,7 +1222,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
 		}
 		if (checked) {
-			return;
+			memoizable = true;
+			return true;
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1191,7 +1269,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				}
 				command.endRendering();
 				CommitGpuWrite(image);
-				return;
+				return false;
 			}
 		}
 		// Finish native metadata writes before reading backing bytes. This can submit the
@@ -1201,6 +1279,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbacks,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
+		work = true;
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
@@ -1219,6 +1298,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
 		}
+		work = true;
 		{
 			std::scoped_lock lock {m_lock};
 			const auto& image = m_slot_images[id];
@@ -1243,6 +1323,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+	memoizable = !work;
+	return !work;
 }
 
 void TextureCache::RefreshImage(ImageId id) {
@@ -1663,8 +1745,97 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	return image.FindView(desc.view_info);
 }
 
+// KYTY_STENCIL_TARGET_FAST: 0 off, 1 on (default), verify (re-checks the state under the lock).
+static int StencilTargetFastMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_STENCIL_TARGET_FAST");
+		if (value == nullptr || value[0] == '\0') {
+			return 1;
+		}
+		if (std::strcmp(value, "verify") == 0) {
+			return 2;
+		}
+		return value[0] == '0' ? 0 : 1;
+	}();
+	return mode;
+}
+
+// The stencil subresources a depth+stencil target selects (see FindDepthTarget); false if the
+// description does not fit the image.
+static bool StencilSubresources(const ImageInfo& image, const ImageInfo& target,
+                                ImageSubresourceRange& out) {
+	const auto layers = image.resources.layers;
+	if (layers == 0 || image.data.size % layers != 0 || target.data.address < image.data.address) {
+		return false;
+	}
+	const auto slice_size = image.data.size / layers;
+	const auto offset     = target.data.address - image.data.address;
+	if (slice_size == 0 || offset % slice_size != 0 || offset / slice_size >= layers ||
+	    target.resources.layers > layers - offset / slice_size) {
+		return false;
+	}
+	out = {0, target.resources.levels, static_cast<uint32_t>(offset / slice_size),
+	       target.resources.layers};
+	return true;
+}
+
+// Under m_lock: whether FindDepthTarget's slow path would change nothing for this depth+stencil
+// image and its stencil plane.
+bool TextureCache::StencilTargetSettled(const Image& depth, ImageId stencil_id) {
+	const auto* stencil = m_slot_images.try_get(stencil_id);
+	if (stencil == nullptr || !depth.registered || depth.depth_id || depth.binding.needs_rebind ||
+	    depth.track_addr != depth.info.data.address || depth.track_addr_end != depth.info.data.End() ||
+	    depth.IsCpuDirty() || depth.IsBufferModified() || !depth.IsGpuModified() ||
+	    depth.backing.image == nullptr || !stencil->registered ||
+	    stencil->info.data != depth.info.stencil ||
+	    stencil->stencil_subresources != depth.stencil_subresources) {
+		return false;
+	}
+	// RefreshImage(stencil) does nothing for compressed or multisampled stencil, else only when
+	// the plane is tracked and clean.
+	return depth.info.metadata.stencil_compressed || depth.info.samples != 1 ||
+	       (stencil->track_addr == stencil->info.data.address &&
+	        stencil->track_addr_end == stencil->info.data.End() && !stencil->IsCpuDirty() &&
+	        !stencil->IsBufferModified());
+}
+
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	auto& image = m_slot_images[id];
+	if (desc.info.HasStencil() && StencilTargetFastMode() != 0 &&
+	    (image.target_settled.load(std::memory_order_acquire) & 1u) != 0 && image.registered &&
+	    !image.depth_id && !image.binding.needs_rebind && image.info.stencil == desc.info.stencil) {
+		auto*                 stencil = m_slot_images.try_get(image.target_stencil_id);
+		ImageSubresourceRange subresources;
+		if (stencil != nullptr &&
+		    (stencil->target_settled.load(std::memory_order_acquire) & 1u) != 0 &&
+		    stencil->depth_id == id && stencil->info.data == desc.info.stencil &&
+		    stencil->stencil_subresources == image.stencil_subresources &&
+		    StencilSubresources(image.info, desc.info, subresources) &&
+		    subresources == image.stencil_subresources) {
+			if (StencilTargetFastMode() == 2) {
+				std::scoped_lock lock {m_lock};
+				if ((image.target_settled.load(std::memory_order_relaxed) & 1u) != 0 &&
+				    (stencil->target_settled.load(std::memory_order_relaxed) & 1u) != 0 &&
+				    !StencilTargetSettled(image, image.target_stencil_id)) {
+					EXIT("KYTY_STENCIL_TARGET_FAST=verify: depth target 0x%016" PRIx64
+					     " needs work\n",
+					     image.info.data.address);
+				}
+			}
+			TouchImage(image);
+			TouchImage(*stencil);
+			// Metadata and its clear state belong to the GPU thread.
+			image.info.metadata = desc.info.metadata;
+			if (desc.info.HasMetadata()) {
+				const auto [metadata, inserted] =
+				    m_surface_metas.try_emplace(desc.info.metadata.range.address);
+				if (inserted && image.info.htile_initial_clear) {
+					metadata->second.clear_mask.set();
+				}
+			}
+			return image.FindView(desc.view_info);
+		}
+	}
 	if (!desc.info.HasStencil() &&
 	    (image.settled.load(std::memory_order_acquire) & Image::SettledWrite) != 0 &&
 	    image.registered && !image.depth_id && !image.binding.needs_rebind) {
@@ -1710,7 +1881,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+		const auto stencil_id = AssociateStencil(id, desc.info.stencil);
+		RefreshImage(stencil_id);
+		if (StencilTargetFastMode() != 0 && StencilTargetSettled(image, stencil_id)) {
+			image.target_stencil_id = stencil_id;
+			image.target_settled.store(1u, std::memory_order_release);
+			m_slot_images[stencil_id].target_settled.store(1u, std::memory_order_release);
+		}
 	} else {
 		Settle(image);
 	}
