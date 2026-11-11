@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -112,14 +113,47 @@ private:
 	bool     m_ranged;
 };
 
+class Worker;
+
+// Free lanes: workers sharing one queue. The command thread posts sequence numbers in order;
+// each worker takes the oldest one nobody has taken yet, so a slow draw holds up only the worker
+// running it. `slots`: draws in flight at most (the posting ring), one done flag each.
+class Pool {
+public:
+	explicit Pool(uint32_t slots);
+	KYTY_CLASS_NO_COPY(Pool);
+
+	// Hands sequence `posted + 1` to the workers and returns it.
+	uint64_t Post();
+	// Waits until `sequence` is finished. Returns the nanoseconds spent waiting.
+	uint64_t Wait(uint64_t sequence);
+	uint64_t WaitIdle();
+	[[nodiscard]] bool Done(uint64_t sequence) const {
+		return m_done[(sequence - 1) % m_slots].load(std::memory_order_acquire) >= sequence;
+	}
+
+private:
+	friend class Worker;
+	void WakeAll();
+
+	uint32_t                                  m_slots;
+	std::unique_ptr<std::atomic<uint64_t>[]> m_done;
+	std::vector<Worker*>                      m_workers;
+	uint64_t                                  m_posted_local = 0; // command thread only
+	alignas(64) std::atomic<uint64_t> m_posted {0};
+	alignas(64) std::atomic<uint64_t> m_claimed {0};
+	alignas(64) std::atomic<uint32_t> m_spinning {0}; // workers idle but awake
+};
+
 // One worker thread. The command thread posts sequence numbers in order; the worker calls
-// run(context, sequence) for each, in order. Workers have distinct indices below
-// ResourcePlan::MaxPrepareWorkers (CPU and walk scratch).
+// run(context, sequence) for each, in order. With a pool, the worker instead runs the pool's
+// sequences it takes (in increasing order), and Post/Wait go through the pool. Workers have
+// distinct indices below ResourcePlan::MaxPrepareWorkers (CPU and walk scratch).
 class Worker {
 public:
 	using Run = void (*)(void* context, uint64_t sequence);
 
-	Worker(Run run, void* context, uint32_t index);
+	Worker(Run run, void* context, uint32_t index, Pool* pool = nullptr);
 	~Worker();
 	KYTY_CLASS_NO_COPY(Worker);
 
@@ -128,7 +162,7 @@ public:
 	// Waits until the worker has finished `sequence`. Returns the nanoseconds spent waiting.
 	uint64_t Wait(uint64_t sequence);
 	// Waits until every posted sequence is finished.
-	uint64_t WaitIdle() { return Wait(m_posted_local); }
+	uint64_t WaitIdle() { return m_pool != nullptr ? m_pool->WaitIdle() : Wait(m_posted_local); }
 	[[nodiscard]] bool Done(uint64_t sequence) const {
 		return m_done.load(std::memory_order_acquire) >= sequence;
 	}
@@ -136,13 +170,16 @@ public:
 	[[nodiscard]] uint64_t BusyNs() const { return m_busy_ns.load(std::memory_order_relaxed); }
 
 private:
+	friend class Pool;
 	void Loop();
+	void LoopPool();
 	// Wakes the worker if it sleeps.
 	void Wake();
 
 	Run      m_run;
 	void*    m_context;
 	uint32_t m_index;
+	Pool*    m_pool;
 	uint64_t m_posted_local = 0; // command thread only
 	alignas(64) std::atomic<uint64_t> m_posted {0};
 	alignas(64) std::atomic<uint64_t> m_done {0};

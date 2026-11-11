@@ -1807,6 +1807,10 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		m_drain_stats    = EnvFlag("KYTY_DRAIN_STATS", false);
 		// KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo.
 		const bool shared_memo = EnvFlag("KYTY_SHARED_TEXTURE_MEMO", true);
+		if (workers > 1 && EnvFlag("KYTY_FREE_LANES", true)) {
+			m_prepare_pool = std::make_unique<DrawPrepare::Pool>(
+			    static_cast<uint32_t>(m_queued_draws.size()));
+		}
 		for (uint32_t i = 0; i < workers; i++) {
 			auto lane      = std::make_unique<PrepareLane>();
 			lane->executor = this;
@@ -1818,11 +1822,13 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 			// Odd serials, distinct among the workers.
 			lane->textures.serial      = 1 + 2 * i;
 			lane->textures.serial_step = 2 * workers;
-			lane->worker   = std::make_unique<DrawPrepare::Worker>(&PrepareQueuedDraw, lane.get(), i);
+			lane->worker   = std::make_unique<DrawPrepare::Worker>(&PrepareQueuedDraw, lane.get(), i,
+			                                                      m_prepare_pool.get());
 			m_prepare_lanes.push_back(std::move(lane));
 		}
-		Log::WriteToConsoleAndLog(fmt::format("Draw preparation on {} thread(s), {} draws ahead{}\n",
-		                                      workers, m_queued_draws.size() - 1,
+		Log::WriteToConsoleAndLog(fmt::format("Draw preparation on {} thread(s){}, {} draws ahead{}\n",
+		                                      workers, m_prepare_pool ? " (free lanes)" : "",
+		                                      m_queued_draws.size() - 1,
 		                                      m_prepare_verify ? " (verifying)" : ""));
 	}
 	// The ring holds one more slot than the queue, so the next one is free.
@@ -1841,7 +1847,8 @@ void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 	queued.sequence           = ++m_queued_posted;
 	// The worker finds the slot from the sequence.
 	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||
-	        PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence));
+	        (m_prepare_pool ? m_prepare_pool->Post() != queued.sequence
+	                        : PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence)));
 	m_queued_count++;
 	m_prepare_stat.queued++;
 	while (m_queued_count + 1 > m_queued_draws.size()) {
@@ -1901,7 +1908,8 @@ uint64_t RenderExecutor::PrepareBusyNs() const {
 void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	auto& lane     = *static_cast<PrepareLane*>(prepare_lane);
 	auto& self     = *lane.executor;
-	const auto sequence = (job - 1) * self.m_prepare_lanes.size() + lane.index + 1;
+	const auto sequence =
+	    self.m_prepare_pool ? job : (job - 1) * self.m_prepare_lanes.size() + lane.index + 1;
 	auto& queued = *self.m_queued_draws[(sequence - 1) % self.m_queued_draws.size()];
 	queued.log.Reset();
 	DrawPrepare::SetLog(&queued.log);
@@ -2051,7 +2059,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
 	EXIT_IF(m_queued_count == 0 || queued.sequence != sequence);
 	m_queued_count--;
-	if (const auto waited = PrepareWorker(sequence).Wait(PrepareJob(sequence)); waited != 0) {
+	if (const auto waited = m_prepare_pool ? m_prepare_pool->Wait(sequence)
+	                                       : PrepareWorker(sequence).Wait(PrepareJob(sequence));
+	    waited != 0) {
 		m_prepare_stat.wait_ns += waited;
 		m_prepare_stat.waits++;
 		using Common::BenchMetrics::Counter;

@@ -657,6 +657,9 @@ private:
 		WorkerTargetMemo                     targets;
 		std::unique_ptr<DrawPrepare::Worker> worker;
 	};
+	// Free lanes (KYTY_FREE_LANES, default on with more than one worker): the workers share one
+	// queue instead of taking every n-th draw. Outlives the lanes.
+	std::unique_ptr<DrawPrepare::Pool>               m_prepare_pool;
 	std::vector<std::unique_ptr<PrepareLane>>        m_prepare_lanes;
 	std::vector<std::unique_ptr<QueuedDraw>>         m_queued_draws;
 	uint64_t                                         m_queued_posted = 0; // sequences posted
