@@ -152,6 +152,7 @@ FrameWindow           g_frames;
 std::atomic<uint64_t> g_generation {0};
 std::atomic<bool>     g_details {false};
 std::atomic<uint64_t> g_revision {0};
+std::atomic<uint64_t> g_flip_count {0}; // g_frames.total_flips, readable without the lock
 
 std::mutex                  g_host_mutex;
 Common::HostStats           g_host_stats;
@@ -755,8 +756,13 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 	}
 	std::scoped_lock lock(g_frame_mutex);
 	g_frames.Record(Clock::now(), ReadCounters());
+	g_flip_count.store(g_frames.total_flips, std::memory_order_relaxed);
 	g_frames.guest_width  = guest_width;
 	g_frames.guest_height = guest_height;
+}
+
+uint64_t PerformanceOverlayFlipCount() noexcept {
+	return g_flip_count.load(std::memory_order_relaxed);
 }
 
 bool PerformanceOverlayEnabled() noexcept {

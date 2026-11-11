@@ -11,6 +11,8 @@ struct GraphicContext;
 
 // Called for each main-bus guest flip, with the guest's video-out size.
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept;
+// Flips recorded so far: the PERF line's frames= (KYTY_PERF_LOG).
+[[nodiscard]] uint64_t PerformanceOverlayFlipCount() noexcept;
 
 [[nodiscard]] bool PerformanceOverlayEnabled() noexcept;
 void               TogglePerformanceOverlay() noexcept;
