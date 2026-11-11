@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -480,8 +481,13 @@ int wmain(int argc, wchar_t* argv[]) {
 // emulator with a signal, so the profile runtime's exit hook never writes the counters. With
 // KYTY_PGO_DUMP=<prefix> a thread writes them every KYTY_PGO_DUMP_INTERVAL seconds (default 10),
 // alternately to <prefix>.a.profraw and <prefix>.b.profraw, so a kill during one write leaves the
-// other file whole. Counters are cumulative: the newer whole file is the profile. The symbols
-// exist only in instrumented builds; elsewhere the weak references are null and this is a no-op.
+// other file whole. Counters are cumulative: the newer whole file is the profile. The runtime
+// truncates a profile only once per process and appends after that, so each slot is removed
+// before it is written (otherwise a slot holds several snapshots that a merge would add up).
+// The symbols exist only in instrumented builds; elsewhere the weak references are null and
+// this is a no-op.
+#include <unistd.h>
+
 extern "C" __attribute__((weak)) int  __llvm_profile_write_file(void);
 extern "C" __attribute__((weak)) void __llvm_profile_set_filename(const char*);
 
@@ -500,7 +506,11 @@ static void StartPgoDumper() {
         names[1] = p + ".b.profraw";
         for (unsigned i = 0;; i++) {
             std::this_thread::sleep_for(std::chrono::seconds(interval));
-            __llvm_profile_set_filename(names[i & 1u].c_str());
+            const std::string& name = names[i & 1u];
+            if (unlink(name.c_str()) != 0 && errno != ENOENT) {
+                continue; // writing would append to the old snapshot
+            }
+            __llvm_profile_set_filename(name.c_str());
             __llvm_profile_write_file();
         }
     }).detach();
