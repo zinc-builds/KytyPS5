@@ -1135,6 +1135,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 	}
 	bool       memoizable = false;
+	// Sampled before the metadata is read: a store published meanwhile moves one of them, and the
+	// result is then not remembered.
+	const auto epoch      = GuestSyncEpoch::g_epoch.load(std::memory_order_acquire);
+	const auto hazard     = DrawPrepare::HazardGeneration();
+	const auto checks     = m_buffer_cache.ColorChecksGeneration();
 	const bool idle       = MaterializeColorClearSlices(id, desc, metadata_base_layer, memoizable);
 	if (hit && !idle) {
 		EXIT("KYTY_COLOR_CLEAR_MEMO=verify: a remembered color clear of 0x%016" PRIx64
@@ -1143,7 +1148,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	if (mode != 0) {
 		auto& memo = m_slot_images[id].color_clear_memo;
-		memo.valid = idle && memoizable;
+		memo.valid = idle && memoizable &&
+		             epoch == GuestSyncEpoch::g_epoch.load(std::memory_order_acquire) &&
+		             hazard == DrawPrepare::HazardGeneration() &&
+		             checks == m_buffer_cache.ColorChecksGeneration();
 		if (memo.valid) {
 			memo.metadata        = desc.info.metadata;
 			memo.view            = view;
@@ -1156,9 +1164,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			memo.bytes_per_block = desc.info.bytes_per_block;
 			memo.base_layer      = metadata_base_layer;
 			memo.binding         = static_cast<uint8_t>(desc.type);
-			memo.epoch           = GuestSyncEpoch::g_epoch.load(std::memory_order_acquire);
-			memo.hazard          = DrawPrepare::HazardGeneration();
-			memo.checks          = m_buffer_cache.ColorChecksGeneration();
+			memo.epoch           = epoch;
+			memo.hazard          = hazard;
+			memo.checks          = checks;
 		}
 	}
 }
@@ -1803,7 +1811,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	auto& image = m_slot_images[id];
 	if (desc.info.HasStencil() && StencilTargetFastMode() != 0 &&
 	    (image.target_settled.load(std::memory_order_acquire) & 1u) != 0 && image.registered &&
-	    !image.depth_id && !image.binding.needs_rebind && image.info.stencil == desc.info.stencil) {
+	    !image.depth_id && !image.binding.needs_rebind && image.info.stencil == desc.info.stencil &&
+	    // Whether RefreshImage skips the stencil plane depends on its compression.
+	    image.info.metadata.stencil_compressed == desc.info.metadata.stencil_compressed) {
 		auto*                 stencil = m_slot_images.try_get(image.target_stencil_id);
 		ImageSubresourceRange subresources;
 		if (stencil != nullptr &&
