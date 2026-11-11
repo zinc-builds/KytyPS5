@@ -16,7 +16,7 @@
 VERIFY_ENV="KYTY_PREPARE_VERIFY=1 KYTY_BINDING_REUSE_VERIFY=1 KYTY_WORKER_TARGETS_VERIFY=1 KYTY_WORKER_PIPELINE_KEY_VERIFY=1"
 # Verifiers that exit on a difference. Others (KYTY_STREAM_VERIFY, KYTY_TILER_VERIFY, ...) only
 # print, so a run that reaches its last frame proves nothing for them: run those by hand.
-EXITING_VERIFY="$VERIFY_ENV KYTY_WORKER_BUFFERS=verify"
+EXITING_VERIFY="$VERIFY_ENV KYTY_WORKER_BUFFERS=verify KYTY_COLOR_CLEAR_MEMO=verify KYTY_STENCIL_TARGET_FAST=verify"
 dir=$(dirname "$0")
 repo=$(git -C "$dir" rev-parse --show-toplevel)
 label=$1
