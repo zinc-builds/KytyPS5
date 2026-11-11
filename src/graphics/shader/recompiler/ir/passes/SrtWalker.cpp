@@ -165,7 +165,15 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 
 thread_local uint32_t t_prepare_worker = 0; // 1 + the prepare worker's index; 0 off them
 
+// The scratch of the plan this thread walked last (WalkSrt): the Walked* queries that follow a
+// walk read it without looking the thread's scratch up again.
+thread_local const ResourcePlan* t_walked_plan    = nullptr;
+thread_local const uint8_t*      t_walked_scratch = nullptr;
+
 const uint8_t* Scratch(const ResourcePlan& plan) {
+	if (&plan == t_walked_plan) {
+		return t_walked_scratch;
+	}
 	return reinterpret_cast<const uint8_t*>(SrtWalkScratch(plan).srt.data());
 }
 
@@ -1536,6 +1544,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	auto& scratch = SrtWalkScratch(plan).srt;
+	t_walked_plan    = &plan;
+	t_walked_scratch = reinterpret_cast<const uint8_t*>(scratch.data());
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),

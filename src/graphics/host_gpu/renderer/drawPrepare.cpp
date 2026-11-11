@@ -21,6 +21,7 @@ namespace Libs::Graphics::DrawPrepare {
 
 namespace {
 thread_local bool    t_worker = false;
+thread_local uint32_t t_worker_slot = 0;
 thread_local Log*    t_log    = nullptr;
 std::atomic<uint64_t> g_hazard_generation {0};
 
@@ -42,6 +43,10 @@ uint64_t NowNs() {
 	                                 .count());
 }
 } // namespace
+
+uint32_t WorkerSlot() noexcept {
+	return t_worker_slot;
+}
 
 bool OnWorker() noexcept {
 	return t_worker;
@@ -152,7 +157,8 @@ void Worker::Loop() {
 	pthread_setname_np(pthread_self(), name);
 	Common::HybridAffinity::ApplyToPrepareThread(m_index);
 #endif
-	t_worker = true;
+	t_worker      = true;
+	t_worker_slot = m_index + 1;
 	ShaderRecompiler::IR::SetSrtWalkPrepareThread(m_index + 1);
 	uint64_t done = 0;
 	for (;;) {

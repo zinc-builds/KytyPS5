@@ -21,6 +21,8 @@ namespace Libs::Graphics::DrawPrepare {
 // Whether this thread is the prepare worker. Its guest reads go through the backing view, never
 // fault into the caches, and are logged for the command thread to check.
 [[nodiscard]] bool OnWorker() noexcept;
+// 1 + the prepare worker's index on a worker, 0 elsewhere.
+[[nodiscard]] uint32_t WorkerSlot() noexcept;
 
 // What a preparation on the worker read and whether its result is usable.
 struct Log {

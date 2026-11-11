@@ -322,17 +322,32 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 		DrawPrepare::Fail();
 		return nullptr;
 	}
-	for (auto& candidate: modules) {
+	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 		        push_data_cursor, layout.ShaderDataDwords()) ||
 		    candidate.specialization != resources.specialization) {
-			continue;
+			return false;
 		}
 		if constexpr (HasCalls) {
-			if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+			if (!std::ranges::equal(candidate.function_code, FunctionCode())) return false;
 		}
-		return &candidate;
+		return true;
+	};
+	// KYTY_FIND_MODULE_LAST=0: scan in order only.
+	static const bool last_first = [] {
+		const char* value = std::getenv("KYTY_FIND_MODULE_LAST");
+		return value == nullptr || value[0] != '0';
+	}();
+	auto& last = last_found[DrawPrepare::WorkerSlot()];
+	if (last_first && last != nullptr && matches(*last)) {
+		return const_cast<ShaderModule*>(last);
+	}
+	for (auto& candidate: modules) {
+		if (&candidate != last && matches(candidate)) {
+			last = &candidate;
+			return &candidate;
+		}
 	}
 	return nullptr;
 }

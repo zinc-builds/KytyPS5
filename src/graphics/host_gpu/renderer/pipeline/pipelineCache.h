@@ -326,6 +326,10 @@ private:
 		ShaderRecompiler::IR::ResourcePlan              resource_plan;
 		// A deque, so a module stays where it is while the program compiles more.
 		std::deque<ShaderModule>                        modules;
+		// The module FindModule returned last on each thread (DrawPrepare::WorkerSlot), tried
+		// first; each slot is used by one thread only.
+		std::array<const ShaderModule*, ShaderRecompiler::IR::ResourcePlan::MaxPrepareWorkers + 1>
+		    last_found {};
 		bool                                            skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
