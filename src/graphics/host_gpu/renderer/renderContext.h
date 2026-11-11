@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/kernelStats.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -120,9 +121,13 @@ public:
 	template <typename T>
 	[[nodiscard]] bool IsCpLabel(uint64_t vaddr, T value) const {
 		const auto& label = m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()];
-		return label.vaddr == vaddr && sizeof(T) <= label.size && static_cast<T>(label.value) == value &&
-		       label.generation == LibKernel::Memory::GuestRemapGeneration() &&
-		       LibKernel::Memory::AsyncGuestPageUntouched(vaddr & ~uint64_t {0xfff}, label.token);
+		if (!(label.vaddr == vaddr && sizeof(T) <= label.size &&
+		      static_cast<T>(label.value) == value &&
+		      label.generation == LibKernel::Memory::GuestRemapGeneration())) {
+			return false;
+		}
+		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::LabelPeek);
+		return LibKernel::Memory::AsyncGuestPageUntouched(vaddr & ~uint64_t {0xfff}, label.token);
 	}
 	void VerifyAsyncWrites(const std::vector<std::pair<uint64_t, uint64_t>>& written,
 	                       bool before_handling);

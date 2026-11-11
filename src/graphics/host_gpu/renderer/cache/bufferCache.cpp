@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/kernelStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1474,7 +1475,8 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
-		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
+		auto*                          destination = reinterpret_cast<uint32_t*>(vaddr);
+		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Fill);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		m_scheduler.Context().NoteGpuWrite(vaddr, size);
 		return;

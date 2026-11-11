@@ -138,14 +138,20 @@ public:
 	// and read as written until the next Scan re-protects them.
 	[[nodiscard]] bool MakeAsync(uint64_t vaddr, uint64_t size) const {
 		uffdio_range range {vaddr, size};
-		if (ioctl(m_fd, UFFDIO_UNREGISTER, &range) != 0) {
+		if ([&] {
+			    Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::UffdReg);
+			    return ioctl(m_fd, UFFDIO_UNREGISTER, &range);
+		    }() != 0) {
 			EXIT("guest write tracking: unregistering 0x%016" PRIx64 "+0x%" PRIx64 " failed: %d\n",
 			     vaddr, size, errno);
 		}
 		uffdio_register reg {};
 		reg.range = {vaddr, size};
 		reg.mode  = UFFDIO_REGISTER_MODE_WP;
-		if (ioctl(m_async_fd, UFFDIO_REGISTER, &reg) == 0 &&
+		if ([&] {
+			    Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::UffdReg);
+			    return ioctl(m_async_fd, UFFDIO_REGISTER, &reg);
+		    }() == 0 &&
 		    (reg.ioctls & (uint64_t {1} << _UFFDIO_WRITEPROTECT)) != 0) {
 			return true;
 		}
@@ -174,7 +180,16 @@ public:
 			arg.vec_len       = regions.size();
 			arg.category_mask = PAGE_IS_WRITTEN;
 			arg.return_mask   = PAGE_IS_WRITTEN;
-			const auto count  = ioctl(m_pagemap, PAGEMAP_SCAN, &arg);
+			const auto count  = [&] {
+				Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::Scan);
+				const auto result = ioctl(m_pagemap, PAGEMAP_SCAN, &arg);
+				const auto kind   = result > 0 ? Common::KernelStats::Kind::ScanHit
+				                               : Common::KernelStats::Kind::Scan;
+				kernel.SetKind(kind);
+				Common::KernelStats::AddUnits(
+				    kind, (arg.walk_end > start ? arg.walk_end - start : 0) >> 12u);
+				return result;
+			}();
 			EXIT_IF(count < 0);
 			for (long i = 0; i < count; i++) {
 				if (Graphics::MemDiag::Traced(regions[i].start, regions[i].end - regions[i].start)) {
@@ -213,6 +228,7 @@ public:
 		} else
 #endif
 		{
+			Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::UffdReg);
 			registered = ioctl(m_fd, UFFDIO_REGISTER, &range) == 0;
 		}
 		if (registered && (range.ioctls & (uint64_t {1} << _UFFDIO_WRITEPROTECT)) == 0) {
@@ -240,6 +256,7 @@ public:
 		range.range.start = start;
 		range.range.len   = ((vaddr + size + page - 1) & ~(page - 1)) - start;
 		range.mode        = write_protect ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
+		Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::UffdWp);
 		return ioctl(async ? m_async_fd : m_fd, UFFDIO_WRITEPROTECT, &range) == 0;
 	}
 

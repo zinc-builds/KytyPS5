@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/hybridAffinity.h"
+#include "common/kernelStats.h"
 #include "common/profiler.h"
 #include "common/stallDiag.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -108,6 +109,7 @@ Worker::~Worker() {
 void Worker::Wake() {
 	if (m_sleeping.load(std::memory_order_seq_cst)) {
 		m_sleeping.store(false, std::memory_order_seq_cst);
+		Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::Wake);
 		m_sleeping.notify_one();
 	}
 }
@@ -127,7 +129,8 @@ uint64_t Worker::Wait(uint64_t sequence) {
 		return 0;
 	}
 	const auto start = NowNs();
-	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdPrepare);
+	Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdPrepare);
+	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::PrepareWait);
 	Wake();
 	for (uint32_t spins = 0; m_done.load(std::memory_order_acquire) < sequence; spins++) {
 		if ((spins & 1023u) == 1023u) {
@@ -136,6 +139,7 @@ uint64_t Worker::Wait(uint64_t sequence) {
 		if (spins < 16384) {
 			KYTY_PREPARE_PAUSE();
 		} else {
+			Common::KernelStats::Syscall yield(Common::KernelStats::Kind::Yield);
 			std::this_thread::yield();
 		}
 	}

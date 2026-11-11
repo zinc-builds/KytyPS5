@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/kernelStats.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1045,6 +1046,7 @@ void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written
 		if (backing.AsyncChunkCount() >= ASYNC_MAX_CHUNKS) {
 			break;
 		}
+		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Promote);
 		if (backing.PromoteChunk(chunk)) {
 			LOGF("\t guest write tracking: asynchronous write protection for 0x%016" PRIx64 "\n",
 			     chunk << GuestBackingStore::ASYNC_CHUNK_BITS);

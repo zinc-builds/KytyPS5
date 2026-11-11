@@ -4,6 +4,7 @@
 // #error "KYTY_PLATFORM != KYTY_PLATFORM_LINUX"
 #else
 
+#include "common/kernelStats.h"
 #include "common/virtualMemory.h"
 
 #include <sys/mman.h>
@@ -54,6 +55,7 @@ bool Protect(uint64_t address, uint64_t size, Mode mode) {
 	const auto addr       = static_cast<uintptr_t>(address);
 	const auto page_start = addr >> 12u;
 	const auto page_end   = (addr + size - 1) >> 12u;
+	Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::Mprotect);
 	return mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
 	                get_protection_flag(mode)) == 0;
 }

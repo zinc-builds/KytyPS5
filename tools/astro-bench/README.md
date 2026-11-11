@@ -59,6 +59,8 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   `_Build/linux/kyty_emulator_clang_lld.map` (perf report prints file offsets; vaddr = offset +
   0x1000; for `perf script` runtime addresses pass the load base = r-xp mapping start − (its file
   offset + 0x1000), e.g. from `/proc/<pid>/maps` or `perf script --show-mmap-events`).
+- `kstats.py <label>` — the GPU command thread's kernel time by call site over the frame window,
+  from a run with `KYTY_KERNEL_STATS=1`.
 - `faultsum.py` — summarise `KYTY_FAULT_DIAG=1` output. `offcpu.py` — off-CPU time from
   `perf record -e sched:sched_switch` (needs root for tracepoints).
 - `patches/` — emk530/issue #745 game patches (NoRT, GI probes) for `--game-patch`; no CPU gain.
