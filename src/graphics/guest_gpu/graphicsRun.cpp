@@ -699,6 +699,48 @@ static bool KeepsAtomicWrites(uint32_t packet_header) {
 	}
 }
 
+// Packets that write no context register (the emulator's handlers; KYTY_RUN_STATE=verify
+// compares the registers of consecutive queued draws to check it).
+static bool KeepsContextRegisters(uint32_t packet_header) {
+	switch ((packet_header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_MULTI_INST:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_RELEASE_MEM:
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_ACQUIRE_MEM:
+		case Pm4::IT_DMA_DATA:
+		case Pm4::IT_WRITE_DATA:
+		case Pm4::IT_MEM_SEMAPHORE:
+		case Pm4::IT_PFP_SYNC_ME: return true;
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(packet_header);
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+		}
+		default: return false;
+	}
+}
+
 // Packets that touch nothing the caches hold and write no guest memory, besides direct draws
 // (which queue themselves, see RenderExecutor::QueueDrawIndex), so a queued draw may wait past
 // them. The indirect register writes read guest memory, which a queued draw's shaders could
@@ -817,6 +859,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		if (!DefersAsyncCollect(packet_header)) {
 			m_renderer.CollectAsyncWritesIfRequested();
+		}
+		if (first_packet || !KeepsContextRegisters(packet_header)) {
+			CurrentBuffer().context_written = true;
 		}
 		if (first_packet || !KeepsDispatchChain(packet_header)) {
 			executor.EndDispatchChain(CurrentBuffer());

@@ -1979,16 +1979,16 @@ void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 	queued.stored_sequence    = DrawPrepare::StoredSequence();
 	queued.gpu_write_sequence = DrawPrepare::GpuWriteSequence();
 	queued.sequence           = ++m_queued_posted;
-	// The previous queued draw's slot keeps its registers until the ring comes round again.
-	if (RunStateMode() != 0 && queued.sequence > 1) {
-		const auto& previous =
-		    *m_queued_draws[(queued.sequence - 2) % m_queued_draws.size()];
-		queued.same_registers =
-		    previous.sequence + 1 == queued.sequence &&
-		    std::memcmp(&previous.registers, &queued.registers, sizeof(queued.registers)) == 0 &&
-		    std::memcmp(&previous.user_config, &queued.user_config, sizeof(queued.user_config)) == 0;
-	} else {
-		queued.same_registers = false;
+	// No packet wrote a context register since the previous queued draw (whose slot keeps its
+	// registers until the ring comes round again).
+	queued.same_registers = RunStateMode() != 0 && !buffer.context_written && queued.sequence > 1 &&
+	                        m_queued_draws[(queued.sequence - 2) % m_queued_draws.size()]->sequence + 1 ==
+	                            queued.sequence;
+	buffer.context_written = false;
+	if (queued.same_registers && RunStateMode() == 2 &&
+	    std::memcmp(&m_queued_draws[(queued.sequence - 2) % m_queued_draws.size()]->registers,
+	                &queued.registers, sizeof(queued.registers)) != 0) {
+		EXIT("KYTY_RUN_STATE=verify: a packet wrote context registers unnoticed\n");
 	}
 	// The worker finds the slot from the sequence.
 	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||

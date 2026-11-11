@@ -180,6 +180,11 @@ public:
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
 
+	// Set by the command processor for every packet that may write a context register (and at
+	// the start of each submission); RenderExecutor clears it when it queues a draw, which then
+	// has the same context registers as the draw queued before it if it was clear (run state).
+	bool context_written = true;
+
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
@@ -378,7 +383,7 @@ private:
 		std::vector<std::unique_ptr<WorkerDepthTargetRecord>> depth_updates;
 		// The pipeline key the worker built from its programs and proposed targets.
 		WorkerPipelineKey pipeline_key;
-		// Its context and user-config registers equal the previous queued draw's (run state).
+		// Its context registers equal the previous queued draw's (run state).
 		bool same_registers = false;
 	};
 	// The worker's pipeline key for the queued draw being committed, if its programs were adopted.
