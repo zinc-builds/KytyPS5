@@ -34,6 +34,7 @@ flock 7 # one builder per commit; later callers wait and reuse its result
 # The whole preparation (worktree, submodules, configure, build) is build work: shared bench lock.
 . "$repo/tools/astro-bench/benchlock.sh"
 benchlock_acquire s "refbuild.sh $key" >&2 || exit 1
+t0=$SECONDS
 
 src=$root/$key.src
 rm -rf "$src" "$dst"
@@ -74,4 +75,5 @@ cp "$src/_Build/linux/kyty_emulator_clang_lld.map" "$dst/"
 kyty_seed_install "$dst/install"
 echo "commit=$sha $mode_desc" > "$dst/BUILD_MODE"
 touch "$done_marker"
+echo "refbuild: $key built in $((SECONDS - t0))s (lock wait excluded)" >&2
 echo "$dst/install"

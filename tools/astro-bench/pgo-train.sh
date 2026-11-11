@@ -52,14 +52,14 @@ t0=$SECONDS
 inst=$(KYTY_BUILD_MODE=pgogen "$bench/refbuild.sh" "$sha")
 t_build=$((SECONDS - t0))
 grep -q KYTY_PGO_DUMP "$inst/kyty_emulator" || { echo "pgo-train: $sha predates KYTY_PGO_DUMP; cannot train it" >&2; exit 1; }
-log "instrumented build ${t_build}s: $inst"
+log "instrumented build ${t_build}s (lock wait included): $inst"
 
 tmp=$dir/$sha.tmp.$$
 rm -rf "$tmp"; mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT
 . "$bench/benchlock.sh"
-t1=$SECONDS
 benchlock_acquire x "pgo-train.sh $sha" >&2 || exit 1
+t1=$SECONDS
 # The exclusive lock means no benchmark is running: an emulator now is the user playing.
 if pgrep -x kyty_emulator >/dev/null; then
 	echo "pgo-train: kyty_emulator is running outside the bench (the user is playing?); try later" >&2
@@ -79,7 +79,7 @@ KYTY_PGO_DUMP=$tmp/train "$bench/garden.sh" "pgo-train-$label" --amd-cpu > "/tmp
 exec 9>&-
 unset KYTY_BENCH_LOCKED
 t_run=$((SECONDS - t1))
-log "runs ${t_run}s (lock wait included): $(head -1 "/tmp/garden-pgo-train-$label.out")"
+log "runs ${t_run}s: $(head -1 "/tmp/garden-pgo-train-$label.out")"
 
 # The two dump files alternate; a kill during a write truncates one. Take the newest that merges.
 merged=
