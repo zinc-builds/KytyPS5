@@ -229,8 +229,9 @@ bool ResidentTextures::StateChanged(const Image& image) const {
 }
 
 void ResidentTextures::Check(std::span<PreparedBindings* const> stages) {
-	auto&      cache    = m_context.GetTextureCache();
-	const auto unsettle = Image::unsettle_generation.load(std::memory_order_relaxed);
+	auto& cache = m_context.GetTextureCache();
+	// Read before the settled flags (Image::StoreSettled).
+	const auto unsettle = Image::unsettle_generation.load(std::memory_order_seq_cst);
 	const auto layout   = Image::read_layout_epoch.load(std::memory_order_relaxed);
 	const auto epoch    = cache.BindingEpoch();
 	const auto tick     = cache.GcTick();
@@ -357,8 +358,9 @@ void ResidentTextures::Check(std::span<PreparedBindings* const> stages) {
 				}
 				Bind(*entry, image, m_scratch_views);
 			}
+			const auto version = image.residency_version.load(std::memory_order_seq_cst);
 			const bool settled =
-			    (image.settled.load(std::memory_order_acquire) & Image::SettledRefresh) != 0 &&
+			    (image.settled.load(std::memory_order_seq_cst) & Image::SettledRefresh) != 0 &&
 			    image.registered && !image.depth_id && !image.binding.needs_rebind;
 			if (!read_branch) {
 				stats.feedback_images++;
@@ -370,7 +372,7 @@ void ResidentTextures::Check(std::span<PreparedBindings* const> stages) {
 			entry->layout_epoch  = layout;
 			entry->binding_epoch = epoch;
 			entry->tick          = tick;
-			entry->version       = image.residency_version.load(std::memory_order_relaxed);
+			entry->version       = version;
 			entry->used_tick     = tick;
 		}
 		for (const auto sampler: prepared->samplers) {
