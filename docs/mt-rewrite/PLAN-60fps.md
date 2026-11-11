@@ -173,6 +173,30 @@ Next moves:
 
 A, B and the deferral would bring the thread to ~3.3 µs/draw; with C1 parked, the rest has to come from elsewhere.
 
+## Thin serial commit roadmap (2026-11-11)
+
+The goal is a design that does not depend on one fast pinned core: the command thread only
+validates and hands off in order, the prepare workers do the per-draw work, and textures,
+samplers and later buffers stay resident on the GPU. Estimated serial path ~4.0 → ~0.7–1.1 µs per
+draw, so FPS then follows worker count up to about 3–4 workers. Design, ruled-out variants and
+exactness risks: `RESEARCH-thin-commit.md` (its `file:line` references are for `dev` 85eb0cb6).
+
+| Step | What | Owner | Gate |
+|---|---|---|---|
+| 0 | Stats: slow-path share, recorder ns/draw, stage 0 (time in the code stage 1 deletes) | Track B | numbers in FINDINGS |
+| 1 | Latency: walker read logging, ranged hazards, depth sweep, free lanes, third worker | Track B4 | wait ≤ 80 ns/draw at depth ≥ 8; rejections < 300/s |
+| 2 | Run-level targets, programs and pipeline | Track B | −270 and −150 ns/draw |
+| 3 | Resident textures and samplers (stage 1; 1a is `KYTY_RESIDENT_TEXTURES=shadow`, then a 1b design review) | Track R | −150 ns/draw on PGO; verify clean |
+| 4 | #78 revived, covering all per-draw uploads | Track B4 (later) | `ObtainBuffer` and uploads −150 ns/draw |
+| 5 | Buffers by address (stage 2), the draw packet filled by the worker | Track R | no `pushDescriptorSet` on queued draws; `CommitBindings` ≤ 100 ns |
+| 6 | Run-level bindings | unassigned | trivial after 5 |
+| 7 | No direct recording on the draw path | unassigned | draw-path recorder drains at 0 |
+| 8 | Parallel recording with secondary command buffers | unassigned | only if the recorder gates |
+| 9 | Decode thread | unassigned | only if decode gates |
+
+Worker time is not free (#77, #78, #82): under the latency co-limit later steps measure flat, so
+step 1 comes first.
+
 ## Shared rules (all tracks)
 
 - **One machine.** Anything that launches `kyty_emulator` takes the exclusive bench lock:
