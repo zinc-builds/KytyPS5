@@ -893,7 +893,8 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged) {
 	// Emulator stores into guest memory (downloads, labels) change bytes without a guest write.
 	// Advance on both sides so no reader pairs the old bytes with the new epoch, or the reverse.
-	const auto advance = ranged ? Graphics::GuestSyncEpoch::AdvanceRanged
+	const auto advance = ranged || Graphics::GuestSyncEpoch::g_stores_ranged
+	                         ? Graphics::GuestSyncEpoch::AdvanceRanged
 	                            : Graphics::GuestSyncEpoch::Advance;
 	advance();
 	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
@@ -903,7 +904,7 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool range
 
 bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 	const auto advance = [] {
-		if (Graphics::GuestSyncEpoch::g_label_stores_ranged) {
+		if (Graphics::GuestSyncEpoch::g_stores_ranged) {
 			Graphics::GuestSyncEpoch::AdvanceRanged();
 		} else {
 			Graphics::GuestSyncEpoch::Advance();

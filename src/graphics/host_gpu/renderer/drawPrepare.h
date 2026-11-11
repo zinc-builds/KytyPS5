@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/guestSyncEpoch.h"
 
 #include <atomic>
 #include <cstdint>
@@ -70,6 +71,29 @@ void                   NoteStoredRange(uint64_t vaddr, uint64_t size);
 // no longer reaches back that far.
 [[nodiscard]] bool StoredSince(uint64_t sequence,
                                const std::vector<std::pair<uint64_t, uint64_t>>& reads);
+
+// An emulator store into guest memory between queued draws (a label, WRITE_DATA, an occlusion
+// dump): the queued draws are checked against [vaddr, vaddr + size) (StoredSince) instead of all
+// being dropped. Backing stores made inside the scope advance only the ranged epoch. Queued
+// draws do read label bytes as data, so the range must cover every byte the store writes.
+class RangedStore {
+public:
+	RangedStore(uint64_t vaddr, uint64_t size) noexcept
+	    : m_vaddr(vaddr), m_size(size), m_outer(GuestSyncEpoch::g_stores_ranged) {
+		NoteStoredRange(vaddr, size);
+		GuestSyncEpoch::g_stores_ranged = true;
+	}
+	~RangedStore() {
+		GuestSyncEpoch::g_stores_ranged = m_outer;
+		NoteStoredRange(m_vaddr, m_size);
+	}
+	KYTY_CLASS_NO_COPY(RangedStore);
+
+private:
+	uint64_t m_vaddr;
+	uint64_t m_size;
+	bool     m_outer;
+};
 
 // One worker thread. The command thread posts sequence numbers in order; the worker calls
 // run(context, sequence) for each, in order. Workers have distinct indices below

@@ -1238,9 +1238,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, bytes.size());
 			// Ranged: a queued draw is dropped only if its worker read these bytes.
-			DrawPrepare::NoteStoredRange(address, bytes.size());
+			DrawPrepare::RangedStore ranged(address, bytes.size());
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size(), true);
-			DrawPrepare::NoteStoredRange(address, bytes.size());
 		}
 	}
 }
@@ -2074,9 +2073,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		download.Invalidate(offset, range.size);
 		// Ranged, as BufferCache's readbacks: queued draws are checked against these bytes
 		// instead of all being dropped.
-		DrawPrepare::NoteStoredRange(range.address, range.size);
+		DrawPrepare::RangedStore ranged(range.address, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size, true);
-		DrawPrepare::NoteStoredRange(range.address, range.size);
 	});
 	return true;
 }
