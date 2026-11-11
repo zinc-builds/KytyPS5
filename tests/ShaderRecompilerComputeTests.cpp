@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -55481,6 +55482,31 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+// DrawPrepare::RangedStore: queued draws reading the stored bytes see the store, others do
+// not; backing stores inside advance only the ranged epoch; scopes nest.
+static void CheckRangedStore() {
+  using Libs::Graphics::Require;
+  namespace DP = Libs::Graphics::DrawPrepare;
+  namespace Epoch = Libs::Graphics::GuestSyncEpoch;
+  const auto before = DP::StoredSequence();
+  {
+    DP::RangedStore outer(0x7000'1000u, 8);
+    Require("RangedStore", "flag", Epoch::g_stores_ranged, "the scope did not mark stores ranged");
+    { DP::RangedStore inner(0x7000'2000u, 256); }
+    Require("RangedStore", "nesting", Epoch::g_stores_ranged,
+            "an inner scope cleared the outer one's flag");
+  }
+  Require("RangedStore", "flag reset", !Epoch::g_stores_ranged, "the flag outlived the scope");
+  const std::vector<std::pair<uint64_t, uint64_t>> label{{0x7000'1004u, 4}};
+  const std::vector<std::pair<uint64_t, uint64_t>> block{{0x7000'20f0u, 0x20}};
+  const std::vector<std::pair<uint64_t, uint64_t>> other{{0x7000'3000u, 0x100}};
+  Require("RangedStore", "ranges",
+          DP::StoredSince(before, label) && DP::StoredSince(before, block) &&
+              !DP::StoredSince(before, other),
+          "a read of the stored bytes was missed, or an unrelated read was hit");
+  std::printf("[host]    RangedStore                      ok\n");
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -56898,6 +56924,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
+  CheckRangedStore();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

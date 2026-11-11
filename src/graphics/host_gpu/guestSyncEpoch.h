@@ -16,9 +16,10 @@ inline std::atomic<uint64_t> g_epoch {1};
 // draws check those by range instead.
 inline std::atomic<uint64_t> g_unranged_epoch {1};
 
-// Set while the caller records the ranges of the emulator's label stores itself
-// (DrawPrepare::NoteStoredRange): those stores then advance only the ranged epoch.
-inline thread_local bool g_label_stores_ranged = false;
+// Set while the caller records the ranges of the emulator's stores itself
+// (DrawPrepare::RangedStore): backing stores (labels, WriteBacking) then advance only the ranged
+// epoch.
+inline thread_local bool g_stores_ranged = false;
 
 inline void Advance() noexcept {
 	g_unranged_epoch.fetch_add(1, std::memory_order_acq_rel);

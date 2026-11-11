@@ -1115,6 +1115,29 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	                                      static_cast<int>(display_buffer_index));
 }
 
+void CommandProcessor::StoreLabel(void* address, const void* value, uint64_t size) {
+	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
+	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
+	// downloads GPU-written bytes under the label before the store.
+	// In an asynchronously tracked page a label goes to the backing too (StoreCpLabel), so
+	// waits on it can be told apart from guest stores.
+	const auto vaddr   = reinterpret_cast<uint64_t>(address);
+	auto&      buffers = m_renderer.GetBufferCache();
+	if (GuestRange {vaddr, size}.Valid() && !buffers.HasGpuDirtyBytes(vaddr, size)) {
+		const bool gpu_modified = buffers.IsRegionGpuModified(vaddr, size);
+		if (m_renderer.StoreCpLabel(vaddr, value, size, !gpu_modified) ||
+		    (gpu_modified && [&] {
+			    uint64_t stored = 0;
+			    std::memcpy(&stored, value, size);
+			    return LibKernel::Memory::TryStoreLabelBacking(vaddr, stored, size);
+		    }())) {
+			return;
+		}
+	}
+	std::memcpy(address, value, size);
+	m_renderer.NoteGpuWrite(vaddr, size);
+}
+
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id) {
 	if (graphics_debug_dump_enabled()) {
@@ -1143,27 +1166,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
-	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
-	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
-	// downloads GPU-written bytes under the label before the store.
-	// In an asynchronously tracked page a label goes to the backing too (StoreCpLabel), so
-	// waits on it can be told apart from guest stores.
 	const auto write_label = [this, address](const void* value, uint64_t size) {
-		const auto vaddr   = reinterpret_cast<uint64_t>(address);
-		auto&      buffers = m_renderer.GetBufferCache();
-		if (GuestRange {vaddr, size}.Valid() && !buffers.HasGpuDirtyBytes(vaddr, size)) {
-			const bool gpu_modified = buffers.IsRegionGpuModified(vaddr, size);
-			if (m_renderer.StoreCpLabel(vaddr, value, size, !gpu_modified) ||
-			    (gpu_modified && [&] {
-				    uint64_t stored = 0;
-				    std::memcpy(&stored, value, size);
-				    return LibKernel::Memory::TryStoreLabelBacking(vaddr, stored, size);
-			    }())) {
-				return;
-			}
-		}
-		std::memcpy(address, value, size);
-		m_renderer.NoteGpuWrite(vaddr, size);
+		StoreLabel(address, value, size);
 	};
 	if (data_sel != 0) {
 		MemDiag::NoteLabel();
