@@ -60,7 +60,8 @@ public:
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
 	// Into the scheduler's current command buffer, taken only if a barrier is needed: a draw that
 	// needs none does not wait for the recording thread.
-	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+	// Returns whether a barrier was recorded.
+	bool Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
@@ -148,10 +149,29 @@ public:
 		SettledTarget  = 4u, // and it is already a render target
 	};
 	std::atomic<uint8_t> settled {0};
-	void                 Unsettle() noexcept { settled.store(0, std::memory_order_release); }
+	void                 Unsettle() noexcept {
+		// Under the texture cache lock, like every write of settled.
+		if (settled.load(std::memory_order_relaxed) != 0) {
+			NoteUnsettled();
+		}
+		settled.store(0, std::memory_order_release);
+	}
+	// A settled image lost a settled bit. Counted before the flag is cleared, so a thread that
+	// sees the cleared flag also sees the count.
+	void NoteUnsettled() noexcept {
+		residency_version.fetch_add(1u, std::memory_order_relaxed);
+		unsettle_generation.fetch_add(1u, std::memory_order_relaxed);
+	}
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
 	static inline std::atomic<uint64_t> serials {0};
+	// Events after which a texture binding may need work again (resident textures,
+	// RESEARCH-thin-commit.md): a settled image lost a settled bit (a CPU write or another change
+	// made it need a refresh), or a barrier took an image out of its read state.
+	static inline std::atomic<uint64_t> unsettle_generation {0};
+	static inline std::atomic<uint64_t> read_layout_epoch {0};
+	// This image's share of both.
+	std::atomic<uint32_t> residency_version {0};
 
 	// Unique per image, unlike ImageId: freed slots are reused.
 	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;

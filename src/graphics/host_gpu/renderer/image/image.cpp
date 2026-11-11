@@ -243,6 +243,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		           OnlyReads(barrier.srcAccessMask);
 	    })) {
 		HeapChanged();
+		residency_version.fetch_add(1u, std::memory_order_relaxed);
+		read_layout_epoch.fetch_add(1u, std::memory_order_relaxed);
 	}
 	return barriers;
 }
@@ -276,18 +278,19 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	command_buffer.pipelineBarrier2(dependency);
 }
 
-void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+bool Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range) {
 	const auto barriers = GetBarriers(destination_layout, destination_access,
 	                                  TransitStages(destination_access), range);
 	if (barriers.empty()) {
-		return;
+		return false;
 	}
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
 	m_scheduler.Current().Handle().pipelineBarrier2(dependency);
+	return true;
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

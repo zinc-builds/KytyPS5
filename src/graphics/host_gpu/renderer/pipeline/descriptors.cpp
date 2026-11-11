@@ -1360,12 +1360,22 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto* proposals = AdoptedTextureProposals(runtime);
 	auto&       texture_cache = m_context.GetTextureCache();
 	auto&       reuse         = prepared.reuse;
+	auto&       shadow        = prepared.resident;
+	shadow.active             = proposals != nullptr && ResidentTexturesShadow();
+	if (shadow.active) {
+		shadow.resolved  = false;
+		shadow.cycles    = 0;
+		shadow.proposals = proposals;
+		shadow.flags.assign(program.info.images.size(), 0);
+	}
 	m_prepare_stat.binding_sets += proposals != nullptr ? 1 : 0;
 	prepared.reused = CanReuseBindings(runtime, prepared, proposals);
 	if (prepared.reused) {
 		// The same images, views and samplers as the last draw of this stage: only the per-draw
 		// steps of a resolve run (RefindExactImage's color-clear step; BindImage).
 		m_prepare_stat.binding_reuses++;
+		const uint64_t shadow_start  = shadow.active ? ResidentTextures::Now() : 0;
+		uint64_t       shadow_clears = 0;
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			if (program.info.images[i].heap) {
 				continue;
@@ -1373,12 +1383,21 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			// The record is read only for its color-clear step. binding.layout is left as the
 			// last commit set it: CommitBindings sets it again before any use.
 			if (const auto& proposal = (*proposals)[i]; proposal.color_clear) {
-				const auto& record = *proposal.record;
+				const uint64_t clear_start = shadow.active ? ResidentTextures::Now() : 0;
+				const auto&    record      = *proposal.record;
 				texture_cache.MaterializeColorClear(record.found_id, record.found,
 				                                    record.metadata_base_layer);
+				if (shadow.active) {
+					shadow_clears += ResidentTextures::Now() - clear_start;
+				}
 			}
 			const auto& binding = prepared.images[i];
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		}
+		if (shadow.active) {
+			// Color clears stay per draw with resident textures.
+			const auto cycles = Resident().Since(shadow_start);
+			shadow.cycles += cycles > shadow_clears ? cycles - shadow_clears : 0;
 		}
 		if (BindingReuseVerify()) {
 			VerifyReusedBindings(runtime, prepared);
@@ -1401,7 +1420,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			ResolveStageTexture(memo, i, program.info.images[i], snapshot.images[i], binding,
 			                    proposals != nullptr && i < proposals->size() ? &(*proposals)[i]
 			                                                                 : nullptr);
+			const uint64_t shadow_start = shadow.active ? ResidentTextures::Now() : 0;
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			if (shadow.active) {
+				shadow.cycles += Resident().Since(shadow_start);
+			}
 		}
 		prepared.samplers.reserve(program.info.samplers.size());
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -1588,6 +1611,23 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
 	bool        resolved      = false;
+	auto&       shadow        = prepared.resident;
+	uint64_t    shadow_start  = 0;
+	if (shadow.active) {
+		// Which lookups below take TextureCache::AcquireTexture's settled path (no refresh).
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (!images[i].image_id) continue;
+			const auto& image = texture_cache.GetImage(images[i].image_id);
+			const auto  need  = images[i].desc.type == TextureCache::BindingType::Storage
+			                        ? Image::SettledWrite
+			                        : Image::SettledRefresh;
+			if ((image.settled.load(std::memory_order_acquire) & need) == 0 || !image.registered ||
+			    image.depth_id || image.binding.needs_rebind) {
+				shadow.flags[i] |= PreparedBindings::ResidentShadow::SlowAcquire;
+			}
+		}
+		shadow_start = ResidentTextures::Now();
+	}
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
@@ -1623,6 +1663,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
+	}
+	if (shadow.active) {
+		shadow.cycles += Resident().Since(shadow_start);
+		shadow.resolved = shadow.resolved || resolved;
 	}
 	// Reusable by a later draw if nothing was resolved again and no image was registered or
 	// unregistered since the stage's resolve began.
@@ -1695,6 +1739,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
 	}
+	const bool resident_shadow =
+	    pipeline_bind_point == vk::PipelineBindPoint::eGraphics && ResidentTexturesShadow();
+	if (resident_shadow) {
+		Resident().Predict(prepared_bindings, m_bound_images);
+	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
 	size_t image_cursor = 0;
@@ -1714,9 +1763,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
+		auto& shadow = descriptors.resident;
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& binding = descriptors.images[i];
 			if (!binding.image_id) continue;
+			const bool watched =
+			    shadow.active && (shadow.flags[i] & (PreparedBindings::ResidentShadow::SkipGlobal |
+			                                         PreparedBindings::ResidentShadow::SkipImage)) != 0;
+			if (watched) {
+				Resident().SaveState(m_context.GetTextureCache().GetImage(binding.image_id));
+			}
+			const uint64_t shadow_start = shadow.active ? ResidentTextures::Now() : 0;
+			bool           barrier      = false;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
@@ -1734,25 +1792,36 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
-				image.Transit(layout,
-				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
-				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
-				                                              : vk::AccessFlags2 {}),
-				              {});
+				barrier = image.Transit(
+				    layout,
+				    image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
+				        (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				                                    : vk::AccessFlags2 {}),
+				    {});
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {});
+				barrier = image.Transit(vk::ImageLayout::eGeneral,
+				                        vk::AccessFlagBits2::eShaderRead | storage_access, {});
 			} else if (storage) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range);
+				barrier = image.Transit(vk::ImageLayout::eGeneral,
+				                        vk::AccessFlagBits2::eShaderRead |
+				                            vk::AccessFlagBits2::eShaderWrite,
+				                        range);
 			} else {
-				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range);
+				barrier = image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range);
 			}
 			binding.layout = image.backing.state.layout;
+			if (shadow.active) {
+				shadow.cycles += Resident().Since(shadow_start);
+				if (barrier) {
+					shadow.flags[i] |= PreparedBindings::ResidentShadow::Barrier;
+				}
+				if (watched && Resident().StateChanged(image)) {
+					shadow.flags[i] |= PreparedBindings::ResidentShadow::StateChanged;
+				}
+			}
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -1813,6 +1882,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			m_descriptor_writes.push_back(write);
 		}
+		const uint64_t fill_start = shadow.active ? ResidentTextures::Now() : 0;
 		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 			const auto& resource = program.info.images[i];
 			const auto& texture = descriptors.images[i];
@@ -1824,12 +1894,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
 			}
 		}
+		if (shadow.active) {
+			shadow.cycles += Resident().Since(fill_start);
+		}
 
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
 			has_push_data = true;
 		}
+	}
+
+	if (resident_shadow) {
+		Resident().Check(prepared_bindings);
 	}
 
 	// Graphics draws record only the push constants and descriptors that changed, queued for the

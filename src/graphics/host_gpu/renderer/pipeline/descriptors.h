@@ -17,6 +17,7 @@
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+struct TextureProposal;
 
 struct TextureBinding {
 	ImageId                    image_id;
@@ -77,6 +78,22 @@ struct PreparedBindings {
 	bool reused = false;
 	// A full resolve of this draw that RebindImages may make reusable.
 	bool reuse_candidate = false;
+	// KYTY_RESIDENT_TEXTURES=shadow: what the classic binding of this stage did in this draw
+	// (ResidentTextures checks it at commit).
+	struct ResidentShadow {
+		enum Flag : uint8_t {
+			SlowAcquire  = 1u,  // the view lookup refreshed or locked (not the settled path)
+			Barrier      = 2u,  // the commit's transition recorded a barrier
+			StateChanged = 4u,  // or changed the tracked image state
+			SkipGlobal   = 8u,  // predicted skippable by the global counters
+			SkipImage    = 16u, // by the per-image versions
+		};
+		bool                                active   = false; // a draw stage with worker records
+		bool                                resolved = false; // RebindImages resolved again
+		uint64_t                            cycles   = 0;     // in code resident bindings delete
+		const std::vector<TextureProposal>* proposals = nullptr;
+		std::vector<uint8_t>                flags; // per image
+	} resident;
 };
 
 [[nodiscard]] vk::DescriptorType

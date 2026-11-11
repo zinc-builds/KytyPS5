@@ -1566,7 +1566,11 @@ Image::Settled TextureCache::SettledState(const Image& image) const {
 }
 
 void TextureCache::Settle(Image& image) {
-	image.settled.store(SettledState(image), std::memory_order_release);
+	const auto state = SettledState(image);
+	if ((image.settled.load(std::memory_order_relaxed) & ~state) != 0) {
+		image.NoteUnsettled();
+	}
+	image.settled.store(state, std::memory_order_release);
 }
 
 // KYTY_TC_SETTLED_VERIFY=1: a lock-free lookup re-checks, under the lock, that the image is still

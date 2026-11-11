@@ -37,6 +37,9 @@ struct WorkerTextureRecord {
 	uint64_t                serial              = 0; // unique per record (TextureBinding::source)
 	uint64_t                key                 = 0; // TextureDescriptionKey(inputs, value)
 	uint32_t                metadata_base_layer = 0;
+	// KYTY_RESIDENT_TEXTURES: the command thread's ResidentTextures entry for this record, 0 if
+	// none. Only the command thread reads or writes it, like generation.
+	mutable uint32_t        resident            = 0;
 	bool                    color_clear         = false;
 	TextureCache::ImageDesc found; // with color_clear
 };

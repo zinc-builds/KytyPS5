@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/residentTextures.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/workerTargets.h"
@@ -400,6 +401,14 @@ private:
 	                          const std::vector<TextureProposal>* proposals);
 	void VerifyReusedBindings(const ShaderStageRuntime& runtime, const PreparedBindings& prepared);
 	[[nodiscard]] static bool BindingReuseVerify();
+	// KYTY_RESIDENT_TEXTURES=shadow.
+	[[nodiscard]] ResidentTextures& Resident() {
+		if (m_resident == nullptr) {
+			m_resident = std::make_unique<ResidentTextures>(m_context);
+		}
+		return *m_resident;
+	}
+	std::unique_ptr<ResidentTextures> m_resident;
 	// Command thread: color_info entry r of render target slot `slot` as the worker proposed it
 	// (record null: no output); the texture cache side, or the whole resolve if the record's image
 	// no longer holds.
