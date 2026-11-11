@@ -23,6 +23,15 @@ namespace Common::PrepareTrace {
 inline thread_local uint64_t t_module_ticks    = 0; // shader module lookup (GetShaderParams)
 inline thread_local uint64_t t_resource_ticks  = 0; // resource materialization (SRT walk)
 inline thread_local uint32_t t_resource_misses = 0; // materializations that recompiled/missed
+// MaterializeResources, per job: calls, walk ticks (WalkSrt), flattened SRT words, resources
+// decoded, and how many calls had inputs (plan, user data, walked values, read ranges) seen
+// before on this thread (any earlier call in the table) or equal to this plan's previous call.
+inline thread_local uint32_t t_mat_calls       = 0;
+inline thread_local uint64_t t_walk_ticks      = 0;
+inline thread_local uint32_t t_srt_words       = 0;
+inline thread_local uint32_t t_resources       = 0;
+inline thread_local uint32_t t_input_seen      = 0;
+inline thread_local uint32_t t_input_same_plan = 0;
 
 class Scope {
 public:

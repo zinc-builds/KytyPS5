@@ -1905,8 +1905,14 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	auto&      t     = queued.trace;
 	if (trace) {
 		t.start = Common::PrepareTrace::Now();
-		Common::PrepareTrace::t_module_ticks   = 0;
-		Common::PrepareTrace::t_resource_ticks = 0;
+		Common::PrepareTrace::t_module_ticks    = 0;
+		Common::PrepareTrace::t_resource_ticks  = 0;
+		Common::PrepareTrace::t_mat_calls       = 0;
+		Common::PrepareTrace::t_walk_ticks      = 0;
+		Common::PrepareTrace::t_srt_words       = 0;
+		Common::PrepareTrace::t_resources       = 0;
+		Common::PrepareTrace::t_input_seen      = 0;
+		Common::PrepareTrace::t_input_same_plan = 0;
 	}
 	queued.log.Reset();
 	DrawPrepare::SetLog(&queued.log);
@@ -1927,6 +1933,12 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 		t.end      = Common::PrepareTrace::Now();
 		t.module   = Common::PrepareTrace::t_module_ticks;
 		t.resource = Common::PrepareTrace::t_resource_ticks;
+		t.walk     = Common::PrepareTrace::t_walk_ticks;
+		t.mat      = static_cast<uint16_t>(Common::PrepareTrace::t_mat_calls);
+		t.words    = static_cast<uint16_t>(std::min<uint32_t>(Common::PrepareTrace::t_srt_words, 65535));
+		t.res      = static_cast<uint16_t>(std::min<uint32_t>(Common::PrepareTrace::t_resources, 65535));
+		t.seen     = static_cast<uint8_t>(Common::PrepareTrace::t_input_seen);
+		t.same     = static_cast<uint8_t>(Common::PrepareTrace::t_input_same_plan);
 	}
 }
 
@@ -2149,6 +2161,12 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 		record.end          = t.end;
 		record.module       = t.module;
 		record.resource     = t.resource;
+		record.walk         = t.walk;
+		record.mat          = t.mat;
+		record.words        = t.words;
+		record.res          = t.res;
+		record.seen         = t.seen;
+		record.same         = t.same;
 		record.idle_wait    = t.idle_wait;
 		record.own_lookup   = t.own_lookup;
 		record.reject       = t.reject;

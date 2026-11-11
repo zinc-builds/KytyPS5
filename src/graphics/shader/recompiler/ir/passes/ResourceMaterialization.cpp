@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include "common/prepareTrace.h"
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -1616,9 +1617,35 @@ static bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRunti
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
+	const bool trace = Common::PrepareTrace::Enabled();
+	const auto walk_start = trace ? Common::PrepareTrace::Now() : 0;
 	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
+	}
+	if (trace) {
+		namespace T = Common::PrepareTrace;
+		T::t_walk_ticks += T::Now() - walk_start;
+		T::t_mat_calls++;
+		T::t_srt_words += static_cast<uint32_t>(snapshot.flattened_srt.size());
+		T::t_resources += static_cast<uint32_t>(program.info.buffers.size() +
+		                                        program.info.images.size() +
+		                                        program.info.samplers.size());
+		// Inputs of the rest of the materialization (upper bound: read ranges by address).
+		uint64_t h = reinterpret_cast<uint64_t>(&program) * 0x9E3779B97F4A7C15ull;
+		const auto mix = [&](uint64_t v) { h = (h ^ v) * 0xBF58476D1CE4E5B9ull; h ^= h >> 31; };
+		for (const auto v: runtime.user_data) mix(v);
+		for (const auto v: snapshot.flattened_srt) mix(v);
+		for (const auto& [a, n]: reads) { mix(a); mix(n); }
+		mix(runtime.indirect_args_address);
+		static thread_local std::vector<uint64_t> seen(1u << 16);
+		static thread_local std::vector<std::pair<const void*, uint64_t>> last(1u << 12);
+		auto& slot = seen[h & ((1u << 16) - 1)];
+		if (slot == h) T::t_input_seen++;
+		slot = h;
+		auto& prev = last[(reinterpret_cast<uint64_t>(&program) >> 4) & ((1u << 12) - 1)];
+		if (prev.first == &program && prev.second == h) T::t_input_same_plan++;
+		prev = {&program, h};
 	}
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;

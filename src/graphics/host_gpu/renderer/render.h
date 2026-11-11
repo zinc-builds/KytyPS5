@@ -360,7 +360,9 @@ private:
 		// (worker), and of the command thread's handling of a rejected preparation.
 		struct Trace {
 			uint64_t post = 0, start = 0, programs = 0, buffers = 0, textures = 0, targets = 0,
-			         end = 0, module = 0, resource = 0, idle_wait = 0, own_lookup = 0;
+			         end = 0, module = 0, resource = 0, idle_wait = 0, own_lookup = 0, walk = 0;
+			uint16_t mat = 0, words = 0, res = 0;
+			uint8_t  seen = 0, same = 0;
 			uint8_t  reject = 0; // 0 adopted, 1 failed, 2 hazard/epoch, 3 stored, 4 gpu-written
 		} trace;
 		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged and
@@ -675,9 +677,11 @@ private:
 	struct TraceRecord {
 		uint64_t sequence;
 		uint64_t post, start, programs, buffers, textures, targets, end, module, resource;
-		uint64_t finish_enter, wait_end, finish_exit, idle_wait, own_lookup;
+		uint64_t finish_enter, wait_end, finish_exit, idle_wait, own_lookup, walk;
 		uint32_t lane;
 		uint8_t  draining, others_idle, reject, queued_at_finish;
+		uint16_t mat, words, res;
+		uint8_t  seen, same;
 	};
 	static constexpr size_t  kTraceWindow = 600000;
 	std::vector<TraceRecord> m_trace;
