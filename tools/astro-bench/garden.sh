@@ -47,12 +47,21 @@ menu) [ -p /tmp/vpad.fifo ] || { echo "vpad.py not running" >&2; exit 1; } ;;
 *) echo "GARDEN_ROUTE must be lvl or menu" >&2; exit 1 ;;
 esac
 rm -f "$log"
+# GARDEN_SHOT=<F>: save the frame shown at level frame F as /tmp/garden-<label>-shot.png (the
+# emulator's KYTY_SHOT_FILE capture: the guest image, no overlay; needs a binary that has it).
+shot_png=/tmp/garden-$label-shot.png
+rm -f "$shot_png"
+if [ -n "$GARDEN_SHOT" ]; then
+	export KYTY_SHOT_FILE=/tmp/kyty-shot-$label.req
+	rm -f "$KYTY_SHOT_FILE"
+fi
 # On any failure (a timeout below, a signal), stop the emulator: left running, it would keep
 # holding the bench lock. KEEP_RUNNING only applies to a run that reaches the level.
 # Kill only this run's emulator (a child of run.sh): a pattern kill could hit the emulator of
 # whoever takes the lock next.
 cleanup() {
 	[ -n "$overlay" ] && rm -rf "$overlay"
+	[ -n "$KYTY_SHOT_FILE" ] && rm -f "$KYTY_SHOT_FILE" "/tmp/garden-$label-shot.ppm"
 	[ -n "$run_pid" ] || return
 	pkill -P "$run_pid" -x kyty_emulator; wait_s 3; pkill -9 -P "$run_pid" -x kyty_emulator
 }
@@ -95,6 +104,7 @@ last_frames() { perf_since_start | grep -o 'frames=[0-9]*' | tail -1 | cut -d= -
 for _ in $(seq 10); do [ -n "$(last_frames)" ] && break; wait_s 1; done
 base=$(perf_since_start | grep -m1 -o 'frames=[0-9]*' | cut -d= -f2)
 window=${GARDEN_FRAMES:-1000-1600}
+[ -n "$GARDEN_SHOT" ] && [ -n "$base" ] && printf '%s %s\n' "$((base + GARDEN_SHOT))" "/tmp/garden-$label-shot.ppm" > "$KYTY_SHOT_FILE"
 if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	f0=$((base + ${window%-*})) f1=$((base + ${window#*-}))
 	end=$((SECONDS + ${window#*-} / 5 + 30)) # even at 5 FPS
@@ -114,10 +124,17 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	# fields appended to the summary line and as /tmp/garden-<label>.json.
 	rm -f "/tmp/garden-$label.json"
 	install=${KYTY_INSTALL:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/_Build/linux/install}
-	kenv=$(env | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|APP0_OVERLAY|INSTALL)=' | sort | tr '\n' ' ')
+	kenv=$(env | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' | sort | tr '\n' ' ')
+	# Build identity: the binary's hash, and the build mode and profile that refbuild.sh/build.sh
+	# record next to the install (plain when there is no BUILD_MODE file).
+	exe=$(sha256sum "$install/kyty_emulator" 2>/dev/null | cut -c1-16)
+	bmode=$(cat "$install/../BUILD_MODE" 2>/dev/null)
+	mode=$(sed -n 's/.*\bmode=\([a-z]*\).*/\1/p' <<<"$bmode") profile=$(sed -n 's/.*\bsha256=\([0-9a-f]*\).*/\1/p' <<<"$bmode")
 	extra=$(python3 -I "$(dirname "$0")/metrics.py" "$log" "$start" "$f0" "$f1" "/tmp/garden-$label.json" \
 		label="$label" window="$window" route="$route" install="$install" flags="$*" env="${kenv% }" \
-		time="$(date -Iseconds)")
+		time="$(date -Iseconds)" exe="$exe" build_mode="${mode:-plain}" profile="$profile")
+	# Every measured run goes into the shared result store (results.sh), so references are reused.
+	case "$label" in *-warmup) ;; *) [ -f "/tmp/garden-$label.json" ] && python3 -I "$(dirname "$0")/results.py" add "/tmp/garden-$label.json" ;; esac
 	grep '^PERF' "/tmp/garden-$label.window" | fields |
 		awk -v l="$label" -v fw="$fw" -v note=" frames=$window$extra" "$summary"
 else
@@ -129,5 +146,19 @@ else
 		awk -v l="$label" -v fw="" -v note=" time window" "$summary"
 fi
 grep -E '^AMD CPU compatibility' "$log" | head -3
+if [ -n "$GARDEN_SHOT" ]; then
+	# The emulator prints SHOT once it has saved the frame (which may lie past the window). A
+	# binary without KYTY_SHOT_FILE never does: stop ~2 s of frames after the shot's frame.
+	for _ in $(seq 60); do
+		grep -q '^SHOT ' "$log" && break
+		[ "$(last_frames)" -ge "$((base + GARDEN_SHOT + 120))" ] 2>/dev/null && break
+		wait_s 1
+	done
+	if [ -s "/tmp/garden-$label-shot.ppm" ] && magick "/tmp/garden-$label-shot.ppm" "$shot_png" 2>/dev/null; then
+		echo "screenshot: $shot_png (level frame $GARDEN_SHOT)"
+	else
+		echo "screenshot: none (frame $GARDEN_SHOT not reached, or a binary without KYTY_SHOT_FILE)" >&2
+	fi
+fi
 echo "level start at log line $start" >&2
 if [ -n "$KEEP_RUNNING" ]; then trap - EXIT; fi
