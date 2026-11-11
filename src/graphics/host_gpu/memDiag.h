@@ -137,6 +137,25 @@ inline void Trace(const char* event, uint64_t vaddr, uint64_t size, uint64_t ext
 // Prints and resets the counters at most once per second (call from the GPU thread).
 void MaybePrint() noexcept;
 
+// KYTY_BDA_STATS=1|access: per-second BDASTATS lines about PrepareBda's uploads (what queued
+// them, pages uploaded again within one frame, and for a 1/8 sample of pages how many bytes
+// changed since their previous upload). `access` also makes DMA shaders mark the 16 KiB pages
+// they read in a second bitmap after the fault bitmap (atomics on every DMA access: slow),
+// and reports uploaded bytes that no DMA shader read in the same or the next second.
+inline const int g_bda_stats_mode = [] {
+	const char* value = std::getenv("KYTY_BDA_STATS");
+	if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "access") == 0 ? 2 : 1;
+}();
+// A plain load: ObtainBuffer checks it ~2M times a second.
+[[nodiscard]] inline int BdaStatsMode() noexcept {
+	return g_bda_stats_mode;
+}
+inline std::atomic<uint64_t> g_flips {0}; // video-out flips queued by the command thread
+inline std::atomic<uint64_t> g_bda_access_shaders {0}; // shaders emitted with access marks
+
 } // namespace Libs::Graphics::MemDiag
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMDIAG_H_

@@ -18,10 +18,13 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <tuple>
 #include <string_view>
@@ -401,7 +404,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
-		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
+		QueueBdaSync(buffer.CpuAddress(), buffer.Size(), BdaSource::NewBuffer);
 	} else {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
 		m_total_used_memory -= buffer.Size();
@@ -599,7 +602,7 @@ BufferCache::~BufferCache() {
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size);
+	QueueBdaSync(vaddr, size, BdaSource::Invalidate);
 }
 
 namespace {
@@ -664,7 +667,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			if (is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-				QueueBdaSync(vaddr, size);
+				QueueBdaSync(vaddr, size, BdaSource::CpuWrite);
 			}
 		});
 	}
@@ -703,7 +706,7 @@ bool BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write) 
 			}
 			if (is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-				QueueBdaSync(vaddr, size);
+				QueueBdaSync(vaddr, size, BdaSource::CpuWrite);
 			}
 		});
 		if (read == nullptr) {
@@ -982,6 +985,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+namespace BdaStats {
+namespace {
+void NoteUpload(const Buffer& buffer, std::span<const vk::BufferCopy> copies);
+void NoteBound(uint64_t vaddr, uint64_t size);
+void NoteStaged(uint64_t vaddr, const uint8_t* staged, uint64_t size);
+} // namespace
+} // namespace BdaStats
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	std::vector<vk::BufferCopy> copies;
@@ -994,6 +1005,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (MemDiag::BdaStatsMode() != 0 && source && g_sync_kind == MemDiag::Sync::Bda) {
+		BdaStats::NoteUpload(buffer, copies);
+	}
 	if (MemDiag::Enabled()) {
 		MemDiag::Add(MemDiag::SyncCalls0, g_sync_kind, 1);
 		if (source) {
@@ -1100,6 +1114,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+			if (MemDiag::BdaStatsMode() != 0 && g_sync_kind == MemDiag::Sync::Bda) {
+				BdaStats::NoteStaged(address, mapped + copy.srcOffset, copy.size);
 			}
 		}
 	};
@@ -1308,6 +1325,9 @@ bool BufferCache::SpeculationValid(const Speculation& speculation) const {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, uint32_t speculated) {
+	if (MemDiag::BdaStatsMode() != 0) {
+		BdaStats::NoteBound(vaddr, size);
+	}
 	if (speculated != UINT32_MAX && m_speculation != nullptr && !is_written && !is_texel_buffer) {
 		const auto& ranges = m_speculation->ranges;
 		if (speculated >= ranges.size() || ranges[speculated].vaddr != vaddr ||
@@ -1410,6 +1430,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	if (MemDiag::BdaStatsMode() != 0) {
+		BdaStats::NoteBound(vaddr, size);
+	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
@@ -1605,16 +1628,310 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
+namespace BdaStats {
+namespace {
+constexpr int SOURCES = static_cast<int>(BufferCache::BdaSource::Count);
+
+// Queued ranges by source (under m_bda_sync_mutex), and the set the current PrepareBda took.
+std::array<RangeSet, SOURCES> g_queued;
+std::array<RangeSet, SOURCES> g_taken; // command thread
+
+struct PageState {
+	uint64_t frame = ~uint64_t {0};
+};
+
+// Command thread only from here on.
+struct Totals {
+	uint64_t uploads = 0, bytes = 0, pages = 0;
+	uint64_t source_bytes[SOURCES + 1] {}; // + not queued by any source this PrepareBda
+	uint64_t repeat_pages = 0;             // uploaded earlier in the same frame
+	uint64_t sampled = 0, sampled_first = 0, changed_bytes = 0, changed_lines = 0, span_bytes = 0;
+	uint64_t line_hist[6] {}; // changed 64-byte lines per sampled page: 0, 1, 2-4, 5-16, 17-48, 49-64
+	uint64_t access_final_bytes = 0, access_read_bytes = 0, access_unread_bytes = 0, access_bits = 0;
+	// Uploads a bind (ObtainBuffer*) later covered, and uploads replaced by another upload of the
+	// page with no bind in between: those a lazy sync would not have made.
+	uint64_t consumed_bytes = 0, superseded_bytes = 0;
+	// Unresolved uploads dropped when the tracking map hit its cap: neither consumed nor
+	// superseded (the classification restarts after a nonzero value).
+	uint64_t unknown_bytes = 0;
+};
+Totals                                                     g_totals;
+std::unordered_map<uint64_t, PageState>                    g_pages; // 4 KiB page
+std::unordered_map<uint64_t, std::unique_ptr<uint8_t[]>>   g_shadow; // sampled 4 KiB pages
+// Access windows: uploaded bytes per 16 KiB caching page, by window, until the bitmap of the
+// same and the next window came back.
+std::unordered_map<uint64_t, uint64_t>                     g_window;
+std::vector<std::unordered_map<uint64_t, uint64_t>>        g_awaiting; // oldest first
+bool                                                       g_access_pending = false;
+// 4 KiB pages whose latest PrepareBda upload no bind has covered yet, with its bytes.
+std::mutex                   g_unconsumed_mutex;
+std::map<uint64_t, uint64_t> g_unconsumed;
+
+// A bind reads [vaddr, vaddr + size): the uploads of those pages were needed.
+void NoteBound(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(g_unconsumed_mutex);
+	auto            it = g_unconsumed.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+	while (it != g_unconsumed.end() && it->first < vaddr + size) {
+		g_totals.consumed_bytes += it->second;
+		it = g_unconsumed.erase(it);
+	}
+}
+
+void NoteUploadedPage(uint64_t page, uint64_t bytes) {
+	std::lock_guard lock(g_unconsumed_mutex);
+	auto [it, inserted] = g_unconsumed.try_emplace(page, bytes);
+	if (!inserted) {
+		g_totals.superseded_bytes += it->second;
+		it->second = bytes;
+	}
+}
+
+bool Sampled(uint64_t page) {
+	return ((page >> 12u) * 0x9E3779B97F4A7C15ull) >> 61u == 0;
+}
+
+// The bytes staged for one sampled 4 KiB page, against the bytes staged for its previous upload.
+void NoteSampledPage(uint64_t page, const uint8_t* staged) {
+	std::array<uint8_t, TRACKER_PAGE_SIZE> now {};
+	std::memcpy(now.data(), staged, now.size());
+	auto& shadow = g_shadow[page];
+	g_totals.sampled++;
+	if (shadow == nullptr) {
+		shadow = std::make_unique<uint8_t[]>(TRACKER_PAGE_SIZE);
+		std::memcpy(shadow.get(), now.data(), now.size());
+		g_totals.sampled_first++;
+		return;
+	}
+	uint64_t bytes = 0, lines = 0, first = TRACKER_PAGE_SIZE, last = 0;
+	for (uint64_t line = 0; line < TRACKER_PAGE_SIZE; line += 64) {
+		bool changed = false;
+		for (uint64_t i = line; i < line + 64; i++) {
+			if (now[i] != shadow[i]) {
+				bytes++;
+				changed = true;
+				first   = std::min(first, i);
+				last    = i;
+			}
+		}
+		lines += changed ? 1 : 0;
+	}
+	g_totals.changed_bytes += bytes;
+	g_totals.changed_lines += lines;
+	g_totals.span_bytes += bytes != 0 ? last - first + 1 : 0;
+	const int bucket = lines == 0 ? 0 : lines == 1 ? 1 : lines <= 4 ? 2 : lines <= 16 ? 3
+	                   : lines <= 48                                     ? 4
+	                                                                     : 5;
+	g_totals.line_hist[bucket]++;
+	std::memcpy(shadow.get(), now.data(), now.size());
+}
+
+// UploadCopies, for PrepareBda: compares the sampled whole pages of a range as it is staged.
+void NoteStaged(uint64_t vaddr, const uint8_t* staged, uint64_t size) {
+	for (auto page = Common::AlignUp(vaddr, TRACKER_PAGE_SIZE); page + TRACKER_PAGE_SIZE <= vaddr + size;
+	     page += TRACKER_PAGE_SIZE) {
+		if (Sampled(page)) {
+			NoteSampledPage(page, staged + (page - vaddr));
+		}
+	}
+}
+
+void NoteUpload(const Buffer& buffer, std::span<const vk::BufferCopy> copies) {
+	const auto frame = MemDiag::g_flips.load(std::memory_order_relaxed);
+	g_totals.uploads++;
+	for (const auto& copy: copies) {
+		const auto begin = buffer.CpuAddress() + copy.dstOffset;
+		const auto end   = begin + copy.size;
+		g_totals.bytes += copy.size;
+		for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
+		     page += TRACKER_PAGE_SIZE) {
+			const auto bytes = std::min(end, page + TRACKER_PAGE_SIZE) - std::max(begin, page);
+			g_totals.pages++;
+			int source = SOURCES;
+			for (int k = 0; k < SOURCES; k++) {
+				if (g_taken[k].Intersects(page, TRACKER_PAGE_SIZE)) {
+					source = k;
+					break;
+				}
+			}
+			g_totals.source_bytes[source] += bytes;
+			auto& state = g_pages[page];
+			if (state.frame == frame) {
+				g_totals.repeat_pages++;
+			}
+			state.frame = frame;
+			if (MemDiag::BdaStatsMode() == 2) {
+				g_window[BufferCache::PageIndex(page)] += bytes;
+			}
+			NoteUploadedPage(page, bytes);
+		}
+	}
+}
+
+// Bitmap of one window came back: drop pages it shows read; the oldest window is final.
+void NoteAccessBitmap(const uint32_t* bits) {
+	const auto read = [bits](uint64_t index) { return ((bits[index >> 5u] >> (index & 31u)) & 1u) != 0; };
+	g_totals.access_bits = 0;
+	for (uint64_t word = 0; word < BufferCache::CACHING_NUMPAGES / 32; word++) {
+		g_totals.access_bits += std::popcount(bits[word]);
+	}
+	for (auto& window: g_awaiting) {
+		for (auto it = window.begin(); it != window.end();) {
+			if (read(it->first)) {
+				g_totals.access_read_bytes += it->second;
+				g_totals.access_final_bytes += it->second;
+				it = window.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+	while (g_awaiting.size() > 1) {
+		for (const auto& [index, bytes]: g_awaiting.front()) {
+			(void)index;
+			g_totals.access_unread_bytes += bytes;
+			g_totals.access_final_bytes += bytes;
+		}
+		g_awaiting.erase(g_awaiting.begin());
+	}
+}
+
+void Print(double seconds, uint64_t frames) {
+	const auto& t  = g_totals;
+	const auto  kb = [seconds](uint64_t bytes) { return static_cast<double>(bytes) / 1024.0 / seconds; };
+	std::printf("BDASTATS frames_s=%.1f uploads_s=%.0f kb_s=%.0f pages_s=%.0f pages_per_frame=%.0f "
+	            "repeat_in_frame_pages_s=%.0f src_invalidate_kb_s=%.0f src_cpuwrite_kb_s=%.0f "
+	            "src_newbuf_kb_s=%.0f src_map_kb_s=%.0f src_none_kb_s=%.0f",
+	            static_cast<double>(frames) / seconds, static_cast<double>(t.uploads) / seconds,
+	            kb(t.bytes), static_cast<double>(t.pages) / seconds,
+	            frames != 0 ? static_cast<double>(t.pages) / static_cast<double>(frames) : 0.0,
+	            static_cast<double>(t.repeat_pages) / seconds, kb(t.source_bytes[0]),
+	            kb(t.source_bytes[1]), kb(t.source_bytes[2]), kb(t.source_bytes[3]),
+	            kb(t.source_bytes[4]));
+	const auto compared = t.sampled - t.sampled_first;
+	const auto per      = [compared](uint64_t v) {
+        return compared != 0 ? static_cast<double>(v) / static_cast<double>(compared) : 0.0;
+	};
+	std::printf(" | sampled=%llu first=%llu changed_bytes_per_page=%.0f changed_lines_per_page=%.1f "
+	            "span_per_page=%.0f lines_hist=%llu/%llu/%llu/%llu/%llu/%llu",
+	            static_cast<unsigned long long>(t.sampled),
+	            static_cast<unsigned long long>(t.sampled_first), per(t.changed_bytes),
+	            per(t.changed_lines), per(t.span_bytes),
+	            static_cast<unsigned long long>(t.line_hist[0]),
+	            static_cast<unsigned long long>(t.line_hist[1]),
+	            static_cast<unsigned long long>(t.line_hist[2]),
+	            static_cast<unsigned long long>(t.line_hist[3]),
+	            static_cast<unsigned long long>(t.line_hist[4]),
+	            static_cast<unsigned long long>(t.line_hist[5]));
+	std::printf(" | consumed_kb_s=%.0f superseded_kb_s=%.0f unknown_kb=%llu unconsumed_pages=%zu",
+	            kb(t.consumed_bytes), kb(t.superseded_bytes),
+	            static_cast<unsigned long long>(t.unknown_bytes / 1024), g_unconsumed.size());
+	if (MemDiag::BdaStatsMode() == 2) {
+		std::printf(" | shaders=%llu bits=%llu", static_cast<unsigned long long>(MemDiag::g_bda_access_shaders.load()),
+		            static_cast<unsigned long long>(t.access_bits));
+		std::printf(" | access_final_kb=%llu read_kb=%llu unread_kb=%llu",
+		            static_cast<unsigned long long>(t.access_final_bytes / 1024),
+		            static_cast<unsigned long long>(t.access_read_bytes / 1024),
+		            static_cast<unsigned long long>(t.access_unread_bytes / 1024));
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+} // namespace
+} // namespace BdaStats
+
+void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
 	m_bda_sync.Add(begin, end - begin);
+	if (MemDiag::BdaStatsMode() != 0) {
+		BdaStats::g_queued[static_cast<int>(source)].Add(begin, end - begin);
+	}
 }
 
 RangeSet BufferCache::TakeBdaSync() {
 	std::lock_guard lock(m_bda_sync_mutex);
+	if (MemDiag::BdaStatsMode() != 0) {
+		for (int k = 0; k < BdaStats::SOURCES; k++) {
+			BdaStats::g_taken[k] = std::exchange(BdaStats::g_queued[k], {});
+		}
+	}
 	return std::exchange(m_bda_sync, {});
+}
+
+void BufferCache::BdaStatsTick() {
+	using Clock = std::chrono::steady_clock;
+	static Clock::time_point last        = Clock::now();
+	static uint64_t          last_frames = MemDiag::g_flips.load(std::memory_order_relaxed);
+	const auto               now         = Clock::now();
+	if (now - last < std::chrono::seconds(1)) {
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - last).count();
+	const auto   frames  = MemDiag::g_flips.load(std::memory_order_relaxed);
+	last                 = now;
+	{
+		// Cap the tracking map; its unresolved bytes are reported as unknown in this line.
+		std::lock_guard lock(BdaStats::g_unconsumed_mutex);
+		if (BdaStats::g_unconsumed.size() > (1u << 22u)) {
+			for (const auto& [page, bytes]: BdaStats::g_unconsumed) {
+				(void)page;
+				BdaStats::g_totals.unknown_bytes += bytes;
+			}
+			BdaStats::g_unconsumed.clear();
+		}
+	}
+	BdaStats::Print(seconds, frames - last_frames);
+	last_frames       = frames;
+	BdaStats::g_totals = {};
+	if (BdaStats::g_pages.size() > (1u << 22u)) {
+		BdaStats::g_pages.clear();
+	}
+	if (MemDiag::BdaStatsMode() != 2 || BdaStats::g_access_pending) {
+		return;
+	}
+	// Copy the access bitmap (the fault buffer's second half) out and clear it.
+	constexpr uint64_t bitmap_size = CACHING_NUMPAGES / 8;
+	if (m_bda_access_download == nullptr) {
+		m_bda_access_download = std::make_unique<Buffer>(m_graphics, m_scheduler,
+		                                                 MemoryUsage::Download, 0, AllFlags, bitmap_size);
+	}
+	auto*      fault   = m_fault_manager.GetFaultBuffer();
+	auto&      command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	const vk::MemoryBarrier before {
+	    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	    .dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite};
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1, &before,
+	                       0, nullptr, 0, nullptr);
+	const vk::BufferCopy copy {bitmap_size, 0, bitmap_size};
+	native.copyBuffer(fault->Handle(), m_bda_access_download->Handle(), 1, &copy);
+	const vk::MemoryBarrier to_host {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+	                                 .dstAccessMask = vk::AccessFlagBits::eHostRead};
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                       vk::DependencyFlags {}, 1, &to_host, 0, nullptr, 0, nullptr);
+	const vk::MemoryBarrier between {.srcAccessMask = vk::AccessFlagBits::eTransferRead,
+	                                 .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1, &between,
+	                       0, nullptr, 0, nullptr);
+	native.fillBuffer(fault->Handle(), bitmap_size, bitmap_size, 0);
+	const vk::MemoryBarrier after {
+	    .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+	    .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlags {}, 1, &after,
+	                       0, nullptr, 0, nullptr);
+	BdaStats::g_awaiting.push_back(std::exchange(BdaStats::g_window, {}));
+	BdaStats::g_access_pending = true;
+	m_scheduler.DeferOperation([this] {
+		auto& download = *m_bda_access_download;
+		download.Invalidate(0, download.Size());
+		BdaStats::NoteAccessBitmap(reinterpret_cast<const uint32_t*>(download.Mapped().data()));
+		BdaStats::g_access_pending = false;
+	});
 }
 
 void BufferCache::BeginUploadBatch() {

@@ -1262,6 +1262,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	if (MemDiag::BdaStatsMode() != 0) {
+		MemDiag::g_flips.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);

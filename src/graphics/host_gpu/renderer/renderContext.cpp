@@ -267,7 +267,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.QueueBdaSync(vaddr, size);
+	m_buffer_cache.QueueBdaSync(vaddr, size, BufferCache::BdaSource::Map);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -504,6 +504,9 @@ void RenderContext::PrepareBda() {
 		});
 	});
 	m_buffer_cache.EndUploadBatch();
+	if (MemDiag::BdaStatsMode() != 0) {
+		m_buffer_cache.BdaStatsTick();
+	}
 	m_fault_process_pending = true;
 }
 
