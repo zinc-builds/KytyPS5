@@ -1787,6 +1787,33 @@ static bool StencilSubresources(const ImageInfo& image, const ImageInfo& target,
 	return true;
 }
 
+bool TextureCache::ColorTargetSettled(const Image& image) const {
+	return (image.settled.load(std::memory_order_acquire) & Image::SettledTarget) != 0 &&
+	       image.registered && !image.depth_id && !image.binding.needs_rebind;
+}
+
+bool TextureCache::DepthTargetSettled(ImageId id, const ImageDesc& desc) {
+	auto& image = m_slot_images[id];
+	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		return false;
+	}
+	if (!desc.info.HasStencil()) {
+		return (image.settled.load(std::memory_order_acquire) & Image::SettledWrite) != 0;
+	}
+	if (StencilTargetFastMode() == 0 ||
+	    (image.target_settled.load(std::memory_order_acquire) & 1u) == 0 ||
+	    image.info.stencil != desc.info.stencil) {
+		return false;
+	}
+	const auto*           stencil = m_slot_images.try_get(image.target_stencil_id);
+	ImageSubresourceRange subresources;
+	return stencil != nullptr && (stencil->target_settled.load(std::memory_order_acquire) & 1u) != 0 &&
+	       stencil->depth_id == id && stencil->info.data == desc.info.stencil &&
+	       stencil->stencil_subresources == image.stencil_subresources &&
+	       StencilSubresources(image.info, desc.info, subresources) &&
+	       subresources == image.stencil_subresources;
+}
+
 // Under m_lock: whether FindDepthTarget's slow path would change nothing for this depth+stencil
 // image and its stencil plane.
 bool TextureCache::StencilTargetSettled(const Image& depth, ImageId stencil_id) {

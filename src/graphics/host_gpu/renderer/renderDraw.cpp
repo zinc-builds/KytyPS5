@@ -452,12 +452,129 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+int RenderExecutor::RunStateMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_RUN_STATE");
+		if (value == nullptr || value[0] == '\0') {
+			return 1;
+		}
+		if (std::strcmp(value, "verify") == 0) {
+			return 2;
+		}
+		return value[0] == '0' ? 0 : 1;
+	}();
+	return mode;
+}
+
+RenderExecutor::RunEpochs RenderExecutor::CurrentRunEpochs() const {
+	auto& texture_cache = m_context.GetTextureCache();
+	return {GuestSyncEpoch::g_epoch.load(std::memory_order_acquire), DrawPrepare::HazardGeneration(),
+	        m_context.GetBufferCache().ColorChecksGeneration(), texture_cache.BindingEpoch(),
+	        texture_cache.GcTick()};
+}
+
+// The run path of AcquireRenderTargets: the same targets as the previous draw, each still
+// acquired as it left them (settled, so FindRenderTarget/FindDepthTarget would only find the view;
+// in the layout and access it set, so Transit records nothing; bound as a texture by this draw
+// exactly when by that one, so the layouts are the same), no depth or stencil clear, no HTile
+// clear to consume, and every stage keeping its binding set (the same sampled depth aspects).
+bool RenderExecutor::TryRunTargets(RenderColorInfo* colors, uint32_t color_count,
+                                   RenderDepthInfo& depth, vk::ImageAspectFlags& feedback_aspects,
+                                   std::span<PreparedBindings* const> stages, RenderState& out) {
+	const auto& run   = m_run.targets;
+	auto&       cache = m_context.GetTextureCache();
+	if (color_count != run.color_count || depth.image_id != run.depth_id) {
+		return false;
+	}
+	for (const auto* stage: stages) {
+		if (!stage->reused && !stage->images.empty()) {
+			return false;
+		}
+	}
+	const auto attachment_access =
+	    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	for (uint32_t i = 0; i < color_count; i++) {
+		const auto& target = colors[i];
+		if (target.image_id != run.color_ids[i] || target.target_slot != run.color_slots[i]) {
+			return false;
+		}
+		const auto& image = cache.GetImage(target.image_id);
+		if (!cache.ColorTargetSettled(image) || image.binding.is_bound != run.color_bound[i] ||
+		    !image.backing.subresource_states.empty() ||
+		    image.backing.state.layout != run.color_layouts[i] ||
+		    image.backing.state.access_mask != attachment_access) {
+			return false;
+		}
+	}
+	if (depth.image_id) {
+		if (depth.depth_clear_enable || depth.stencil_clear_enable) {
+			return false;
+		}
+		const auto& metadata = depth.desc.info.metadata;
+		if (metadata.kind == ImageMetadataKind::Htile &&
+		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer)) {
+			return false;
+		}
+		const auto& image = cache.GetImage(depth.image_id);
+		if (!cache.DepthTargetSettled(depth.image_id, depth.desc) ||
+		    image.binding.is_bound != run.depth_bound || !image.backing.subresource_states.empty() ||
+		    image.backing.state.layout != run.depth_layout ||
+		    image.backing.state.access_mask != run.depth_access) {
+			return false;
+		}
+	}
+	// What the full path would set again.
+	for (uint32_t i = 0; i < color_count; i++) {
+		auto& image                     = cache.GetImage(colors[i].image_id);
+		image.binding.attachment_layout = run.color_layouts[i];
+		image.binding.attachment_access = attachment_access;
+		cache.TrackImageDownload(colors[i].image_id, image);
+	}
+	if (depth.image_id) {
+		auto& image                     = cache.GetImage(depth.image_id);
+		image.binding.attachment_layout = run.depth_layout;
+		image.binding.attachment_access = run.depth_access;
+		depth.load_clear_aspects        = {};
+	}
+	feedback_aspects = run.feedback;
+	out              = run.rendering;
+	return true;
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
+	if (RunTargetsValid()) {
+		RenderState run;
+		if (TryRunTargets(colors, color_count, depth, feedback_aspects, stages, run)) {
+			m_prepare_stat.run_targets++;
+			if (RunStateMode() == 2) {
+				const auto            depth_before = depth;
+				vk::ImageAspectFlags  feedback;
+				const auto            full = AcquireRenderTargetsFull(buffer, colors, color_count, depth,
+				                                                      feedback, stages);
+				if (!(full == run) || feedback != feedback_aspects ||
+				    depth.load_clear_aspects != depth_before.load_clear_aspects) {
+					EXIT("KYTY_RUN_STATE=verify: the previous draw's render targets differ\n");
+				}
+			}
+			m_run.targets.sequence = m_committing;
+			return run;
+		}
+	}
+	return AcquireRenderTargetsFull(buffer, colors, color_count, depth, feedback_aspects, stages);
+}
+
+RenderState RenderExecutor::AcquireRenderTargetsFull(CommandBuffer& buffer, RenderColorInfo* colors,
+                                                     uint32_t color_count, RenderDepthInfo& depth,
+                                                     vk::ImageAspectFlags& feedback_aspects,
+                                                     std::span<PreparedBindings* const> stages) {
 	feedback_aspects = {};
+	auto& run        = m_run.targets;
+	run.sequence     = 0;
+	run.slot_ids     = {};
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
@@ -476,9 +593,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+		run.color_bound[i] = image.binding.is_bound;
 		image.Transit(layout, image.binding.attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count});
+		run.color_ids[i]                  = target.image_id;
+		run.color_slots[i]                = target.target_slot;
+		run.color_layouts[i]              = layout;
+		run.slot_ids[target.target_slot]  = target.image_id;
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
@@ -543,8 +665,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    read_only ? vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead}
 		              : vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		run.depth_bound                 = image.binding.is_bound;
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
+		run.depth_layout                = layout;
+		run.depth_access                = access;
 		const auto& view                = depth.desc.view_info;
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
@@ -576,6 +701,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.width == std::numeric_limits<uint32_t>::max() ||
 	        state.height == std::numeric_limits<uint32_t>::max());
+	// For the next draw of a run (not after a clear: its load operation is this draw's only).
+	run.color_count = color_count;
+	run.depth_id    = depth.image_id;
+	run.rendering   = state;
+	run.feedback    = feedback_aspects;
+	run.sequence    = depth.load_clear_aspects ? 0 : m_committing;
 	return state;
 }
 
@@ -1505,6 +1636,11 @@ void RenderExecutor::FlushAtomicWrites(CommandBuffer& buffer) {
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
                                QueuedDraw* queued) {
 	KYTY_PROFILER_FUNCTION();
+	if (queued == nullptr) {
+		// A direct draw ends any run.
+		m_committing = 0;
+		m_run_ok     = false;
+	}
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -1603,6 +1739,10 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args,
                               QueuedDraw* queued) {
 	KYTY_PROFILER_FUNCTION();
+	if (queued == nullptr) {
+		m_committing = 0;
+		m_run_ok     = false;
+	}
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -1839,6 +1979,17 @@ void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 	queued.stored_sequence    = DrawPrepare::StoredSequence();
 	queued.gpu_write_sequence = DrawPrepare::GpuWriteSequence();
 	queued.sequence           = ++m_queued_posted;
+	// The previous queued draw's slot keeps its registers until the ring comes round again.
+	if (RunStateMode() != 0 && queued.sequence > 1) {
+		const auto& previous =
+		    *m_queued_draws[(queued.sequence - 2) % m_queued_draws.size()];
+		queued.same_registers =
+		    previous.sequence + 1 == queued.sequence &&
+		    std::memcmp(&previous.registers, &queued.registers, sizeof(queued.registers)) == 0 &&
+		    std::memcmp(&previous.user_config, &queued.user_config, sizeof(queued.user_config)) == 0;
+	} else {
+		queued.same_registers = false;
+	}
 	// The worker finds the slot from the sequence.
 	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||
 	        PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence));
@@ -2078,11 +2229,20 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	auto& user_config = *buffer.m_user_config;
 	auto& shaders     = *buffer.m_shaders;
 	buffer.Bind(queued.registers, queued.user_config, queued.shaders);
+	m_committing = sequence;
+	m_run_ok     = queued.same_registers && m_run.sequence != 0 && m_run.sequence + 1 == sequence &&
+	           m_run.epochs == CurrentRunEpochs();
+	m_prepare_stat.run_draws += m_run_ok ? 1 : 0;
 	if (queued.indexed) {
 		(void)DrawIndex(buffer, queued.index_args, &queued);
 	} else {
 		(void)DrawAuto(buffer, queued.auto_args, &queued);
 	}
+	// What the next draw of a run compares with.
+	m_run.sequence = RunStateMode() != 0 ? sequence : 0;
+	m_run.epochs   = CurrentRunEpochs();
+	m_run_ok       = false;
+	m_committing   = 0;
 	m_adopted_buffers  = nullptr;
 	m_adopted_textures = nullptr;
 	m_adopted_targets  = nullptr;
@@ -2117,7 +2277,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%"
 			            " hazard_gpu=%" PRIu64 " hazard_epoch=%" PRIu64
 			            " kept_by_ranged=%" PRIu64 " kept_by_gpu_range=%" PRIu64 " walker_pages=%.2f pages_hist=%" PRIu64 "/%" PRIu64
-			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " run=%.1f%% run_targets=%.1f%%\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
@@ -2134,7 +2294,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			                static_cast<double>(std::max<uint64_t>(stat.adopted, 1)),
 			            stat.page_buckets[0], stat.page_buckets[1], stat.page_buckets[2],
 			            stat.page_buckets[3], stat.page_buckets[4], stat.page_buckets[5],
-			            stat.page_buckets[6], stat.page_buckets[7]);
+			            stat.page_buckets[6], stat.page_buckets[7],
+			            100.0 * static_cast<double>(stat.run_draws) / draws,
+			            100.0 * static_cast<double>(stat.run_targets) / draws);
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;

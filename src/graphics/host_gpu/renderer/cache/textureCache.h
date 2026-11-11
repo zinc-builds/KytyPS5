@@ -207,6 +207,9 @@ private:
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	[[nodiscard]] bool StencilTargetSettled(const Image& depth, ImageId stencil_id);
+	// Whether FindRenderTarget / FindDepthTarget would only find the view (their fast paths).
+	[[nodiscard]] bool ColorTargetSettled(const Image& image) const;
+	[[nodiscard]] bool DepthTargetSettled(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] bool MaterializeColorClearSlices(ImageId id, const ImageDesc& desc,
 	                                              uint32_t metadata_base_layer, bool& memoizable);
 	void                        InitializeImage(ImageId id);

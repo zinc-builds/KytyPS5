@@ -474,6 +474,14 @@ void RenderExecutor::ResolveProposedDepthTarget(CommandBuffer&                 b
 		return; // no depth or stencil attachment
 	}
 	auto& texture_cache = m_context.GetTextureCache();
+	// A run keeps the previous draw's depth target (see ResolveProposedColorTarget).
+	const bool run = record->resolved && RunTargetsValid() &&
+	                 m_run.targets.depth_id == record->image_id && r.image_id == record->image_id;
+	if (run && RunStateMode() != 2) {
+		BindRenderTarget(r.image_id);
+		return;
+	}
+	const auto run_id = record->image_id;
 	if (record->resolved) {
 		const auto& found       = record->desc;
 		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
@@ -510,6 +518,10 @@ void RenderExecutor::ResolveProposedDepthTarget(CommandBuffer&                 b
 			m_depth_updates.push_back(std::move(update));
 		}
 	}
+	if (run && r.image_id != run_id) {
+		EXIT("KYTY_RUN_STATE=verify: the depth target of a run is image %u, not %u\n",
+		     static_cast<uint32_t>(r.image_id.index), static_cast<uint32_t>(run_id.index));
+	}
 	if (WorkerTargetsVerify()) {
 		const auto&     hw = buffer.GetRegisters();
 		RenderDepthInfo check;
@@ -539,6 +551,17 @@ void RenderExecutor::ResolveProposedColorTarget(CommandBuffer&                 b
 		return; // no color output: r is unbound
 	}
 	auto& texture_cache = m_context.GetTextureCache();
+	// A run keeps the previous draw's target: the same registers, so the same record contents,
+	// and no image registered, unregistered or collected since (RunEpochs), so RefindExactImage
+	// would find it again; its color clear would find nothing to do either (the memo's epochs).
+	const bool run = record->resolved && RunTargetsValid() && slot < RENDER_COLOR_ATTACHMENTS_MAX &&
+	                 m_run.targets.slot_ids[slot] == record->info.image_id &&
+	                 r.image_id == record->info.image_id;
+	if (run && RunStateMode() != 2) {
+		BindRenderTarget(r.image_id);
+		return;
+	}
+	const auto run_id = record->info.image_id;
 	if (record->resolved) {
 		const auto& found       = record->info.desc;
 		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
@@ -576,6 +599,12 @@ void RenderExecutor::ResolveProposedColorTarget(CommandBuffer&                 b
 			update->generation          = generation;
 			m_target_updates.push_back(std::move(update));
 		}
+	}
+	// (A stale worker record resolves again to the same image and is handed back refreshed; the
+	// run path keeps the image and leaves the record as it is.)
+	if (run && r.image_id != run_id) {
+		EXIT("KYTY_RUN_STATE=verify: color target slot %u of a run is image %u, not %u\n", slot,
+		     static_cast<uint32_t>(r.image_id.index), static_cast<uint32_t>(run_id.index));
 	}
 	if (WorkerTargetsVerify()) {
 		const auto& hw   = buffer.GetRegisters();

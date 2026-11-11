@@ -378,6 +378,8 @@ private:
 		std::vector<std::unique_ptr<WorkerDepthTargetRecord>> depth_updates;
 		// The pipeline key the worker built from its programs and proposed targets.
 		WorkerPipelineKey pipeline_key;
+		// Its context and user-config registers equal the previous queued draw's (run state).
+		bool same_registers = false;
 	};
 	// The worker's pipeline key for the queued draw being committed, if its programs were adopted.
 	const WorkerPipelineKey* m_adopted_pipeline_key = nullptr;
@@ -568,6 +570,55 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
+	[[nodiscard]] RenderState AcquireRenderTargetsFull(CommandBuffer& buffer, RenderColorInfo* colors,
+	                                                   uint32_t color_count, RenderDepthInfo& depth,
+	                                                   vk::ImageAspectFlags& feedback_aspects,
+	                                                   std::span<PreparedBindings* const> stages);
+
+	// Run state (KYTY_RUN_STATE=0 turns it off, =verify runs the full path as well and compares):
+	// what a queued draw may keep from the draw committed just before it. RunValid holds when its
+	// context and user-config registers equal that draw's, nothing drew in between, and none of
+	// RunEpochs moved since that draw finished: then the texture cache registered, unregistered
+	// and collected no image (binding epoch, GC tick), the guest synchronized with no queued work
+	// (guest-sync epoch), the GPU wrote no new buffer range (hazard generation) and no color
+	// metadata check was forgotten. Each use checks what else it needs (image state, settled
+	// flags, pending metadata clears) itself; see FINDINGS "Run-level commit".
+	struct RunEpochs {
+		uint64_t sync = 0, hazard = 0, color_checks = 0, binding = 0, gc = 0;
+		bool     operator==(const RunEpochs&) const = default;
+	};
+	// The previous draw's render targets, as AcquireRenderTargets left them.
+	struct RunTargets {
+		uint64_t                                                 sequence    = 0; // 0: none
+		uint32_t                                                 color_count = 0;
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX>        color_ids {};
+		std::array<uint32_t, RENDER_COLOR_ATTACHMENTS_MAX>       color_slots {};
+		std::array<bool, RENDER_COLOR_ATTACHMENTS_MAX>           color_bound {};
+		std::array<vk::ImageLayout, RENDER_COLOR_ATTACHMENTS_MAX> color_layouts {};
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX>        slot_ids {}; // by target slot
+		ImageId                                                  depth_id {};
+		bool                                                     depth_bound = false;
+		vk::ImageLayout                                          depth_layout {};
+		vk::AccessFlags2                                         depth_access {};
+		RenderState                                              rendering {};
+		vk::ImageAspectFlags                                     feedback {};
+	};
+	struct RunState {
+		uint64_t   sequence = 0; // the queued draw RunTargets and epochs belong to
+		RunEpochs  epochs;
+		RunTargets targets;
+	};
+	RunState m_run;
+	bool     m_run_ok     = false; // the draw being committed continues the run
+	uint64_t m_committing = 0;     // its queue sequence (0: a direct draw)
+	[[nodiscard]] static int RunStateMode();
+	[[nodiscard]] RunEpochs  CurrentRunEpochs() const;
+	[[nodiscard]] bool       RunTargetsValid() const {
+		return m_run_ok && m_run.targets.sequence != 0 && m_run.targets.sequence + 1 == m_committing;
+	}
+	[[nodiscard]] bool TryRunTargets(RenderColorInfo* colors, uint32_t color_count,
+	                                 RenderDepthInfo& depth, vk::ImageAspectFlags& feedback_aspects,
+	                                 std::span<PreparedBindings* const> stages, RenderState& out);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
 	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
 	void                      BindImage(ImageId id, bool storage);
@@ -690,6 +741,7 @@ private:
 		uint64_t texture_updates = 0; // resolves handed back for the workers' memo
 		uint64_t texture_generation_refreshes = 0; // adopted records whose page check ran again
 		uint64_t binding_sets = 0, binding_reuses = 0; // stage binding sets, and those reused
+		uint64_t run_draws = 0, run_targets = 0; // draws in a run, and those keeping the targets
 	} m_prepare_stat;
 
 	friend class CommandProcessor;
