@@ -50,6 +50,18 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   builds instead of building your merge-base yourself, and call it before `batch.sh`, not inside:
   `ref=$(tools/astro-bench/refbuild.sh "$(git merge-base HEAD origin/dev)")`, then a batch line
   `ref1 KYTY_INSTALL=$ref -- --amd-cpu`.
+- **Build modes** (`KYTY_BUILD_MODE`, `buildmode.sh`): `plain` (default), `lto` (ThinLTO),
+  `pgo` (ThinLTO + PGO with `KYTY_PGO_PROFILE`, the fast build: ~+12% FPS) and `pgogen`
+  (instrumented). `refbuild.sh` keys its cache on the mode and the profile's hash
+  (`<sha>-pgo-<hash12>/`), so plain and PGO installs never mix. A/B protocol, retrain rule and
+  measured times: "Build modes" in `docs/mt-rewrite/PLAN-60fps.md`.
+  - `build.sh [target]` — builds this checkout in the mode into `_Build/linux` (plain) or
+    `_Build/linux-<mode>`, installs it there (`…/install`, save and shader cache copied in) and
+    prints the install dir: the other side of a `refbuild.sh` A/B.
+  - `pgo-train.sh [commit]` — trains a profile for a commit (default `origin/dev`): instrumented
+    refbuild, a warm-up run and a `KYTY_PGO_DUMP` garden run under one exclusive hold, then
+    `llvm-profdata merge` into `~/.cache/kyty-pgo/<sha>.profdata` (printed). One trainer per
+    commit; `current.profdata` follows `origin/dev`.
 - Builds use **ccache** (`/usr/bin/ccache`, shared cache with `base_dir = /home/tomm` in
   `~/.config/ccache/ccache.conf`, so worktrees under `$HOME` share entries; a full build drops from
   ~107 s to ~28 s on hits). A build dir configured before ccache was installed cached

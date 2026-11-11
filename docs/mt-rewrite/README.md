@@ -42,3 +42,25 @@ is never pushed to and never receives PRs from here.
   `cmake --install _Build/linux --prefix _Build/linux/install`.
 - The user plays from a separate checkout (`~/AI/emu/KytyPS5`, launcher installed from there);
   never install into or rebuild that one, and never run benchmarks while they are playing.
+
+## Building the fast binary (PGO + ThinLTO)
+
+The play build gains ~12% FPS in Sky Garden from profile-guided optimization plus ThinLTO (see
+"Build modes" in `PLAN-60fps.md`). In a checkout of `dev`, in its own build dir:
+
+```bash
+prof=$(readlink -e ~/.cache/kyty-pgo/current.profdata)   # a profile trained on a recent dev commit
+cmake -S . -B _Build/linux-pgo -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ -DKYTY_LTO=thin -DKYTY_PGO=use -DKYTY_PGO_PROFILE="$prof"
+cmake --build _Build/linux-pgo --target launcher kyty_emulator
+cmake --install _Build/linux-pgo --prefix _Build/linux-pgo/install
+```
+
+- A profile from an older commit still works: code changed since then just gets no counts. To
+  train one for a commit yourself, `tools/astro-bench/pgo-train.sh <commit>` (~5 minutes; it runs
+  the Sky Garden bench, so not while playing).
+- The profile comes from Sky Garden's first 1,600 frames only, and other levels are unmeasured.
+  Code the profile saw rarely is laid out and optimized as cold, so a level that leans on other
+  paths may gain less, or in the worst case run slower than a plain build. If a level seems
+  slow, compare it with a plain build of the same commit.
+- `tools/astro-bench/build.sh` does the same for `kyty_emulator` alone (`KYTY_BUILD_MODE=pgo`).

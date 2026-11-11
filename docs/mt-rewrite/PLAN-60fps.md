@@ -223,6 +223,61 @@ step 1 comes first.
   its cache lookup around preparation.
 - **Record progress.** Add a row to the FINDINGS.md progress table for every merged gain (on a
   conflict, rebase and keep both rows). Update your track's status line below.
+- **Build modes.** Both sides of an A/B use the same `KYTY_BUILD_MODE` and, in `pgo` mode, the
+  same profile file: pin it once with `export KYTY_PGO_PROFILE=$(readlink -e
+  ~/.cache/kyty-pgo/current.profdata)` before `refbuild.sh` and `build.sh` (protocol below).
+
+### Build modes: PGO + ThinLTO (Track P, 2026-11-11)
+
+PGO + ThinLTO is worth +12% FPS on `dev` with no source change (plain 49.29 / 48.56, PGO+LTO
+55.04 / 54.76, same batch). The tools build any commit or checkout in one of four modes
+(`KYTY_BUILD_MODE`, `tools/astro-bench/buildmode.sh`): `plain` (default), `lto`, `pgo` (ThinLTO +
+`-fprofile-use=$KYTY_PGO_PROFILE`) and `pgogen` (instrumented). CMake: `-DKYTY_LTO=thin`,
+`-DKYTY_PGO=generate|use`, `-DKYTY_PGO_PROFILE=<file>`; all off by default. Relinks share a ThinLTO
+cache in `~/.cache/kyty-thinlto`.
+
+**A/B in pgo mode:**
+
+```bash
+export KYTY_BUILD_MODE=pgo KYTY_PGO_PROFILE=$(readlink -e ~/.cache/kyty-pgo/current.profdata)
+ref=$(tools/astro-bench/refbuild.sh "$(git merge-base HEAD origin/dev)")  # ~/.cache/kyty-builds/<sha>-pgo-<hash>/install
+new=$(tools/astro-bench/build.sh)                                         # _Build/linux-pgo/install
+printf '%s\n' "ref1 KYTY_INSTALL=$ref -- --amd-cpu" "new1 KYTY_INSTALL=$new -- --amd-cpu" \
+  "ref2 KYTY_INSTALL=$ref -- --amd-cpu" "new2 KYTY_INSTALL=$new -- --amd-cpu" | tools/astro-bench/batch.sh
+```
+
+- Same mode and same profile file on both sides, always. `refbuild.sh` keys its cache on the mode
+  and the profile's hash, both scripts print `mode=pgo … sha256=<hash>`, and each install dir has a
+  `BUILD_MODE` file next to it: check the two hashes match before reading the numbers.
+- A shared profile is fine for A/Bs; there is no need to retrain per side. It was trained on the
+  merge-base, so a branch's new code runs without counts, but measured on #83 (+1.8% on plain
+  builds) that cost nothing: #83 with the `dev` profile 54.83 FPS, with a profile retrained on #83
+  itself 54.70 (4 runs each, standard error ~0.3; FINDINGS "Build modes"). For a branch that adds
+  a lot of new hot code, check once: train its own profile (`pgo-train.sh HEAD`) and compare the
+  branch built with it against the branch built with the shared one.
+- Retrain after hot-path merges to `dev` (anything on the command thread, the prepare workers or
+  the guest-memory paths): whoever merges runs `tools/astro-bench/pgo-train.sh origin/dev` after
+  `git fetch`; `current.profdata` then moves to the new `dev` commit. A retrain takes ~5 minutes
+  of machine time: the instrumented build, 2.5–3.5 min (153 s cold in a build dir, 209 s as a
+  `refbuild.sh` of a new commit while other builds ran), then a warm-up run and the training run,
+  ~1¾ min under the exclusive lock (the instrumented build runs at ~31 FPS), and seconds to merge.
+  Lock waits come on top.
+- Prefer the pgo-mode A/B for merge decisions: that is the build the user plays, and gains sized
+  on plain builds shrink on it (14–26% in the research measurements; #83's +1.8% on plain read
+  +0.1% on PGO). A plain A/B is still fine for quick iteration.
+- Build times (one changed `.cpp` is `renderDraw.cpp`; wall time without lock waits):
+
+  | Build | Cold (no ccache) | Incremental | Fresh dir, ccache warm |
+  |---|---|---|---|
+  | plain | 146 s | 7 s | 111 s (`refbuild.sh`, worktree setup included) |
+  | pgogen (instrumented) | 153 s | 6 s | 209 s (`refbuild.sh` of a new commit) |
+  | pgo (ThinLTO + PGO) | 141 s (link 17 s) | 7 s (relink ~2 s from the cache) | 202 s with a new profile, 22 s for `build.sh` after `refbuild.sh` with the same profile |
+
+  A new profile changes every compile command, so the first build with it recompiles everything;
+  `refbuild.sh` and `build.sh` with the same profile then share ccache entries.
+- The profile is trained on Sky Garden frames 0–1600 only. Other levels run code paths it saw
+  rarely or never, so a play build may gain less there (see "Building the fast binary" in
+  `docs/mt-rewrite/README.md`).
 
 ## Bench metrics and A/B (Track T, 2026-11-11)
 
