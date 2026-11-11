@@ -48,6 +48,79 @@ function(clang_tidy_check target config headers dirs)
   endif()
 endfunction()
 
+# Optional whole-program builds, off by default (plain builds are unchanged). Clang with lld only.
+#   KYTY_LTO=thin         ThinLTO; relinks reuse a ThinLTO cache shared by every build dir.
+#   KYTY_PGO=generate     instrumented build for tools/astro-bench/pgo-train.sh (KYTY_PGO_DUMP).
+#   KYTY_PGO=use          optimize with KYTY_PGO_PROFILE (an llvm-profdata .profdata file).
+# The flags apply to every target, 3rd-party code included. tools/astro-bench/build.sh and
+# refbuild.sh set them through KYTY_BUILD_MODE; see "Build modes" in docs/mt-rewrite/PLAN-60fps.md.
+macro(config_lto_pgo)
+
+set(KYTY_LTO "OFF" CACHE STRING "Link-time optimization: OFF or thin")
+set_property(CACHE KYTY_LTO PROPERTY STRINGS OFF thin)
+set(KYTY_PGO "OFF" CACHE STRING "Profile-guided optimization: OFF, generate or use")
+set_property(CACHE KYTY_PGO PROPERTY STRINGS OFF generate use)
+set(KYTY_PGO_PROFILE "" CACHE FILEPATH "Profile for KYTY_PGO=use (.profdata)")
+set(KYTY_LTO_CACHE_DIR "$ENV{HOME}/.cache/kyty-thinlto" CACHE PATH "ThinLTO cache shared by all build dirs")
+set(KYTY_LTO_CACHE_POLICY "cache_size_bytes=8g:prune_after=168h" CACHE STRING "lld --thinlto-cache-policy")
+set(KYTY_LTO_JOBS "8" CACHE STRING "ThinLTO backend threads at link time (the machine is shared)")
+
+string(TOLOWER "${KYTY_LTO}" kyty_lto)
+string(TOLOWER "${KYTY_PGO}" kyty_pgo)
+if(kyty_lto MATCHES "^(|off|no|false|0)$")
+	set(kyty_lto off)
+endif()
+if(kyty_pgo MATCHES "^(|off|no|false|0)$")
+	set(kyty_pgo off)
+endif()
+
+set(kyty_lto_pgo_flags "")
+if(NOT kyty_lto STREQUAL "off" OR NOT kyty_pgo STREQUAL "off")
+	if(NOT CLANG OR KYTY_CLANG_CL OR NOT KYTY_LINKER STREQUAL "LLD")
+		message(FATAL_ERROR "KYTY_LTO and KYTY_PGO need Clang with lld")
+	endif()
+endif()
+
+if(kyty_lto STREQUAL "thin")
+	string(APPEND kyty_lto_pgo_flags " -flto=thin")
+	# Every link (tests too) reads bitcode, so every link needs lld.
+	add_link_options(-fuse-ld=lld -flto=thin
+		"-Wl,--thinlto-cache-dir=${KYTY_LTO_CACHE_DIR}"
+		"-Wl,--thinlto-cache-policy=${KYTY_LTO_CACHE_POLICY}"
+		"-Wl,--thinlto-jobs=${KYTY_LTO_JOBS}")
+	message(STATUS "ThinLTO on, cache ${KYTY_LTO_CACHE_DIR}")
+elseif(NOT kyty_lto STREQUAL "off")
+	message(FATAL_ERROR "KYTY_LTO must be OFF or thin, not '${KYTY_LTO}'")
+endif()
+
+if(kyty_pgo STREQUAL "generate")
+	string(APPEND kyty_lto_pgo_flags " -fprofile-generate")
+	add_link_options(-fprofile-generate)
+	message(STATUS "PGO: instrumented build")
+elseif(kyty_pgo STREQUAL "use")
+	if(NOT EXISTS "${KYTY_PGO_PROFILE}" OR IS_DIRECTORY "${KYTY_PGO_PROFILE}")
+		message(FATAL_ERROR "KYTY_PGO=use needs KYTY_PGO_PROFILE=<file.profdata>; got '${KYTY_PGO_PROFILE}'")
+	endif()
+	# Compile against a copy named by the profile's content: a new profile changes every compile
+	# command, so Ninja rebuilds (it does not track the profile itself), and a moved `current`
+	# link or a profile rewritten in place re-runs CMake (configure_file depends on its input).
+	file(SHA256 "${KYTY_PGO_PROFILE}" kyty_pgo_hash)
+	string(SUBSTRING "${kyty_pgo_hash}" 0 12 KYTY_PGO_PROFILE_HASH)
+	set(kyty_pgo_copy "${CMAKE_BINARY_DIR}/pgo-${KYTY_PGO_PROFILE_HASH}.profdata")
+	configure_file("${KYTY_PGO_PROFILE}" "${kyty_pgo_copy}" COPYONLY)
+	# Code newer than the profile has no counts; that is expected, not a warning.
+	string(APPEND kyty_lto_pgo_flags " -fprofile-use=${kyty_pgo_copy}"
+		" -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin")
+	message(STATUS "PGO: profile ${KYTY_PGO_PROFILE} (${KYTY_PGO_PROFILE_HASH})")
+elseif(NOT kyty_pgo STREQUAL "off")
+	message(FATAL_ERROR "KYTY_PGO must be OFF, generate or use, not '${KYTY_PGO}'")
+endif()
+
+string(APPEND KYTY_CPP_FLAGS "${kyty_lto_pgo_flags}")
+string(APPEND KYTY_C_FLAGS "${kyty_lto_pgo_flags}")
+
+endmacro()
+
 macro(config_compiler_and_linker)
 
 set(KYTY_WARNINGS_ARE_ERRORS OFF)
@@ -118,8 +191,10 @@ elseif(CLANG OR GCC)
 	unset(CMAKE_C_STANDARD_LIBRARIES CACHE)
 	
 	set(KYTY_C_FLAGS "${KYTY_CPP_FLAGS}")
-	
+
 endif()
+
+config_lto_pgo()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${KYTY_C_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KYTY_CPP_FLAGS}")
