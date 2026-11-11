@@ -288,13 +288,31 @@ public:
 	// outside the command processor's packet loop. KYTY_PREPARE_THREAD=0 draws at once instead.
 	void QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	void QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
-	void FinishQueuedDraws(CommandBuffer& buffer) {
+	// Why the queue drains (KYTY_DRAIN_STATS=1): a PM4 opcode (0..255), 512 + the R code of an
+	// emulator NOP, or one of these.
+	enum DrainReason : uint32_t {
+		DrainEndOfLoop     = 256, // the packet loop returns (end of submission, or blocked)
+		DrainGuestCommands = 257, // guest commands pending (readbacks, unmaps)
+		DrainAsyncCollect  = 258, // async writes collected before a kept packet
+		DrainNumInstances  = 259, // a draw reads NUM_INSTANCES from guest memory
+		DrainDirectDraw    = 260, // a draw that cannot be queued
+		DrainReasons       = 768,
+	};
+	void FinishQueuedDraws(CommandBuffer& buffer, uint32_t reason = DrainDirectDraw) {
 		if (m_queued_count == 0) {
 			return;
 		}
 		m_prepare_stat.drains++;
+		m_drain_reason = reason < DrainReasons ? reason : DrainDirectDraw;
+		m_draining     = true;
 		while (m_queued_count != 0) {
 			FinishQueuedDraw(buffer);
+		}
+		m_draining = false;
+		// The draws posted next refill the queue: their waits are this drain's refill cost.
+		m_refill_until = m_queued_posted + m_queued_draws.size() - 1;
+		if (m_drain_stats) {
+			m_drain_stat.count[m_drain_reason]++;
 		}
 	}
 	[[nodiscard]] bool HasQueuedDraw() const { return m_queued_count != 0; }
@@ -633,6 +651,19 @@ private:
 	uint32_t                                         m_queued_count  = 0; // posted, not committed
 	bool                                             m_prepare_verify = false;
 	bool                                             m_prepare_stats  = false;
+	// KYTY_DRAIN_STATS=1: DRAIN lines, the queue drains by reason and the prepare waits each
+	// causes (while draining, and refilling the queue after it).
+	bool                                             m_drain_stats    = false;
+	bool                                             m_draining       = false;
+	uint32_t                                         m_drain_reason   = 0;
+	uint64_t                                         m_refill_until   = 0;
+	struct DrainStats {
+		std::array<uint64_t, 768> count {}, drain_wait {}, refill_wait {};
+		uint64_t steady_wait = 0, start_ns = 0;
+	};
+	std::unique_ptr<DrainStats> m_drain_stat_storage = std::make_unique<DrainStats>();
+	DrainStats&                 m_drain_stat         = *m_drain_stat_storage;
+	void                        PrintDrainStats();
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
 		uint64_t stored = 0;

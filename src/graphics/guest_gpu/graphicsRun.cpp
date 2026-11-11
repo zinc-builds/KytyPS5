@@ -591,7 +591,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 
 	ProcessPm4(execution);
 	// Nothing stays queued past the packet loop.
-	m_renderer.GetRenderExecutor().FinishQueuedDraws(CurrentBuffer());
+	m_renderer.GetRenderExecutor().FinishQueuedDraws(CurrentBuffer(),
+	                                                 RenderExecutor::DrainEndOfLoop);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -733,7 +734,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (g_gpu_state != nullptr) {
 			// Guest commands (readbacks, unmaps) see every draw before them committed.
 			if (executor.HasQueuedDraw() && g_gpu_state->HasPendingCommands()) {
-				executor.FinishQueuedDraws(CurrentBuffer());
+				executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainGuestCommands);
 			}
 			g_gpu_state->ProcessCommands();
 		}
@@ -776,7 +777,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (executor.HasQueuedDraw() &&
 		    (!KeepsQueuedDraw(packet_header) ||
 		     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
-			executor.FinishQueuedDraws(CurrentBuffer());
+			uint32_t reason = RenderExecutor::DrainAsyncCollect;
+			if (!KeepsQueuedDraw(packet_header)) {
+				reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
+			}
+			executor.FinishQueuedDraws(CurrentBuffer(), reason);
 		}
 		if (!DefersAsyncCollect(packet_header)) {
 			m_renderer.CollectAsyncWritesIfRequested();
@@ -917,7 +922,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
 			// Reads guest memory a queued draw may write.
-			executor.FinishQueuedDraws(CurrentBuffer());
+			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
 	}
@@ -1080,7 +1085,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
-			executor.FinishQueuedDraws(CurrentBuffer());
+			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
 	}
