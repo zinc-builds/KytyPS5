@@ -236,19 +236,19 @@ PGO + ThinLTO is worth +12% FPS on `dev` with no source change (plain 49.29 / 48
 `-DKYTY_PGO=generate|use`, `-DKYTY_PGO_PROFILE=<file>`; all off by default. Relinks share a ThinLTO
 cache in `~/.cache/kyty-thinlto`.
 
-**A/B in pgo mode:**
+**A/B in pgo mode** (`ab.sh` and `gate.sh`, "Bench metrics and A/B" below, build the reference
+with `refbuild.sh`, which follows the exported mode and profile):
 
 ```bash
 export KYTY_BUILD_MODE=pgo KYTY_PGO_PROFILE=$(readlink -e ~/.cache/kyty-pgo/current.profdata)
-ref=$(tools/astro-bench/refbuild.sh "$(git merge-base HEAD origin/dev)")  # ~/.cache/kyty-builds/<sha>-pgo-<hash>/install
-new=$(tools/astro-bench/build.sh)                                         # _Build/linux-pgo/install
-printf '%s\n' "ref1 KYTY_INSTALL=$ref -- --amd-cpu" "new1 KYTY_INSTALL=$new -- --amd-cpu" \
-  "ref2 KYTY_INSTALL=$ref -- --amd-cpu" "new2 KYTY_INSTALL=$new -- --amd-cpu" | tools/astro-bench/batch.sh
+new=$(tools/astro-bench/build.sh)                          # this checkout: _Build/linux-pgo/install
+tools/astro-bench/ab.sh mylabel --new-install "$new"       # screening; the ref is <merge-base>-pgo-<hash>
+tools/astro-bench/gate.sh mylabel --new-install "$new"     # once, before merge
 ```
 
 - Same mode and same profile file on both sides, always. `refbuild.sh` keys its cache on the mode
-  and the profile's hash, both scripts print `mode=pgo … sha256=<hash>`, and each install dir has a
-  `BUILD_MODE` file next to it: check the two hashes match before reading the numbers.
+  and the profile's hash, both scripts print `mode=pgo … sha256=<hash>`, each install has a
+  `BUILD_MODE` file next to it, and `ab.sh` refuses two installs whose mode or profile differ.
 - A shared profile is fine for A/Bs; there is no need to retrain per side. It was trained on the
   merge-base, so a branch's new code runs without counts, but measured on #83 (+1.8% on plain
   builds) that cost nothing: #83 with the `dev` profile 54.83 FPS, with a profile retrained on #83
