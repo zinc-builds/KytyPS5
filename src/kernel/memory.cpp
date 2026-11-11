@@ -902,9 +902,16 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool range
 }
 
 bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
-	Graphics::GuestSyncEpoch::Advance();
+	const auto advance = [] {
+		if (Graphics::GuestSyncEpoch::g_label_stores_ranged) {
+			Graphics::GuestSyncEpoch::AdvanceRanged();
+		} else {
+			Graphics::GuestSyncEpoch::Advance();
+		}
+	};
+	advance();
 	const bool written = g_guest_address_space->TryStoreLabelBacking(vaddr, value, size);
-	Graphics::GuestSyncEpoch::Advance();
+	advance();
 	return written;
 }
 
