@@ -209,16 +209,93 @@ step 1 comes first.
   (run `setup-install.sh` once per build dir). Never build, install or benchmark in another track's
   checkout or in the user's `~/AI/emu/KytyPS5`. One `vpad.py` serves everyone: start it only if
   `/tmp/vpad.fifo` is missing.
-- **A/B in one batch.** `dev` moves under you. Compare against a reference build of your own
-  merge-base, run in the same `batch.sh` (which holds the lock across both runs).
-- **Correctness first:** screenshots compared with a `dev` build, the touched unit tests (one suite
-  at a time, under `MemoryMax=10G`), and a verify mode for any cache. Review with sol-loop, then a
-  small PR to `dev` and a squash merge.
+- **A/B with `ab.sh`, judged on instructions and cycles per draw.** `dev` moves under you: compare
+  against your merge-base (`ab.sh` builds it with `refbuild.sh`). Decide on `ipd`/`cpd` (the
+  command thread's instructions/cycles per draw), not FPS: see "Bench metrics and A/B" below.
+  An FPS claim of record needs a same-batch pair in frames 1000–1600 (`gate.sh` runs it).
+- **Correctness first:** `gate.sh` before merging (screenshots against the merge-base, the verify
+  modes), the touched unit tests (one suite at a time, under `MemoryMax=10G`), and a verify mode
+  for any cache. Review with sol-loop, then a small PR to `dev` and a squash merge; paste the gate
+  block into the PR body.
 - **Stay in your files.** If you must touch another track's files, keep the change minimal and say
   so in the PR. `renderDraw.cpp` is shared: A changes its barrier and render-pass sections, B adds
   its cache lookup around preparation.
 - **Record progress.** Add a row to the FINDINGS.md progress table for every merged gain (on a
   conflict, rebase and keep both rows). Update your track's status line below.
+
+## Bench metrics and A/B (Track T, 2026-11-11)
+
+Every `garden.sh` run reports per-draw costs over its frame window, at no measurable cost (#86).
+They are appended to the summary line; `/tmp/garden-<label>.json` has the full set, and
+`metrics.py` documents every field.
+- `cmd_ipd` / `cmd_cpd`: the command thread's user-mode instructions and cycles per draw.
+- `cmd_ns = cmd_uns + cmd_sns`: its CPU ns per draw, user plus sys.
+- `wait_prep` / `wait_rec`: ns per draw it waits for the workers / the recorder.
+- `prep_ns`: mean worker time per prepared draw.
+- `rej_f`: rejected prepared draws per frame. `drains_kd`: queue drains per 1,000 draws.
+
+Every run also lands in `~/.cache/kyty-builds/results.jsonl`.
+
+**Noise** (sd per run; one binary, one batch / between batches / between two binaries of the
+same hot code):
+
+| metric | 1000–1600 | 200–500 | drift between batches | two binaries (layout) |
+|---|---|---|---|---|
+| `cmd_ipd` | 0.15% | 0.17% | ~0.1% | ~0.1% |
+| `cmd_cpd` | 0.47% | 0.53% | ~0.2% | ~0.6% |
+| `cmd_uns` | 0.25% | 0.95% | ~0.6% | ~0.9% |
+| FPS | 0.39% | 1.1% | ~0.8% | ~0.8% |
+
+Code layout alone moves cycles, CPU time and FPS by up to ~1% between two builds of the same
+hot-path code, whatever the number of runs. Instructions per draw don't move. So a change worth
+less than ~1% is only visible in `ipd`, plus `cpd` when it is a stall fix rather than less work.
+
+**Commands.**
+- `ab.sh <label>`: screening A/B, frames 200–500 (~35 s a run instead of ~59).
+  - With ≥3 stored runs of the merge-base binary from the last 24 h, it runs only the new side
+    (2 runs); otherwise 2 + 2 interleaved.
+  - It prints one verdict line: each metric's Δ ± sigma, then `!` signal (≥3 sigma), `?` (2–3)
+    or `~` noise. Sigma includes the drift term for a stored reference and the layout term for
+    two binaries.
+  - For a kill switch on one binary (no layout term):
+    `ab.sh <label> --ref-install D --new-install D --new-env KYTY_X=0`.
+- `results.sh ref <sha> [--window W]`: stored numbers of a commit (median, spread).
+- `gate.sh <label>` (~7 min, one lock hold) prints a pass/fail block for the PR:
+  - a same-batch pair in 1000–1600 (2 + 2 runs, the FPS of record);
+  - one run with `KYTY_PREPARE_VERIFY`, `KYTY_BINDING_REUSE_VERIFY`,
+    `KYTY_WORKER_TARGETS_VERIFY` and `KYTY_WORKER_PIPELINE_KEY_VERIFY` (`--verify-env` adds more);
+  - screenshots of level frame 600 from both sides (`GARDEN_SHOT`, saved in-emulator through
+    `KYTY_SHOT_FILE`: the guest image, no desktop capture).
+
+**When a same-batch FPS pair is still required:** for any FPS number written into FINDINGS.md or
+a PR title, and when the change targets waits or the GPU (cycles and instructions on the command
+thread don't see those). A stored reference is never valid for FPS or waits: they drift with clock
+speed (CPU 10 runs at 92–96 °C).
+
+**Design note: in-process ABAB of kill switches** (assessed, not built). A switch registry that
+the bench flips at frame boundaries would give A and B phases inside one run, free of drift and
+layout noise.
+- Flip point: queue drained and workers idle (`FinishQueuedDraws` + `WaitPrepareIdle`, no open
+  dispatch chain).
+- METRICS lines would gain `phase=` and `value=`; `metrics.py` would sum A phases against B
+  phases, dropping ~30 frames after each flip.
+- Safe to flip:
+  - at any time: `KYTY_LRU_MIRROR`;
+  - drained: `KYTY_WORKER_TARGETS`, `_TEXTURES`, `_PIPELINE_KEY`, `_BUFFERS`, `KYTY_META_LOCK`;
+  - drained, with a reset hook that drops state recorded by earlier draws:
+    `KYTY_BINDING_REUSE`, `KYTY_BIND_DEDUPE`;
+  - at a submission boundary: `KYTY_DISPATCH_CHAIN`;
+  - startup only: prepare depth/workers/threads, the shared texture memo, the record thread, CPU
+    pinning, async upload/WP, fast guest reads, DTC, shader codegen switches, late labels.
+- A flippable feature must:
+  - read its switch through the registry, never a `static`;
+  - declare its flip class;
+  - keep derived state current while off, or provide a reset hook;
+  - keep its verify mode valid across flips.
+- Limits: switches only, not code changes. Caches carry over between phases. Phases must
+  alternate often (~150 frames), because `ipd` differs by up to 1% between scenes.
+- Cost: ~200 lines plus 2–5 per switch. Worth building when Track B's run-level commit cuts
+  (each kill-switched, ~150–270 ns/draw) need FPS numbers of record.
 
 ## Status
 

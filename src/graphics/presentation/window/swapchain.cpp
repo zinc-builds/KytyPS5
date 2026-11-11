@@ -21,8 +21,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -287,6 +291,171 @@ private:
 	uint32_t                       m_frame_index         = 0;
 };
 
+// KYTY_SHOT_FILE=<path>: bench screenshots (tools/astro-bench/gate.sh). The bench writes
+// "<flip> <out.ppm>" into <path>; the first main-bus frame presented once the performance overlay
+// has counted <flip> flips (the PERF line's frames=) is saved as a binary PPM of the guest's
+// image (no overlay, no scaling), and <path> is removed. 8-bit RGBA/BGRA and 10-bit A2RGB/A2BGR
+// SDR frames (reduced to 8 bits). The file
+// is checked every 16 presents; a capture waits for its frame's GPU work once.
+class BenchShot final {
+public:
+	explicit BenchShot(GraphicContext& graphics): m_graphics(graphics) {
+		if (const char* path = std::getenv("KYTY_SHOT_FILE"); path != nullptr) {
+			m_request = path;
+		}
+	}
+	~BenchShot() {
+		if (m_buffer != nullptr) {
+			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_allocation);
+		}
+	}
+	KYTY_CLASS_NO_COPY(BenchShot);
+
+	// Before the present commands: records a copy of `frame` when a requested shot is due.
+	bool Record(vk::CommandBuffer command, Presenter::Frame* frame) {
+		if (m_request.empty() || frame == nullptr || frame->blank || frame->hdr || !Due()) {
+			return false;
+		}
+		switch (frame->image.format) {
+			case vk::Format::eR8G8B8A8Unorm:
+			case vk::Format::eR8G8B8A8Srgb: m_layout = Layout::Rgba8; break;
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb: m_layout = Layout::Bgra8; break;
+			case vk::Format::eA2R10G10B10UnormPack32: m_layout = Layout::A2Rgb10; break;
+			case vk::Format::eA2B10G10R10UnormPack32: m_layout = Layout::A2Bgr10; break;
+			default: m_layout = Layout::Unsupported; break;
+		}
+		const auto format = frame->image.format;
+		if (m_layout == Layout::Unsupported) {
+			std::printf("SHOT unsupported frame format %s\n", vk::to_string(format).c_str());
+			Finish();
+			return false;
+		}
+		m_extent = {frame->image.extent.width, frame->image.extent.height};
+		const vk::DeviceSize size = static_cast<vk::DeviceSize>(m_extent.width) * m_extent.height * 4;
+		if (size > m_size) {
+			if (m_buffer != nullptr) {
+				vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_allocation);
+				m_buffer     = VK_NULL_HANDLE;
+				m_allocation = nullptr;
+				m_mapped     = nullptr;
+				m_size       = 0;
+			}
+			vk::BufferCreateInfo buffer {};
+			buffer.size  = size;
+			buffer.usage = vk::BufferUsageFlagBits::eTransferDst;
+			VmaAllocationCreateInfo allocation {};
+			allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			allocation.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+			VmaAllocationInfo info {};
+			VkBuffer          handle = VK_NULL_HANDLE;
+			if (vmaCreateBuffer(m_graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer),
+			                    &allocation, &handle, &m_allocation, &info) != VK_SUCCESS) {
+				std::printf("SHOT could not allocate a %llu-byte readback buffer\n",
+				            static_cast<unsigned long long>(size));
+				Finish();
+				return false;
+			}
+			m_buffer = handle;
+			m_mapped = info.pMappedData;
+			m_size   = size;
+		}
+		frame->Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+		vk::BufferImageCopy region {};
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.imageExtent      = vk::Extent3D {m_extent.width, m_extent.height, 1};
+		command.copyImageToBuffer(frame->image.image, vk::ImageLayout::eTransferSrcOptimal, m_buffer, 1,
+		                          &region);
+		vk::BufferMemoryBarrier to_host {};
+		to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.buffer              = m_buffer;
+		to_host.size                = VK_WHOLE_SIZE;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+		                        {}, 0, nullptr, 1, &to_host, 0, nullptr);
+		return true;
+	}
+
+	// After the copy's submission has completed.
+	void Save() {
+		vmaInvalidateAllocation(m_graphics.allocator, m_allocation, 0, VK_WHOLE_SIZE);
+		FILE* f = std::fopen(m_out.c_str(), "wb");
+		if (f != nullptr) {
+			std::fprintf(f, "P6\n%u %u\n255\n", m_extent.width, m_extent.height);
+			const auto*          src = static_cast<const uint8_t*>(m_mapped);
+			std::vector<uint8_t> row(static_cast<size_t>(m_extent.width) * 3);
+			for (uint32_t y = 0; y < m_extent.height; y++) {
+				for (uint32_t x = 0; x < m_extent.width; x++, src += 4) {
+					uint8_t* out = &row[x * 3];
+					if (m_layout == Layout::Rgba8 || m_layout == Layout::Bgra8) {
+						const bool bgra = m_layout == Layout::Bgra8;
+						out[0]          = bgra ? src[2] : src[0];
+						out[1]          = src[1];
+						out[2]          = bgra ? src[0] : src[2];
+					} else {
+						uint32_t v = 0;
+						std::memcpy(&v, src, 4);
+						// A2R10G10B10: blue in the low bits; A2B10G10R10: red.
+						const uint32_t low = (v >> 2u) & 0xffu, mid = (v >> 12u) & 0xffu,
+						               high = (v >> 22u) & 0xffu;
+						const bool rgb = m_layout == Layout::A2Rgb10;
+						out[0]         = static_cast<uint8_t>(rgb ? high : low);
+						out[1]         = static_cast<uint8_t>(mid);
+						out[2]         = static_cast<uint8_t>(rgb ? low : high);
+					}
+				}
+				std::fwrite(row.data(), 1, row.size(), f);
+			}
+			std::fclose(f);
+		}
+		std::printf("SHOT flip=%llu file=%s%s\n", static_cast<unsigned long long>(PerformanceOverlayFlipCount()),
+		            m_out.c_str(), f != nullptr ? "" : " (could not write)");
+		std::fflush(stdout);
+		Finish();
+	}
+
+private:
+	bool Due() {
+		if (m_out.empty()) {
+			if ((++m_polls & 15u) != 0) {
+				return false;
+			}
+			FILE* f = std::fopen(m_request.c_str(), "r");
+			if (f == nullptr) {
+				return false;
+			}
+			unsigned long long flip = 0;
+			char               out[512] {};
+			const bool         ok = std::fscanf(f, "%llu %511s", &flip, out) == 2;
+			std::fclose(f);
+			if (!ok) {
+				return false;
+			}
+			m_flip = flip;
+			m_out  = out;
+		}
+		return PerformanceOverlayFlipCount() >= m_flip;
+	}
+	void Finish() {
+		std::remove(m_request.c_str());
+		m_out.clear();
+	}
+
+	GraphicContext& m_graphics;
+	std::string     m_request;
+	std::string     m_out;
+	uint64_t        m_flip  = 0;
+	uint32_t        m_polls = 0;
+	VkBuffer        m_buffer     = VK_NULL_HANDLE;
+	VmaAllocation   m_allocation = nullptr;
+	void*           m_mapped     = nullptr;
+	vk::DeviceSize  m_size       = 0;
+	vk::Extent2D    m_extent {};
+	enum class Layout { Unsupported, Rgba8, Bgra8, A2Rgb10, A2Bgr10 } m_layout = Layout::Unsupported;
+};
+
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
@@ -333,6 +502,7 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	BenchShot             bench_shot {window.graphic_ctx};
 };
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
@@ -1068,9 +1238,14 @@ void Presenter::Impl::Present() {
 			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
 			       swapchain.PrepareSystemOverlay();
 		}();
+		const bool shot = bench_shot.Record(command.Handle(), layers[0].frame);
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 		                                draw_system_overlay);
 		const auto tick = swapchain.Submit(present_scheduler);
+		if (shot) {
+			present_scheduler.Wait(tick);
+			bench_shot.Save();
+		}
 		for (const auto& layer: layers) {
 			if (layer.frame != nullptr) {
 				layer.frame->present_tick = tick;
