@@ -1328,8 +1328,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (MemDiag::BdaStatsMode() != 0) {
 		BdaStats::NoteBound(vaddr, size);
 	}
-	if (GuestGpu::s_late_read_checks.load(std::memory_order_relaxed)) {
-		GuestGpu::NoteLateRead(vaddr, size);
+	if (GuestGpu::s_late_unlanded.load(std::memory_order_relaxed)) {
+		GuestGpu::BeforeLateRead(vaddr, size);
 	}
 	if (speculated != UINT32_MAX && m_speculation != nullptr && !is_written && !is_texel_buffer) {
 		const auto& ranges = m_speculation->ranges;
@@ -1436,8 +1436,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (MemDiag::BdaStatsMode() != 0) {
 		BdaStats::NoteBound(vaddr, size);
 	}
-	if (GuestGpu::s_late_read_checks.load(std::memory_order_relaxed)) {
-		GuestGpu::NoteLateRead(vaddr, size);
+	if (GuestGpu::s_late_unlanded.load(std::memory_order_relaxed)) {
+		GuestGpu::BeforeLateRead(vaddr, size);
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
@@ -1463,6 +1463,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	});
 }
 
+bool BufferCache::FillRunsOnCpu(uint64_t vaddr, uint64_t size) {
+	return vaddr != 0 && !IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::CopyRunsOnCpu(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
+	return dst_vaddr != 0 && src_vaddr != 0 && !IsRegionGpuModified(dst_vaddr, size) &&
+	       !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size);
+}
+
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
@@ -1478,7 +1487,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
-	if (!IsRegionGpuModified(vaddr, size)) {
+	if (FillRunsOnCpu(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -1504,8 +1513,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
-	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	if (src_memory && dst_memory && CopyRunsOnCpu(dst_vaddr, src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		m_scheduler.Context().NoteGpuWrite(dst_vaddr, size);

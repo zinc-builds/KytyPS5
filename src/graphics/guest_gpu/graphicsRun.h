@@ -58,10 +58,10 @@ public:
 	// idle. A WAIT_REG_MEM that this processor's own pending store will satisfy is satisfied at
 	// once: every guest queue records into the one host queue, so the work after it runs after
 	// the work before the label (see LateLabelsEnabled). Effects the CPU performs at decode after
-	// such a wait follow those labels: WRITE_DATA and semaphore signals are deferred behind them
-	// (in order), DMA_DATA waits for them.
-	// Not ordered: a later packet reading a pending label's or deferred write's bytes at decode
-	// (as data) reads them before they land; =verify counts binds that do (read_unlanded).
+	// such a wait follow those labels: WRITE_DATA, semaphore signals and CPU fills and copies
+	// (DMA_DATA) are deferred behind them, in order.
+	// A buffer bind reading a pending label's or deferred effect's bytes at decode waits for them
+	// to land (other decode-time reads of them, such as SRT tables, are not ordered).
 	[[nodiscard]] static int LateLabelsMode() noexcept; // 0 off, 1 on, 2 verify
 	// Tests: forces the mode (-1: back to KYTY_LATE_LABELS). Only while the GPU is idle.
 	static void SetLateLabelsModeForTests(int mode) noexcept;
@@ -86,10 +86,13 @@ public:
 	// now (DMA_DATA) lands after them and reads what they and the
 	// work before them wrote.
 	void DrainLateFence();
-	// =verify, GPU thread: a buffer bind reads [vaddr, vaddr + size) at decode; counts it if a
-	// passed-early label or deferred write there has not landed yet.
-	static inline std::atomic_bool s_late_read_checks {false};
-	static void                    NoteLateRead(uint64_t vaddr, uint64_t size);
+	// GPU thread: a buffer bind is about to copy [vaddr, vaddr + size) of guest memory at decode.
+	// If a label a wait passed on, or a deferred effect, has not stored its bytes there yet, waits
+	// until it has (read_unlanded in LATELABELS).
+	static inline std::atomic_bool s_late_unlanded {false}; // any such range
+	static void                    BeforeLateRead(uint64_t vaddr, uint64_t size);
+	// GPU thread: waits until the stores and effects up to `target` have landed.
+	void DrainLate(uint64_t target);
 	// GPU thread: runs posted stores; true if any ran.
 	bool ProcessLateLabels();
 
@@ -194,11 +197,15 @@ private:
 	uint64_t                                       m_late_applied  = 0; // sequences applied
 	uint64_t                                       m_late_fence    = 0; // CP effects wait for this
 	bool                                           m_late_applying = false; // running an effect
-	// =verify: ranges a wait passed on or a deferred write covers, until stored (sequence).
+	// Ranges a wait passed on or a deferred effect writes, until stored (sequence).
 	struct LateUnlanded {
 		uint64_t begin = 0, end = 0, sequence = 0;
 	};
 	std::vector<LateUnlanded>                      m_late_unlanded;
+	std::array<uint32_t, 4096>                     m_late_unlanded_pages {}; // per hashed 4 KiB page
+	[[nodiscard]] static size_t UnlandedPageSlot(uint64_t page) noexcept;
+	void                        AddUnlanded(uint64_t begin, uint64_t end, uint64_t sequence);
+	void                        PruneUnlanded();
 	std::vector<LateLabelSlot>                     m_late_labels = std::vector<LateLabelSlot>(1u << 16u);
 	size_t                                         m_late_label_count = 0;
 	// Interrupts of the stores run in this drain, raised after it in order (exact repeats once).
@@ -209,7 +216,7 @@ private:
 	std::vector<LateInterrupt>                     m_late_interrupts;
 	struct {
 		uint64_t deferred = 0, applied = 0, satisfied = 0, foreign = 0, foreign_zero = 0,
-		         refused = 0, fenced = 0, drained = 0, read_unlanded = 0, delay_ns = 0, max_delay_ns = 0, start_ns = 0;
+		         refused = 0, refused_unknown = 0, refused_width = 0, fenced = 0, drained = 0, read_unlanded = 0, delay_ns = 0, max_delay_ns = 0, start_ns = 0;
 		uint64_t releasing_foreign = 0; // other stores that would have released a passed wait
 	} m_late_stats;
 	uint32_t                                       m_next_queue        = 0;
