@@ -8,6 +8,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/kernelStats.h"
 #include "common/stallDiag.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -100,6 +101,7 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		Common::StallDiag::CommandScope stall;
+		Common::KernelStats::SiteScope  kernel(Common::KernelStats::Site::Command);
 		command();
 	}
 }
@@ -439,9 +441,11 @@ void GuestGpu::ThreadRun(void* data) {
 #endif
 	g_gpu_state = gpu;
 	Common::StallDiag::SetCommandThread();
+	Common::KernelStats::SetCommandThread();
 
 	for (;;) {
 		Common::StallDiag::Report();
+		Common::KernelStats::Report();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         should_stop = false;
@@ -450,7 +454,8 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
-				Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdNoWork);
+				Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdNoWork);
+				Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -474,7 +479,8 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					{
-						Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdBlocked);
+						Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdBlocked);
+						Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Idle);
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					}
 					for (auto& queue: gpu->m_queues) {
@@ -503,6 +509,7 @@ void GuestGpu::ThreadRun(void* data) {
 				Common::DebugCounters::ScopedTimer busy(
 				    Common::DebugCounters::Counter::GpuThreadBusyNs);
 				Common::StallDiag::CommandScope stall;
+				Common::KernelStats::SiteScope  kernel(Common::KernelStats::Site::Command);
 				command();
 			}
 

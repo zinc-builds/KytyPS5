@@ -1,4 +1,5 @@
 #include "common/hostException.h"
+#include "common/kernelStats.h"
 
 #include <atomic>
 #include <cstdio>
@@ -160,6 +161,8 @@ static AccessViolationType DecodeAccess(const ucontext_t* context) {
 // action so the retry terminates the process.
 static void SignalHandler(int signal_number, siginfo_t* signal_info, void* native_context) {
 	auto* context = static_cast<ucontext_t*>(native_context);
+	// KYTY_KERNEL_STATS: handler time on the GPU command thread, charged to its current site.
+	Common::KernelStats::Syscall kernel_stats(Common::KernelStats::Kind::Signal);
 
 	ExceptionInfo info {};
 #if defined(__APPLE__)

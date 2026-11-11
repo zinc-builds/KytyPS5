@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/deferredRecorder.h"
 
 #include "common/hybridAffinity.h"
+#include "common/kernelStats.h"
 #include "common/profiler.h"
 #include "common/stallDiag.h"
 
@@ -63,6 +64,7 @@ void DeferredRecorder::Publish() {
 
 void DeferredRecorder::Wake() {
 	m_sleeping.store(false, std::memory_order_seq_cst);
+	Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::Wake);
 	m_sleeping.notify_one();
 }
 
@@ -70,7 +72,8 @@ void DeferredRecorder::WaitDone(uint64_t position) {
 	if (m_done.load(std::memory_order_acquire) >= position) {
 		return;
 	}
-	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdRecorder);
+	Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdRecorder);
+	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::RecorderWait);
 	Publish();
 	// Pairs with the recorder's seq_cst sleeping store and published load: either it sees what
 	// was published, or this sees it asleep.
@@ -82,6 +85,7 @@ void DeferredRecorder::WaitDone(uint64_t position) {
 		if (spins < 4096) {
 			KYTY_RECORDER_PAUSE();
 		} else {
+			Common::KernelStats::Syscall yield(Common::KernelStats::Kind::Yield);
 			std::this_thread::yield();
 		}
 	}

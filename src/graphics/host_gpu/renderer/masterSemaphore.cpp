@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/kernelStats.h"
 #include "common/stallDiag.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -53,6 +54,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	Common::StallDiag::Scope stall(Common::StallDiag::GpuWaitCause(),
 	                               Common::StallDiag::OnCommandThread());
+	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::GpuWait);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();

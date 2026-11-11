@@ -78,6 +78,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-08 | Pipeline key on the prepare worker: the worker builds the graphics pipeline key and its hash from its programs, proposed targets and the queued registers; the command thread checks the final targets (formats, samples, slots, export mappings, depth, topology, restart) and looks the pipeline up with the worker's hash (hash first on the last-pipeline check, last key kept as a pointer, keys hash only their used bytes). Command thread `GetGraphicsPipeline` 4.1% → 2.4% (~162 → ~95 ns/draw); 99.6% of draws use the worker's key, 0 target mismatches, `KYTY_WORKER_PIPELINE_KEY_VERIFY` 8M checks clean. Worker time counts: a first version without the used-bytes hash and the prefetch was −0.5% (the same binary building the key but ignoring it, −2.4%) (Track B5; same batch, 2 pairs: ref `dev` 93ac4f97 49.48 / 50.00; +0.9%, both pairs up; earlier bases +0.7% on f1386607, +1.4% on c7bdab8f) | 50.07 / 50.33 | 263.1k / 259.1k | 33.4 (max 33.5) / 38.5 (max 99.5) | 29.9 / 26.9 |
 | 2026-11-08 | `KYTY_BDA_STATS` diagnostic for `PrepareBda`'s uploads, off by default (Track B; findings under "Buffer uploads": the bytes are real, DMA shaders read almost none of them and 56% are replaced before any overlapping bind, so pointing the BDA page table at guest memory (C1) could remove the eager copy, with the binds' share to be measured on the prototype; with the diagnostic off, same binary after an access run 45.28, `dev` 23191d32 45.30) | 45.28 | 238.0k | 37.0 (max 83.4) | 27.3 |
 | 2026-11-11 | The emulator's context-state NOP (push/pop/clear of the context registers) keeps the draw queue, like a register write: queued draws hold their own register copy, and it touches no memory and signals nothing (`KYTY_CONTEXT_STATE_DRAIN=1` drains again). `KYTY_DRAIN_STATS=1` attributes queue drains and the prepare waits they cause (while draining, and refilling after) by packet: all drains cost ~2.1% of the command thread (RELEASE_MEM 0.8%, EVENT_WRITE 0.5%, context state 0.24%, ACQUIRE_MEM 0.2%, guest commands 0.2%, dispatches 0.15%); `KYTY_STALL_DIAG` roughly doubles the measured prepare wait (217 vs 101 ns/draw) (Track B4; same batch: ref `dev` e0999e89 47.93 / 48.64; `KYTY_PREPARE_VERIFY` clean) | 48.38 / 49.46 | 252.5k / 260.5k | 38.5 (max 50.1) / 36.2 (max 50.1) | 28.4 / 29.6 |
+| 2026-11-11 | `KYTY_KERNEL_STATS` diagnostic: the GPU command thread's kernel time by call site, off by default (Track K; findings under "Kernel time on the command thread": ~12% of the thread is sys time, half of it `PAGEMAP_SCAN` walks for async write collection and label stores; same batch: ref `dev` 084ca762 49.70, this build with the diagnostic on 49.86) | 49.70 | 261.0k | 38.5 (max 50.0) | 27.6 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1276,6 +1277,38 @@ Ruled out:
   recorder (69 ns) still needs the same descriptor infos copied, so it is not pursued. Unmerged
   branch `trackB/recorder-descriptors`.
 
+### Kernel time on the command thread (Track K, 2026-11-11)
+
+The budget tables above come from user-mode samples, so they miss the command thread's kernel
+time: ~12% of `KytyGpuCmd` (116 ms/s of `stime` in `/proc/self/task/<tid>/stat`, ~440 ns/draw).
+`KYTY_KERNEL_STATS=1` times every system call the emulator makes on purpose on that thread with
+rdtsc and charges it to the innermost call-site scope; `tools/astro-bench/kstats.py <label>`
+averages the `KSTATS` lines over `garden.sh`'s frame window. On `dev` 084ca762 (261.6k draws/s),
+the timed calls cover 97 of the 116 ms/s; the rest is page faults (~6.5k minor faults/s), futexes
+inside locks, and signal delivery. Kernel time by site:
+
+| Site | What | calls/s | ns/call | ns/draw |
+|---|---|---|---|---|
+| Async write collection (`CollectAsyncWrites`) | `PAGEMAP_SCAN` over ~68 hot 2 MiB chunks, ~21 calls and ~34k pages per collection, ~1,160 collections/s | 22.4k empty + 2.4k with written pages | 1,584 / 6,455 | 136 + 59 |
+| CP label stores (`StoreCpLabel` → `ProtectAsyncPage`) | one-page `PAGEMAP_SCAN` with re-protect | 61.3k empty + 2.6k with written pages | 382 / 2,392 | 90 + 24 |
+| Page-tracker watch changes | `mprotect` 1.2k/s, `PAGEMAP_SCAN` 4.4k/s, `UFFDIO_WRITEPROTECT` 0.6k/s | 6.2k | 1,435 avg | 34 |
+| WAIT_REG_MEM label peeks (`AsyncPageUntouched`) | one-page `PAGEMAP_SCAN`, no re-protect | 12.4k | 358 | 17 |
+| Worker/recorder wakes, spin-wait yields | futex wakes 3.5k/s, `sched_yield` 4.8k/s | 8.3k | ~280 avg | 9 |
+| `FillBuffer` through the guest mapping | 92 SIGBUS/s (handler 3.9 µs, delivery not visible) plus write faults; whole fill region 8.1 µs × 838/s | 838 | 8,086 (region) | 26 (region) |
+| Compute/graphics SRT walk on the command thread | 797 SIGSEGV/s, handler 125 ns | 797 | 125 | 0.4 |
+
+- **The collection walk is memory-bound in the kernel:** ~1.06 ns per PTE for an empty scan
+  (it is already on `PAGEMAP_SCAN`'s fast path: category and return mask exactly
+  `PAGE_IS_WRITTEN`). A scan that finds and re-protects written pages costs ~3.7 µs more (TLB
+  shootdown). About 900 of the ~1,160 collections/s are the one at each submission start
+  (`GuestGpu::Process`), ~240 come from waits. Only 53% of the scanned pages have a write watcher
+  (18.3k of 34.6k per collection, in ~87 runs).
+- **Label stores:** 89% hit a page a previous label store protected, with no guest store since,
+  but that is only known by scanning; skipping the scan would leave the guest's earlier stores
+  in the page, so the next peek on it would collect (~46 µs) instead.
+- The research figure "FillBuffer 11% of kernel entries" is entries, not time: the fill path
+  costs ~26 ns/draw in all, and the SRT-walk SIGSEGVs ~0.4 ns/draw of handler time.
+
 ### Where the command thread's library time goes (2026-11-07)
 
 Call stacks of `KytyGpuCmd` on `dev` 4c86dc01 (`perf record -e cpu_core/cycles/u --call-graph lbr
@@ -1639,6 +1672,12 @@ What this means:
   draws, drains, the command thread's wait and the worker's time per draw, texture resolves handed
   back to the workers' memo and adopted records whose page check ran again). `KYTY_SHARED_TEXTURE_MEMO=0`
   gives each worker its own texture memo again.
+- Kernel time (Track K): `KYTY_KERNEL_STATS=1` prints a `KSTATS` line once per second with the
+  GPU command thread's `/proc` user/sys time, faults and context switches, and per call site the
+  calls/s and µs/s of each timed system call kind (`PAGEMAP_SCAN` with and without written pages,
+  with pages walked; `UFFDIO_WRITEPROTECT`, uffd register, `mprotect`, futex wakes, `sched_yield`,
+  signal handlers) plus each site's inclusive wall time; `tools/astro-bench/kstats.py <label>`
+  averages them over the `garden.sh` frame window. Costs nothing measurable when off.
 - Critical path: `KYTY_STALL_DIAG=1` prints a `STALL` line once per second with the GPU command
   thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
   GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)

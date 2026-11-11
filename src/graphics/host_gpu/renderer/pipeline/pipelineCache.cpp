@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/kernelStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -315,6 +316,7 @@ template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor,
                                                  StageResources& resources) {
+	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::SrtWalk);
 	if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources.snapshot,
 	                                               resources.specialization)) {
 		// On the worker, a heap it may not acquire can be why.

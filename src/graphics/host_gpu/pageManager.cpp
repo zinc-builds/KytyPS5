@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/kernelStats.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -237,6 +238,7 @@ struct PageManager::Impl {
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
 	             bool access_changed) noexcept {
+		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Watch);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode, access_changed)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));

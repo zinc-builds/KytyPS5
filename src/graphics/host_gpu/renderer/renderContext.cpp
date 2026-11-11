@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/assert.h"
+#include "common/kernelStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/memDiag.h"
@@ -430,15 +431,19 @@ void RenderContext::CollectAsyncWrites() {
 	// Chunks without write watchers need no scan (their writes invalidate nothing).
 	static const PageManager* pages = nullptr;
 	pages = &m_page_manager;
-	LibKernel::Memory::CollectAsyncGuestWrites(written, [](uint64_t begin, uint64_t end) {
-		return pages->HasWriteWatched(begin, end);
-	});
+	{
+		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::CollectScan);
+		LibKernel::Memory::CollectAsyncGuestWrites(written, [](uint64_t begin, uint64_t end) {
+			return pages->HasWriteWatched(begin, end);
+		});
+	}
 	if (written.empty()) {
 		VerifyAsyncWrites(written, true);
 		VerifyAsyncWrites(written, false);
 		return;
 	}
 	KYTY_PROFILER_BLOCK("CollectAsyncWrites");
+	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::CollectInvalidate);
 	watched.clear();
 	for (const auto& [begin, end]: written) {
 		m_page_manager.AppendWriteWatched(begin, end, watched);
@@ -471,6 +476,7 @@ bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t siz
 	if (size == 0 || size > sizeof(uint64_t) || ((vaddr + size - 1) & ~uint64_t {0xfff}) != page) {
 		return false;
 	}
+	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::LabelStore);
 	// Read first: a remap after this read voids the label.
 	const auto generation = LibKernel::Memory::GuestRemapGeneration();
 	uint64_t   token      = 0;
