@@ -611,6 +611,19 @@ void CommandProcessor::SuspendPm4() {
 
 // Packets that read no guest data through the caches, so a requested collection of guest writes
 // (RenderContext::RequestAsyncCollect) can wait past them.
+// The emulator's context-state NOP (push, pop, clear of the context registers) changes only the
+// register context the command processor decodes from: a queued draw holds its own copy of the
+// registers, and the packet touches no memory and signals nothing, so it is handled like a
+// register write. KYTY_CONTEXT_STATE_DRAIN=1: it finishes the queue again.
+static bool IsQueuedContextStateNop(uint32_t packet_header) {
+	static const bool drains = [] {
+		const char* value = std::getenv("KYTY_CONTEXT_STATE_DRAIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	return !drains && ((packet_header >> 8u) & 0xffu) == Pm4::IT_NOP &&
+	       KYTY_PM4_R(packet_header) == Pm4::R_CONTEXT_STATE;
+}
+
 static bool DefersAsyncCollect(uint32_t packet_header) {
 	switch ((packet_header >> 8u) & 0xffu) {
 		case Pm4::IT_SET_CONTEXT_REG:
@@ -629,7 +642,8 @@ static bool DefersAsyncCollect(uint32_t packet_header) {
 		case Pm4::IT_NOP: {
 			// Other NOP codes carry emulator operations (flips, custom draws).
 			const auto r = KYTY_PM4_R(packet_header);
-			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       IsQueuedContextStateNop(packet_header);
 		}
 		default: return false;
 	}
@@ -662,7 +676,8 @@ static bool KeepsAtomicWrites(uint32_t packet_header) {
 		case Pm4::IT_DRAW_INDEX_AUTO: return true;
 		case Pm4::IT_NOP: {
 			const auto r = KYTY_PM4_R(packet_header);
-			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       IsQueuedContextStateNop(packet_header);
 		}
 		default: return false;
 	}
@@ -695,7 +710,8 @@ static bool KeepsQueuedDraw(uint32_t packet_header) {
 		case Pm4::IT_DRAW_INDEX_AUTO: return true;
 		case Pm4::IT_NOP: {
 			const auto r = KYTY_PM4_R(packet_header);
-			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       IsQueuedContextStateNop(packet_header);
 		}
 		default: return false;
 	}
