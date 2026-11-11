@@ -302,6 +302,8 @@ public:
 		if (m_queued_count == 0) {
 			return;
 		}
+		// An ordered item runs in place of a draw: draws after it must not commit before it.
+		EXIT_IF(m_running_item);
 		m_prepare_stat.drains++;
 		m_drain_reason = reason < DrainReasons ? reason : DrainDirectDraw;
 		m_draining     = true;
@@ -316,6 +318,27 @@ public:
 		}
 	}
 	[[nodiscard]] bool HasQueuedDraw() const { return m_queued_count != 0; }
+
+	// An ordered item: a non-draw packet's effects, run by the command thread when it reaches the
+	// item's place among the queued draws (PM4 order) instead of draining the queue first. The
+	// prepare workers skip it. Returns false (the caller runs the effects now) when no draw is
+	// queued. `args` (up to ItemArgsSize bytes) is copied.
+	static constexpr size_t ItemArgsSize = 64;
+	using ItemRun = void (*)(void* context, const void* args);
+	bool QueueOrderedItem(CommandBuffer& buffer, ItemRun run, void* context, const void* args,
+	                      size_t size);
+	// While an item runs: the draws queued after it (for verify modes).
+	template <typename Func>
+	void ForEachQueuedDraw(Func&& func) {
+		WaitPrepareIdle();
+		for (uint64_t sequence = m_queued_posted - m_queued_count + 1; sequence <= m_queued_posted;
+		     sequence++) {
+			auto& queued = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
+			if (queued.item_run == nullptr) {
+				func(queued.stored_sequence, queued.log.reads);
+			}
+		}
+	}
 
 private:
 	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,
@@ -356,6 +379,10 @@ private:
 		PipelineCache::GraphicsResources resources;
 		DrawPrepare::Log                 log;
 		uint64_t                         sequence = 0;
+		// Non-null: an ordered item (QueueOrderedItem), not a draw.
+		ItemRun                                 item_run     = nullptr;
+		void*                                   item_context = nullptr;
+		std::array<uint8_t, ItemArgsSize>       item_args {};
 		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged and
 		// DrawPrepare::StoredSequence when it was queued.
 		uint64_t                         hazard_generation = 0;
@@ -651,6 +678,7 @@ private:
 	uint32_t                                         m_queued_count  = 0; // posted, not committed
 	bool                                             m_prepare_verify = false;
 	bool                                             m_prepare_stats  = false;
+	bool                                             m_running_item   = false;
 	// KYTY_DRAIN_STATS=1: DRAIN lines, the queue drains by reason and the prepare waits each
 	// causes (while draining, and refilling the queue after it).
 	bool                                             m_drain_stats    = false;
@@ -666,6 +694,7 @@ private:
 	void                        PrintDrainStats();
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t items = 0;
 		uint64_t stored = 0;
 		uint64_t wait_ns = 0, verified = 0, worker_busy_ns = 0, start_ns = 0;
 		uint64_t drains = 0, waits = 0; // drains: FinishQueuedDraws with draws queued

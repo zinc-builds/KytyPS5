@@ -88,6 +88,19 @@ public:
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
 	                uint32_t interrupt_context_id);
+	// RELEASE_MEM's effects, decoded: run at once, or as an ordered item among the queued draws
+	// (ProcessPm4 sets m_release_mem_item for a packet it lets keep the queue).
+	struct ReleaseMemEffects {
+		uint32_t data_sel             = 0;
+		bool     interrupt            = false;
+		void*    address              = nullptr;
+		uint64_t data                 = 0;
+		uint32_t interrupt_context_id = 0;
+		int      event_id             = 0;
+	};
+	void        RunReleaseMem(const ReleaseMemEffects& effects, bool item);
+	static void RunReleaseMemItem(void* processor, const void* effects);
+	bool        m_release_mem_item = false;
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,

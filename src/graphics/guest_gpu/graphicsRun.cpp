@@ -1,7 +1,9 @@
 #if defined(__linux__)
 #include "common/hybridAffinity.h"
+#include <string_view>
 #include <pthread.h>
 #endif
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/memDiag.h"
@@ -689,6 +691,8 @@ static bool KeepsAtomicWrites(uint32_t packet_header) {
 // write only racily: the hardware command processor reads these packets long before earlier
 // draws run, so a guest must put a wait or cache operation in between, and those finish the
 // queue. Sky Garden uses them for nearly every draw.
+static int ReleaseMemItemMode();
+
 static bool KeepsQueuedDraw(uint32_t packet_header) {
 	switch ((packet_header >> 8u) & 0xffu) {
 		case Pm4::IT_SET_CONTEXT_REG:
@@ -790,7 +794,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 
-		if (executor.HasQueuedDraw() &&
+		// RELEASE_MEM keeps the draw queue as an ordered item (see RunReleaseMem): its store,
+		// interrupt and atomic flush happen when the queue reaches it, in PM4 order, and its
+		// store is checked against the queued draws by range, not by the unranged epoch. A GDS
+		// read and a pending async collect still finish the queue first.
+		const bool release_item = opcode == Pm4::IT_RELEASE_MEM && executor.HasQueuedDraw() &&
+		                          ReleaseMemItemMode() != 0 && packet_header == 0xc0064900u &&
+		                          remaining_dw >= 7 && ((packet[2] >> 29u) & 0x7u) != 5u &&
+		                          !m_renderer.AsyncCollectRequested();
+		if (executor.HasQueuedDraw() && !release_item &&
 		    (!KeepsQueuedDraw(packet_header) ||
 		     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
 			uint32_t reason = RenderExecutor::DrainAsyncCollect;
@@ -806,7 +818,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			executor.EndDispatchChain(CurrentBuffer());
 			first_packet = false;
 		}
-		if (!KeepsAtomicWrites(packet_header)) {
+		if (!release_item && !KeepsAtomicWrites(packet_header)) {
 			// The same packets may signal the guest or store into its memory.
 			GuestSyncEpoch::Advance();
 			if (executor.HasAtomicWrites()) {
@@ -831,9 +843,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		// Only dispatches from the packet loop chain: it ends chains at synchronizing packets.
 		m_in_dispatch_packet = opcode == Pm4::IT_DISPATCH_DIRECT;
+		m_release_mem_item   = release_item;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		m_in_dispatch_packet = false;
+		m_release_mem_item   = false;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1162,18 +1176,88 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	if (data_sel == 0 && !interrupt) {
 		return;
 	}
+	const ReleaseMemEffects effects {data_sel, interrupt, address, data, interrupt_context_id,
+	                                 m_interrupt_event_id};
+	if (m_release_mem_item &&
+	    m_renderer.GetRenderExecutor().QueueOrderedItem(CurrentBuffer(), &RunReleaseMemItem, this,
+	                                                    &effects, sizeof(effects))) {
+		return;
+	}
+	RunReleaseMem(effects, false);
+}
 
+void CommandProcessor::RunReleaseMemItem(void* processor, const void* effects) {
+	auto& cp = *static_cast<CommandProcessor*>(processor);
+	ReleaseMemEffects copy;
+	std::memcpy(&copy, effects, sizeof(copy));
+	// The decode-time packet loop left these to the item: the atomic shader writes of the draws
+	// before it are flushed here, after those draws.
+	auto& executor = cp.m_renderer.GetRenderExecutor();
+	if (executor.HasAtomicWrites()) {
+		executor.FlushAtomicWrites(cp.CurrentBuffer());
+	}
+	cp.RunReleaseMem(copy, true);
+}
+
+// KYTY_RELEASE_MEM_ITEM=0: RELEASE_MEM finishes the draw queue first again; =verify: each item
+// checks that every queued draw that read the stored bytes on its worker will be rejected.
+static int ReleaseMemItemMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_RELEASE_MEM_ITEM");
+		if (value == nullptr) return 1;
+		if (std::string_view(value) == "verify") return 2;
+		return value[0] == '0' ? 0 : 1;
+	}();
+	return mode;
+}
+
+void CommandProcessor::RunReleaseMem(const ReleaseMemEffects& effects, bool item) {
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
-	const auto write_label = [this, address](const void* value, uint64_t size) {
-		StoreLabel(address, value, size);
+	auto*      address    = effects.address;
+	const auto write_label = [this, address, item](const void* value, uint64_t size) {
+		if (!item) {
+			StoreLabel(address, value, size);
+			return;
+		}
+		// Draws queued after the item were prepared before this store: those that read these
+		// bytes are rejected by range (StoredSince), the others stay.
+		const auto vaddr = reinterpret_cast<uint64_t>(address);
+		{
+			DrawPrepare::RangedStore ranged(vaddr, size);
+			StoreLabel(address, value, size);
+		}
+		if (ReleaseMemItemMode() == 2) {
+			static uint64_t checked = 0, overlapping = 0;
+			m_renderer.GetRenderExecutor().ForEachQueuedDraw(
+			    [&](uint64_t stored_sequence, const std::vector<std::pair<uint64_t, uint64_t>>& reads) {
+				    checked++;
+				    for (const auto& [read, bytes]: reads) {
+					    if (read < vaddr + size && vaddr < read + bytes) {
+						    overlapping++;
+						    if (!DrawPrepare::StoredSince(stored_sequence, reads)) {
+							    EXIT("KYTY_RELEASE_MEM_ITEM=verify: a queued draw read the label at "
+							         "0x%016" PRIx64 " but is not rejected\n",
+							         vaddr);
+						    }
+						    break;
+					    }
+				    }
+			    });
+			if ((checked & 0xffffu) == 0) {
+				std::printf("RELEASE_MEM_ITEM_VERIFY queued_draws_checked=%" PRIu64
+				            " overlapping=%" PRIu64 "\n",
+				            checked, overlapping);
+			}
+		}
 	};
-	if (data_sel != 0) {
+	auto data = effects.data;
+	if (effects.data_sel != 0) {
 		MemDiag::NoteLabel();
 	}
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
-	switch (data_sel) {
+	switch (effects.data_sel) {
 		case 0: break;
 		case 1: {
 			const auto value = static_cast<uint32_t>(data);
@@ -1183,6 +1267,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
 		case 2: write_label(&data, sizeof(data)); break;
 		case 5: {
+			EXIT_IF(item); // ProcessPm4 keeps GDS reads out of the queue
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
@@ -1191,13 +1276,14 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			                        uint64_t {gds >> 16u} * sizeof(uint32_t));
 			break;
 		}
-		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
+		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", effects.data_sel);
 	}
 
 	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
-	if (interrupt) {
+	if (effects.interrupt) {
 		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+		    [&renderer = m_renderer, event_id = effects.event_id,
+		     interrupt_context_id = effects.interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 		    });
 	}

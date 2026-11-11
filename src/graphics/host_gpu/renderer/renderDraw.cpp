@@ -1829,6 +1829,26 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 	return m_queued_draws[m_queued_posted % m_queued_draws.size()].get();
 }
 
+bool RenderExecutor::QueueOrderedItem(CommandBuffer& buffer, ItemRun run, void* context,
+                                      const void* args, size_t size) {
+	if (m_queued_count == 0) {
+		return false;
+	}
+	EXIT_IF(size > ItemArgsSize || run == nullptr);
+	auto& queued        = *m_queued_draws[m_queued_posted % m_queued_draws.size()];
+	queued.item_run     = run;
+	queued.item_context = context;
+	std::memcpy(queued.item_args.data(), args, size);
+	queued.sequence = ++m_queued_posted;
+	EXIT_IF(PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence));
+	m_queued_count++;
+	m_prepare_stat.items++;
+	while (m_queued_count + 1 > m_queued_draws.size()) {
+		FinishQueuedDraw(buffer);
+	}
+	return true;
+}
+
 void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 	queued.registers         = buffer.GetRegisters();
 	queued.user_config       = buffer.GetUserConfig();
@@ -1896,6 +1916,9 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	auto& self     = *lane.executor;
 	const auto sequence = (job - 1) * self.m_prepare_lanes.size() + lane.index + 1;
 	auto& queued = *self.m_queued_draws[(sequence - 1) % self.m_queued_draws.size()];
+	if (queued.item_run != nullptr) {
+		return; // an ordered item: nothing to prepare
+	}
 	queued.log.Reset();
 	DrawPrepare::SetLog(&queued.log);
 	std::destroy_at(&queued.state);
@@ -2059,6 +2082,14 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	}
 	if (m_drain_stats) {
 		PrintDrainStats();
+	}
+	if (queued.item_run != nullptr) {
+		const auto run     = queued.item_run;
+		queued.item_run    = nullptr;
+		m_running_item     = true;
+		run(queued.item_context, queued.item_args.data());
+		m_running_item = false;
+		return;
 	}
 	// The draw reads the registers it was queued with.
 	auto& registers   = *buffer.m_registers;
