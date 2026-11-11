@@ -38,6 +38,8 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(int handle, int index);
+	// Flips submitted on the port and not yet shown (the guest's flipPendingNum).
+	int PendingFlips(int handle);
 
 	[[nodiscard]] Impl& State() noexcept;
 

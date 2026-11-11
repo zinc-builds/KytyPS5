@@ -1330,7 +1330,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	GetScheduler().Flush();
 	if (FrameSkip::Enabled()) {
-		FrameSkip::OnFlip();
+		FrameSkip::OnFlip(m_renderer.GetVideoOut().PendingFlips(handle));
 	}
 }
 

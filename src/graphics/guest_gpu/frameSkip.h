@@ -12,8 +12,9 @@
 // no new image (the window keeps the previous one). The game still sees one flip per vblank.
 //
 //   KYTY_FRAME_SKIP=<n>   n >= 2: skip the draws of every n-th frame.
-//   KYTY_FRAME_SKIP=auto  skip a frame only when the command thread has fallen behind the
-//                         60 Hz budget; never two frames in a row.
+//   KYTY_FRAME_SKIP=auto  skip a frame only when the display has no frame banked: when this
+//                         flip is the only one pending, the previous one has already been
+//                         shown, so the next vblank is at risk. Never two frames in a row.
 //   KYTY_FRAME_SKIP_LOG=1 one FRAMESKIP line per second (flips, skipped frames, debt).
 //
 // Unset, every hook is one predictable branch on a constant.
@@ -36,8 +37,8 @@ inline bool SkippingDraws() noexcept {
 void Init();
 
 // Called by the command thread at a guest flip packet, after the flip has been queued. Ends the
-// current frame and decides whether the next one is skipped.
-void OnFlip();
+// current frame and decides whether the next one is skipped. `pending_flips` counts this flip.
+void OnFlip(int pending_flips);
 
 // Called by the command thread for every draw dropped.
 void NoteSkippedDraw();
