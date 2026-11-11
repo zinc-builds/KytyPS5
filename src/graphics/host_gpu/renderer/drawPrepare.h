@@ -68,11 +68,14 @@ void               NoteHazard() noexcept;
 // (buffer readbacks publish before their pages are released), recorded instead of advancing
 // GuestSyncEpoch's unranged epoch. A preparation read such bytes only through a logging reader,
 // so a result whose logged reads miss every range stored since its post is still current.
-// Called before and after the store.
-void                   NoteStoredRange(uint64_t vaddr, uint64_t size);
+// OpenStoredRange before the store (returns its key), CloseStoredRange(key) after it; any thread.
+// Both record the range, and a store stays open in between.
+[[nodiscard]] uint64_t OpenStoredRange(uint64_t vaddr, uint64_t size);
+void                   CloseStoredRange(uint64_t open);
 [[nodiscard]] uint64_t StoredSequence() noexcept;
-// Whether a range recorded after `sequence` overlaps one of `reads`; also true when the record
-// no longer reaches back that far.
+// Whether a range recorded after `sequence`, or a store still open, overlaps one of `reads`;
+// also true when the record no longer reaches back that far. An open store may have written any
+// time after its opening record, which a draw posted at `sequence` may already include.
 [[nodiscard]] bool StoredSince(uint64_t sequence,
                                const std::vector<std::pair<uint64_t, uint64_t>>& reads);
 // The same over a log's reads and walker pages.
@@ -94,8 +97,7 @@ public:
 	[[nodiscard]] bool Ranged() const noexcept { return m_ranged; }
 
 private:
-	uint64_t m_vaddr;
-	uint64_t m_size;
+	uint64_t m_open = 0;
 	bool     m_outer;
 	bool     m_ranged;
 };

@@ -513,10 +513,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			// release command follows publication): a prepared draw that read these bytes
 			// logged them, and DrawPrepare checks it by range.
 			const auto address = buffer_address + copy.srcOffset;
-			DrawPrepare::NoteStoredRange(address, copy.size);
+			const auto open = DrawPrepare::OpenStoredRange(address, copy.size);
 			Libs::LibKernel::Memory::WriteBacking(address, mapped + (copy.dstOffset - offset),
 			                                      copy.size, true);
-			DrawPrepare::NoteStoredRange(address, copy.size);
+			DrawPrepare::CloseStoredRange(open);
 		}
 		if (read != nullptr) {
 			read->published.store(true, std::memory_order_release);

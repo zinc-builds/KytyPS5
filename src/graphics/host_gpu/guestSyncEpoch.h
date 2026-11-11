@@ -26,7 +26,8 @@ inline void Advance() noexcept {
 	g_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
-// For a store whose range the caller also records with DrawPrepare::NoteStoredRange.
+// For a store whose range the caller also records with DrawPrepare::OpenStoredRange and
+// CloseStoredRange.
 inline void AdvanceRanged() noexcept {
 	g_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
