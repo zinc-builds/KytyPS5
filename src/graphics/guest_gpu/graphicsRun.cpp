@@ -591,7 +591,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 
 	ProcessPm4(execution);
 	// Nothing stays queued past the packet loop.
-	m_renderer.GetRenderExecutor().FinishQueuedDraws(CurrentBuffer());
+	m_renderer.GetRenderExecutor().FinishQueuedDraws(CurrentBuffer(),
+	                                                 RenderExecutor::DrainEndOfLoop);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -610,6 +611,19 @@ void CommandProcessor::SuspendPm4() {
 
 // Packets that read no guest data through the caches, so a requested collection of guest writes
 // (RenderContext::RequestAsyncCollect) can wait past them.
+// The emulator's context-state NOP (push, pop, clear of the context registers) changes only the
+// register context the command processor decodes from: a queued draw holds its own copy of the
+// registers, and the packet touches no memory and signals nothing, so it is handled like a
+// register write. KYTY_CONTEXT_STATE_DRAIN=1: it finishes the queue again.
+static bool IsQueuedContextStateNop(uint32_t packet_header) {
+	static const bool drains = [] {
+		const char* value = std::getenv("KYTY_CONTEXT_STATE_DRAIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	return !drains && ((packet_header >> 8u) & 0xffu) == Pm4::IT_NOP &&
+	       KYTY_PM4_R(packet_header) == Pm4::R_CONTEXT_STATE;
+}
+
 static bool DefersAsyncCollect(uint32_t packet_header) {
 	switch ((packet_header >> 8u) & 0xffu) {
 		case Pm4::IT_SET_CONTEXT_REG:
@@ -628,7 +642,8 @@ static bool DefersAsyncCollect(uint32_t packet_header) {
 		case Pm4::IT_NOP: {
 			// Other NOP codes carry emulator operations (flips, custom draws).
 			const auto r = KYTY_PM4_R(packet_header);
-			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       IsQueuedContextStateNop(packet_header);
 		}
 		default: return false;
 	}
@@ -661,7 +676,8 @@ static bool KeepsAtomicWrites(uint32_t packet_header) {
 		case Pm4::IT_DRAW_INDEX_AUTO: return true;
 		case Pm4::IT_NOP: {
 			const auto r = KYTY_PM4_R(packet_header);
-			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       IsQueuedContextStateNop(packet_header);
 		}
 		default: return false;
 	}
@@ -694,7 +710,8 @@ static bool KeepsQueuedDraw(uint32_t packet_header) {
 		case Pm4::IT_DRAW_INDEX_AUTO: return true;
 		case Pm4::IT_NOP: {
 			const auto r = KYTY_PM4_R(packet_header);
-			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       IsQueuedContextStateNop(packet_header);
 		}
 		default: return false;
 	}
@@ -733,7 +750,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (g_gpu_state != nullptr) {
 			// Guest commands (readbacks, unmaps) see every draw before them committed.
 			if (executor.HasQueuedDraw() && g_gpu_state->HasPendingCommands()) {
-				executor.FinishQueuedDraws(CurrentBuffer());
+				executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainGuestCommands);
 			}
 			g_gpu_state->ProcessCommands();
 		}
@@ -776,7 +793,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (executor.HasQueuedDraw() &&
 		    (!KeepsQueuedDraw(packet_header) ||
 		     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
-			executor.FinishQueuedDraws(CurrentBuffer());
+			uint32_t reason = RenderExecutor::DrainAsyncCollect;
+			if (!KeepsQueuedDraw(packet_header)) {
+				reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
+			}
+			executor.FinishQueuedDraws(CurrentBuffer(), reason);
 		}
 		if (!DefersAsyncCollect(packet_header)) {
 			m_renderer.CollectAsyncWritesIfRequested();
@@ -917,7 +938,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
 			// Reads guest memory a queued draw may write.
-			executor.FinishQueuedDraws(CurrentBuffer());
+			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
 	}
@@ -1080,7 +1101,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
-			executor.FinishQueuedDraws(CurrentBuffer());
+			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
 	}

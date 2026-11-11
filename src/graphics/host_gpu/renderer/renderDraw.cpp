@@ -1803,6 +1803,7 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		}
 		m_prepare_verify = EnvFlag("KYTY_PREPARE_VERIFY", false);
 		m_prepare_stats  = EnvFlag("KYTY_PREPARE_STATS", false);
+		m_drain_stats    = EnvFlag("KYTY_DRAIN_STATS", false);
 		// KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo.
 		const bool shared_memo = EnvFlag("KYTY_SHARED_TEXTURE_MEMO", true);
 		for (uint32_t i = 0; i < workers; i++) {
@@ -2046,6 +2047,18 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	if (const auto waited = PrepareWorker(sequence).Wait(PrepareJob(sequence)); waited != 0) {
 		m_prepare_stat.wait_ns += waited;
 		m_prepare_stat.waits++;
+		if (m_drain_stats) {
+			if (m_draining) {
+				m_drain_stat.drain_wait[m_drain_reason] += waited;
+			} else if (sequence <= m_refill_until) {
+				m_drain_stat.refill_wait[m_drain_reason] += waited;
+			} else {
+				m_drain_stat.steady_wait += waited;
+			}
+		}
+	}
+	if (m_drain_stats) {
+		PrintDrainStats();
 	}
 	// The draw reads the registers it was queued with.
 	auto& registers   = *buffer.m_registers;
@@ -2104,6 +2117,46 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			stat.worker_busy_ns = busy;
 		}
 	}
+}
+
+void RenderExecutor::PrintDrainStats() {
+	auto&      stat = m_drain_stat;
+	const auto now  = PrepareNowNs();
+	if (stat.start_ns == 0) {
+		stat.start_ns = now;
+		return;
+	}
+	if (now - stat.start_ns < 1'000'000'000ull) {
+		return;
+	}
+	const double s = static_cast<double>(now - stat.start_ns) / 1e9;
+	std::vector<uint32_t> reasons;
+	uint64_t              drain_total = 0, refill_total = 0, count_total = 0;
+	for (uint32_t r = 0; r < DrainReasons; r++) {
+		if (stat.count[r] != 0 || stat.drain_wait[r] != 0 || stat.refill_wait[r] != 0) {
+			reasons.push_back(r);
+			drain_total += stat.drain_wait[r];
+			refill_total += stat.refill_wait[r];
+			count_total += stat.count[r];
+		}
+	}
+	std::ranges::sort(reasons, [&](uint32_t a, uint32_t b) {
+		return stat.drain_wait[a] + stat.refill_wait[a] > stat.drain_wait[b] + stat.refill_wait[b];
+	});
+	std::printf("DRAIN total drains_s=%.0f drain_wait_us_s=%.0f refill_wait_us_s=%.0f "
+	            "steady_wait_us_s=%.0f\n",
+	            count_total / s, drain_total / s / 1e3, refill_total / s / 1e3,
+	            stat.steady_wait / s / 1e3);
+	for (size_t i = 0; i < reasons.size() && i < 12; i++) {
+		const auto r = reasons[i];
+		std::printf("DRAIN reason=%u (%s0x%02x) drains_s=%.0f drain_wait_us_s=%.0f "
+		            "refill_wait_us_s=%.0f\n",
+		            r, r >= 512 ? "nop r=" : r >= 256 ? "site " : "op ", r & 0xffu,
+		            stat.count[r] / s, stat.drain_wait[r] / s / 1e3, stat.refill_wait[r] / s / 1e3);
+	}
+	std::fflush(stdout);
+	*m_drain_stat_storage = {};
+	stat.start_ns         = now;
 }
 
 void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
