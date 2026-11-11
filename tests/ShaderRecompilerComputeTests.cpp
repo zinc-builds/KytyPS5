@@ -55482,27 +55482,52 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
-// DrawPrepare::RangedStore: queued draws reading the stored bytes see the store, others do
-// not; backing stores inside advance only the ranged epoch; scopes nest.
+// DrawPrepare::RangedStore: a store to pages the SRT walker logs reads of is ranged (queued
+// draws reading the stored bytes see it, others do not); to any other page it stays unranged, as
+// the walker reads those in place without logging. Scopes nest.
 static void CheckRangedStore() {
   using Libs::Graphics::Require;
   namespace DP = Libs::Graphics::DrawPrepare;
   namespace Epoch = Libs::Graphics::GuestSyncEpoch;
+  namespace IR = Libs::Graphics::ShaderRecompiler::IR;
+  const void *const *saved_regions = nullptr;
+  uint64_t saved_offset = 0;
+  IR::SrtWalkerReader saved_read = nullptr;
+  IR::GetSrtWalkerGuestAccess(&saved_regions, &saved_offset, &saved_read);
+  // A page table covering 0x7000'0000..: region 0x1c0, with only page 0x70001 read-watched.
+  constexpr uint64_t kWatched = 0x7000'1000u;
+  std::vector<uint8_t> region(1u << (IR::SrtWalkerRegionBits - IR::SrtWalkerPageBits), 0);
+  region[(kWatched >> IR::SrtWalkerPageBits) &
+         ((1u << (IR::SrtWalkerRegionBits - IR::SrtWalkerPageBits)) - 1u)] =
+      IR::SrtWalkerReadWatchedBit;
+  std::vector<const void *> regions((kWatched >> IR::SrtWalkerRegionBits) + 1, nullptr);
+  regions[kWatched >> IR::SrtWalkerRegionBits] = region.data();
+  IR::SetSrtWalkerGuestAccess(
+      regions.data(), 0,
+      [](uint64_t, uint32_t *) { return IR::SrtWalkerRead::Failed; });
   const auto before = DP::StoredSequence();
+  bool watched_ranged = false, unwatched_ranged = true, outer_kept = false;
   {
-    DP::RangedStore outer(0x7000'1000u, 8);
-    Require("RangedStore", "flag", Epoch::g_stores_ranged, "the scope did not mark stores ranged");
-    { DP::RangedStore inner(0x7000'2000u, 256); }
-    Require("RangedStore", "nesting", Epoch::g_stores_ranged,
-            "an inner scope cleared the outer one's flag");
+    DP::RangedStore outer(kWatched + 0x10u, 8);
+    watched_ranged = outer.Ranged() && Epoch::g_stores_ranged;
+    {
+      DP::RangedStore inner(kWatched + 0x1000u, 256); // the next page: not watched
+      unwatched_ranged = inner.Ranged() || Epoch::g_stores_ranged;
+    }
+    outer_kept = Epoch::g_stores_ranged;
   }
-  Require("RangedStore", "flag reset", !Epoch::g_stores_ranged, "the flag outlived the scope");
-  const std::vector<std::pair<uint64_t, uint64_t>> label{{0x7000'1004u, 4}};
-  const std::vector<std::pair<uint64_t, uint64_t>> block{{0x7000'20f0u, 0x20}};
-  const std::vector<std::pair<uint64_t, uint64_t>> other{{0x7000'3000u, 0x100}};
+  const bool reset = !Epoch::g_stores_ranged;
+  IR::SetSrtWalkerGuestAccess(saved_regions, saved_offset, saved_read);
+  Require("RangedStore", "watched page", watched_ranged,
+          "a store to a read-watched page was not ranged");
+  Require("RangedStore", "unwatched page", !unwatched_ranged,
+          "a store to a page the walker reads unlogged was ranged");
+  Require("RangedStore", "nesting", outer_kept && reset,
+          "an inner scope changed the outer one's flag, or the flag outlived the scope");
+  const std::vector<std::pair<uint64_t, uint64_t>> label{{kWatched + 0x14u, 4}};
+  const std::vector<std::pair<uint64_t, uint64_t>> other{{kWatched + 0x200u, 0x100}};
   Require("RangedStore", "ranges",
-          DP::StoredSince(before, label) && DP::StoredSince(before, block) &&
-              !DP::StoredSince(before, other),
+          DP::StoredSince(before, label) && !DP::StoredSince(before, other),
           "a read of the stored bytes was missed, or an unrelated read was hit");
   std::printf("[host]    RangedStore                      ok\n");
 }

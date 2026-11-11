@@ -1237,9 +1237,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, bytes.size());
-			// Ranged: a queued draw is dropped only if its worker read these bytes.
+			// Ranged where worker reads are logged: a queued draw is dropped only if it read these
+			// bytes.
 			DrawPrepare::RangedStore ranged(address, bytes.size());
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size(), true);
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
 }
@@ -2071,10 +2072,10 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
-		// Ranged, as BufferCache's readbacks: queued draws are checked against these bytes
-		// instead of all being dropped.
+		// Ranged where worker reads are logged, as BufferCache's readbacks: queued draws are
+		// checked against these bytes instead of all being dropped.
 		DrawPrepare::RangedStore ranged(range.address, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size, true);
+		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
 }

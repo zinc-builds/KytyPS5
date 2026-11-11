@@ -73,26 +73,25 @@ void                   NoteStoredRange(uint64_t vaddr, uint64_t size);
                                const std::vector<std::pair<uint64_t, uint64_t>>& reads);
 
 // An emulator store into guest memory between queued draws (a label, WRITE_DATA, an occlusion
-// dump): the queued draws are checked against [vaddr, vaddr + size) (StoredSince) instead of all
-// being dropped. Backing stores made inside the scope advance only the ranged epoch. Queued
-// draws do read label bytes as data, so the range must cover every byte the store writes.
+// dump). If every page of [vaddr, vaddr + size) is read-watched, so that a prepare worker's reads
+// of those bytes were logged, the queued draws are checked against the range (StoredSince)
+// instead of all being dropped, and backing stores made inside the scope (TryStoreLabelBacking,
+// WriteBacking) advance only the ranged epoch. Otherwise the store advances the unranged epoch
+// as before. Queued draws do read label bytes as data, so the range must cover every byte the
+// store writes.
 class RangedStore {
 public:
-	RangedStore(uint64_t vaddr, uint64_t size) noexcept
-	    : m_vaddr(vaddr), m_size(size), m_outer(GuestSyncEpoch::g_stores_ranged) {
-		NoteStoredRange(vaddr, size);
-		GuestSyncEpoch::g_stores_ranged = true;
-	}
-	~RangedStore() {
-		GuestSyncEpoch::g_stores_ranged = m_outer;
-		NoteStoredRange(m_vaddr, m_size);
-	}
+	RangedStore(uint64_t vaddr, uint64_t size) noexcept;
+	~RangedStore();
 	KYTY_CLASS_NO_COPY(RangedStore);
+
+	[[nodiscard]] bool Ranged() const noexcept { return m_ranged; }
 
 private:
 	uint64_t m_vaddr;
 	uint64_t m_size;
 	bool     m_outer;
+	bool     m_ranged;
 };
 
 // One worker thread. The command thread posts sequence numbers in order; the worker calls

@@ -65,6 +65,22 @@ uint64_t HazardGeneration() noexcept {
 	return g_hazard_generation.load(std::memory_order_relaxed);
 }
 
+RangedStore::RangedStore(uint64_t vaddr, uint64_t size) noexcept
+    : m_vaddr(vaddr), m_size(size), m_outer(GuestSyncEpoch::g_stores_ranged),
+      m_ranged(ShaderRecompiler::IR::SrtWalkerReadsLogged(vaddr, size)) {
+	if (m_ranged) {
+		NoteStoredRange(vaddr, size);
+	}
+	GuestSyncEpoch::g_stores_ranged = m_ranged;
+}
+
+RangedStore::~RangedStore() {
+	GuestSyncEpoch::g_stores_ranged = m_outer;
+	if (m_ranged) {
+		NoteStoredRange(m_vaddr, m_size);
+	}
+}
+
 void NoteStoredRange(uint64_t vaddr, uint64_t size) {
 	std::scoped_lock lock(g_stored_mutex);
 	g_stored.push_back({++g_stored_last, vaddr, vaddr + size});
