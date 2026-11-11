@@ -2072,9 +2072,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
-		// Ranged where worker reads are logged, as BufferCache's readbacks: queued draws are
-		// checked against these bytes instead of all being dropped.
-		DrawPrepare::RangedStore ranged(range.address, range.size);
+		// Unranged: this runs on the priority thread, where the read watches a ranged store relies
+		// on may be removed (BufferCache::FinishRead) while it writes.
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;

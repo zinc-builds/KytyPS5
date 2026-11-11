@@ -78,7 +78,7 @@ void                   NoteStoredRange(uint64_t vaddr, uint64_t size);
 // instead of all being dropped, and backing stores made inside the scope (TryStoreLabelBacking,
 // WriteBacking) advance only the ranged epoch. Otherwise the store advances the unranged epoch
 // as before. Queued draws do read label bytes as data, so the range must cover every byte the
-// store writes.
+// store writes. Only on the GPU thread: elsewhere the read watches may go while the store runs.
 class RangedStore {
 public:
 	RangedStore(uint64_t vaddr, uint64_t size) noexcept;
