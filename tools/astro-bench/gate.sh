@@ -16,7 +16,7 @@
 VERIFY_ENV="KYTY_PREPARE_VERIFY=1 KYTY_BINDING_REUSE_VERIFY=1 KYTY_WORKER_TARGETS_VERIFY=1 KYTY_WORKER_PIPELINE_KEY_VERIFY=1"
 # Verifiers that exit on a difference. Others (KYTY_STREAM_VERIFY, KYTY_TILER_VERIFY, ...) only
 # print, so a run that reaches its last frame proves nothing for them: run those by hand.
-EXITING_VERIFY="KYTY_PREPARE_VERIFY KYTY_BINDING_REUSE_VERIFY KYTY_WORKER_TARGETS_VERIFY KYTY_WORKER_PIPELINE_KEY_VERIFY KYTY_WORKER_BUFFERS"
+EXITING_VERIFY="$VERIFY_ENV KYTY_WORKER_BUFFERS=verify"
 dir=$(dirname "$0")
 repo=$(git -C "$dir" rev-parse --show-toplevel)
 label=$1
@@ -37,8 +37,8 @@ while [ $# -gt 0 ]; do
 	shift
 done
 for kv in $verify_env; do
-	[[ " $EXITING_VERIFY " == *" ${kv%%=*} "* ]] || {
-		echo "gate.sh: --verify-env ${kv%%=*}: not a verifier that exits on a difference ($EXITING_VERIFY); check it in its own run" >&2
+	[[ " $EXITING_VERIFY " == *" $kv "* ]] || {
+		echo "gate.sh: --verify-env $kv: not a verifier setting that exits on a difference ($EXITING_VERIFY); check it in its own run" >&2
 		exit 2
 	}
 done
