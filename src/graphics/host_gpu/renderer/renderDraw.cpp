@@ -1,3 +1,4 @@
+#include "common/prepareTrace.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -1830,6 +1831,10 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 }
 
 void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
+	if (Common::PrepareTrace::Enabled()) {
+		queued.trace       = {};
+		queued.trace.post  = Common::PrepareTrace::Now();
+	}
 	queued.registers         = buffer.GetRegisters();
 	queued.user_config       = buffer.GetUserConfig();
 	queued.shaders           = buffer.GetShaders();
@@ -1896,6 +1901,13 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	auto& self     = *lane.executor;
 	const auto sequence = (job - 1) * self.m_prepare_lanes.size() + lane.index + 1;
 	auto& queued = *self.m_queued_draws[(sequence - 1) % self.m_queued_draws.size()];
+	const bool trace = Common::PrepareTrace::Enabled();
+	auto&      t     = queued.trace;
+	if (trace) {
+		t.start = Common::PrepareTrace::Now();
+		Common::PrepareTrace::t_module_ticks   = 0;
+		Common::PrepareTrace::t_resource_ticks = 0;
+	}
 	queued.log.Reset();
 	DrawPrepare::SetLog(&queued.log);
 	std::destroy_at(&queued.state);
@@ -1903,10 +1915,33 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	self.m_context.GetPipelineCache().GetGraphicsPrograms(
 	    queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
 	DrawPrepare::SetLog(nullptr);
+	if (trace) t.programs = Common::PrepareTrace::Now();
 	self.SpeculateBuffers(queued);
+	if (trace) t.buffers = Common::PrepareTrace::Now();
 	self.SpeculateTextures(queued, lane.textures);
+	if (trace) t.textures = Common::PrepareTrace::Now();
 	self.SpeculateTargets(queued, lane.targets);
+	if (trace) t.targets = Common::PrepareTrace::Now();
 	self.ProposePipelineKey(queued);
+	if (trace) {
+		t.end      = Common::PrepareTrace::Now();
+		t.module   = Common::PrepareTrace::t_module_ticks;
+		t.resource = Common::PrepareTrace::t_resource_ticks;
+	}
+}
+
+void RenderExecutor::WriteTrace() {
+	const auto  tsc = Common::PrepareTrace::Now();
+	const auto  ns  = PrepareNowNs();
+	const double hz = static_cast<double>(tsc - m_trace_tsc0) * 1e9 /
+	                  static_cast<double>(std::max<uint64_t>(ns - m_trace_ns0, 1));
+	if (FILE* file = std::fopen(Common::PrepareTrace::File(), "wb"); file != nullptr) {
+		const uint64_t header[2] = {static_cast<uint64_t>(hz), sizeof(TraceRecord)};
+		std::fwrite(header, sizeof(header), 1, file);
+		std::fwrite(m_trace.data(), sizeof(TraceRecord), m_trace.size(), file);
+		std::fclose(file);
+	}
+	m_trace.clear();
 }
 
 // Prepare worker: the pipeline key GetGraphicsPipeline would build for the queued draw if the
@@ -2043,6 +2078,20 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	const auto sequence = m_queued_posted - m_queued_count + 1;
 	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
 	EXIT_IF(m_queued_count == 0 || queued.sequence != sequence);
+	const bool trace = Common::PrepareTrace::Enabled();
+	TraceRecord record {};
+	if (trace) {
+		record.finish_enter     = Common::PrepareTrace::Now();
+		record.lane             = static_cast<uint32_t>((sequence - 1) % m_prepare_lanes.size());
+		record.draining         = m_draining ? 1 : 0;
+		record.queued_at_finish = static_cast<uint8_t>(m_queued_count);
+		record.others_idle      = 1;
+		for (uint32_t i = 0; i < m_prepare_lanes.size(); i++) {
+			if (i != record.lane && !m_prepare_lanes[i]->worker->Idle()) {
+				record.others_idle = 0;
+			}
+		}
+	}
 	m_queued_count--;
 	if (const auto waited = PrepareWorker(sequence).Wait(PrepareJob(sequence)); waited != 0) {
 		m_prepare_stat.wait_ns += waited;
@@ -2059,6 +2108,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	}
 	if (m_drain_stats) {
 		PrintDrainStats();
+	}
+	if (trace) {
+		record.wait_end = Common::PrepareTrace::Now();
 	}
 	// The draw reads the registers it was queued with.
 	auto& registers   = *buffer.m_registers;
@@ -2085,6 +2137,32 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	m_texture_updates.clear();
 	m_context.GetBufferCache().SetSpeculation(nullptr);
 	buffer.Bind(registers, user_config, shaders);
+	if (trace) {
+		const auto& t       = queued.trace;
+		record.sequence     = sequence;
+		record.post         = t.post;
+		record.start        = t.start;
+		record.programs     = t.programs;
+		record.buffers      = t.buffers;
+		record.textures     = t.textures;
+		record.targets      = t.targets;
+		record.end          = t.end;
+		record.module       = t.module;
+		record.resource     = t.resource;
+		record.idle_wait    = t.idle_wait;
+		record.own_lookup   = t.own_lookup;
+		record.reject       = t.reject;
+		record.finish_exit  = Common::PrepareTrace::Now();
+		if (m_trace.empty()) {
+			m_trace.reserve(kTraceWindow);
+			m_trace_tsc0 = Common::PrepareTrace::Now();
+			m_trace_ns0  = PrepareNowNs();
+		}
+		m_trace.push_back(record);
+		if (m_trace.size() == kTraceWindow) {
+			WriteTrace();
+		}
+	}
 
 	if (m_prepare_stats) {
 		auto&      stat = m_prepare_stat;
@@ -2182,11 +2260,25 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		usable = true;
 	}
 	if (!usable) {
+		const bool trace = Common::PrepareTrace::Enabled();
+		const auto t0    = trace ? Common::PrepareTrace::Now() : 0;
 		// The command thread may not look programs up while the worker does.
 		WaitPrepareIdle();
+		const auto t1 = trace ? Common::PrepareTrace::Now() : 0;
 		ResetProgramState(state);
 		pipelines.GetGraphicsPrograms(queued.registers, queued.user_config, queued.shaders, state,
 		                              queued.resources);
+		if (trace) {
+			queued.trace.idle_wait  = t1 - t0;
+			queued.trace.own_lookup = Common::PrepareTrace::Now() - t1;
+			queued.trace.reject     = queued.log.failed ? 1
+			                          : (DrawPrepare::HazardGeneration() != queued.hazard_generation ||
+			                             GuestSyncEpoch::CurrentUnranged() != queued.sync_epoch)
+			                              ? 2
+			                          : DrawPrepare::StoredSince(queued.stored_sequence, queued.log.reads)
+			                              ? 3
+			                              : 4;
+		}
 		return;
 	}
 	m_prepare_stat.adopted++;

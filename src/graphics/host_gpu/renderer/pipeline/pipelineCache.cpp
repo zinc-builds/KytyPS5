@@ -1,3 +1,4 @@
+#include "common/prepareTrace.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
@@ -315,8 +316,14 @@ template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor,
                                                  StageResources& resources) {
-	if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources.snapshot,
-	                                               resources.specialization)) {
+	Common::PrepareTrace::Scope module_scope(Common::PrepareTrace::t_module_ticks);
+	bool materialized = false;
+	{
+		Common::PrepareTrace::Scope resource_scope(Common::PrepareTrace::t_resource_ticks);
+		materialized = ShaderRecompiler::IR::MaterializeResources(
+		    resource_plan, runtime, resources.snapshot, resources.specialization);
+	}
+	if (!materialized) {
 		// On the worker, a heap it may not acquire can be why.
 		EXIT_IF(!DrawPrepare::OnWorker());
 		DrawPrepare::Fail();

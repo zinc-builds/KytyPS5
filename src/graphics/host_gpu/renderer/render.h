@@ -356,6 +356,13 @@ private:
 		PipelineCache::GraphicsResources resources;
 		DrawPrepare::Log                 log;
 		uint64_t                         sequence = 0;
+		// KYTY_PREPARE_TRACE: TSC ticks of the post (command thread) and of the job's stages
+		// (worker), and of the command thread's handling of a rejected preparation.
+		struct Trace {
+			uint64_t post = 0, start = 0, programs = 0, buffers = 0, textures = 0, targets = 0,
+			         end = 0, module = 0, resource = 0, idle_wait = 0, own_lookup = 0;
+			uint8_t  reject = 0; // 0 adopted, 1 failed, 2 hazard/epoch, 3 stored, 4 gpu-written
+		} trace;
 		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged and
 		// DrawPrepare::StoredSequence when it was queued.
 		uint64_t                         hazard_generation = 0;
@@ -664,6 +671,18 @@ private:
 	std::unique_ptr<DrainStats> m_drain_stat_storage = std::make_unique<DrainStats>();
 	DrainStats&                 m_drain_stat         = *m_drain_stat_storage;
 	void                        PrintDrainStats();
+	// KYTY_PREPARE_TRACE: per-draw records, written to the file in windows of kTraceWindow.
+	struct TraceRecord {
+		uint64_t sequence;
+		uint64_t post, start, programs, buffers, textures, targets, end, module, resource;
+		uint64_t finish_enter, wait_end, finish_exit, idle_wait, own_lookup;
+		uint32_t lane;
+		uint8_t  draining, others_idle, reject, queued_at_finish;
+	};
+	static constexpr size_t  kTraceWindow = 600000;
+	std::vector<TraceRecord> m_trace;
+	uint64_t                 m_trace_tsc0 = 0, m_trace_ns0 = 0;
+	void                     WriteTrace();
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
 		uint64_t stored = 0;

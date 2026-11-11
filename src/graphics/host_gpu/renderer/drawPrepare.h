@@ -86,6 +86,10 @@ public:
 	uint64_t Post();
 	// Waits until the worker has finished `sequence`. Returns the nanoseconds spent waiting.
 	uint64_t Wait(uint64_t sequence);
+	// Whether every posted sequence is finished (racy; for statistics).
+	[[nodiscard]] bool Idle() const {
+		return m_done.load(std::memory_order_relaxed) == m_posted.load(std::memory_order_relaxed);
+	}
 	// Waits until every posted sequence is finished.
 	uint64_t WaitIdle() { return Wait(m_posted_local); }
 	[[nodiscard]] bool Done(uint64_t sequence) const {
