@@ -472,6 +472,25 @@ void BdaPrestager::Take(uint64_t address, uint64_t size, uint64_t dst_offset,
 			// The part of this page being uploaded (a buffer need not start or end on a page).
 			const auto piece       = std::max(page, address);
 			const auto piece_bytes = std::min(end, page + PageSize) - piece;
+			if (m_mode >= 2 && !m_marked.empty()) {
+				if (auto marked = m_marked.find(page); marked != m_marked.end()) {
+					if (PageVersions::Read(page) != marked->second) {
+						m_stat.loop_closed.fetch_add(1, std::memory_order_relaxed);
+					} else {
+						m_stat.loop_open.fetch_add(1, std::memory_order_relaxed);
+						std::printf("BDAPRESTAGE_LOOP_OPEN page=0x%016" PRIx64
+						            " version=%u: used again with no newer version after a marked "
+						            "mismatch\n",
+						            page, marked->second);
+						if (m_mode == 3) {
+							EXIT("KYTY_BDA_PRESTAGE=strict: page 0x%016" PRIx64
+							     " was used again without the pending store being reported\n",
+							     page);
+						}
+					}
+					m_marked.erase(marked);
+				}
+			}
 			auto       it          = m_entries.find(page);
 			if (it == m_entries.end()) {
 				auto reason = Miss::None;
@@ -554,11 +573,20 @@ void BdaPrestager::Take(uint64_t address, uint64_t size, uint64_t dst_offset,
 							    });
 							(marked ? m_stat.mismatched_marked : m_stat.mismatched_unmarked)
 							    .fetch_add(1, std::memory_order_relaxed);
-							std::printf("BDAPRESTAGE_MISMATCH page=0x%016" PRIx64
+							if (marked) {
+								m_marked[page] = version;
+							} else if (m_mode == 3) {
+								EXIT("KYTY_BDA_PRESTAGE=strict: the staged copy of page 0x%016" PRIx64
+								     " differs from guest memory at use with no pending write mark\n",
+								     page);
+							}
+							std::printf("BDAPRESTAGE_MISMATCH buffer=0x%016" PRIx64 "+0x%" PRIx64
+							            " page=0x%016" PRIx64
 							            " version=%u generation=%" PRIu64 " age_ms=%.2f "
 							            "differing_bytes=%u first=0x%x last=0x%x staged=%02x%02x%02x%02x "
 							            "now=%02x%02x%02x%02x queued_ago_ms=%.2f pending_mark=%d\n",
-							            page, version, generation,
+							            address - dst_offset, page - (address - dst_offset), page,
+							            version, generation,
 							            entry.staged_ns != 0
 							                ? static_cast<double>(NowNs() - entry.staged_ns) / 1e6
 							                : -1.0,
@@ -578,11 +606,7 @@ void BdaPrestager::Take(uint64_t address, uint64_t size, uint64_t dst_offset,
 							add_fresh(piece, piece_bytes);
 							continue;
 						}
-						if (m_mode == 3) {
-							EXIT("KYTY_BDA_PRESTAGE=strict: the staged copy of page 0x%016" PRIx64
-							     " differs from guest memory at use (version %u)\n",
-							     page, version);
-						}
+
 					}
 				}
 			}
@@ -628,7 +652,8 @@ void BdaPrestager::ReportIfDue() {
 	    "evicted=%.1f%% version=%.1f%% generation=%.1f%% | stager: staged_mb_s=%.0f "
 	    "wasted_mb_s=%.0f (superseded %.0f, evicted %.0f, moved_in_copy %.0f) refused_pages_s=%.0f "
 	    "odd_s=%.0f arena_full_s=%.0f arms_s=%.0f busy=%.1f%% | verify: compared_s=%.0f "
-	    "mismatched=%" PRIu64 " (pending_mark %" PRIu64 ", unmarked %" PRIu64 ")\n",
+	    "mismatched=%" PRIu64 " (pending_mark %" PRIu64 ", unmarked %" PRIu64 ") loop_closed=%" PRIu64
+	    " loop_open=%" PRIu64 "\n",
 	    pct(served), static_cast<double>(uses * PageSize) / 1e6 / seconds, pct(missing),
 	    pct(refused), pct(evicted), pct(version), pct(generation),
 	    static_cast<double>(staged * PageSize) / 1e6 / seconds,
@@ -642,7 +667,7 @@ void BdaPrestager::ReportIfDue() {
 	    static_cast<double>(take(m_stat.arms)) / seconds,
 	    100.0 * static_cast<double>(take(m_stat.busy_ns)) / (seconds * 1e9),
 	    static_cast<double>(compared) / seconds, mismatched, take(m_stat.mismatched_marked),
-	    take(m_stat.mismatched_unmarked));
+	    take(m_stat.mismatched_unmarked), take(m_stat.loop_closed), take(m_stat.loop_open));
 	uint64_t age[4], by[4];
 	for (int i = 0; i < 4; i++) {
 		age[i] = take(m_stat.moved_age[i]);

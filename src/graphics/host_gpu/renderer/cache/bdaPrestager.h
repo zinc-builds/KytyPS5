@@ -88,7 +88,10 @@ public:
 		// Batches taken from the inbox: queued and coalesced bytes, and their lag (oldest queueing
 		// to the batch's end).
 		std::atomic<uint64_t> batches {0}, queued_bytes {0}, coalesced_bytes {0}, lag_ns {0},
-		    lag_max_ns {0}, current {0}, mismatched_marked {0}, mismatched_unmarked {0};
+		    lag_max_ns {0}, current {0}, mismatched_marked {0}, mismatched_unmarked {0},
+		    // Verify: a page whose copy differed under a pending mark must be at a newer version
+		    // by its next use (the next collection reported the store).
+		    loop_closed {0}, loop_open {0};
 	};
 	[[nodiscard]] const Stats& Counters() const noexcept { return m_stat; }
 
@@ -175,6 +178,7 @@ private:
 	uint32_t                                m_trace_every = 0;
 	uint64_t                                m_trace_count = 0;
 	std::unordered_map<uint64_t, Trace>     m_trace; // under m_mutex
+	std::unordered_map<uint64_t, uint32_t>  m_marked; // verify: page -> version at a marked mismatch
 	void NoteOutcome(uint64_t page, Outcome outcome, uint32_t version); // under m_mutex
 };
 
