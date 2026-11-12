@@ -564,7 +564,41 @@ static void ReportSubmitScans() {
 	std::fflush(stdout);
 }
 
+// KYTY_PRESTAGE_STATS=1: a PRESTAGE line per second (BDA pre-staging arms, refusals, pre-arm
+// stores kept, versions moved by consumed marks, staged pages, remap generation moves).
+static void ReportPrestage() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PRESTAGE_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	static auto     last            = std::chrono::steady_clock::now();
+	static uint64_t last_generation = LibKernel::Memory::TakePrestageCounters().remap_generation;
+	const auto      now             = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(1)) {
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - last).count();
+	last                 = now;
+	const auto c         = LibKernel::Memory::TakePrestageCounters();
+	std::printf("PRESTAGE arms_s=%.0f refused_async_s=%.0f refused_alias_s=%.0f "
+	            "refused_private_s=%.0f prearm_pages_s=%.0f bumped_pages_s=%.0f staged_pages=%llu "
+	            "remap_moves_s=%.1f\n",
+	            static_cast<double>(c.arms) / seconds, static_cast<double>(c.refused_async) / seconds,
+	            static_cast<double>(c.refused_alias) / seconds,
+	            static_cast<double>(c.refused_private) / seconds,
+	            static_cast<double>(c.prearm_pages) / seconds,
+	            static_cast<double>(c.bumped_pages) / seconds,
+	            static_cast<unsigned long long>(c.staged_pages),
+	            static_cast<double>(c.remap_generation - last_generation) / seconds);
+	last_generation = c.remap_generation;
+	std::fflush(stdout);
+}
+
 void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
+	ReportPrestage();
 	// A pending request (a satisfied wait published guest data, maybe in another submission
 	// that is now blocked) needs a full scan: only a full scan settles it.
 	if (m_async_collect_requested) {
@@ -608,6 +642,30 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 	} else {
 		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::CollectScan);
 		LibKernel::Memory::CollectAsyncGuestWrites(written, WantsAsyncScan);
+	}
+	// KYTY_PRESTAGE_SELFTEST=1 (test only, no stager): stage up to 16 pages of the first written
+	// run each collection, and unstage them all every 16th collection, to run the arm (including
+	// re-arms of staged pages), consumption and unstage paths under KYTY_ASYNC_WP_VERIFY.
+	static const bool selftest = [] {
+		const char* value = std::getenv("KYTY_PRESTAGE_SELFTEST");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (selftest) {
+		static std::vector<std::pair<uint64_t, uint64_t>> armed;
+		static uint32_t                                   collections = 0;
+		if (++collections % 16 == 0) {
+			for (const auto& [begin, size]: armed) {
+				LibKernel::Memory::Unstage(begin, size);
+			}
+			armed.clear();
+		}
+		if (!written.empty()) {
+			const auto size = std::min<uint64_t>(written.front().second - written.front().first,
+			                                     16 * TRACKER_PAGE_SIZE);
+			if (LibKernel::Memory::ArmStaged(written.front().first, size)) {
+				armed.emplace_back(written.front().first, size);
+			}
+		}
 	}
 	if (written.empty()) {
 		VerifyAsyncWrites(written, true);

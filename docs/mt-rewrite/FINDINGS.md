@@ -1976,6 +1976,7 @@ ran ~54.8 FPS: the command thread just became less busy (95.5% → 93.6%). `KYTY
   draws, drains, the command thread's wait and the worker's time per draw, texture resolves handed
   back to the workers' memo and adopted records whose page check ran again). `KYTY_SHARED_TEXTURE_MEMO=0`
   gives each worker its own texture memo again.
+- BDA pre-staging, tracker side (Track K, `docs/mt-rewrite/bda-prestage-design.md`): `KYTY_PRESTAGE_STATS=1` prints a `PRESTAGE` line per second (arms, refusals by reason, pre-arm stores kept, staged versions moved by consumed written marks, staged pages, remap-generation moves; in Sky Garden's steady state the remap generation moves 0 times per second). `KYTY_PRESTAGE_SELFTEST=1` (test only) stages written runs from the GPU thread so the arm, consumption and unstage paths run under `KYTY_ASYNC_WP_VERIFY` without the stager.
 - Kernel time (Track K): `KYTY_KERNEL_STATS=1` prints a `KSTATS` line once per second with the
   GPU command thread's `/proc` user/sys time, faults and context switches, and per call site the
   calls/s and µs/s of each timed system call kind (`PAGEMAP_SCAN` with and without written pages,
