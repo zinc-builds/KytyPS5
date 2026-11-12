@@ -35,17 +35,25 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
-# batch.sh lines are whitespace-split and cut at the first "--": -e values can hold neither.
+# batch.sh lines are whitespace-split and cut at the first "--", one run per line: -e words are
+# re-joined with single spaces, and must be K=V without "--".
+words=()
 for kv in $extra; do
 	[[ "$kv" == *=* && "$kv" != *--* ]] || { echo "levels.sh: -e takes K=V words without spaces or \"--\" ($kv)" >&2; exit 1; }
+	words+=("$kv")
 done
+extra="${words[*]}"
 [ ${#levels[@]} -gt 0 ] || { echo "usage: levels.sh [-m verify|perf] [-f A-B] [-s F] [-e ENV] [-t TAG] [-l FILE] <level>..." >&2; exit 1; }
 case "$mode" in
 verify) window=${window:-0-400} shot=${shot:-300} env=$VERIFY_ENV ;;
 perf) window=${window:-200-800} env= ;;
 *) echo "levels.sh: -m verify|perf" >&2; exit 1 ;;
 esac
-# A run that never happens (no lock) must not leave an earlier run's files to be read as its own.
+# The whole sweep is one hold of the bench lock (batch.sh inherits it), so clearing old outputs
+# below cannot touch another sweep's live files, and a run that never happens cannot leave an
+# earlier run's files to be read as its own.
+. "$here/benchlock.sh"
+benchlock_acquire x "levels.sh $tag-$mode" || exit 1
 for l in "${levels[@]}"; do
 	rm -f "/tmp/garden-$tag-$mode-$l.out" "/tmp/bench-$tag-$mode-$l.log" "/tmp/garden-$tag-$mode-$l-shot.png"
 done
@@ -63,14 +71,21 @@ table=/tmp/levels-$tag-$mode.md
 		label=$tag-$mode-$l log=/tmp/bench-$tag-$mode-$l.log out=/tmp/garden-$tag-$mode-$l.out
 		loaded=$(grep -o -m1 'Level has started: [a-z0-9_]\+' "$log" 2>/dev/null | tail -1 | cut -d' ' -f4)
 		first=$(head -1 "$out" 2>/dev/null)
+		# The counter is cumulative (max over the summary lines); a loss after the last summary
+		# still prints its own line at once.
 		lost=$(grep -o 'ASYNCWPVERIFY .*lost=[0-9]*' "$log" 2>/dev/null | grep -o 'lost=[0-9]*' | cut -d= -f2 | awk '$1>m{m=$1} END {print m+0}')
+		lostline=$(grep -m1 -E 'ASYNCWPVERIFY (lost write|kept write not handled)' "$log" 2>/dev/null | cut -c1-120)
 		if [[ "$first" == "$label: fps="* ]]; then
 			result=ok
-			[ "${lost:-0}" -gt 0 ] && result="FAIL: KYTY_ASYNC_WP_VERIFY reported lost=$lost — $(grep -m1 'ASYNCWPVERIFY.*lost=[1-9]' "$log" | cut -c1-120)"
 			fps=$(sed -E 's/.*fps=([0-9.]+).*/\1/' <<<"$first")
 			dpf=$(sed -E 's/.*draws\/frame=([0-9]+).*/\1/' <<<"$first")
 			cmd=$(grep -o 'cmd_ns=[0-9]*' <<<"$first" | cut -d= -f2)
 			worst=$(sed -E 's/.*worst_ms=([0-9.]+) \(max ([0-9.]+)\).*/\1 (\2)/' <<<"$first")
+			# An unknown -lvl name still "starts" and renders an empty scene (~20 draws/frame).
+			[ "${dpf:-0}" -lt 100 ] && result="FAIL: near-empty scene ($dpf draws/frame): unknown level name?"
+			if [ "${lost:-0}" -gt 0 ] || [ -n "$lostline" ]; then
+				result="FAIL: KYTY_ASYNC_WP_VERIFY lost=$lost — ${lostline:-$(grep -m1 'ASYNCWPVERIFY.*lost=[1-9]' "$log" | cut -c1-120)}"
+			fi
 		else
 			# The cause garden.sh gave, then the log's last error-looking line.
 			cause=$(grep -v -E '^(AMD CPU|benchlock|level start)' "$out" 2>/dev/null | head -1)
