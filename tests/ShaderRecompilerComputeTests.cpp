@@ -2612,6 +2612,10 @@ public:
   void CheckRetireNoWait() {
     EnsureRuntimeContext();
     constexpr const char *name = "RetireNoWait";
+    if (const char *nowait = std::getenv("KYTY_RETIRE_NOWAIT"); nowait != nullptr && nowait[0] == '0') {
+      std::printf("[host]    %-32s skipped (KYTY_RETIRE_NOWAIT=0)\n", name);
+      return; // retirement waits for the held priority operation: the case would block
+    }
     CommandScheduler scheduler(Renderer(), m_runtime_context);
     HW::Context registers{};
     HW::UserConfig user_config{};
