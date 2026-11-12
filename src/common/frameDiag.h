@@ -78,6 +78,39 @@ void OnGuestFlip(uint64_t frame) noexcept;
 // (PERF lines' frames=) and `interval_ms` the time since the previous one.
 void OnFlip(uint64_t frame, double interval_ms) noexcept;
 
+// What the guest's submitting thread did while the command thread had no work. Guest waits
+// (the emulator's implementations of the calls below) are timed per thread; those of 20 µs or
+// more go into a per-thread ring, shorter ones only into per-kind totals. Each guest submission
+// marks its thread as the submitter. When the command thread's wait for guest work lasts 1 ms or
+// more, it prints one GIDLE line: the gap, how long after the last guest submission the command
+// thread woke, and the submitter's waits inside the gap by kind (clipped to it), plus its last wait
+// before the gap ended (kind, ident, length, and how long before the end it returned).
+enum class GuestWait : uint8_t { Equeue, Sleep, Cond, Mutex, Sema, EventFlag, Count };
+
+class GuestWaitScope {
+public:
+	explicit GuestWaitScope(GuestWait kind, uint64_t ident = 0) noexcept;
+	~GuestWaitScope();
+	// For waits whose ident is known only after they return (equeue: the first event's filter and
+	// ident).
+	void SetIdent(uint64_t ident) noexcept { m_ident = ident; }
+	GuestWaitScope(const GuestWaitScope&)            = delete;
+	GuestWaitScope& operator=(const GuestWaitScope&) = delete;
+
+private:
+	uint64_t  m_start = 0;
+	uint64_t  m_ident = 0;
+	GuestWait m_kind;
+};
+
+// A guest thread submitted a command buffer.
+void OnGuestSubmit() noexcept;
+
+// The command thread begins waiting for guest work; then it waited from `start_ns` to `end_ns`
+// (NowNs()). Short waits (under 20 µs) count when they ended in the gap.
+void OnCmdIdleBegin() noexcept;
+void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept;
+
 } // namespace Common::FrameDiag
 
 #endif // KYTY_COMMON_FRAME_DIAG_H_

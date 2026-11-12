@@ -11,9 +11,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #if defined(__linux__)
 #include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace Common::FrameDiag {
@@ -265,6 +270,182 @@ void OnGuestFlip(uint64_t frame) noexcept {
 	g_guest.last    = now;
 	g_guest.last_ns = now_ns;
 	g_guest.count++;
+}
+
+namespace {
+
+constexpr uint64_t kRingMinNs = 20'000;
+constexpr uint64_t kIdleMinNs = 1'000'000;
+constexpr uint32_t kRing      = 512;
+constexpr int      kKinds     = static_cast<int>(GuestWait::Count);
+constexpr const char* kKindNames[kKinds] = {"eq", "sleep", "cond", "mutex", "sema", "ef"};
+
+// One guest thread's waits. Written only by its thread; read by the command thread.
+struct GuestThread {
+	struct Entry {
+		std::atomic<uint64_t> start {0};
+		std::atomic<uint64_t> end {0};
+		std::atomic<uint64_t> ident {0}; // kind in the top 8 bits
+	};
+	int                   tid = 0;
+	char                  name[20] {};
+	std::atomic<uint64_t> head {0};
+	Entry                 ring[kRing];
+	std::atomic<uint64_t> short_ns[kKinds] {};
+	std::atomic<uint64_t> short_count[kKinds] {};
+};
+
+std::mutex                                 g_threads_mutex;
+std::vector<std::unique_ptr<GuestThread>>  g_threads; // never freed: the command thread reads them
+std::atomic<GuestThread*>                  g_submitter {nullptr};
+std::atomic<uint64_t>                      g_last_submit_ns {0};
+// The submitter's short-wait totals when the command thread began waiting (command thread only).
+GuestThread*                               g_idle_sub = nullptr;
+uint64_t                                   g_idle_short_ns[kKinds] {};
+uint64_t                                   g_idle_short_count[kKinds] {};
+thread_local GuestThread*                  t_guest       = nullptr;
+thread_local int                           t_guest_depth = 0;
+
+GuestThread* Self() {
+	if (t_guest == nullptr) {
+		auto thread = std::make_unique<GuestThread>();
+#if defined(__linux__)
+		thread->tid = static_cast<int>(syscall(SYS_gettid));
+		if (FILE* f = std::fopen("/proc/thread-self/comm", "r"); f != nullptr) {
+			if (std::fgets(thread->name, sizeof(thread->name), f) != nullptr) {
+				thread->name[std::strcspn(thread->name, "\n ")] = '\0';
+			}
+			std::fclose(f);
+		}
+#endif
+		t_guest = thread.get();
+		std::lock_guard lock(g_threads_mutex);
+		g_threads.push_back(std::move(thread));
+	}
+	return t_guest;
+}
+
+} // namespace
+
+GuestWaitScope::GuestWaitScope(GuestWait kind, uint64_t ident) noexcept: m_ident(ident), m_kind(kind) {
+	// Only the outermost wait of a thread counts (a timed wait may be built on another).
+	if (Enabled() && t_guest_depth++ == 0) {
+		m_start = NowNs();
+	}
+}
+
+GuestWaitScope::~GuestWaitScope() {
+	if (!Enabled()) {
+		return;
+	}
+	t_guest_depth--;
+	if (m_start == 0) {
+		return;
+	}
+	const auto end  = NowNs();
+	auto*      self = Self();
+	const auto kind = static_cast<int>(m_kind);
+	if (end - m_start < kRingMinNs) {
+		self->short_ns[kind].fetch_add(end - m_start, std::memory_order_relaxed);
+		self->short_count[kind].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	const auto head  = self->head.load(std::memory_order_relaxed);
+	auto&      entry = self->ring[head % kRing];
+	entry.start.store(m_start, std::memory_order_relaxed);
+	entry.end.store(end, std::memory_order_relaxed);
+	entry.ident.store((static_cast<uint64_t>(kind) << 56) | (m_ident & ((uint64_t {1} << 56) - 1)),
+	                  std::memory_order_relaxed);
+	self->head.store(head + 1, std::memory_order_release);
+}
+
+void OnGuestSubmit() noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	g_submitter.store(Self(), std::memory_order_relaxed);
+	g_last_submit_ns.store(NowNs(), std::memory_order_relaxed);
+}
+
+void OnCmdIdleBegin() noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	g_idle_sub = g_submitter.load(std::memory_order_relaxed);
+	if (g_idle_sub != nullptr) {
+		for (int k = 0; k < kKinds; k++) {
+			g_idle_short_ns[k]    = g_idle_sub->short_ns[k].load(std::memory_order_relaxed);
+			g_idle_short_count[k] = g_idle_sub->short_count[k].load(std::memory_order_relaxed);
+		}
+	}
+}
+
+void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept {
+	if (!Enabled() || end_ns - start_ns < kIdleMinNs) {
+		return;
+	}
+	auto* sub = g_submitter.load(std::memory_order_relaxed);
+	if (sub == nullptr) {
+		return;
+	}
+	const auto submit_ns = g_last_submit_ns.load(std::memory_order_relaxed);
+	uint64_t   in_gap[kKinds] {};
+	uint64_t   count[kKinds] {};
+	uint64_t   last_end = 0, last_start = 0, last_ident = 0;
+	const auto head     = sub->head.load(std::memory_order_acquire);
+	const auto first    = head > kRing ? head - kRing : 0;
+	for (auto i = head; i > first; i--) {
+		const auto& entry = sub->ring[(i - 1) % kRing];
+		const auto  start = entry.start.load(std::memory_order_relaxed);
+		const auto  end   = entry.end.load(std::memory_order_relaxed);
+		const auto  ident = entry.ident.load(std::memory_order_relaxed);
+		if (end <= start_ns) {
+			break; // the ring is in end order
+		}
+		if (end <= end_ns && end > last_end) {
+			last_end   = end;
+			last_start = start;
+			last_ident = ident;
+		}
+		const auto kind = static_cast<int>(ident >> 56);
+		const auto lo   = std::max(start, start_ns);
+		const auto hi   = std::min(end, end_ns);
+		if (kind < kKinds && hi > lo) {
+			in_gap[kind] += hi - lo;
+			count[kind]++;
+		}
+	}
+	char line[512];
+	int  n = std::snprintf(line, sizeof(line),
+	                       "GIDLE g=%" PRIu64 " t=%" PRIu64 " ms=%.3f wake_ms=%.3f sub=%d:%s", g_guest.count,
+	                       end_ns, static_cast<double>(end_ns - start_ns) / 1e6,
+	                       submit_ns > start_ns && submit_ns <= end_ns
+	                           ? static_cast<double>(end_ns - submit_ns) / 1e6
+	                           : -1.0,
+	                       sub->tid, sub->name);
+	if (sub == g_idle_sub) {
+		for (int k = 0; k < kKinds; k++) {
+			in_gap[k] += sub->short_ns[k].load(std::memory_order_relaxed) - g_idle_short_ns[k];
+			count[k] += sub->short_count[k].load(std::memory_order_relaxed) - g_idle_short_count[k];
+		}
+	}
+	for (int k = 0; k < kKinds && n > 0 && n < static_cast<int>(sizeof(line)); k++) {
+		if (count[k] != 0) {
+			n += std::snprintf(line + n, sizeof(line) - n, " %s_ms=%.3f %s_n=%" PRIu64, kKindNames[k],
+			                   static_cast<double>(in_gap[k]) / 1e6, kKindNames[k], count[k]);
+		}
+	}
+	if (last_end != 0 && n > 0 && n < static_cast<int>(sizeof(line))) {
+		const auto kind = static_cast<int>(last_ident >> 56);
+		n += std::snprintf(line + n, sizeof(line) - n,
+		                   " last=%s last_id=0x%" PRIx64 " last_ms=%.3f last_before_ms=%.3f",
+		                   kind < kKinds ? kKindNames[kind] : "?", last_ident & ((uint64_t {1} << 56) - 1),
+		                   static_cast<double>(last_end - last_start) / 1e6,
+		                   static_cast<double>(end_ns - last_end) / 1e6);
+	}
+	if (n > 0 && n < static_cast<int>(sizeof(line))) {
+		std::printf("%s\n", line);
+	}
 }
 
 } // namespace Common::FrameDiag

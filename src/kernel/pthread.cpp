@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "common/frameDiag.h"
 #include "common/hybridAffinity.h"
 
 #include "common/assert.h"
@@ -1745,6 +1746,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Mutex, reinterpret_cast<uintptr_t>(mutex));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2842,6 +2844,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Cond, reinterpret_cast<uintptr_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3007,6 +3010,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Cond, reinterpret_cast<uintptr_t>(cond));
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3855,6 +3859,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sleep, microseconds);
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3865,6 +3870,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sleep, rqtp != nullptr ? static_cast<uint64_t>(rqtp->tv_nsec / 1000) : 0);
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
