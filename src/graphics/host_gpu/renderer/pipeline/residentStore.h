@@ -30,7 +30,7 @@ struct WorkerTextureRecord;
 //   GC ticks, or whose image is no longer registered, retires at the next GC tick.
 // - A conflict element (a sampled image that is also a target or storage image of the draw)
 //   lives for one draw, in the layout the classic commit chose.
-// - An entry per worker texture record (WorkerTextureRecord::resident) remembers the element its
+// - Each worker texture record (WorkerTextureRecord::resident_skip) remembers the element its
 //   last resolve used and whether a later draw could sample it with no per-image work: the
 //   binding epoch, the GC tick, Image::unsettle_generation and Image::read_layout_epoch unchanged
 //   (or, per image, Image::residency_version), and the image settled and in its read state then.
@@ -63,8 +63,9 @@ public:
 
 	[[nodiscard]] Counters Snapshot() const;
 	// Whether a record's slot can sample its remembered element with no per-image work.
-	[[nodiscard]] bool TrySkip(const WorkerTextureRecord& record, ImageId id, const Counters& now,
-	                           TextureCache& cache, Skip& out);
+	// `serial`: the record's, as proposed (TextureProposal::serial).
+	[[nodiscard]] bool TrySkip(const WorkerTextureRecord& record, uint64_t serial, ImageId id,
+	                           const Counters& now, TextureCache& cache, Skip& out);
 	// The element sampling `view` of `image` in its read layout; `record`'s, if it is that one.
 	[[nodiscard]] uint32_t Element(const WorkerTextureRecord* record, Image& image, ImageId id,
 	                               vk::ImageView view);
@@ -74,8 +75,8 @@ public:
 	[[nodiscard]] uint16_t Sampler(vk::Sampler sampler);
 	// After the commit's transitions, with the counters taken before (Snapshot): what a later draw
 	// of this record can skip. Returns whether it can.
-	bool Remember(const WorkerTextureRecord& record, Image& image, ImageId id, uint32_t element,
-	              bool read_state, const Counters& counters);
+	bool Remember(const WorkerTextureRecord& record, uint64_t serial, Image& image, ImageId id,
+	              uint32_t element, bool read_state, const Counters& counters);
 	// After a draw's commit: writes new descriptors, retires its conflict elements, ages.
 	void EndDraw() {
 		if (m_dirty || !m_draw_conflicts.empty()) {
@@ -119,23 +120,11 @@ private:
 		ViewKey         key;
 		ImageId         image_id;
 		vk::ImageLayout layout       = vk::ImageLayout::eUndefined;
-		uint32_t        generation   = 0;
 		uint64_t        used_tick    = 0;
 		uint64_t        retired_tick = 0; // the scheduler tick it was last retired in
 		bool            live         = false;
 		bool            conflict     = false;
 		bool            retired      = false;
-	};
-	struct Entry {
-		uint64_t record_serial = 0; // 0: free
-		uint32_t element       = 0;
-		uint32_t generation    = 0; // the element's
-		ImageId  image_id;
-		uint64_t image_serial = 0;
-		bool     ok           = false;
-		Counters counters;
-		uint32_t version   = 0;
-		uint64_t used_tick = 0;
 	};
 
 	uint32_t Allocate(vk::ImageView view, vk::ImageLayout layout);
@@ -148,8 +137,6 @@ private:
 	RenderContext&                                    m_context;
 	std::vector<ElementState>                         m_elements; // by heap element index
 	std::unordered_map<ViewKey, uint32_t, ViewKeyHash> m_views;
-	std::vector<Entry>                                m_entries; // [0] unused
-	std::vector<uint32_t>                             m_free_entries;
 	std::unordered_map<VkSampler, uint16_t>           m_samplers;
 	std::vector<uint32_t>                             m_draw_conflicts;
 	VulkanImageState                                  m_saved_state;

@@ -29,9 +29,7 @@ size_t ResidentStore::ViewKeyHash::operator()(const ViewKey& key) const noexcept
 	return static_cast<size_t>((key.image_serial * 0x9e3779b97f4a7c15ull) ^ view);
 }
 
-ResidentStore::ResidentStore(RenderContext& context): m_context(context) {
-	m_entries.emplace_back();
-}
+ResidentStore::ResidentStore(RenderContext& context): m_context(context) {}
 
 ResidentStore::~ResidentStore() = default;
 
@@ -44,37 +42,25 @@ ResidentStore::Counters ResidentStore::Snapshot() const {
 	        .layout        = Image::read_layout_epoch.load(std::memory_order_relaxed)};
 }
 
-bool ResidentStore::TrySkip(const WorkerTextureRecord& record, ImageId id, const Counters& now,
-                            TextureCache& cache, Skip& out) {
-	const auto index = record.resident;
-	if (index == 0 || index >= m_entries.size()) {
+bool ResidentStore::TrySkip(const WorkerTextureRecord& record, uint64_t serial, ImageId id,
+                            const Counters& now, TextureCache& cache, Skip& out) {
+	// Reads the record's skip line only. The element is live: elements retire at a GC tick
+	// change (Age) or are one-draw conflict elements, and the tick is unchanged. The image at `id`
+	// is the remembered one: the binding epoch (registrations) is unchanged.
+	const auto& skip = record.resident_skip;
+	if (skip.record_serial != serial || !skip.ok || skip.image_id != id ||
+	    skip.counters.binding_epoch != now.binding_epoch || skip.counters.tick != now.tick) {
 		return false;
 	}
-	auto& entry = m_entries[index];
-	if (entry.record_serial != record.serial || !entry.ok || entry.image_id != id ||
-	    entry.counters.binding_epoch != now.binding_epoch || entry.counters.tick != now.tick) {
-		return false;
-	}
-	auto& element = m_elements[entry.element];
-	if (!element.live || element.generation != entry.generation) {
-		return false;
-	}
-	out.global = entry.counters.unsettle == now.unsettle && entry.counters.layout == now.layout;
-	if (!out.global) {
+	out.global = skip.counters.unsettle == now.unsettle && skip.counters.layout == now.layout;
+	if (!out.global &&
+	    cache.GetImage(id).residency_version.load(std::memory_order_seq_cst) != skip.version) {
 		// One image's counters: it was neither unsettled nor taken out of its read state.
-		const auto& image = cache.GetImage(id);
-		if (image.serial != entry.image_serial ||
-		    image.residency_version.load(std::memory_order_seq_cst) != entry.version) {
-			return false;
-		}
+		return false;
 	}
-	if (element.used_tick != now.tick) {
-		element.used_tick = now.tick;
-		entry.used_tick   = now.tick;
-	}
-	out.element = entry.element;
-	out.version = entry.version;
-	out.view          = element.key.view;
+	out.element = skip.element;
+	out.version = skip.version;
+	out.view    = skip.view;
 	return true;
 }
 
@@ -91,7 +77,6 @@ uint32_t ResidentStore::Allocate(vk::ImageView view, vk::ImageLayout layout) {
 		     " is free\n",
 		     index, element.retired_tick);
 	}
-	element.generation++;
 	element.live     = true;
 	element.retired  = false;
 	element.conflict = false;
@@ -107,13 +92,14 @@ uint32_t ResidentStore::Element(const WorkerTextureRecord* record, Image& image,
                                 vk::ImageView view) {
 	const auto tick = m_context.GetTextureCache().GcTick();
 	// The record's last element, if it still samples this view of this image.
-	if (record != nullptr && record->resident != 0 && record->resident < m_entries.size()) {
-		const auto& entry = m_entries[record->resident];
-		if (entry.record_serial == record->serial && entry.image_serial == image.serial) {
-			auto& element = m_elements[entry.element];
-			if (element.live && element.generation == entry.generation && element.key.view == view) {
+	if (record != nullptr && record->resident_skip.record_serial != 0) {
+		const auto index = record->resident_skip.element;
+		if (index < m_elements.size()) {
+			auto& element = m_elements[index];
+			if (element.live && !element.conflict && element.key.image_serial == image.serial &&
+			    element.key.view == view) {
 				element.used_tick = tick;
-				return entry.element;
+				return index;
 			}
 		}
 	}
@@ -161,33 +147,21 @@ uint16_t ResidentStore::Sampler(vk::Sampler sampler) {
 	return found->second;
 }
 
-bool ResidentStore::Remember(const WorkerTextureRecord& record, Image& image, ImageId id,
-                             uint32_t element, bool read_state, const Counters& counters) {
-	auto index = record.resident;
-	if (index == 0 || index >= m_entries.size() || m_entries[index].record_serial != record.serial) {
-		if (m_free_entries.empty()) {
-			index = static_cast<uint32_t>(m_entries.size());
-			m_entries.emplace_back();
-		} else {
-			index = m_free_entries.back();
-			m_free_entries.pop_back();
-		}
-		record.resident = index;
-	}
-	auto& entry         = m_entries[index];
-	entry.record_serial = record.serial;
-	entry.element       = element;
-	entry.generation    = m_elements[element].generation;
-	entry.image_id      = id;
-	entry.image_serial  = image.serial;
+bool ResidentStore::Remember(const WorkerTextureRecord& record, uint64_t serial, Image& image,
+                             ImageId id, uint32_t element, bool read_state,
+                             const Counters& counters) {
+	auto& skip         = record.resident_skip;
+	skip.record_serial = serial;
+	skip.element       = element;
+	skip.view          = m_elements[element].key.view;
+	skip.image_id      = id;
 	// The counters were read before the settled flag (Image::StoreSettled).
-	entry.counters = counters;
-	entry.version  = image.residency_version.load(std::memory_order_seq_cst);
-	entry.ok = read_state &&
-	           (image.settled.load(std::memory_order_seq_cst) & Image::SettledRefresh) != 0 &&
-	           image.registered && !image.depth_id && !image.binding.needs_rebind;
-	entry.used_tick = entry.counters.tick;
-	return entry.ok;
+	skip.counters = counters;
+	skip.version  = image.residency_version.load(std::memory_order_seq_cst);
+	skip.ok       = read_state &&
+	          (image.settled.load(std::memory_order_seq_cst) & Image::SettledRefresh) != 0 &&
+	          image.registered && !image.depth_id && !image.binding.needs_rebind;
+	return skip.ok;
 }
 
 void ResidentStore::Retire(uint32_t index) {
@@ -205,7 +179,6 @@ void ResidentStore::Retire(uint32_t index) {
 	element.live         = false;
 	element.retired      = true;
 	element.retired_tick = m_context.GetCommandScheduler().CurrentTick();
-	element.generation++;
 	m_stats.retirements++;
 	m_stats.live--;
 }
@@ -227,13 +200,6 @@ void ResidentStore::Age(uint64_t tick) {
 		if (element.used_tick + AgeTicks < tick || image == nullptr ||
 		    image->serial != element.key.image_serial || !image->registered) {
 			Retire(index);
-		}
-	}
-	for (uint32_t index = 1; index < m_entries.size(); index++) {
-		auto& entry = m_entries[index];
-		if (entry.record_serial != 0 && entry.used_tick + AgeTicks < tick) {
-			entry.record_serial = 0;
-			m_free_entries.push_back(index);
 		}
 	}
 }
