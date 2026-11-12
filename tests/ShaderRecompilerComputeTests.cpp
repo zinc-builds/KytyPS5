@@ -2609,6 +2609,71 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckEarlySubmit() {
+    EnsureRuntimeContext();
+    constexpr const char *name = "EarlySubmit";
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    scheduler.Finish();
+
+    // Off: never submits.
+    auto tick = scheduler.CurrentTick();
+    Require(name, "off", !scheduler.SubmitIfGpuIdle() && scheduler.CurrentTick() == tick,
+            "early submission ran while off");
+    // On, idle GPU, buffer younger than the age: waits for more work.
+    scheduler.SetEarlySubmitUs(int64_t{3600} * 1000 * 1000);
+    Require(name, "young buffer", !scheduler.SubmitIfGpuIdle() && scheduler.CurrentTick() == tick,
+            "a command buffer younger than the age was submitted");
+    // On, idle GPU, old enough: submits the open buffer and starts the next one.
+    scheduler.SetEarlySubmitUs(0);
+    Require(name, "idle GPU",
+            scheduler.SubmitIfGpuIdle() && scheduler.CurrentTick() == tick + 1 &&
+                scheduler.Active() && !scheduler.Current().IsInvalid(),
+            "an idle GPU did not get the open command buffer");
+
+    // GPU still busy (a submission blocked on an external timeline): no early submission.
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo timeline_create{};
+    timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+    timeline_create.pNext = &timeline_type;
+    vk::Semaphore gate = nullptr;
+    Require(name, "timeline create",
+            m_runtime_context.device.createSemaphore(&timeline_create, nullptr, &gate) ==
+                    vk::Result::eSuccess && gate != nullptr,
+            "failed to create the timeline semaphore");
+    SubmitInfo blocked;
+    blocked.AddWait(gate, 1);
+    const auto blocked_tick = scheduler.CurrentTick();
+    scheduler.Flush(blocked);
+    tick = scheduler.CurrentTick();
+    for (int i = 0; i < 3; i++) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50)); // past the refresh limit
+      Require(name, "busy GPU", !scheduler.SubmitIfGpuIdle() && scheduler.CurrentTick() == tick,
+              "early submission ran while the GPU still had work");
+    }
+    vk::SemaphoreSignalInfo signal_info{};
+    signal_info.sType = vk::StructureType::eSemaphoreSignalInfo;
+    signal_info.semaphore = gate;
+    signal_info.value = 1;
+    Require(name, "timeline signal",
+            m_runtime_context.device.signalSemaphore(&signal_info) == vk::Result::eSuccess,
+            "failed to signal the timeline semaphore");
+    scheduler.Wait(blocked_tick);
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    Require(name, "GPU drained", scheduler.SubmitIfGpuIdle() && scheduler.CurrentTick() == tick + 1,
+            "the drained GPU did not get the open command buffer");
+    scheduler.SetEarlySubmitUs(-1);
+    scheduler.Finish();
+    m_runtime_context.device.destroySemaphore(gate, nullptr);
+    scheduler.Shutdown();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -55838,6 +55903,9 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // Early submission is timing-driven (an idle GPU and an old command buffer), and many cases
+  // count submissions: it stays off except where CheckEarlySubmit turns it on.
+  setenv("KYTY_EARLY_SUBMIT", "0", 1);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
@@ -56488,6 +56556,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    vulkan.CheckEarlySubmit();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
@@ -57195,6 +57264,7 @@ int main(int argc, char **argv) {
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckEarlySubmit();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckVideoOutHdr10ToSdr();
   vulkan.CheckDescriptorHeapLargeSet();

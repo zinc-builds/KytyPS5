@@ -850,6 +850,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (executor.HasAtomicWrites()) {
 				executor.FlushAtomicWrites(CurrentBuffer());
 			}
+			// Nothing is held open across command buffers here: the draw queue was drained and
+			// the dispatch chain ended above (both packets' Keeps* are false) and the atomic
+			// batch was just closed. If the GPU has run out of work, it gets what was recorded
+			// so far now, not when the guest's command buffer ends (KYTY_EARLY_SUBMIT).
+			if (!KeepsQueuedDraw(packet_header) && !KeepsDispatchChain(packet_header)) {
+				GetScheduler().SubmitIfGpuIdle();
+			}
 		}
 
 		if (handler == nullptr) {
