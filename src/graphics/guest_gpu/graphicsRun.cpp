@@ -40,7 +40,9 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -610,6 +612,93 @@ bool GuestGpu::Process(Submission& submission) {
 	return complete;
 }
 
+// KYTY_GAP_STATS=1 (diagnostic): between two queued draws, the packets that finish the queue
+// (or would, with draws queued) and the decode-time reads, as a signature; GAP lines print the
+// most frequent signatures. Tokens: EWnn event write (type), AM acquire mem, PS pfp sync me, WD
+// write data, RM release mem, WR wait reg mem, Nnn emulator NOP, R decode-time read, AC async
+// collect, GC guest commands, NI instances from memory, END end of the packet loop, opNN others.
+namespace GapStats {
+static bool Enabled() {
+	static const bool enabled = std::getenv("KYTY_GAP_STATS") != nullptr;
+	return enabled;
+}
+struct State {
+	std::string                               signature, last;
+	std::unordered_map<std::string, uint64_t> count;
+	std::vector<uint64_t>                     labels; // WRITE_DATA / RELEASE_MEM addresses this gap
+	uint64_t                                  gaps = 0;
+};
+static State& Get() {
+	static State state;
+	return state;
+}
+static void Note(const char* token) {
+	auto& state = Get();
+	if (state.last == token || state.signature.size() > 160) {
+		return;
+	}
+	state.last = token;
+	if (!state.signature.empty()) {
+		state.signature += ' ';
+	}
+	state.signature += token;
+}
+static void NotePacket(const uint32_t* packet) {
+	const auto opcode = (packet[0] >> 8u) & 0xffu;
+	char       token[16];
+	switch (opcode) {
+		case Pm4::IT_EVENT_WRITE: std::snprintf(token, sizeof(token), "EW%02x", packet[1] & 0x3fu); break;
+		case Pm4::IT_ACQUIRE_MEM: std::snprintf(token, sizeof(token), "AM"); break;
+		case Pm4::IT_PFP_SYNC_ME: std::snprintf(token, sizeof(token), "PS"); break;
+		case Pm4::IT_WRITE_DATA:
+			Get().labels.push_back((packet[2] | (static_cast<uint64_t>(packet[3]) << 32u)) & ~7ull);
+			std::snprintf(token, sizeof(token), "WD");
+			break;
+		case Pm4::IT_RELEASE_MEM:
+			Get().labels.push_back((packet[3] | (static_cast<uint64_t>(packet[4]) << 32u)) & ~7ull);
+			std::snprintf(token, sizeof(token), "RM");
+			break;
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64: {
+			// WRo: waits on an address a WRITE_DATA or RELEASE_MEM of this gap stored.
+			const auto address =
+			    (packet[2] | (static_cast<uint64_t>(packet[3] & 0x3ffffu) << 32u)) & ~7ull;
+			const bool own = std::ranges::find(Get().labels, address) != Get().labels.end();
+			std::snprintf(token, sizeof(token), own ? "WRo" : "WRx");
+			break;
+		}
+		case Pm4::IT_NOP: std::snprintf(token, sizeof(token), "N%02x", KYTY_PM4_R(packet[0]) & 0xffu); break;
+		default: std::snprintf(token, sizeof(token), "op%02x", opcode);
+	}
+	Note(token);
+}
+static void Close() {
+	auto& state = Get();
+	state.count[state.signature]++;
+	state.signature.clear();
+	state.last.clear();
+	state.labels.clear();
+	if (++state.gaps < 1500000) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, std::string>> rows;
+	for (const auto& [signature, n]: state.count) {
+		rows.emplace_back(n, signature);
+	}
+	std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.first > b.first; });
+	for (size_t i = 0; i < rows.size(); i++) {
+		std::printf("GAP n=%" PRIu64 " share=%.4f sig=[%s]\n", rows[i].first,
+		            static_cast<double>(rows[i].first) / static_cast<double>(state.gaps),
+		            rows[i].second.c_str());
+	}
+	std::printf("GAP total=%" PRIu64 " distinct=%zu\n", state.gaps, rows.size());
+	std::fflush(stdout);
+	state.count.clear();
+	state.gaps = 0;
+}
+} // namespace GapStats
+
+
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
                                            std::span<const uint32_t> commands) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
@@ -627,6 +716,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(execution);
 
 	ProcessPm4(execution);
+	if (GapStats::Enabled()) {
+		GapStats::Note("END");
+	}
 	// Nothing stays queued past the packet loop.
 	m_renderer.GetRenderExecutor().FinishQueuedDraws(CurrentBuffer(),
 	                                                 RenderExecutor::DrainEndOfLoop);
@@ -755,6 +847,33 @@ static bool KeepsQueuedDraw(uint32_t packet_header) {
 	}
 }
 
+// KYTY_CACHE_OP_KEEP (diagnostic, not sound in general: a decode-time read after the operation
+// may miss a queued draw's write): cache operations keep the draw queue and the atomic batch
+// open. 1: always; 2: unless the GPU has run out of work (then they drain and submit as before).
+static uint32_t CacheOpKeepMode() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_CACHE_OP_KEEP");
+		return value != nullptr ? static_cast<uint32_t>(std::atoi(value)) : 0u;
+	}();
+	return mode;
+}
+
+// Cache operations and partial flushes: the emulator records nothing for them (the renderer's
+// barriers order GPU work). The occlusion-counter dump writes guest memory.
+static bool IsCacheOp(const uint32_t* packet) {
+	switch ((packet[0] >> 8u) & 0xffu) {
+		case Pm4::IT_ACQUIRE_MEM:
+		case Pm4::IT_PFP_SYNC_ME: return true;
+		case Pm4::IT_EVENT_WRITE: return (packet[1] & 0x3fu) != 0x39u;
+		default: return false;
+	}
+}
+
+static bool IsDecodeTimeRead(uint32_t opcode) {
+	return opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+	       opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT || opcode == Pm4::IT_INDIRECT_BUFFER;
+}
+
 // Packets that neither wait nor touch memory, so consecutive dispatches around them may overlap
 // on the guest: register writes, markers and the dispatches themselves. Any other packet may be
 // the guest's synchronization between two dispatches (a partial flush, a cache operation, a label
@@ -787,6 +906,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			// Guest commands (readbacks, unmaps) see every draw before them committed.
+			if (GapStats::Enabled() && g_gpu_state->HasPendingCommands()) {
+				GapStats::Note("GC");
+			}
 			if (executor.HasQueuedDraw() && g_gpu_state->HasPendingCommands()) {
 				executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainGuestCommands);
 			}
@@ -828,11 +950,38 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 
+		const auto posted_before = executor.m_queued_posted;
+		if (GapStats::Enabled()) {
+			if (!KeepsQueuedDraw(packet_header)) {
+				GapStats::NotePacket(packet);
+			} else if (IsDecodeTimeRead(opcode)) {
+				GapStats::Note("R");
+			}
+			if (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()) {
+				GapStats::Note("AC");
+			}
+		}
+		bool keep_cache_op = false;
+		if (CacheOpKeepMode() != 0 && executor.HasQueuedDraw()) {
+			if (IsCacheOp(packet)) {
+				keep_cache_op = CacheOpKeepMode() == 1 || !GetScheduler().EarlySubmitDue();
+				if (keep_cache_op) {
+					executor.m_cache_mark = executor.m_queued_posted;
+					executor.m_drain_stat.cache_kept++;
+				}
+			} else if (IsDecodeTimeRead(opcode) && executor.CacheMarkPending()) {
+				executor.m_drain_stat.mark_reads++;
+				executor.m_drain_stat.mark_reads_unprepared += executor.PreparedThroughCacheMark() ? 0 : 1;
+			}
+		}
+		const bool keeps_queued_draw  = keep_cache_op || KeepsQueuedDraw(packet_header);
+		const bool keeps_atomic_write = keep_cache_op || KeepsAtomicWrites(packet_header);
+
 		if (executor.HasQueuedDraw() &&
-		    (!KeepsQueuedDraw(packet_header) ||
+		    (!keeps_queued_draw ||
 		     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
 			uint32_t reason = RenderExecutor::DrainAsyncCollect;
-			if (!KeepsQueuedDraw(packet_header)) {
+			if (!keeps_queued_draw) {
 				reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
 			}
 			executor.FinishQueuedDraws(CurrentBuffer(), reason);
@@ -844,7 +993,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			executor.EndDispatchChain(CurrentBuffer());
 			first_packet = false;
 		}
-		if (!KeepsAtomicWrites(packet_header)) {
+		if (!keeps_atomic_write) {
 			// The same packets may signal the guest or store into its memory.
 			GuestSyncEpoch::Advance();
 			if (executor.HasAtomicWrites()) {
@@ -854,7 +1003,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			// the dispatch chain ended above (both packets' Keeps* are false) and the atomic
 			// batch was just closed. If the GPU has run out of work, it gets what was recorded
 			// so far now, not when the guest's command buffer ends (KYTY_EARLY_SUBMIT).
-			if (!KeepsQueuedDraw(packet_header) && !KeepsDispatchChain(packet_header)) {
+			if (!keeps_queued_draw && !KeepsDispatchChain(packet_header)) {
 				GetScheduler().SubmitIfGpuIdle();
 			}
 		}
@@ -879,6 +1028,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		m_in_dispatch_packet = false;
+		if (GapStats::Enabled() && executor.m_queued_posted != posted_before) {
+			GapStats::Close();
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -992,6 +1144,9 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
+			if (GapStats::Enabled()) {
+				GapStats::Note("NI");
+			}
 			// Reads guest memory a queued draw may write.
 			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
@@ -1167,6 +1322,9 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
+			if (GapStats::Enabled()) {
+				GapStats::Note("NI");
+			}
 			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();

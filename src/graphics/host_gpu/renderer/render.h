@@ -320,6 +320,20 @@ public:
 		}
 	}
 	[[nodiscard]] bool HasQueuedDraw() const { return m_queued_count != 0; }
+	// KYTY_CACHE_OP_KEEP (diagnostic): the last sequence posted before a cache operation that kept
+	// the queue, and whether every queued draw up to it is prepared.
+	[[nodiscard]] bool CacheMarkPending() const {
+		return m_queued_count != 0 && m_queued_posted - m_queued_count + 1 <= m_cache_mark;
+	}
+	[[nodiscard]] bool PreparedThroughCacheMark() const {
+		for (auto sequence = m_queued_posted - m_queued_count + 1; sequence <= m_cache_mark; sequence++) {
+			if (m_prepare_pool ? !m_prepare_pool->Done(sequence)
+			                   : !PrepareWorker(sequence).Done(PrepareJob(sequence))) {
+				return false;
+			}
+		}
+		return true;
+	}
 
 private:
 	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,
@@ -717,9 +731,11 @@ private:
 	bool                                             m_draining       = false;
 	uint32_t                                         m_drain_reason   = 0;
 	uint64_t                                         m_refill_until   = 0;
+	uint64_t                                         m_cache_mark     = 0;
 	struct DrainStats {
 		std::array<uint64_t, 768> count {}, drain_wait {}, refill_wait {};
 		uint64_t steady_wait = 0, start_ns = 0;
+		uint64_t cache_kept = 0, mark_reads = 0, mark_reads_unprepared = 0;
 	};
 	std::unique_ptr<DrainStats> m_drain_stat_storage = std::make_unique<DrainStats>();
 	DrainStats&                 m_drain_stat         = *m_drain_stat_storage;

@@ -2322,9 +2322,11 @@ void RenderExecutor::PrintDrainStats() {
 		return stat.drain_wait[a] + stat.refill_wait[a] > stat.drain_wait[b] + stat.refill_wait[b];
 	});
 	std::printf("DRAIN total drains_s=%.0f drain_wait_us_s=%.0f refill_wait_us_s=%.0f "
-	            "steady_wait_us_s=%.0f\n",
+	            "steady_wait_us_s=%.0f cache_kept_s=%.0f mark_reads_s=%.0f "
+	            "mark_reads_unprepared_s=%.0f\n",
 	            count_total / s, drain_total / s / 1e3, refill_total / s / 1e3,
-	            stat.steady_wait / s / 1e3);
+	            stat.steady_wait / s / 1e3, stat.cache_kept / s, stat.mark_reads / s,
+	            stat.mark_reads_unprepared / s);
 	for (size_t i = 0; i < reasons.size() && i < 12; i++) {
 		const auto r = reasons[i];
 		std::printf("DRAIN reason=%u (%s0x%02x) drains_s=%.0f drain_wait_us_s=%.0f "
