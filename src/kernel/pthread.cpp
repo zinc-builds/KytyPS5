@@ -3309,7 +3309,6 @@ static void* RunThread(void* arg) {
 	Common::GpuWaitDiag::SetGuestThread(thread->name,
 	                                    reinterpret_cast<uintptr_t>(thread->attr->stack_addr),
 	                                    static_cast<size_t>(thread->attr->stack_size));
-
 	PthreadPlacementCheck();
 #endif
 #endif

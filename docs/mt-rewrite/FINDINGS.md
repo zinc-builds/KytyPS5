@@ -2103,7 +2103,17 @@ efficiency cores changes the game's pace from batch to batch, so only arms of on
 | 2 | nice +5 below 680 (all on efficiency cores) | 54.1 | 2.20 | 10.9% (10.8%) |
 | 3 | rule off | 51.4 | 2.65 | 16.3% (16.3%) |
 | 3 | `Draw*` by name | 55.1 | 1.93 | 9.1% (9.0%) |
-| 3 | automatic bar (this change) | 59.1 | 0.30 | 1.5% (1.4%) |
+| 3 | automatic bar (first version) | 59.1 | 0.30 | 1.5% (1.4%) |
+| 4 | rule off (`dev` 03d5d306 + #113, profile retrained) | 53.3 | 2.84 | 8.2% (8.0%) |
+| 4 | automatic bar (this change, threads place themselves) | 49.8 | 1.18 | 0.9% (0.7%) |
+
+- **Batch 4's FPS is not the steady-state rate.** Batch 4's means include texture GC hitches: a
+  GC of 0.3–1.3 s, a GPU wait for 144–222 MB of texture downloads, then the game catching up.
+  - 0–2 per run with the rule off, 2–4 with it on, inside frames 1000–1600.
+  - Without those frames and the three after each, the rule-on runs make 60.1–60.2 FPS (the
+    cap), with 0.05–0.16 ms of no guest work and 0.2–0.5% two-refresh frames in the replay. The
+    rule-off runs make 54.7–56.6 FPS, with 2.3–2.7 ms and 5.9–9.9%.
+  - With the rule on, the frames still at two refreshes are those hitches.
 
 - In batch 1, `ab.sh` gave FPS +5.39% (≥ 3 sd) with `cmd_ns` flat.
 - The priority rule also moves the `Havok` workers (~0.4–0.5 CPU) and audio. On Sky Garden that
