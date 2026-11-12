@@ -42,6 +42,9 @@ struct GraphicContext {
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
 	bool                               pipeline_stats_enabled                 = false;
+	// KYTY_RESIDENT_TEXTURES=1|verify on a device that supports it: draw shaders sample their
+	// textures and samplers from the image heap's set by indices in shader data.
+	bool                               resident_textures                      = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

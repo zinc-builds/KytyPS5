@@ -637,6 +637,14 @@ struct RenderExecutorTestAccess {
     executor.ResetBindings();
   }
 
+  static void BindImage(RenderExecutor &executor, ImageId id, bool storage) {
+    executor.BindImage(id, storage);
+  }
+
+  static ResidentStore &Resident(RenderExecutor &executor) {
+    return executor.ResidentStoreOf();
+  }
+
   static bool ResolveColorTargets(RenderExecutor &executor, CommandBuffer &buffer) {
     return executor.ResolveColorTargets(buffer);
   }
@@ -6439,6 +6447,262 @@ public:
             LibKernel::Memory::KernelMunmap(base, 3 * page) == 0 &&
                 LibKernel::Memory::KernelReleaseDirectMemory(direct, 3 * page) == 0,
             "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Resident textures (IR::ImageResource::resident): a sampled slot takes a shared element in the
+  // image's read layout, a skip once its record's element holds, and a one-draw element in the
+  // draw's layout when the image is also a target or storage image of the draw. Every element a
+  // draw names samples the view and layout the image has at the draw.
+  void CheckResidentTextureBindings() {
+    constexpr const char *name = "ResidentTextureBindings";
+    constexpr uintptr_t base = 0x000000020b000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t depth_offset = 0x100000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    using Slots = PreparedBindings::ResidentSlots;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      auto &store = RenderExecutorTestAccess::Resident(executor);
+      std::vector<PipelineCache::Pipeline> pipelines;
+      ShaderTextureResource descriptor{{
+          static_cast<uint32_t>(base >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+              (((width - 1u) & 3u) << 30u),
+          ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+          DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      auto &value = snapshot.images.emplace_back();
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+
+      ShaderModule module;
+      auto &program = module.info;
+      program.stage = ShaderType::Pixel;
+      auto &resource = program.info.images.emplace_back();
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      resource.resident = true;
+      resource.descriptor_index = 0;
+      program.bindings.resident_images = 1;
+      program.bindings.push_data_start_dword = 0;
+      ShaderStageRuntime runtime{&module, &snapshot};
+
+      WorkerTextureRecord record;
+      record.serial = 0x1001;
+      std::vector<TextureProposal> proposals{ProposeRecord(&record)};
+
+      // One draw of the stage: `before` runs after the draw's targets are bound, `after` after
+      // its bindings are prepared (as AcquireRenderTargets would set target layouts).
+      PreparedBindings prepared;
+      bool reused = false; // the next draw reuses the set (binding-set reuse)
+      const auto Draw = [&](const TextureBinding &binding, bool with_record, auto &&before,
+                            auto &&after) {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        before();
+        prepared.runtime = &runtime;
+        prepared.reused = reused;
+        prepared.images = {binding};
+        prepared.images[0].source = with_record ? record.serial : 0;
+        prepared.shader_data.assign(program.bindings.ShaderDataDwords(), 0u);
+        prepared.resident_slots.proposals = with_record ? &proposals : nullptr;
+        std::array<PreparedBindings *, 1> stages{&prepared};
+        RenderExecutorTestAccess::PrepareGraphicsBindings(executor, stages, {});
+        after();
+        pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), prepared));
+        const auto element = prepared.resident_slots.elements[0];
+        Require(name, "index word", (prepared.shader_data[0] & 0xffffu) == element,
+                "the slot's index word does not name its element");
+        return element;
+      };
+      const auto Nothing = [] {};
+      const auto Kind = [&] { return prepared.resident_slots.kinds[0]; };
+      // The element samples the view and layout the image has at the draw. A one-draw
+      // (conflict) element is retired once its draw is committed.
+      const auto Samples = [&](const char *step, uint32_t element, ImageId id,
+                               vk::ImageView view) {
+        const auto &image = texture_cache.GetImage(id);
+        const bool conflict = Kind() == Slots::Conflict;
+        Require(name, step,
+                store.ElementLive(element) != conflict && store.ElementView(element) == view &&
+                    store.ElementLayout(element) == image.backing.state.layout,
+                "the element's view or layout differs from the image's at the draw");
+      };
+
+      ShaderRecompiler::IR::ImageResource lookup = resource;
+      lookup.resident = false;
+      auto texture = RenderExecutorTestAccess::ResolveTexture(executor, lookup, value);
+      const auto color = texture.image_id;
+      Require(name, "texture", static_cast<bool>(color), "the texture did not resolve");
+
+      // A first draw acquires the image and samples a shared element in its read layout.
+      const auto first = Draw(texture, true, Nothing, Nothing);
+      Require(name, "acquired", Kind() == Slots::Acquired && first != 0u,
+              "a first draw did not acquire its resident slot");
+      Samples("acquired element", first, color, prepared.images[0].image_view);
+      Require(name, "read layout",
+              texture_cache.GetImage(color).backing.state.layout ==
+                  texture_cache.GetImage(color).ReadLayout(),
+              "an acquired slot left the image outside its read layout");
+      const auto view = prepared.images[0].image_view;
+      texture.image_view = view;
+
+      // The same record again: a skip naming the same element.
+      const auto skipped = Draw(texture, true, Nothing, Nothing);
+      Require(name, "skip", Kind() == Slots::Skip && skipped == first,
+              "an unchanged record did not skip to its element");
+      Samples("skipped element", skipped, color, view);
+
+      // The image leaves its read layout after the prediction and before the commit (a copy
+      // source in an alias copy, say): the skip moves it back.
+      const auto late = Draw(texture, true, Nothing, [&] {
+        texture_cache.GetImage(color).Transit(
+            vk::ImageLayout::eGeneral,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+            ImageSubresourceRange{0, 1, 0, 1});
+      });
+      Require(name, "late transit",
+              Kind() == Slots::Skip && late == first &&
+                  texture_cache.GetImage(color).backing.state.layout ==
+                      texture_cache.GetImage(color).ReadLayout(),
+              "a skipped image that left its read layout after the prediction was not moved "
+              "back");
+      Samples("late transit element", late, color, view);
+      // Its counters moved, so the next draw acquires again, sharing the element.
+      const auto reacquired = Draw(texture, true, Nothing, Nothing);
+      Require(name, "acquired again", Kind() == Slots::Acquired && reacquired == first,
+              "a record acquired again did not share its view's element");
+
+      // The reused set, settled: skipped whole, with no per-slot work.
+      reused = true;
+      const auto whole = Draw(texture, true, Nothing, Nothing);
+      Require(name, "fast set", prepared.resident_slots.fast && whole == first,
+              "a settled reused set was not skipped whole");
+      Samples("fast set element", whole, color, view);
+
+      // The image becomes a target between two draws of the set: a one-draw element in the
+      // attachment layout (general, since the draw also samples it).
+      const auto feedback = Draw(
+          texture, true, [&] { RenderExecutorTestAccess::BindRenderTarget(executor, color); },
+          [&] {
+            auto &image = texture_cache.GetImage(color);
+            image.binding.attachment_layout = image.binding.is_bound
+                                                  ? vk::ImageLayout::eGeneral
+                                                  : vk::ImageLayout::eColorAttachmentOptimal;
+            image.binding.attachment_access = vk::AccessFlagBits2::eColorAttachmentRead |
+                                              vk::AccessFlagBits2::eColorAttachmentWrite;
+            image.Transit(image.binding.attachment_layout, image.binding.attachment_access,
+                          ImageSubresourceRange{0, 1, 0, 1});
+          });
+      Require(name, "own color target", Kind() == Slots::Conflict && feedback != first &&
+                  store.ElementLayout(feedback) == vk::ImageLayout::eGeneral,
+              "a draw sampling its own color target did not take a general-layout element");
+      Samples("own color target element", feedback, color, view);
+
+      // Storage and sampled use of one image in one draw: the general layout for both.
+      const auto storage = Draw(
+          texture, false, [&] { RenderExecutorTestAccess::BindImage(executor, color, true); },
+          Nothing);
+      Require(name, "storage and sampled", Kind() == Slots::Conflict &&
+                  store.ElementLayout(storage) == vk::ImageLayout::eGeneral,
+              "a sampled slot of a storage-bound image did not take a general-layout element");
+      Samples("storage and sampled element", storage, color, view);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      reused = false; // new bindings from here on
+
+      // A draw sampling its depth target read-only: the element in the read-only layout.
+      auto depth = MakeLinearDesc(base + depth_offset, width * height * 4u,
+                                  vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+                                  Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      depth.type = BindingType::DepthTarget;
+      depth.info.tile_mode = Prospero::TileMode::kDepth;
+      depth.info.UpdateSize();
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_id = texture_cache.FindImage(depth);
+      TextureBinding depth_texture;
+      depth_texture.image_id = depth_id;
+      depth_texture.desc = depth;
+      depth_texture.desc.type = BindingType::Texture;
+      depth_texture.desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto read_only = Draw(
+          depth_texture, false,
+          [&] { RenderExecutorTestAccess::BindRenderTarget(executor, depth_id); },
+          [&] {
+            auto &image = texture_cache.GetImage(depth_id);
+            image.binding.attachment_layout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+            image.binding.attachment_access = vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+            image.Transit(image.binding.attachment_layout, image.binding.attachment_access,
+                          ImageSubresourceRange{0, 1, 0, 1});
+          });
+      Require(name, "read-only depth target",
+              Kind() == Slots::Conflict &&
+                  store.ElementLayout(read_only) == vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+              "a draw sampling its read-only depth target did not take a read-only element");
+      Samples("read-only depth element", read_only, depth_id, prepared.images[0].image_view);
+
+      // The sampled image leaves the cache between two draws: the binding epoch moves, so the
+      // record's set is acquired again; the new image gets its own element, and the old one
+      // retires at the next GC tick.
+      const auto before_epoch = texture_cache.BindingEpoch();
+      context.UnmapMemory(base, allocation_size);
+      context.MapMemory(base, allocation_size);
+      Require(name, "eviction epoch", texture_cache.BindingEpoch() != before_epoch,
+              "unregistering a sampled image did not move the binding epoch");
+      auto again = RenderExecutorTestAccess::ResolveTexture(executor, lookup, value);
+      TextureCacheTestAccess::SkipFrames(texture_cache, 1);
+      const auto replaced = Draw(again, false, Nothing, Nothing);
+      Require(name, "evicted image", Kind() == Slots::Acquired && replaced != first &&
+                  !store.ElementLive(first),
+              "a draw after eviction named the evicted image's element, or it stayed live");
+      Samples("replacement element", replaced, again.image_id, prepared.images[0].image_view);
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      scheduler.Finish();
+      RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, pipelines);
+      context.UnmapMemory(base, allocation_size);
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -56672,6 +56936,11 @@ int main(int argc, char **argv) {
     vulkan.CheckTextureLookupReuse();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--resident-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResidentTextureBindings();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
@@ -56945,6 +57214,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckTextureLookupReuse();
+  vulkan.CheckResidentTextureBindings();
   vulkan.CheckUnifiedTextureCacheFlow();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   vulkan.CheckTrackedGuestWriteFaults();

@@ -20,6 +20,9 @@ struct Profile {
 	// 8 and 8_8 sRGB textures sample through sRGB views; without one the shader decodes them.
 	bool r8_srgb_views   = false;
 	bool r8g8_srgb_views = false;
+	// Draw stages sample eligible textures and samplers through the image heap's set
+	// (IR::ImageResource::resident). Every module compiled under it differs.
+	bool resident_textures = false;
 };
 
 inline constexpr Profile DefaultProfile {};

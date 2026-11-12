@@ -12,6 +12,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <xxhash.h>
 
@@ -72,9 +73,7 @@ size_t ImageHeap::DescriptorHash::operator()(const DescriptorValue& value) const
 	return XXH3_64bits(value.dwords.data(), sizeof(value.dwords));
 }
 
-ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
-    : m_context(context), m_page_manager(page_manager) {
-	auto& graphics = context.GetGraphics();
+ImageHeapLayout::ImageHeapLayout(GraphicContext& graphics): m_graphics(graphics) {
 	vk::PhysicalDeviceVulkan12Properties limits {};
 	vk::PhysicalDeviceProperties2        properties {};
 	properties.pNext = &limits;
@@ -84,38 +83,59 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	                               limits.maxPerStageUpdateAfterBindResources}) <
 	                     IR::ImageHeapCapacity);
 
-	const vk::DescriptorBindingFlags binding_flags =
-	    vk::DescriptorBindingFlagBits::ePartiallyBound |
-	    vk::DescriptorBindingFlagBits::eUpdateAfterBind |
-	    vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+	const vk::DescriptorBindingFlags flags = vk::DescriptorBindingFlagBits::ePartiallyBound |
+	                                         vk::DescriptorBindingFlagBits::eUpdateAfterBind |
+	                                         vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+	const std::array binding_flags {flags, flags};
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
-	flags_info.bindingCount  = 1;
-	flags_info.pBindingFlags = &binding_flags;
-	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eSampledImage,
-	                                              IR::ImageHeapCapacity,
-	                                              vk::ShaderStageFlagBits::eAll, nullptr};
+	flags_info.bindingCount  = Bindings(graphics);
+	flags_info.pBindingFlags = binding_flags.data();
+	const std::array bindings {
+	    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity,
+	                                    vk::ShaderStageFlagBits::eAll, nullptr},
+	    vk::DescriptorSetLayoutBinding {IR::ResidentSamplerBinding, vk::DescriptorType::eSampler,
+	                                    IR::ResidentSamplerCapacity, vk::ShaderStageFlagBits::eAll,
+	                                    nullptr}};
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.pNext        = &flags_info;
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
-	layout_info.bindingCount = 1;
-	layout_info.pBindings    = &binding;
+	layout_info.bindingCount = Bindings(graphics);
+	layout_info.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout) !=
 	        vk::Result::eSuccess);
-	const vk::DescriptorPoolSize pool_size {vk::DescriptorType::eSampledImage,
-	                                        IR::ImageHeapCapacity};
+	graphics.image_heap_layout = m_layout;
+}
+
+ImageHeapLayout::~ImageHeapLayout() {
+	m_graphics.image_heap_layout = nullptr;
+	m_graphics.device.destroyDescriptorSetLayout(m_layout, nullptr);
+}
+
+uint32_t ImageHeapLayout::Bindings(const GraphicContext& graphics) {
+	// Resident textures add the samplers their shaders index (binding 1).
+	return graphics.resident_textures ? 2u : 1u;
+}
+
+ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
+    : m_context(context), m_page_manager(page_manager) {
+	auto& graphics = context.GetGraphics();
+	// RenderContext's ImageHeapLayout, made before its pipeline cache warms up.
+	EXIT_IF(graphics.image_heap_layout == nullptr);
+	const std::array pool_sizes {
+	    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity},
+	    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, IR::ResidentSamplerCapacity}};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
 	pool_info.maxSets       = 1;
-	pool_info.poolSizeCount = 1;
-	pool_info.pPoolSizes    = &pool_size;
+	pool_info.poolSizeCount = ImageHeapLayout::Bindings(graphics);
+	pool_info.pPoolSizes    = pool_sizes.data();
 	EXIT_IF(graphics.device.createDescriptorPool(&pool_info, nullptr, &m_pool) !=
 	        vk::Result::eSuccess);
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorPool     = m_pool;
 	allocate.descriptorSetCount = 1;
-	allocate.pSetLayouts        = &m_layout;
+	allocate.pSetLayouts        = &graphics.image_heap_layout;
 	EXIT_IF(graphics.device.allocateDescriptorSets(&allocate, &m_set) != vk::Result::eSuccess);
-	graphics.image_heap_layout = m_layout;
 	// Slot word 0 selects element 0, which stays a null image.
 	m_elements.push_back({.binding = {.layout = vk::ImageLayout::eShaderReadOnlyOptimal}});
 	m_writes.push_back(0u);
@@ -124,10 +144,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 
 ImageHeap::~ImageHeap() {
 	for (const auto& memory: m_memories) Unwatch(*memory);
-	auto& graphics             = m_context.GetGraphics();
-	graphics.image_heap_layout = nullptr;
-	graphics.device.destroyDescriptorPool(m_pool, nullptr);
-	graphics.device.destroyDescriptorSetLayout(m_layout, nullptr);
+	m_context.GetGraphics().device.destroyDescriptorPool(m_pool, nullptr);
 }
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
@@ -405,6 +422,29 @@ uint32_t ImageHeap::AllocateResident(vk::ImageView view, vk::ImageLayout layout)
 	return index;
 }
 
+void ImageHeap::SetResident(uint32_t index, vk::ImageView view, vk::ImageLayout layout) {
+	m_elements[index].binding.image_view = view;
+	m_elements[index].binding.layout     = layout;
+	m_writes.push_back(index);
+}
+
+void ImageHeap::WriteResidentSampler(uint32_t index, vk::Sampler sampler) {
+	EXIT_IF(index >= IR::ResidentSamplerCapacity);
+	const vk::DescriptorImageInfo info {sampler, nullptr, vk::ImageLayout::eUndefined};
+	vk::WriteDescriptorSet        write {};
+	write.dstSet          = m_set;
+	write.dstBinding      = IR::ResidentSamplerBinding;
+	write.dstArrayElement = index;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eSampler;
+	write.pImageInfo      = &info;
+	m_context.GetGraphics().device.updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+bool ImageHeap::ResidentElementFree(uint64_t tick) {
+	return m_context.GetCommandScheduler().IsFree(tick);
+}
+
 void ImageHeap::RetireResident(uint32_t index) {
 	m_retired.emplace_back(m_context.GetCommandScheduler().CurrentTick(), index);
 }
@@ -560,7 +600,7 @@ void ImageHeap::WriteDescriptors() {
 }
 
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
-                       vk::PipelineLayout layout) {
+                       vk::PipelineLayout layout, bool bind) {
 	KYTY_PROFILER_FUNCTION();
 	const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
 	for (auto* view: m_active) {
@@ -597,6 +637,9 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		});
 	}
 	m_active.clear();
+	if (!bind) {
+		return;
+	}
 	buffer.Record([bind_point, layout, set = m_set](vk::CommandBuffer cb) {
 		cb.bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &set, 0, nullptr);
 	});

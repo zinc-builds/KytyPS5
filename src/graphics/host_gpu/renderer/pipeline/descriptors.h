@@ -41,6 +41,15 @@ struct TextureDescription {
 	bool                    null              = false;
 };
 
+// Resident textures: what a slot's skip depends on (ResidentStore::Snapshot).
+struct ResidentCounters {
+	uint64_t binding_epoch = 0;
+	uint64_t tick          = 0;
+	uint64_t unsettle      = 0;
+	uint64_t layout        = 0;
+	bool operator==(const ResidentCounters&) const = default;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -94,6 +103,37 @@ struct PreparedBindings {
 		const std::vector<TextureProposal>* proposals = nullptr;
 		std::vector<uint8_t>                flags; // per image
 	} resident;
+	// Resident textures (IR::ImageResource::resident slots; ResidentStore): what this draw's
+	// slots sample, decided in RebindImages and committed in CommitBindings.
+	struct ResidentSlots {
+		enum Kind : uint8_t {
+			None     = 0, // not a resident slot
+			Null     = 1, // no image: element 0
+			Skip     = 2, // the record's element, no per-image work
+			Acquired = 3, // acquired and transitioned here; a shared element
+			Conflict = 4, // also a target or storage image of the draw: a one-draw element
+		};
+		enum Verify : uint8_t {
+			Predicted   = 1, // KYTY_RESIDENT_TEXTURES=verify: a skip, done the classic way
+			SlowAcquire = 2, // and the view lookup did not take the settled path
+		};
+		const std::vector<TextureProposal>* proposals = nullptr;
+		std::vector<uint8_t>                kinds;    // per image
+		std::vector<uint8_t>                verify;   // per image
+		std::vector<uint32_t>               elements; // per image
+		std::vector<uint32_t>               versions; // per image, verify: a skip's residency_version
+		std::vector<uint16_t>               words;    // resident images, then samplers
+		uint64_t                            layout_epoch   = 0; // read_layout_epoch at RebindImages
+		bool                                samplers_valid = false;
+		// The set: every slot could be sampled with no per-image work when the counters were
+		// `settled_at` (taken at the end of a commit). A reused set (the same records) whose
+		// counters still are those skips every slot: `fast` (no per-slot state is touched).
+		ResidentCounters rebind;     // at this draw's RebindImages
+		ResidentCounters settled_at;
+		bool             settled     = false;
+		bool             fast        = false;
+		bool             verify_fast = false; // KYTY_RESIDENT_TEXTURES=verify: fast, done per slot
+	} resident_slots;
 };
 
 [[nodiscard]] vk::DescriptorType

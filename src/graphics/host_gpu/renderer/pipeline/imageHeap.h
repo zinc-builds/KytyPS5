@@ -16,10 +16,27 @@ namespace Libs::Graphics {
 
 class Buffer;
 class CommandBuffer;
+struct GraphicContext;
 class PageManager;
 class RenderContext;
 class RenderExecutor;
 struct ImageHeapTestAccess;
+
+// The image heap's set layout (IR::ImageHeapSet), as GraphicContext::image_heap_layout while it
+// lives. RenderContext makes it before its pipeline cache, whose warm-up from the shader store
+// creates pipeline layouts that include it.
+class ImageHeapLayout final {
+public:
+	explicit ImageHeapLayout(GraphicContext& graphics);
+	~ImageHeapLayout();
+	KYTY_CLASS_NO_COPY(ImageHeapLayout);
+	// Bindings of the set: the images, and with resident textures the samplers.
+	[[nodiscard]] static uint32_t Bindings(const GraphicContext& graphics);
+
+private:
+	GraphicContext&         m_graphics;
+	vk::DescriptorSetLayout m_layout = nullptr;
+};
 
 // Guest image tables that shaders index by GPU-computed offsets, kept resident in one bindless
 // sampled-image array. A table is keyed by its base and follows its descriptor's size. Each view
@@ -43,7 +60,9 @@ public:
 	// Image discovery: resolves new elements and rediscovers changed images.
 	void Rebind(RenderExecutor& executor);
 	// Recording: uploads slots, moves resident images to their read layout and binds the array.
-	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
+	// `bind`: false when the set is still bound for `layout` (GraphicsBindings::NeedsHeapSet).
+	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+	            bool bind = true);
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -54,8 +73,13 @@ public:
 	// samples `view` in `layout`, written at the next WriteResidentElements. Retiring one makes
 	// it reusable once the current scheduler tick is free.
 	[[nodiscard]] uint32_t AllocateResident(vk::ImageView view, vk::ImageLayout layout);
+	// Points an element allocated earlier at a view (a feedback element written at commit).
+	void                   SetResident(uint32_t index, vk::ImageView view, vk::ImageLayout layout);
 	void                   RetireResident(uint32_t index);
 	void                   WriteResidentElements() { WriteDescriptors(); }
+	// Resident samplers (binding IR::ResidentSamplerBinding), written at once; never retired.
+	void                   WriteResidentSampler(uint32_t index, vk::Sampler sampler);
+	[[nodiscard]] bool     ResidentElementFree(uint64_t tick);
 
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
@@ -145,7 +169,6 @@ private:
 	std::vector<uint32_t>                     m_scratch;
 	std::vector<uint32_t>                     m_writes; // Elements whose descriptors changed.
 	std::vector<GuestRange>                   m_unmapped; // Since the last Bury.
-	vk::DescriptorSetLayout                   m_layout = nullptr;
 	vk::DescriptorPool                        m_pool   = nullptr;
 	vk::DescriptorSet                         m_set    = nullptr;
 

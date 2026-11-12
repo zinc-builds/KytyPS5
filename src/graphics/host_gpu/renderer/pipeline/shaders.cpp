@@ -127,6 +127,7 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
+	EXIT_IF(pipeline.uses_image_heap && graphics.image_heap_layout == nullptr);
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
@@ -294,6 +295,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			const auto native_stage = NativeShaderStage(stage->info.stage);
 			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+			// Resident textures sample through the image heap's set as well.
+			pipeline.uses_image_heap |= stage->info.bindings.ResidentWords() != 0u;
 			pipeline.push_stages |= native_stage;
 		}
 	}

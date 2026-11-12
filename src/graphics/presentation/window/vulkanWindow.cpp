@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -71,6 +72,38 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 
 vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noexcept {
 	return {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
+}
+
+// KYTY_RESIDENT_TEXTURES=1|verify: whether the device has what resident textures rely on. Without
+// it, draws keep their classic bindings (logged), whatever the setting.
+static bool ResidentTexturesSupported(const vk::PhysicalDeviceFeatures&         features,
+                                      const vk::PhysicalDeviceVulkan12Properties& limits) {
+	const char* value = std::getenv("KYTY_RESIDENT_TEXTURES");
+	if (value == nullptr || (strcmp(value, "1") != 0 && strcmp(value, "verify") != 0)) {
+		return false;
+	}
+	const char* missing = nullptr;
+	if (features.shaderSampledImageArrayDynamicIndexing != VK_TRUE) {
+		missing = "shaderSampledImageArrayDynamicIndexing";
+	} else if (std::min(limits.maxDescriptorSetUpdateAfterBindSampledImages,
+	                    limits.maxPerStageDescriptorUpdateAfterBindSampledImages) <
+	           ShaderRecompiler::IR::ImageHeapCapacity) {
+		missing = "update-after-bind sampled images";
+	} else if (std::min(limits.maxDescriptorSetUpdateAfterBindSamplers,
+	                    limits.maxPerStageDescriptorUpdateAfterBindSamplers) <
+	           ShaderRecompiler::IR::ResidentSamplerCapacity) {
+		missing = "update-after-bind samplers";
+	} else if (limits.maxPerStageUpdateAfterBindResources <
+	           ShaderRecompiler::IR::ImageHeapCapacity + ShaderRecompiler::IR::ResidentSamplerCapacity) {
+		missing = "update-after-bind resources per stage";
+	}
+	if (missing != nullptr) {
+		Log::WriteToConsoleAndLog(std::string("Resident textures unavailable (") + missing +
+		                          "); draws keep classic bindings\n");
+		return false;
+	}
+	LOGF("Resident textures: on\n");
+	return true;
 }
 
 static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, const char* name) {
@@ -491,10 +524,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
 	    vk::PhysicalDeviceRobustness2PropertiesEXT, vk::PhysicalDeviceVulkan11Properties,
 	    vk::PhysicalDeviceSubgroupSizeControlProperties, vk::PhysicalDevicePushDescriptorProperties,
-	    vk::PhysicalDeviceMeshShaderPropertiesEXT>
+	    vk::PhysicalDeviceVulkan12Properties, vk::PhysicalDeviceMeshShaderPropertiesEXT>
 	    properties;
 	auto& [properties2, float_controls, robustness2_props, properties11, subgroup_control,
-	       push_descriptor, mesh_properties] = properties;
+	       push_descriptor, properties12, mesh_properties] = properties;
 	if (!graphics.mesh_shader_enabled) {
 		properties.unlink<vk::PhysicalDeviceMeshShaderPropertiesEXT>();
 	}
@@ -527,6 +560,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.robust_buffer_access_enabled =
 	    robustness2.robustBufferAccess2 &&
 	    robustness2_props.robustStorageBufferAccessSizeAlignment == 1u;
+	graphics.resident_textures = ResidentTexturesSupported(supported2.features, properties12);
 	graphics.r8_srgb_views   = graphics.SamplesFiltered(vk::Format::eR8Srgb);
 	graphics.r8g8_srgb_views = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
 	// The device clock ticks at timestampPeriod nanoseconds.
@@ -576,6 +610,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	// Resident textures index the heap's arrays by dynamically uniform indices.
+	device_features.shaderSampledImageArrayDynamicIndexing = graphics.resident_textures;
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =

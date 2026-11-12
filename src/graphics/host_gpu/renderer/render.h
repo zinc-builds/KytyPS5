@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/residentStore.h"
 #include "graphics/host_gpu/renderer/pipeline/residentTextures.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -412,6 +413,25 @@ private:
 		return *m_resident;
 	}
 	std::unique_ptr<ResidentTextures> m_resident;
+	// Resident textures (KYTY_RESIDENT_TEXTURES=1|verify): the draw's slots, by stage.
+	[[nodiscard]] ResidentStore& ResidentStoreOf() {
+		if (m_resident_store == nullptr) {
+			m_resident_store = std::make_unique<ResidentStore>(m_context);
+		}
+		return *m_resident_store;
+	}
+	// Returns whether the whole set is skipped (no per-slot work).
+	[[nodiscard]] bool BeginResidentImages(PreparedBindings& prepared, ResidentStore::Counters& now);
+	void RebindResidentImage(PreparedBindings& prepared, uint32_t index,
+	                         const ResidentStore::Counters& now, bool& resolved);
+	void EndResidentImages(PreparedBindings& prepared);
+	void CommitResidentImage(PreparedBindings& prepared, uint32_t index);
+	void EndResidentCommit(std::span<PreparedBindings* const> stages);
+	[[nodiscard]] static bool ResidentStatsEnabled();
+	void                      NoteResidentStats(std::span<PreparedBindings* const> stages);
+	std::unique_ptr<ResidentStore> m_resident_store;
+	// This draw's targets and storage images that resident elements sample.
+	std::vector<ImageId>           m_resident_conflicts;
 	// Command thread: color_info entry r of render target slot `slot` as the worker proposed it
 	// (record null: no output); the texture cache side, or the whole resolve if the record's image
 	// no longer holds.

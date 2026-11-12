@@ -187,9 +187,9 @@ exactness risks: `RESEARCH-thin-commit.md` (its `file:line` references are for `
 | 0 | Stats: slow-path share, recorder ns/draw, stage 0 (time in the code stage 1 deletes) | Track B | numbers in FINDINGS |
 | 1 | Latency: walker read logging, ranged hazards, depth sweep, free lanes, third worker | Track B4 | wait ≤ 80 ns/draw at depth ≥ 8; rejections < 300/s |
 | 2 | Run-level targets, programs and pipeline | Track B | −270 and −150 ns/draw |
-| 3 | Resident textures and samplers (stage 1; 1a is `KYTY_RESIDENT_TEXTURES=shadow`, then a 1b design review) | Track R | −150 ns/draw on PGO; verify clean |
+| 3 | Resident textures and samplers (stage 1). 1a: `KYTY_RESIDENT_TEXTURES=shadow`. 1b merged, off by default: `=1`, `=verify`; plain build `cmd_ns` −1.9%, `cpd` −2.5% (FINDINGS). Default on decided on a PGO pair | Track R | −150 ns/draw on PGO; verify clean |
 | 4 | #78 revived, covering all per-draw uploads | Track B4 (later) | `ObtainBuffer` and uploads −150 ns/draw |
-| 5 | Buffers by address (stage 2), the draw packet filled by the worker | Track R | no `pushDescriptorSet` on queued draws; `CommitBindings` ≤ 100 ns |
+| 5 | Buffers by address (stage 2), the draw packet filled by the worker. On hold (2026-11-12): like 1b, it would delete work whose loads hit L2, and the thread's stalls are elsewhere | Track R | no `pushDescriptorSet` on queued draws; `CommitBindings` ≤ 100 ns |
 | 6 | Run-level bindings | unassigned | trivial after 5 |
 | 7 | No direct recording on the draw path | unassigned | draw-path recorder drains at 0 |
 | 8 | Parallel recording with secondary command buffers | unassigned | only if the recorder gates |
@@ -217,7 +217,10 @@ step 1 comes first.
   An FPS claim of record needs a same-batch pair in frames 1000–1600 (`gate.sh` runs it).
 - **Correctness first:** `gate.sh` before merging (screenshots against the merge-base, the verify
   modes), the touched unit tests (one suite at a time, under `MemoryMax=10G`), and a verify mode
-  for any cache. Review with sol-loop, then a small PR to `dev` and a squash merge; paste the gate
+  for any cache. After any change to pipeline layouts or to the order of warm-up and context
+  setup, run one build of each affected mode once under `--vulkan-validation`: a null set layout
+  in every warmed pipeline drew black frames, and `gate.sh` still passed (its screenshots are
+  compared by eye, with no pixel check). Review with sol-loop, then a small PR to `dev` and a squash merge; paste the gate
   block into the PR body.
 - **Stay in your files.** If you must touch another track's files, keep the change minimal and say
   so in the PR. `renderDraw.cpp` is shared: A changes its barrier and render-pass sections, B adds
@@ -327,7 +330,10 @@ predict it poorly:
 
 The thread is stall-bound (IPC 1.3 on pgo builds, 1.6 on plain; see "Where the command thread's
 cycles go"), so cutting instructions often removes work that overlapped a stall:
-- resident textures cut `ipd` 10.7% but `cpd` 1.2% (`r1b-ab3`, one binary);
+- resident textures (1b, one binary, plain, 1000–1600) cut `ipd` 10.1% but `cpd` 2.5% and
+  `cmd_ns` 1.9%: the ~32 L1 misses per draw they remove hit in L2, and L2/L3 misses and snoop
+  hits stay (`r1b-pmu`; an earlier `r1b-ab3` reading of −1.2% `cpd` is void: its resident
+  pipelines had a null set 1 and drew black);
 - #83/#87/#88/#90 on pgo cut `ipd` 4.5% and `cpd` 0%.
 
 The rule, in any build mode:

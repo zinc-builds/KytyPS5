@@ -231,6 +231,8 @@ public:
 	std::atomic<uint32_t> heap_refs {0};
 	// This image's share of unsettle_generation and read_layout_epoch.
 	std::atomic<uint32_t> residency_version {0};
+	// Live resident texture elements (ResidentStore) that sample it. Command thread only.
+	uint32_t              resident_live = 0;
 
 private:
 	friend struct ImageTestAccess;

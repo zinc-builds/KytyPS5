@@ -166,6 +166,9 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
+	// Sampled through the image heap's array by an index in shader data (resident textures);
+	// descriptor_index is then its index word.
+	bool                          resident          = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -348,6 +351,10 @@ inline constexpr uint32_t ImageBindingCount           = 50u;
 inline constexpr uint32_t ImageHeapSet                = 1u;
 inline constexpr uint32_t ImageHeapCapacity           = 65536u;
 inline constexpr uint32_t ImageHeapKindShift          = 20u;
+// Resident textures (Profile::resident_textures): draw shaders sample set ImageHeapSet's image
+// array at binding 0 and its sampler array at this binding, by 16-bit indices in shader data.
+inline constexpr uint32_t ResidentSamplerBinding      = 1u;
+inline constexpr uint32_t ResidentSamplerCapacity     = 4096u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -502,6 +509,11 @@ struct Bindings {
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
+	// Resident textures: 16-bit heap indices after the buffer ranges, two per dword: the
+	// resident images (ImageResource::descriptor_index), then every sampler if these are
+	// resident (resident_samplers == the sampler count; the sampler binding is then empty).
+	uint32_t resident_images   = 0;
+	uint32_t resident_samplers = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
 	// reads 0 for ranges of 2 GiB or more on NVIDIA.
@@ -509,9 +521,13 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t ResidentDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
+	[[nodiscard]] uint32_t ResidentWords() const { return resident_images + resident_samplers; }
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return ResidentDword() + (ResidentWords() + 1u) / 2u;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
