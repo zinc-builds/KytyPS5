@@ -319,7 +319,7 @@ void RenderExecutor::PrintDispatchChainStats() {
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute, bool may_chain) {
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().RetirePendingOperations();
 	FlushAtomicWrites(buffer);
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -552,7 +552,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	{
 		KYTY_PROFILER_BLOCK("DI:PopPending");
-		m_context.GetCommandScheduler().PopPendingOperations();
+		m_context.GetCommandScheduler().RetirePendingOperations();
 	}
 	FlushAtomicWrites(buffer);
 	Common::LockGuard lock(m_context.GetMutex());

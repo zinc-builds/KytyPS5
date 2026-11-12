@@ -93,6 +93,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	m_command.m_recorder = m_recorder.get();
+	if (const char* retire = std::getenv("KYTY_RETIRE_NOWAIT"); retire != nullptr && retire[0] == '0') {
+		m_retire_nowait = false;
+	}
 	if (record_thread) {
 		m_master.EnableWaitDiag();
 		const char* early = std::getenv("KYTY_EARLY_SUBMIT");
@@ -231,6 +234,14 @@ void CommandScheduler::Wait(uint64_t tick, const std::source_location& site) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	PopPendingOperations(true);
+}
+
+void CommandScheduler::RetirePendingOperations() {
+	PopPendingOperations(!m_retire_nowait);
+}
+
+void CommandScheduler::PopPendingOperations(bool wait_priority) {
 	// Every draw comes here; reading the GPU tick at most every 20 us is enough to retire work.
 	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
 	if (now - m_last_refresh.load(std::memory_order_relaxed) >=
@@ -252,11 +263,22 @@ void CommandScheduler::PopPendingOperations() {
 			    !m_master.IsFree(m_pending_operations.front().tick)) {
 				return;
 			}
+			const auto tick = m_pending_operations.front().tick;
+			// Priority operations of this tick or earlier run first. Not waiting for them: keep
+			// the operation for a later call. Any priority operation queued from now on has a
+			// tick past this one (it is free, so submitted), so none can slip in before it.
+			if (!wait_priority &&
+			    ((m_priority_active_tick != 0 && m_priority_active_tick <= tick) ||
+			     (!m_priority_operations.empty() && m_priority_operations.front().tick <= tick))) {
+				return;
+			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 			NotePendingFront();
 		}
-		WaitPriorityOperations(operation.tick);
+		if (wait_priority) {
+			WaitPriorityOperations(operation.tick);
+		}
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -335,19 +357,34 @@ void CommandScheduler::DrainPriorityOperations() {
 	    lock, [this] { return m_priority_operations.empty() && m_priority_active_tick == 0; });
 }
 
-void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
+void CommandScheduler::WaitPriorityOperations(uint64_t tick, const std::source_location& site) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdScheduler,
 	                               Common::StallDiag::OnCommandThread());
 	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::SchedulerWait);
 	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
+	const auto done = [this, tick] {
 		const bool active_before_or_at =
 		    m_priority_active_tick != 0 && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
-	});
+	};
+	if (m_master.WaitDiag() && Common::StallDiag::OnCommandThread() && !done()) {
+		// KYTY_GPU_WAIT_DIAG: what this wait is for (the blocking operation's GPU tick known done?).
+		const auto blocking = m_priority_active_tick != 0 ? m_priority_active_tick
+		                                                  : m_priority_operations.front().tick;
+		const bool gpu_done = m_master.IsFree(blocking);
+		uint32_t   ahead    = m_priority_active_tick != 0 ? 1 : 0;
+		ahead += static_cast<uint32_t>(m_priority_operations.size());
+		const auto start = Common::GpuWaitDiag::NowNs();
+		m_operation_available.wait(lock, done);
+		lock.unlock();
+		Common::GpuWaitDiag::NoteSchedulerWait(start, Common::GpuWaitDiag::NowNs(), gpu_done, ahead,
+		                                       site);
+		return;
+	}
+	m_operation_available.wait(lock, done);
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {

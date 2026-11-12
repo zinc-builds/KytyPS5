@@ -56,8 +56,14 @@ public:
 	void                      Shutdown();
 	void Wait(uint64_t tick, const std::source_location& site = std::source_location::current());
 	void                      PopPendingOperations();
+	// The per-draw and per-dispatch retirement: like PopPendingOperations, but an operation whose
+	// tick's priority operations (readback publishes, interrupts, flips) haven't run yet stays
+	// queued for a later call instead of waiting for the priority thread (KYTY_RETIRE_NOWAIT=0
+	// waits, as PopPendingOperations does).
+	void                      RetirePendingOperations();
 	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
+	void WaitPriorityOperations(uint64_t                    tick,
+	                            const std::source_location& site = std::source_location::current());
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
@@ -104,6 +110,7 @@ private:
 	};
 
 	void BeginNext();
+	void PopPendingOperations(bool wait_priority);
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -132,6 +139,7 @@ private:
 	OperationState               m_operation_state      = OperationState::Open;
 	vk::Semaphore                m_next_wait_semaphore  = nullptr;
 	uint64_t                     m_next_wait_value      = 0;
+	bool                         m_retire_nowait        = true;
 	int64_t                      m_command_begin        = 0;  // steady_clock ticks at BeginCommand
 	int64_t                      m_early_submit_age     = -1; // steady_clock ticks; < 0: off
 };

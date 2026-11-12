@@ -79,6 +79,10 @@ struct State {
 	uint64_t                                   early       = 0;
 	std::unordered_map<uint64_t, SiteTotal>    sites;
 	std::unordered_map<uint64_t, StackTotal>   stacks;
+	std::unordered_map<uint64_t, SiteTotal>    sched_sites;  // backlog = ahead, idle = gpu_done
+	std::unordered_map<uint64_t, StackTotal>   sched_stacks;
+	uint64_t                                   sched_waits   = 0;
+	uint64_t                                   sched_wait_ns = 0;
 	uint32_t                                   next_site_id = 1;
 	std::unordered_map<uint64_t, uint32_t>     site_ids;
 	std::string                                trace;
@@ -346,6 +350,50 @@ void NoteWait(uint64_t tick, uint64_t current, uint64_t known, uint64_t start_ns
 	}
 }
 
+void NoteSchedulerWait(uint64_t start_ns, uint64_t end_ns, bool gpu_done, uint32_t ahead,
+                       const std::source_location& site) noexcept {
+	std::array<void*, StackDepth + StackSkip> raw {};
+	int                                       depth = 0;
+#if defined(__linux__)
+	depth = backtrace(raw.data(), static_cast<int>(raw.size()));
+#endif
+	auto&           s     = Get();
+	std::lock_guard lock(s.mutex);
+	const auto      ns    = end_ns - start_ns;
+	const auto      key   = SiteKey(site);
+	auto&           total = s.sched_sites[key];
+	if (total.n == 0) {
+		total.file     = site.file_name();
+		total.function = site.function_name();
+		total.line     = site.line();
+	}
+	total.n++;
+	total.ns += ns;
+	total.max_ns = std::max(total.max_ns, ns);
+	total.backlog += ahead;
+	total.idle += gpu_done ? 1 : 0;
+	s.sched_waits++;
+	s.sched_wait_ns += ns;
+	uint64_t   hash = key;
+	StackTotal stack;
+	for (int i = StackSkip; i < depth && stack.depth < StackDepth; i++) {
+		const auto address          = reinterpret_cast<uintptr_t>(raw[static_cast<size_t>(i)]);
+		stack.frames[stack.depth++] = address;
+		hash                        = hash * 1099511628211ull ^ address;
+	}
+	auto& stack_total = s.sched_stacks[hash];
+	if (stack_total.n == 0) {
+		stack_total.frames = stack.frames;
+		stack_total.depth  = stack.depth;
+	}
+	stack_total.n++;
+	stack_total.ns += ns;
+	if (Mode() == 2 && s.origin != 0) {
+		Append(s, "P %" PRIu64 " %" PRIu64 " %d %u\n", Rel(s, start_ns), Rel(s, end_ns), gpu_done ? 1 : 0,
+		       ahead);
+	}
+}
+
 void NoteFlip(uint64_t tick) noexcept {
 	auto&           s = Get();
 	std::lock_guard lock(s.mutex);
@@ -429,6 +477,40 @@ void Report() noexcept {
 		            static_cast<double>(t->age_ns) / 1e3 / n, 100.0 * static_cast<double>(t->idle) / n,
 		            t->function);
 	}
+	std::printf("SCHEDWAIT waits_s=%.0f wait_ms_s=%.2f\n", static_cast<double>(s.sched_waits) / secs,
+	            static_cast<double>(s.sched_wait_ns) / 1e6 / secs);
+	for (const auto& [key, t]: s.sched_sites) {
+		const double n    = static_cast<double>(t.n);
+		const char*  file = std::strstr(t.file, "src/");
+		std::printf("SCHEDWAITSITE %s:%u waits_s=%.1f ms_s=%.3f avg_us=%.1f max_us=%.1f ahead=%.2f "
+		            "gpu_done=%.0f%% fn=%s\n",
+		            file != nullptr ? file : t.file, t.line, n / secs, static_cast<double>(t.ns) / 1e6 / secs,
+		            static_cast<double>(t.ns) / 1e3 / n, static_cast<double>(t.max_ns) / 1e3,
+		            static_cast<double>(t.backlog) / n, 100.0 * static_cast<double>(t.idle) / n, t.function);
+	}
+	{
+		std::vector<const StackTotal*> top;
+		for (const auto& [key, total]: s.sched_stacks) {
+			top.push_back(&total);
+		}
+		std::sort(top.begin(), top.end(), [](const auto* a, const auto* b) { return a->ns > b->ns; });
+#if defined(__linux__)
+		const auto base = reinterpret_cast<uintptr_t>(&__executable_start);
+#else
+		const uintptr_t base = 0;
+#endif
+		for (size_t i = 0; i < top.size() && i < 6; i++) {
+			std::string frames;
+			for (int f = 0; f < top[i]->depth; f++) {
+				char text[32];
+				std::snprintf(text, sizeof(text), " %lx",
+				              static_cast<unsigned long>(top[i]->frames[static_cast<size_t>(f)] - base));
+				frames += text;
+			}
+			std::printf("SCHEDWAITSTACK waits_s=%.1f ms_s=%.3f at%s\n", static_cast<double>(top[i]->n) / secs,
+			            static_cast<double>(top[i]->ns) / 1e6 / secs, frames.c_str());
+		}
+	}
 	std::vector<const StackTotal*> stacks;
 	for (const auto& [key, total]: s.stacks) {
 		stacks.push_back(&total);
@@ -478,6 +560,9 @@ void Report() noexcept {
 	s.waits = s.wait_ns = s.flips = s.early = 0;
 	s.sites.clear();
 	s.stacks.clear();
+	s.sched_sites.clear();
+	s.sched_stacks.clear();
+	s.sched_waits = s.sched_wait_ns = 0;
 	s.period_start = now;
 	if (Mode() == 2 && !s.trace.empty()) {
 		std::string trace;
