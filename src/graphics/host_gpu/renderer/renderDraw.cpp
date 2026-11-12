@@ -1881,8 +1881,72 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 	return m_queued_draws[m_queued_posted % m_queued_draws.size()].get();
 }
 
+namespace {
+// KYTY_REGISTER_SNAPSHOT: 1 (default) share, 0 copy per draw, 2 verify.
+int RegisterSnapshotMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_REGISTER_SNAPSHOT");
+		if (value == nullptr) return 1;
+		return std::string_view(value) == "0" ? 0 : std::string_view(value) == "verify" ? 2 : 1;
+	}();
+	return mode;
+}
+} // namespace
+
+HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64_t sequence) {
+	const auto mode    = RegisterSnapshotMode();
+	auto*      current = m_register_snapshot;
+	// Compare only the lines written since the last post with the previous draw's registers.
+	const bool same_source = current != nullptr && m_register_snapshot_source == &live;
+	const auto written     = live.WrittenLines();
+	live.ClearWritten();
+	m_register_lines_changed =
+	    same_source ? (written != 0 ? HW::Context::DifferingLines(live, current->registers, written) : 0)
+	                : ~uint64_t {0};
+	if (mode != 0 && same_source && m_register_lines_changed == 0) {
+		if (mode == 2 && !current->registers.SameRegisters(live)) {
+			EXIT("KYTY_REGISTER_SNAPSHOT=verify: the registers changed without a written mark\n");
+		}
+		current->last_sequence = sequence;
+		return &current->registers;
+	}
+	// Queued draws not yet committed: sequences from `oldest` on.
+	const auto oldest = m_queued_posted - m_queued_count + 1;
+	if (m_register_snapshots.empty()) {
+		m_register_snapshots.push_back(std::make_unique<RegisterSnapshot>());
+	}
+	auto& candidate = m_register_snapshots[m_register_snapshot_next];
+	if (candidate.get() == current || candidate->last_sequence >= oldest) {
+		// Still in use: one more snapshot (they are taken in order, so the next one is the
+		// oldest).
+		m_register_snapshots.insert(m_register_snapshots.begin() +
+		                                static_cast<ptrdiff_t>(m_register_snapshot_next),
+		                            std::make_unique<RegisterSnapshot>());
+	}
+	auto* snapshot = m_register_snapshots[m_register_snapshot_next].get();
+	m_register_snapshot_next = (m_register_snapshot_next + 1) % m_register_snapshots.size();
+	if (mode == 2) {
+		for (const auto& slot: m_queued_draws) {
+			EXIT_IF(slot->registers == &snapshot->registers && slot->sequence >= oldest &&
+			        slot->sequence <= m_queued_posted);
+		}
+	}
+	snapshot->registers = live;
+	m_prepare_stat.register_snapshots++;
+	snapshot->last_sequence    = sequence;
+	m_register_snapshot        = snapshot;
+	m_register_snapshot_source = &live;
+	return &snapshot->registers;
+}
+
 void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
-	queued.registers          = buffer.GetRegisters();
+	queued.registers = RegisterSnapshotFor(buffer.GetRegisters(), m_queued_posted + 1);
+	if (RegisterSnapshotMode() == 2) {
+		if (!queued.registers_verify) {
+			queued.registers_verify = std::make_unique<HW::Context>();
+		}
+		*queued.registers_verify = buffer.GetRegisters();
+	}
 	queued.user_config        = buffer.GetUserConfig();
 	queued.shaders            = buffer.GetShaders();
 	queued.hazard_generation  = DrawPrepare::HazardGeneration();
@@ -1961,7 +2025,7 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	std::destroy_at(&queued.state);
 	std::construct_at(&queued.state);
 	self.m_context.GetPipelineCache().GetGraphicsPrograms(
-	    queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
+	    *queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
 	DrawPrepare::SetLog(nullptr);
 	self.SpeculateBuffers(queued, lane.stream_ring);
 	self.SpeculateTextures(queued, lane.textures);
@@ -1993,7 +2057,7 @@ void RenderExecutor::ProposePipelineKey(QueuedDraw& queued) {
 			case Prospero::IndexType::kIndex8: element_size = 1; break;
 			default: return;
 		}
-		switch (PrimitiveRestartFromRegisters(queued.user_config, queued.registers, element_size)) {
+		switch (PrimitiveRestartFromRegisters(queued.user_config, *queued.registers, element_size)) {
 			case PrimitiveRestartMode::On: targets.primitive_restart_enable = 1; break;
 			case PrimitiveRestartMode::Off:
 			case PrimitiveRestartMode::Scan: break;
@@ -2029,7 +2093,7 @@ void RenderExecutor::ProposePipelineKey(QueuedDraw& queued) {
 			return;
 		}
 	}
-	m_context.GetPipelineCache().ProposeGraphicsPipelineKey(queued.registers, queued.user_config,
+	m_context.GetPipelineCache().ProposeGraphicsPipelineKey(*queued.registers, queued.user_config,
 	                                                        state, targets, proposal);
 }
 
@@ -2157,7 +2221,11 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	auto& registers   = *buffer.m_registers;
 	auto& user_config = *buffer.m_user_config;
 	auto& shaders     = *buffer.m_shaders;
-	buffer.Bind(queued.registers, queued.user_config, queued.shaders);
+	if (queued.registers_verify && !queued.registers->SameRegisters(*queued.registers_verify)) {
+		EXIT("KYTY_REGISTER_SNAPSHOT=verify: a queued draw's register snapshot changed before its "
+		     "commit\n");
+	}
+	buffer.Bind(*queued.registers, queued.user_config, queued.shaders);
 	if (queued.indexed) {
 		(void)DrawIndex(buffer, queued.index_args, &queued);
 	} else {
@@ -2202,7 +2270,8 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%"
 			            " hazard_gpu=%" PRIu64 " hazard_epoch=%" PRIu64
 			            " kept_by_ranged=%" PRIu64 " kept_by_gpu_range=%" PRIu64 " walker_pages=%.2f pages_hist=%" PRIu64 "/%" PRIu64
-			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+			            " register_snapshots=%.1f%%\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
@@ -2219,7 +2288,8 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			                static_cast<double>(std::max<uint64_t>(stat.adopted, 1)),
 			            stat.page_buckets[0], stat.page_buckets[1], stat.page_buckets[2],
 			            stat.page_buckets[3], stat.page_buckets[4], stat.page_buckets[5],
-			            stat.page_buckets[6], stat.page_buckets[7]);
+			            stat.page_buckets[6], stat.page_buckets[7],
+			            100.0 * static_cast<double>(stat.register_snapshots) / draws);
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;
@@ -2300,7 +2370,7 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		// The command thread may not look programs up while the worker does.
 		WaitPrepareIdle();
 		ResetProgramState(state);
-		pipelines.GetGraphicsPrograms(queued.registers, queued.user_config, queued.shaders, state,
+		pipelines.GetGraphicsPrograms(*queued.registers, queued.user_config, queued.shaders, state,
 		                              queued.resources);
 		return;
 	}
@@ -2342,7 +2412,7 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		static auto check = std::make_unique<std::pair<DrawRenderState, PipelineCache::GraphicsResources>>();
 		check->first = state;
 		ResetProgramState(check->first);
-		pipelines.GetGraphicsPrograms(queued.registers, queued.user_config, queued.shaders,
+		pipelines.GetGraphicsPrograms(*queued.registers, queued.user_config, queued.shaders,
 		                              check->first, check->second);
 		if (const auto diff = ComparePrograms(state, queued.resources, check->first, check->second);
 		    !diff.empty()) {

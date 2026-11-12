@@ -352,7 +352,10 @@ private:
 
 	// A queued draw: what it was given, its registers when queued, and the worker's lookup.
 	struct QueuedDraw {
-		HW::Context                      registers;
+		// The draw's context registers: a command-thread-owned snapshot shared by consecutive
+		// draws while the registers do not change (RegisterSnapshot).
+		HW::Context*                     registers = nullptr;
+		std::unique_ptr<HW::Context>     registers_verify; // KYTY_REGISTER_SNAPSHOT=verify
 		HW::UserConfig                   user_config;
 		HW::Shader                       shaders;
 		bool                             indexed = true;
@@ -687,6 +690,23 @@ private:
 	std::unique_ptr<DrawPrepare::Pool>               m_prepare_pool;
 	std::vector<std::unique_ptr<PrepareLane>>        m_prepare_lanes;
 	std::vector<std::unique_ptr<QueuedDraw>>         m_queued_draws;
+	// Register snapshots for queued draws (KYTY_REGISTER_SNAPSHOT=0: a new one per draw; =verify:
+	// a reused snapshot is compared with the registers, and a draw's snapshot at commit with a
+	// copy taken at post). Only the command thread allocates, reuses and retires them: one is
+	// free once the oldest queued draw's sequence is past the last draw that used it. Workers
+	// only read a snapshot, between their draw's post and its commit.
+	struct RegisterSnapshot {
+		HW::Context registers;
+		uint64_t    last_sequence = 0;
+	};
+	std::vector<std::unique_ptr<RegisterSnapshot>> m_register_snapshots;
+	size_t                                         m_register_snapshot_next = 0;
+	RegisterSnapshot*                              m_register_snapshot      = nullptr;
+	const HW::Context*                             m_register_snapshot_source = nullptr;
+	// Lines of the context registers that differ from the previous queued draw's (all with a new
+	// source). Set at each queued post.
+	uint64_t     m_register_lines_changed = ~uint64_t {0};
+	HW::Context* RegisterSnapshotFor(const HW::Context& live, uint64_t sequence);
 	uint64_t                                         m_queued_posted = 0; // sequences posted
 	uint32_t                                         m_queued_count  = 0; // posted, not committed
 	bool                                             m_prepare_verify = false;
@@ -706,6 +726,7 @@ private:
 	void                        PrintDrainStats();
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t register_snapshots = 0; // new register snapshots (the rest share one)
 		// Adopted although an emulator store came after the post (the unranged epoch would have
 		// dropped them), and the walker page log's distinct pages per draw (buckets 0, 1, 2-3,
 		// 4-7, ... 64+).
