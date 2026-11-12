@@ -1855,7 +1855,9 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		// sibling of the last worker's core) takes only draws at least KYTY_PREPARE_OVERFLOW_K
 		// (default 3) past the oldest untaken one: burst capacity that never holds a draw the
 		// command thread wants next. KYTY_PREPARE_OVERFLOW=0 turns it off.
-		const bool     overflow   = free_lanes && Common::HybridAffinity::PrepareOverflowCpu() >= 0;
+		// It needs a walk scratch of its own: none with the regular workers at the limit.
+		const bool     overflow   = free_lanes && Common::HybridAffinity::PrepareOverflowCpu() >= 0 &&
+		                      workers < ShaderRecompiler::IR::ResourcePlan::MaxPrepareWorkers;
 		const char*    k_text     = std::getenv("KYTY_PREPARE_OVERFLOW_K");
 		const uint32_t overflow_k = overflow ? static_cast<uint32_t>(std::clamp(
 		                                           k_text != nullptr ? std::atoi(k_text) : 3, 1, 15))
