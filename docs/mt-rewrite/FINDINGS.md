@@ -1599,8 +1599,10 @@ PGO, same binary (dev ab68b255 + the prototype), frames 1000–1600, `KYTY_BENCH
 | L3 misses (off 7.3) | −8.4% | +0.9% | +0.1% |
 | memory-bound cycles | −4.7% | −3.3% | −6.6% |
 
-- **The hand-off loads were already overlapped.** The slot levels alone remove 26 of the 29 points of forwarded snoop hits, and memory-bound cycles fall 3–7%, yet total cycles and `cmd_ns` don't move. So the ~55 cycles per snoop-hit load estimated in "Where the command thread's cycles go" overstates what they cost: out-of-order execution hides most of them.
-- **Judge hand-off work by lines and copies removed, not by snoop counts.** Making a line arrive earlier, by prefetch or by layout, saves little. Removing the line, or the work that reads it, is what can save cycles.
+- **Removing the snoop-hit loads did not save cycles.** The slot levels alone (3) cut forwarded snoop hits by 26% (29.4 → 21.8 per draw, 7.6 fewer), against 29% (8.5 fewer) with all levels. Memory-bound cycles fall 3–7%, yet total cycles and `cmd_ns` don't move.
+  - The likeliest reading is that out-of-order execution already hid most of these loads' latency, so the ~55 cycles per snoop-hit load estimated in "Where the command thread's cycles go" overstates their cost.
+  - The prefetch's own instructions offset part of any saving, but not all of it: level 3 adds only ~225 instructions per draw (+1.04%), takes most of the snoop reduction, and still moves cycles by −0.25%, within noise.
+- **So judge hand-off work by lines and copies removed, not by snoop counts.** These measurements test early arrival by prefetch, not by a layout change. A layout that only makes the same lines arrive earlier would be expected to save little too. Removing the lines, or the work that reads them, is what can save cycles.
 - An earlier version, which prefetched every image and record with no pointer compare, also took a third of the snoop hits for ~690 more instructions per draw: cycles −0.97%. Prefetch in the prepare worker, so the line sits in the worker's cache, changed nothing measurable.
 - Draws already prepared at distance d when draw N commits: d1 81%, d2 66%, d3 57%.
 
