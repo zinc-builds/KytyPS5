@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
+#include "common/hybridAffinity.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
@@ -305,3 +306,35 @@ int main(int argc, char** argv) {
 	testing::InitGoogleTest(&argc, argv);
 	return RUN_ALL_TESTS();
 }
+
+#if defined(__linux__)
+TEST(HybridAffinity, GameThreadsAtOrAboveTheBarOrNamedStayOnPerformanceCores) {
+	using Common::HybridAffinity::KeepGuestOnPerformanceCores;
+	const std::vector<std::string> names {"DrawThread"};
+	// Lower numbers are higher priorities.
+	EXPECT_TRUE(KeepGuestOnPerformanceCores("Draw Geometry", 680, 680, names));
+	EXPECT_TRUE(KeepGuestOnPerformanceCores("Havok Worker", 478, 680, names));
+	EXPECT_FALSE(KeepGuestOnPerformanceCores("tbb_thead", 700, 680, names));
+	EXPECT_FALSE(KeepGuestOnPerformanceCores("Draw Geometry", 680, -1, names));
+	EXPECT_TRUE(KeepGuestOnPerformanceCores("DrawThread", 700, -1, names));
+}
+
+TEST(HybridAffinity, OnlyARaisedGraphicsSubmitterSetsTheBar) {
+	using namespace Common::HybridAffinity;
+	if (std::getenv("KYTY_GUEST_PCORE_PRIORITY") != nullptr) {
+		GTEST_SKIP() << "KYTY_GUEST_PCORE_PRIORITY is set";
+	}
+	const auto epoch = GuestPlacementEpoch().load();
+	EXPECT_FALSE(RaiseGuestPriorityBar(680, false)); // placement inactive: no bar
+	EXPECT_FALSE(RaiseGuestPriorityBar(kGuestDefaultPriority, true)); // default priority: no bar
+	EXPECT_EQ(GuestPriorityBar().load(), -1);
+	EXPECT_EQ(GuestPlacementEpoch().load(), epoch);
+	EXPECT_TRUE(RaiseGuestPriorityBar(680, true));
+	EXPECT_EQ(GuestPriorityBar().load(), 680);
+	EXPECT_EQ(GuestPlacementEpoch().load(), epoch + 1); // the threads re-place themselves
+	EXPECT_FALSE(RaiseGuestPriorityBar(650, true)); // a higher-priority submitter keeps the bar
+	EXPECT_TRUE(RaiseGuestPriorityBar(690, true));  // a second, lower-priority submitter lowers it
+	EXPECT_EQ(GuestPriorityBar().load(), 690);
+	GuestPriorityBar().store(-1); // leave no bar behind (--gtest_repeat)
+}
+#endif

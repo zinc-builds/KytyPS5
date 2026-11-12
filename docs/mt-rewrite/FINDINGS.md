@@ -2060,6 +2060,69 @@ Share of presented frames taking 2+ refreshes:
 - p99 = 1 refresh (under 1% here) is reached by removing the waits for guest work together with
   ~0.5 ms of CPU, or by ~1.5 ms of CPU alone.
 
+### Game threads by guest priority: the render workers off the busy efficiency cores (Track R, 2026-11-12)
+
+**Why the game was late.** With the command thread faster, it had no guest work ~1 ms per guest
+frame on Sky Garden (`KYTY_FRAME_DIAG`, PR #113). The chain:
+- The game's submitting thread (`DrawThread`) waits on a condition variable that its `Draw*`
+  render workers signal.
+- Those workers waited for an efficiency core 2.7 times longer than they ran (schedstat). They
+  shared CPUs 12–18 with 11 `tbb_thead` workers (~4.6 CPUs running, ~3.9 waiting) and 19 `Havok`
+  workers.
+- No emulator event (flip, vblank, EOP, label) is in that chain.
+
+**The rule.** The guest's own priorities mark these threads on Sky Garden (lower numbers run
+first, 700 is the default):
+- `DrawThread` and the `Draw*` workers are at 678–680, `Havok` workers at 478, audio at 256.
+- The `tbb` pool, main thread and streamers are at 699–716.
+
+The threads that submit graphics command buffers set a bar: the largest raised priority number
+(below 700) any submitter has had. Every game thread at that priority or above runs on the
+emulator's performance cores, the rest on the efficiency cores.
+- Each thread places itself when it starts, and again at its next wait (condition, semaphore,
+  event flag, equeue, sleep) after the bar or its own priority changed. No thread changes another
+  thread's affinity.
+- The game's main thread stays with the emulator, as before.
+- A submitter at the default priority sets no bar.
+
+This is a heuristic: a guest priority does not say what the frame waits for. It fits Sky Garden,
+where the render workers the submitter waits on share its priority. On Linux the emulator
+otherwise ignores guest priorities (`PthreadSetprio` maps them only on Windows).
+
+**Measured** (PGO, `dev` 6f46c2ca, frames 1000–1600, same binary, 3 runs per arm interleaved;
+two-refresh share from `KYTY_FRAME_DIAG` `FRAME` lines). Load from other programs on the
+efficiency cores changes the game's pace from batch to batch, so only arms of one batch compare:
+
+| batch | layout | FPS | no guest work ms/frame | presented 2+ refreshes (without the 2 s spike frames) |
+|---|---|---|---|---|
+| 1 | default (`DrawThread` only) | 57.6 | 0.85 | 4.4% (4.3%) |
+| 1 | `Draw*` by name | 59.8 | 0.14 | 0.3% (0.3%) |
+| 2 | default | 51.9 | 2.97 | 15.5% (15.4%) |
+| 2 | `Draw*` by name | 56.3 | 1.68 | 6.6% (6.5%) |
+| 2 | priority ≤ 680 | 60.0 | 0.01 | 0.1% (0.0%) |
+| 2 | nice +5 below 680 (all on efficiency cores) | 54.1 | 2.20 | 10.9% (10.8%) |
+| 3 | rule off | 51.4 | 2.65 | 16.3% (16.3%) |
+| 3 | `Draw*` by name | 55.1 | 1.93 | 9.1% (9.0%) |
+| 3 | automatic bar (first version) | 59.1 | 0.30 | 1.5% (1.4%) |
+| 4 | rule off (`dev` 03d5d306 + #113, profile retrained) | 53.3 | 2.84 | 8.2% (8.0%) |
+| 4 | automatic bar (this change, threads place themselves) | 49.8 | 1.18 | 0.9% (0.7%) |
+
+- **Batch 4's FPS is not the steady-state rate.** Batch 4's means include texture GC hitches: a
+  GC of 0.3–1.3 s, a GPU wait for 144–222 MB of texture downloads, then the game catching up.
+  - 0–2 per run with the rule off, 2–4 with it on, inside frames 1000–1600.
+  - Without those frames and the three after each, the rule-on runs make 60.1–60.2 FPS (the
+    cap), with 0.05–0.16 ms of no guest work and 0.2–0.5% two-refresh frames in the replay. The
+    rule-off runs make 54.7–56.6 FPS, with 2.3–2.7 ms and 5.9–9.9%.
+  - With the rule on, the frames still at two refreshes are those hitches.
+
+- In batch 1, `ab.sh` gave FPS +5.39% (≥ 3 sd) with `cmd_ns` flat.
+- The priority rule also moves the `Havok` workers (~0.4–0.5 CPU) and audio. On Sky Garden that
+  held up when the efficiency cores were busy, where the name list alone did not.
+- Raising the other threads' nice (no privilege needed) helped less: the render workers still
+  share cores with the `tbb` pool.
+- **The 2 s spike frames** (the host's fan-control daemon on the command thread's SMT sibling) are
+  included in the numbers of record; the bracketed share leaves them out.
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
@@ -2208,8 +2271,10 @@ Share of presented frames taking 2+ refreshes:
 - `KYTY_MASKED_SELECTS=0` (Track G): vertex shaders keep every EXEC select. For A/B only, in
   an install dir of its own: the shader store doesn't record the setting.
 - Core layout: `KYTY_GUEST_THREAD_CPUS=<list>|none` (where the game's threads run, default the
-  efficiency cores but the recorder's), `KYTY_GUEST_PCORE_NAMES=<name,...>` (game threads kept
-  on the performance cores, default `DrawThread`), `KYTY_RESERVE_CPUS=<list>` (performance CPUs
+  efficiency cores but the recorder's), `KYTY_GUEST_PCORE_PRIORITY=<n>|off` (game threads at
+  guest priority n or above stay on the performance cores; default: the graphics submitter's
+  priority when the game raised it above 700), `KYTY_GUEST_PCORE_NAMES=<name,...>` (game threads
+  kept on the performance cores, default `DrawThread`), `KYTY_RESERVE_CPUS=<list>` (performance CPUs
   the emulator leaves free, e.g. for `KYTY_RECORDER_CPU`).
 - Pipeline key on the worker (Track B5): `KYTY_WORKER_PIPELINE_KEY=0` builds every key on the command
   thread again, `=stats` prints `WORKERPIPELINEKEY` lines (draws, worker keys used, none, target

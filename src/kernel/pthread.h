@@ -111,6 +111,14 @@ void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
+// The calling game thread submitted graphics work: on hybrid CPUs, game threads at or above its
+// priority move to the performance cores (HybridAffinity::NoteGraphicsSubmitter).
+void                  PthreadNoteGraphicsSubmitter();
+// The calling game thread places itself if its priority or the placement rule changed since it
+// last did (hybrid CPUs; called from its waits: conditions, semaphores, event flags, equeues,
+// sleeps). Cheap when nothing changed. A thread that never enters one of those waits keeps the
+// placement it had at its last one.
+void                  PthreadPlacementCheck();
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);

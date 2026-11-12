@@ -8,6 +8,7 @@
 
 #if defined(__linux__)
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -277,13 +278,11 @@ inline void ApplyToDecodeThread() {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
-// Call from a thread the game created, once it has its name. The game's threads run on the
-// efficiency cores (all but the recording thread's): since write faults stopped raising signals
-// they are light, and leaving the performance cores to the emulator's threads, the game's main
-// thread and its render thread gained 3%. Threads whose name starts with one of
-// KYTY_GUEST_PCORE_NAMES=<name,...> (default DrawThread) stay on the emulator's cores.
-// KYTY_GUEST_THREAD_CPUS=<list> picks other CPUs, =none keeps every game thread with the emulator.
-inline void ApplyToGuestThread(const std::string& name) {
+// The CPUs for the game's threads: the efficiency cores but the recording thread's. Leaving the
+// performance cores to the emulator's threads, the game's main thread and its render thread
+// gained 3% (core layout, #46). KYTY_GUEST_THREAD_CPUS=<list> picks other CPUs, =none keeps every
+// game thread with the emulator. Empty when the plan is not active.
+inline const std::set<int>& GuestCpus() {
 	static const std::set<int> cpus = [] {
 		if (!GetPlan().active) {
 			return std::set<int> {};
@@ -301,24 +300,110 @@ inline void ApplyToGuestThread(const std::string& name) {
 		}
 		return efficiency;
 	}();
+	return cpus;
+}
+
+// Guest priorities: lower numbers run first; 700 is the default, so a thread below 700 is one the
+// game raised. The threads that submit graphics command buffers set a bar: game threads at or
+// above the lowest raised priority any submitter has had (the largest number below 700) run with
+// the emulator on the performance cores, the others on GuestCpus(). On Sky Garden the submitter
+// (DrawThread, 680) waits for render workers at 678-680 that, on the efficiency cores, waited for
+// a core 2.7 times longer than they ran; the rule moves them, the physics workers (478) and audio,
+// and leaves the job pool and streamers (699-716). It is a heuristic: a guest priority does not
+// say what the frame waits for. A submitter at the default priority sets no bar (it would move
+// most of the game). KYTY_GUEST_PCORE_PRIORITY=<n> fixes the bar, =off turns the rule off.
+inline constexpr int kGuestDefaultPriority = 700;
+
+// Whether game threads are placed at all (a hybrid CPU with the plan active).
+inline bool GuestPlacementActive() {
+	return !GuestCpus().empty();
+}
+
+// The bar: -1 for none yet (or off).
+inline std::atomic<int>& GuestPriorityBar() {
+	static std::atomic<int> bar = [] {
+		const char* value = std::getenv("KYTY_GUEST_PCORE_PRIORITY");
+		return value != nullptr && value[0] >= '0' && value[0] <= '9' ? std::atoi(value) : -1;
+	}();
+	return bar;
+}
+
+// Bumped when the bar changes: each game thread re-places itself when it sees a new value.
+inline std::atomic<uint32_t>& GuestPlacementEpoch() {
+	static std::atomic<uint32_t> epoch {0};
+	return epoch;
+}
+
+inline bool GuestPriorityAuto() {
+	static const bool automatic = std::getenv("KYTY_GUEST_PCORE_PRIORITY") == nullptr;
+	return automatic;
+}
+
+// Whether a game thread stays on the performance cores: its name starts with one of `names`, or
+// its priority is at or above the bar (bar >= 0).
+inline bool KeepGuestOnPerformanceCores(const std::string& name, int priority, int bar,
+                                        const std::vector<std::string>& names) {
+	if (bar >= 0 && priority <= bar) {
+		return true;
+	}
+	for (const auto& prefix: names) {
+		if (name.rfind(prefix, 0) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Raises the bar to `priority` (automatic mode, raised priorities only, `active` placement).
+// Returns whether it changed; then the placement epoch moves.
+inline bool RaiseGuestPriorityBar(int priority, bool active) {
+	if (!active || !GuestPriorityAuto() || priority >= kGuestDefaultPriority || priority < 0) {
+		return false;
+	}
+	auto& bar     = GuestPriorityBar();
+	int   current = bar.load(std::memory_order_relaxed);
+	while (priority > current) {
+		if (bar.compare_exchange_weak(current, priority, std::memory_order_relaxed)) {
+			GuestPlacementEpoch().fetch_add(1, std::memory_order_release);
+			return true;
+		}
+	}
+	return false;
+}
+
+// A thread submitted graphics work at `priority`.
+inline void NoteGraphicsSubmitter(int priority) {
+	if (RaiseGuestPriorityBar(priority, GuestPlacementActive())) {
+		std::printf("Hybrid CPU: game threads at guest priority %d or above (a graphics "
+		            "submitter's) on the performance cores\n",
+		            priority);
+	}
+}
+
+// Places the calling game thread by its name and guest priority. Threads whose name starts with
+// one of KYTY_GUEST_PCORE_NAMES=<name,...> (default DrawThread) also stay on the performance
+// cores. A thread only ever places itself, so no other thread's lifetime is involved.
+inline void ApplyToGuestThread(const std::string& name, int priority) {
+	const auto& cpus = GuestCpus();
 	if (cpus.empty()) {
 		return;
 	}
-	static const std::vector<std::string> keep = [] {
+	static const std::vector<std::string> names = [] {
 		const char*              value = std::getenv("KYTY_GUEST_PCORE_NAMES");
 		std::stringstream        stream(value != nullptr ? value : "DrawThread");
-		std::vector<std::string> names;
+		std::vector<std::string> result;
 		for (std::string prefix; std::getline(stream, prefix, ',');) {
 			if (!prefix.empty()) {
-				names.push_back(prefix);
+				result.push_back(prefix);
 			}
 		}
-		return names;
+		return result;
 	}();
-	for (const auto& prefix: keep) {
-		if (name.rfind(prefix, 0) == 0) {
-			return;
-		}
+	if (KeepGuestOnPerformanceCores(name, priority,
+	                                GuestPriorityBar().load(std::memory_order_relaxed), names)) {
+		const auto& process = GetPlan().process;
+		(void)pthread_setaffinity_np(pthread_self(), sizeof(process), &process);
+		return;
 	}
 	cpu_set_t set;
 	CPU_ZERO(&set);
