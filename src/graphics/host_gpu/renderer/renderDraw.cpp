@@ -1846,6 +1846,14 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		for (auto& slot: m_queued_draws) {
 			slot = std::make_unique<QueuedDraw>();
 		}
+		// KYTY_HANDOFF_MAP=1: the slots' addresses, for attributing sampled data addresses.
+		if (EnvFlag("KYTY_HANDOFF_MAP", false)) {
+			for (size_t i = 0; i < m_queued_draws.size(); i++) {
+				std::printf("HANDOFF slot=%zu base=0x%" PRIx64 " size=%zu\n", i,
+				            reinterpret_cast<uint64_t>(m_queued_draws[i].get()), sizeof(QueuedDraw));
+			}
+			std::fflush(stdout);
+		}
 		m_prepare_verify = EnvFlag("KYTY_PREPARE_VERIFY", false);
 		m_prepare_stats  = EnvFlag("KYTY_PREPARE_STATS", false);
 		m_drain_stats    = EnvFlag("KYTY_DRAIN_STATS", false);
