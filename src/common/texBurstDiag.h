@@ -51,6 +51,8 @@ struct Frame {
 	std::array<uint64_t, 5>      size_hist {};
 	std::array<uint64_t, 7>      lead_hist {};
 	uint64_t                     lead_b[7] {}; // guest bytes by lead bucket
+	std::array<uint64_t, 7>      reup_lead_hist {}; // the same for re-uploads
+	uint64_t                     reup_lead_b[7] {};
 	uint64_t                     file_b = 0;   // guest file bytes read since the last flip
 };
 
@@ -139,18 +141,21 @@ inline void NoteUpload(uint64_t vaddr, uint64_t size) {
 	const auto key   = vaddr ^ (size << 40u);
 	auto&      count = s.uploaded[key];
 	f.guest_b += size;
-	if (count++ != 0) {
-		f.reups++;
-		return;
-	}
-	f.ups++;
-	f.size_hist[size < (64u << 10) ? 0 : size < (1u << 20) ? 1 : size < (4u << 20) ? 2 : size < (16u << 20) ? 3 : 4]++;
+	const bool reup = count++ != 0;
 	const auto [latest, covered] = LatestFileWrite(vaddr, size);
 	int bucket = 6;
 	if (covered * 2 >= size && latest != 0) {
 		const double ms = static_cast<double>(NowNs() - latest) / 1e6;
 		bucket = ms < 17 ? 0 : ms < 50 ? 1 : ms < 100 ? 2 : ms < 500 ? 3 : ms < 2000 ? 4 : 5;
 	}
+	if (reup) {
+		f.reups++;
+		f.reup_lead_hist[bucket]++;
+		f.reup_lead_b[bucket] += size;
+		return;
+	}
+	f.ups++;
+	f.size_hist[size < (64u << 10) ? 0 : size < (1u << 20) ? 1 : size < (4u << 20) ? 2 : size < (16u << 20) ? 3 : 4]++;
 	f.lead_hist[bucket]++;
 	f.lead_b[bucket] += size;
 }
@@ -194,14 +199,19 @@ inline void OnFlip(uint64_t flip) {
 	            " obtain_ms=%.2f upload_ms=%.2f detile_direct=%" PRIu64 " detile_linear=%" PRIu64
 	            " size_hist=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
 	            " lead_hist=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-	            " lead_mb=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+	            " lead_mb=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f"
+	            " reup_lead_hist=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+	            " reup_lead_mb=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
 	            flip, NowNs(), f.ups, f.reups, mb(f.guest_b), mb(f.sync_b), mb(f.stage_b), mb(file_b),
 	            ms(f.ns[FindNs]), ms(f.ns[InsertNs]), ms(f.ns[ObtainNs]), ms(f.ns[UploadNs]),
 	            f.detile_direct, f.detile_linear, f.size_hist[0], f.size_hist[1], f.size_hist[2],
 	            f.size_hist[3], f.size_hist[4], f.lead_hist[0], f.lead_hist[1], f.lead_hist[2],
 	            f.lead_hist[3], f.lead_hist[4], f.lead_hist[5], f.lead_hist[6], mb(f.lead_b[0]),
 	            mb(f.lead_b[1]), mb(f.lead_b[2]), mb(f.lead_b[3]), mb(f.lead_b[4]), mb(f.lead_b[5]),
-	            mb(f.lead_b[6]));
+	            mb(f.lead_b[6]), f.reup_lead_hist[0], f.reup_lead_hist[1], f.reup_lead_hist[2],
+	            f.reup_lead_hist[3], f.reup_lead_hist[4], f.reup_lead_hist[5], f.reup_lead_hist[6],
+	            mb(f.reup_lead_b[0]), mb(f.reup_lead_b[1]), mb(f.reup_lead_b[2]), mb(f.reup_lead_b[3]),
+	            mb(f.reup_lead_b[4]), mb(f.reup_lead_b[5]), mb(f.reup_lead_b[6]));
 	std::fflush(stdout);
 	f = {};
 }
