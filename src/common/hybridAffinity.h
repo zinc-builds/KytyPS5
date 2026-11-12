@@ -8,6 +8,7 @@
 
 #if defined(__linux__)
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -277,13 +278,11 @@ inline void ApplyToDecodeThread() {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
-// Call from a thread the game created, once it has its name. The game's threads run on the
-// efficiency cores (all but the recording thread's): since write faults stopped raising signals
-// they are light, and leaving the performance cores to the emulator's threads, the game's main
-// thread and its render thread gained 3%. Threads whose name starts with one of
-// KYTY_GUEST_PCORE_NAMES=<name,...> (default DrawThread) stay on the emulator's cores.
-// KYTY_GUEST_THREAD_CPUS=<list> picks other CPUs, =none keeps every game thread with the emulator.
-inline void ApplyToGuestThread(const std::string& name) {
+// The CPUs for the game's threads: the efficiency cores but the recording thread's. Leaving the
+// performance cores to the emulator's threads, the game's main thread and its render thread
+// gained 3% (core layout, #46). KYTY_GUEST_THREAD_CPUS=<list> picks other CPUs, =none keeps every
+// game thread with the emulator. Empty when the plan is not active.
+inline const std::set<int>& GuestCpus() {
 	static const std::set<int> cpus = [] {
 		if (!GetPlan().active) {
 			return std::set<int> {};
@@ -301,31 +300,98 @@ inline void ApplyToGuestThread(const std::string& name) {
 		}
 		return efficiency;
 	}();
+	return cpus;
+}
+
+// Guest priorities: lower numbers run first; 700 is the default, so a thread below 700 is one the
+// game raised. The thread that submits graphics command buffers sets the bar: game threads at
+// or above its priority (number <= its) run with the emulator on the performance cores, the
+// others on GuestCpus(). On Sky Garden this keeps the render workers that the submitting thread
+// waits for (and the physics workers, at higher priority) off the busy efficiency cores. A
+// submitter at the default priority sets no bar (it would move most of the game).
+// KYTY_GUEST_PCORE_PRIORITY=<n> fixes the bar, =off turns the rule off (names only).
+inline constexpr int kGuestDefaultPriority = 700;
+
+// The bar: -1 for none yet (or off).
+inline std::atomic<int>& GuestPriorityBar() {
+	static std::atomic<int> bar = [] {
+		const char* value = std::getenv("KYTY_GUEST_PCORE_PRIORITY");
+		return value != nullptr && value[0] >= '0' && value[0] <= '9' ? std::atoi(value) : -1;
+	}();
+	return bar;
+}
+
+inline bool GuestPriorityAuto() {
+	static const bool automatic = std::getenv("KYTY_GUEST_PCORE_PRIORITY") == nullptr;
+	return automatic;
+}
+
+// Whether a game thread stays on the performance cores: its name starts with one of `names`, or
+// its priority is at or above the bar (bar >= 0).
+inline bool KeepGuestOnPerformanceCores(const std::string& name, int priority, int bar,
+                                        const std::vector<std::string>& names) {
+	if (bar >= 0 && priority <= bar) {
+		return true;
+	}
+	for (const auto& prefix: names) {
+		if (name.rfind(prefix, 0) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// A thread submitted graphics work at `priority`: raises the bar to it (automatic mode, raised
+// priorities only). Returns whether the bar changed, so the caller re-places the game's threads.
+inline bool NoteGraphicsSubmitter(int priority) {
+	if (!GuestPriorityAuto() || priority >= kGuestDefaultPriority || priority < 0) {
+		return false;
+	}
+	auto& bar     = GuestPriorityBar();
+	int   current = bar.load(std::memory_order_relaxed);
+	while (priority > current) {
+		if (bar.compare_exchange_weak(current, priority, std::memory_order_relaxed)) {
+			std::printf("Hybrid CPU: game threads at guest priority %d or above (the graphics "
+			            "submitter's) on the performance cores\n",
+			            priority);
+			return true;
+		}
+	}
+	return false;
+}
+
+// Places a game thread by its name and guest priority, with its host thread id: call when it
+// starts, when its priority changes, and for every thread when the bar changes.
+// Threads whose name starts with one of KYTY_GUEST_PCORE_NAMES=<name,...> (default DrawThread)
+// also stay on the performance cores.
+inline void ApplyToGuestThread(const std::string& name, int priority, int tid) {
+	const auto& cpus = GuestCpus();
 	if (cpus.empty()) {
 		return;
 	}
-	static const std::vector<std::string> keep = [] {
+	static const std::vector<std::string> names = [] {
 		const char*              value = std::getenv("KYTY_GUEST_PCORE_NAMES");
 		std::stringstream        stream(value != nullptr ? value : "DrawThread");
-		std::vector<std::string> names;
+		std::vector<std::string> result;
 		for (std::string prefix; std::getline(stream, prefix, ',');) {
 			if (!prefix.empty()) {
-				names.push_back(prefix);
+				result.push_back(prefix);
 			}
 		}
-		return names;
+		return result;
 	}();
-	for (const auto& prefix: keep) {
-		if (name.rfind(prefix, 0) == 0) {
-			return;
-		}
+	if (KeepGuestOnPerformanceCores(name, priority,
+	                                GuestPriorityBar().load(std::memory_order_relaxed), names)) {
+		const auto& process = GetPlan().process;
+		(void)sched_setaffinity(static_cast<pid_t>(tid), sizeof(process), &process);
+		return;
 	}
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	for (const int cpu: cpus) {
 		CPU_SET(cpu, &set);
 	}
-	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	(void)sched_setaffinity(static_cast<pid_t>(tid), sizeof(set), &set);
 }
 
 // Call from the GPU recording thread: an efficiency core of its own, which the emulator leaves

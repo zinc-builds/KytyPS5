@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
+#include "common/hybridAffinity.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
@@ -305,3 +306,30 @@ int main(int argc, char** argv) {
 	testing::InitGoogleTest(&argc, argv);
 	return RUN_ALL_TESTS();
 }
+
+#if defined(__linux__)
+TEST(HybridAffinity, GameThreadsAtOrAboveTheBarOrNamedStayOnPerformanceCores) {
+	using Common::HybridAffinity::KeepGuestOnPerformanceCores;
+	const std::vector<std::string> names {"DrawThread"};
+	// Lower numbers are higher priorities.
+	EXPECT_TRUE(KeepGuestOnPerformanceCores("Draw Geometry", 680, 680, names));
+	EXPECT_TRUE(KeepGuestOnPerformanceCores("Havok Worker", 478, 680, names));
+	EXPECT_FALSE(KeepGuestOnPerformanceCores("tbb_thead", 700, 680, names));
+	EXPECT_FALSE(KeepGuestOnPerformanceCores("Draw Geometry", 680, -1, names));
+	EXPECT_TRUE(KeepGuestOnPerformanceCores("DrawThread", 700, -1, names));
+}
+
+TEST(HybridAffinity, OnlyARaisedGraphicsSubmitterSetsTheBar) {
+	using namespace Common::HybridAffinity;
+	if (std::getenv("KYTY_GUEST_PCORE_PRIORITY") != nullptr) {
+		GTEST_SKIP() << "KYTY_GUEST_PCORE_PRIORITY is set";
+	}
+	EXPECT_FALSE(NoteGraphicsSubmitter(kGuestDefaultPriority)); // default priority: no bar
+	EXPECT_EQ(GuestPriorityBar().load(), -1);
+	EXPECT_TRUE(NoteGraphicsSubmitter(680));
+	EXPECT_EQ(GuestPriorityBar().load(), 680);
+	EXPECT_FALSE(NoteGraphicsSubmitter(650)); // a higher-priority submitter keeps the bar
+	EXPECT_TRUE(NoteGraphicsSubmitter(690));  // a second, lower-priority submitter lowers it
+	EXPECT_EQ(GuestPriorityBar().load(), 690);
+}
+#endif

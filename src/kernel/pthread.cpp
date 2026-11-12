@@ -587,6 +587,16 @@ public:
 
 	void FreeDetachedThreads();
 
+	// Calls fn for every running thread (started, not finished), under the pool's lock.
+	template <class F> void ForEachRunning(F&& fn) {
+		Common::LockGuard lock(m_mutex);
+		for (auto* p: m_threads) {
+			if (!p->free && !p->almost_done && p->host_thread_id != 0 && p->attr != nullptr) {
+				fn(p);
+			}
+		}
+	}
+
 private:
 	std::vector<Pthread> m_threads;
 	Common::Mutex        m_mutex;
@@ -3086,6 +3096,24 @@ Pthread PthreadSelfOrNull() {
 	return g_pthread_self;
 }
 
+void PthreadNoteGraphicsSubmitter() {
+#if defined(__linux__)
+	// Each submission checks only that its thread's priority is the one it last saw.
+	thread_local int seen = -1;
+	auto*            self = g_pthread_self;
+	if (self == nullptr || self->attr == nullptr || self->attr->guest_priority == seen) {
+		return;
+	}
+	seen = self->attr->guest_priority;
+	if (Common::HybridAffinity::NoteGraphicsSubmitter(seen)) {
+		g_pthread_context->GetPthreadPool()->ForEachRunning([](Pthread thread) {
+			Common::HybridAffinity::ApplyToGuestThread(thread->name, thread->attr->guest_priority,
+			                                           static_cast<int>(thread->host_thread_id));
+		});
+	}
+#endif
+}
+
 Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
 	g_pthread_self = thread;
@@ -3230,7 +3258,8 @@ static void* RunThread(void* arg) {
 #endif
 	}
 #if defined(__linux__)
-	Common::HybridAffinity::ApplyToGuestThread(thread->name);
+	Common::HybridAffinity::ApplyToGuestThread(thread->name, thread->attr->guest_priority,
+	                                           static_cast<int>(os_thread_id));
 	Common::GpuWaitDiag::SetGuestThread(thread->name,
 	                                    reinterpret_cast<uintptr_t>(thread->attr->stack_addr),
 	                                    static_cast<size_t>(thread->attr->stack_size));
@@ -3543,6 +3572,12 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 #endif
 
 	thread->attr->guest_priority = prio;
+#if defined(__linux__)
+	if (thread->host_thread_id != 0) {
+		Common::HybridAffinity::ApplyToGuestThread(thread->name, prio,
+		                                           static_cast<int>(thread->host_thread_id));
+	}
+#endif
 	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
 	return OK;
 }

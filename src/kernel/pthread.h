@@ -111,6 +111,9 @@ void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
+// The calling game thread submitted graphics work: on hybrid CPUs, game threads at or above its
+// priority move to the performance cores (HybridAffinity::NoteGraphicsSubmitter).
+void                  PthreadNoteGraphicsSubmitter();
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
