@@ -267,6 +267,7 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>        m_bda_lead_pending;
 	void                                              ProbeUnobserved(uint64_t address, uint64_t size);
 	const Buffer*                                     FindBufferPtr(uint64_t vaddr);
+	void                                              ProbeEligible(uint64_t address, uint64_t size);
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

@@ -98,6 +98,9 @@ inline void EndStore(uint64_t vaddr, uint64_t size) noexcept {
 	BeginStore(vaddr, size);
 }
 
+// Diagnostic (KYTY_BDA_LEAD_STATS): collections so far (submit scans and GPU-thread ones).
+inline std::atomic<uint64_t> g_collections {0};
+
 [[nodiscard]] inline uint32_t Read(uint64_t page) noexcept {
 	auto* slot = Slot(page);
 	return slot != nullptr ? slot->load(std::memory_order_acquire) : 1u; // odd: never usable

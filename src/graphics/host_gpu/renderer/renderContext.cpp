@@ -497,6 +497,7 @@ uint64_t                        g_resume_verify_scans   = 0;
 } // namespace
 
 bool RenderContext::ScanAsyncWritesAtSubmit() {
+	PageVersions::g_collections.fetch_add(1, std::memory_order_relaxed);
 	const auto mode = GetSubmitScanMode();
 	if (mode == SubmitScanMode::Off) {
 		return false;
@@ -565,6 +566,7 @@ static void ReportSubmitScans() {
 }
 
 void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
+	PageVersions::g_collections.fetch_add(1, std::memory_order_relaxed);
 	// A pending request (a satisfied wait published guest data, maybe in another submission
 	// that is now blocked) needs a full scan: only a full scan settles it.
 	if (m_async_collect_requested) {

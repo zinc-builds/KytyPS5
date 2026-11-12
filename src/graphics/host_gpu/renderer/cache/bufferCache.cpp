@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/pageVersions.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/alignment.h"
@@ -272,6 +273,7 @@ namespace Libs::Graphics {
 
 static std::unordered_map<uint64_t, uint64_t> g_probe_hashes; // under m_bda_sync_mutex
 static std::unordered_map<uint64_t, uint64_t> g_probe_times;
+static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> g_probe_queue; // page -> (ns, collection)
 static std::unordered_map<uint64_t, std::vector<uint8_t>> g_probe_copies;
 
 
@@ -1123,6 +1125,51 @@ const Buffer* BufferCache::FindBufferPtr(uint64_t vaddr) {
 	return vaddr < buffer.CpuAddress() + buffer.Size() ? &buffer : nullptr;
 }
 
+// Probe (KYTY_BDA_LEAD_STATS): PrepareBda's uploaded bytes a pre-stager could serve: async
+// write-tracked, and by lead time since queueing and collections in between.
+void BufferCache::ProbeEligible(uint64_t address, uint64_t size) {
+	static constexpr uint64_t Bounds[] = {100'000, 250'000, 500'000, 1'000'000, ~uint64_t {0}};
+	static uint64_t total = 0, unknown = 0, async = 0, async_epoch = 0, start = 0;
+	static uint64_t by_lead[std::size(Bounds)] = {}; // async and at most one collection in between
+	std::lock_guard lock(m_bda_sync_mutex);
+	const auto now   = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+	const auto epoch = PageVersions::g_collections.load(std::memory_order_relaxed);
+	for (uint64_t page = Common::AlignDown(address, TRACKER_PAGE_SIZE); page < address + size;
+	     page += TRACKER_PAGE_SIZE) {
+		total += TRACKER_PAGE_SIZE;
+		auto it = g_probe_queue.find(page);
+		if (it == g_probe_queue.end()) {
+			unknown += TRACKER_PAGE_SIZE;
+			continue;
+		}
+		if (LibKernel::Memory::IsAsyncWriteTracked(page, TRACKER_PAGE_SIZE)) {
+			async += TRACKER_PAGE_SIZE;
+			if (epoch - it->second.second <= 1) {
+				async_epoch += TRACKER_PAGE_SIZE;
+				const auto lead = now - it->second.first;
+				size_t     i    = 0;
+				while (lead >= Bounds[i]) i++;
+				by_lead[i] += TRACKER_PAGE_SIZE;
+			}
+		}
+		g_probe_queue.erase(it);
+	}
+	if (start == 0) {
+		start = now;
+	} else if (now - start >= 1'000'000'000ull) {
+		std::printf("BDAELIGIBLE bda_kb=%llu unknown=%.1f%% async=%.1f%% async_le1epoch=%.1f%% of_which_lead<100us/250/500us/1ms/more=",
+		            (unsigned long long)(total / 1024), total ? 100.0 * double(unknown) / double(total) : 0.0,
+		            total ? 100.0 * double(async) / double(total) : 0.0,
+		            total ? 100.0 * double(async_epoch) / double(total) : 0.0);
+		for (auto b: by_lead) std::printf("%.1f/", async_epoch ? 100.0 * double(b) / double(async_epoch) : 0.0);
+		std::printf("\n");
+		std::fflush(stdout);
+		total = unknown = async = async_epoch = 0;
+		std::fill(std::begin(by_lead), std::end(by_lead), 0);
+		start = now;
+	}
+}
+
 // Probe (KYTY_BDA_LEAD_STATS): sampled pages whose bytes changed between being queued for
 // upload (a collection or store) and the upload, with no queueing in between.
 void BufferCache::ProbeUnobserved(uint64_t address, uint64_t size) {
@@ -1200,6 +1247,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			ProbeUnobserved(address, copy.size);
+			if (g_sync_kind == MemDiag::Sync::Bda) {
+				ProbeEligible(address, copy.size);
+			}
 			if (MemDiag::BdaStatsMode() != 0 && g_sync_kind == MemDiag::Sync::Bda) {
 				BdaStats::NoteStaged(address, mapped + copy.srcOffset, copy.size);
 			}
@@ -2248,6 +2298,11 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source) 
 		}
 	}
 	if (lead) {
+		const auto now_ns = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+		const auto epoch  = PageVersions::g_collections.load(std::memory_order_relaxed);
+		for (uint64_t page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			g_probe_queue[page] = {now_ns, epoch};
+		}
 		m_bda_lead_pending.emplace_back(
 		    static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
 		    end - begin);
