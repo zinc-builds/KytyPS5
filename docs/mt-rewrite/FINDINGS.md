@@ -1562,6 +1562,23 @@ A draw that continues a run (same target registers, nothing drawn in between, no
   - **Verify must assert the skipped work had no effect at all** (clear work, stores by this thread, flags, layout), not only that it found the same image. The global guest-sync epoch also moves for the priority thread's stores, so verify counts this thread's own stores.
 - Value-change detection for the target registers, done by comparing the registers at post, cost what it saved (cycles +0.7% `~`). B4's line-change mask (#104) replaces it.
 
+### Upload copies and guest writes nobody observes (Track B, 2026-11-12)
+
+PrepareBda's uploads, measured on a plain build in Sky Garden:
+- **Volume:** ~760 MB/s to ~1 GB/s (~18.6 MB a frame, ~3.6 KB a draw). That is ~2,900 uploads/s, each one contiguous range of ~260 KB.
+- **Cost:** 7.9% of the command thread's user cycles (~270 ns/draw); ~5% on the PGO build.
+- **Source:** almost entirely pages the guest CPU wrote, found by the asynchronous write scans. Per page, 69% of the bytes and 88% of the cache lines change.
+- **Readers:** with `KYTY_BDA_STATS=access`, **no DMA shader read any of the uploaded bytes** (22 shaders instrumented, one access bit in total). Binds later cover 44% of the bytes; 56% is rewritten before any bind reads it. This makes "upload only what a DMA shader or bind can read" the strongest research lead for removing the copy, if a sound bound on DMA reads can be found.
+- **Lead time** from a range being queued (collection or store) to the PrepareBda that takes it, by bytes: <100 µs 2.5%, 100–250 µs ~20–29%, 250–500 µs ~35%, 0.5–1 ms ~10%, >1 ms ~20–35%.
+
+**CPU-dirty pages are unwatched, so writes to them are never observed.**
+- When a page becomes CPU-dirty, the tracker stops watching it (`RegionManager::ChangeState<Cpu,true>` → `UpdateProtection`). Later guest writes raise no fault and no scan report until the page is uploaded and watched again.
+- A probe hashed a 1/16 sample of pages as they were queued and compared them at upload: **0.4–0.6% had been rewritten** with no re-queue in between (~1,000 pages/s). Usually most of the page differed (1.5–4 KB of 4 KB).
+- Queue to upload took a median of 7.7 s, a p10 of 1.3 ms and a p90 of 31 s: mostly pages PrepareBda doesn't take, which a bind uploads much later.
+- Today this is harmless, because uploads read guest memory at upload time.
+- **Anyone who copies guest data earlier than its use** (pre-staging, worker-side copies, snapshots at a collection) must re-arm write tracking on what they copy, or they will upload stale bytes. That holds even where the guest orders its write before the draw with a label and a wait, because that wait's collection doesn't see unwatched pages.
+- Probe and page versions: branch `trackB/bda-prestage`, `KYTY_BDA_LEAD_STATS`. The pre-staging design that would re-arm tracking is under review with Track K.
+
 ### The command thread's own data misses, by level (Track B, 2026-11-12)
 
 How it was measured:
