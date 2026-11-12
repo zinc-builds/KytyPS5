@@ -512,6 +512,15 @@ private:
 	void        PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued);
 	// Commits the oldest queued draw.
 	void        FinishQueuedDraw(CommandBuffer& buffer);
+	// Whether queued draw `sequence` is prepared. Never blocks.
+	[[nodiscard]] bool PreparedDone(uint64_t sequence) const;
+	// KYTY_COMMIT_PREFETCH=cmd|both (commitPrefetch.h): at the commit of `sequence`, prefetches
+	// for the queued draws behind it.
+	void PrefetchQueued(uint64_t sequence);
+	struct CommitPrefetchStat {
+		uint64_t                draws = 0;
+		std::array<uint64_t, 5> done {}; // by distance: the draw there was prepared
+	} m_commit_prefetch_stat;
 	// The queued draw's programs: the worker's if nothing they depend on changed since it was
 	// queued, else looked up here.
 	void AdoptPrograms(QueuedDraw& queued, DrawRenderState& state);

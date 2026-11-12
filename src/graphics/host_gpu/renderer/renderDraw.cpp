@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/commitPrefetch.h"
 
 #include "common/assert.h"
 #include "common/benchMetrics.h"
@@ -2187,6 +2188,146 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring
 	buffers.ready = true;
 }
 
+bool RenderExecutor::PreparedDone(uint64_t sequence) const {
+	return m_prepare_pool ? m_prepare_pool->Done(sequence)
+	                      : PrepareWorker(sequence).Done(PrepareJob(sequence));
+}
+
+namespace {
+
+// The lines of an Image the commit reads (RefindExactImage, TouchImage, AcquireTexture,
+// FindView's array header, transitions, resident checks).
+void PrefetchImage(const Image& image) {
+	PrefetchLine(&image.registered);
+	PrefetchLine(&image.lru_tick);
+	PrefetchLine(&image.settled);
+	PrefetchLine(&image.binding);
+	PrefetchLine(&image.depth_id);
+	PrefetchLine(&image.backing.state);
+	PrefetchLine(&image.views);
+	PrefetchLine(&image.residency_version);
+}
+
+// The lines of a texture record ResolveProposedTexture reads (not its desc, copied only when the
+// binding held another record).
+void PrefetchTextureRecord(const WorkerTextureRecord& record) {
+	PrefetchLine(&record.resolved);
+	PrefetchLine(&record.binding.image_id);
+	PrefetchLine(&record.binding.layout);
+	PrefetchLine(&record.found_id);
+	PrefetchLine(&record.generation);
+	PrefetchLine(&record.metadata_base_layer);
+}
+
+} // namespace
+
+void RenderExecutor::PrefetchQueued(uint64_t sequence) {
+	auto&       stat   = m_commit_prefetch_stat;
+	auto&       cache  = m_context.GetTextureCache();
+	const auto  posted = m_queued_posted;
+	const auto  depth  = m_queued_draws.size();
+	static const bool print = std::getenv("KYTY_COMMIT_PREFETCH_STATS") != nullptr;
+	stat.draws++;
+	const auto slot = [&](uint64_t distance) -> const QueuedDraw* {
+		const auto s = sequence + distance;
+		if (distance >= depth || s > posted || !PreparedDone(s)) {
+			return nullptr;
+		}
+		stat.done[distance]++;
+		return m_queued_draws[(s - 1) % depth].get();
+	};
+	const auto image = [&](ImageId id) {
+		if (const auto* found = cache.m_slot_images.try_get(id); found != nullptr) {
+			PrefetchImage(*found);
+		}
+	};
+	// N+4: the slot's header lines the commit reads (B4's hand-off map).
+	if (const auto* q = slot(4)) {
+		PrefetchLine(&q->sequence);
+		PrefetchLine(&q->log);
+		PrefetchBytes(&q->state.vertex_info, 128);
+		PrefetchLine(&q->state.color_info);
+		PrefetchLine(&q->state.vertex_stage_count);
+		PrefetchLine(&q->state.depth_info);
+		PrefetchLine(&q->state.ps_input_info);
+		PrefetchBytes(&q->textures, sizeof(q->textures));
+		PrefetchBytes(&q->targets, sizeof(q->targets));
+		PrefetchLine(&q->resources);
+		PrefetchBytes(&q->buffers.sources, sizeof(q->buffers.sources));
+		PrefetchLine(&q->buffers.speculation);
+		PrefetchLine(&q->pipeline_key);
+	}
+	// N+3: the arrays and records the header points at.
+	if (const auto* q = slot(3)) {
+		if (q->textures.ready) {
+			for (uint32_t s = 0; s < q->textures.stage_count; s++) {
+				const auto& proposals = q->textures.stages[s];
+				PrefetchBytes(proposals.data(), proposals.size() * sizeof(TextureProposal));
+			}
+		}
+		if (q->targets.ready) {
+			for (uint32_t i = 0; i < q->targets.count; i++) {
+				if (const auto* record = q->targets.color[i]; record != nullptr) {
+					PrefetchLine(&record->info);
+					PrefetchLine(&record->resolved);
+				}
+			}
+			if (const auto* record = q->targets.depth; record != nullptr) {
+				PrefetchLine(&record->image_id);
+			}
+		}
+		PrefetchBytes(q->log.reads.data(), q->log.reads.size() * sizeof(q->log.reads[0]), 4);
+		PrefetchBytes(q->log.pages.data(), q->log.pages.size() * sizeof(q->log.pages[0]), 4);
+		for (uint32_t s = 0; s < q->buffers.stage_count; s++) {
+			const auto& sources = q->buffers.sources[s];
+			PrefetchBytes(sources.data(), sources.size() * sizeof(sources[0]), 8);
+		}
+		const auto& ranges = q->buffers.speculation.ranges;
+		PrefetchBytes(ranges.data(), ranges.size() * sizeof(ranges[0]), 8);
+	}
+	// N+2: texture records; target images.
+	if (const auto* q = slot(2)) {
+		if (q->textures.ready) {
+			for (uint32_t s = 0; s < q->textures.stage_count; s++) {
+				for (const auto& proposal: q->textures.stages[s]) {
+					if (proposal.record != nullptr) {
+						PrefetchTextureRecord(*proposal.record);
+					}
+				}
+			}
+		}
+		if (q->targets.ready) {
+			for (uint32_t i = 0; i < q->targets.count; i++) {
+				if (const auto* record = q->targets.color[i]; record != nullptr) {
+					image(record->info.image_id);
+				}
+			}
+			if (const auto* record = q->targets.depth; record != nullptr) {
+				image(record->image_id);
+			}
+		}
+	}
+	// N+1: texture images, through the records prefetched a draw ago.
+	if (const auto* q = slot(1)) {
+		if (q->textures.ready) {
+			for (uint32_t s = 0; s < q->textures.stage_count; s++) {
+				for (const auto& proposal: q->textures.stages[s]) {
+					if (const auto* record = proposal.record; record != nullptr && record->resolved) {
+						image(record->found_id);
+					}
+				}
+			}
+		}
+	}
+	if (print && (stat.draws & ((1u << 20) - 1u)) == 0) {
+		const auto pct = [&](uint64_t n) { return 100.0 * static_cast<double>(n) / stat.draws; };
+		std::printf("COMMIT_PREFETCH draws=%llu done d1=%.1f%% d2=%.1f%% d3=%.1f%% d4=%.1f%%\n",
+		            static_cast<unsigned long long>(stat.draws), pct(stat.done[1]), pct(stat.done[2]),
+		            pct(stat.done[3]), pct(stat.done[4]));
+		std::fflush(stdout);
+	}
+}
+
 void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const auto sequence = m_queued_posted - m_queued_count + 1;
@@ -2216,6 +2357,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	}
 	if (m_drain_stats) {
 		PrintDrainStats();
+	}
+	if (CommitPrefetchCmd()) {
+		PrefetchQueued(sequence);
 	}
 	// The draw reads the registers it was queued with.
 	auto& registers   = *buffer.m_registers;
