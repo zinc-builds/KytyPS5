@@ -414,10 +414,19 @@ void OnGuestCondSignal(const void* cond) noexcept {
 	slot.cond.store(key, std::memory_order_release);
 }
 
+namespace {
+std::atomic<bool> g_cmd_idle {false};
+} // namespace
+
+bool CmdIdle() noexcept {
+	return g_cmd_idle.load(std::memory_order_relaxed);
+}
+
 void OnCmdIdleBegin() noexcept {
 	if (!Enabled()) {
 		return;
 	}
+	g_cmd_idle.store(true, std::memory_order_relaxed);
 	g_idle_sub = g_submitter.load(std::memory_order_relaxed);
 	if (g_idle_sub != nullptr) {
 		for (int k = 0; k < kKinds; k++) {
@@ -428,6 +437,7 @@ void OnCmdIdleBegin() noexcept {
 }
 
 void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept {
+	g_cmd_idle.store(false, std::memory_order_relaxed);
 	if (!Enabled() || end_ns - start_ns < kIdleMinNs) {
 		return;
 	}

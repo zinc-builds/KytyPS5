@@ -113,6 +113,8 @@ void OnGuestCondSignal(const void* cond) noexcept;
 // The command thread begins waiting for guest work; then it waited from `start_ns` to `end_ns`
 // (NowNs()). Short waits (under 20 µs) count when they ended in the gap.
 void OnCmdIdleBegin() noexcept;
+// Whether the command thread is waiting for guest work now (any thread; diagnostic only).
+[[nodiscard]] bool CmdIdle() noexcept;
 void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept;
 
 } // namespace Common::FrameDiag
