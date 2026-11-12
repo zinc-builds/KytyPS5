@@ -639,6 +639,8 @@ public:
 	// Lines of the registers the color and depth target decode reads (Track B's run check).
 	[[nodiscard]] static constexpr uint64_t RunTargetLines();
 	// Whether the registers (not the written mask) equal `other`'s.
+	// The bytes holding register values (the written-line marks follow).
+	[[nodiscard]] static constexpr size_t RegisterBytes() { return offsetof(Context, m_written); }
 	[[nodiscard]] bool SameRegisters(const Context& other) const {
 		return std::memcmp(this, &other, offsetof(Context, m_written)) == 0;
 	}

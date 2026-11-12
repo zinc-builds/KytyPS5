@@ -8,12 +8,15 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -148,6 +151,74 @@ uint64_t NowNs() {
 	                                 .count());
 }
 } // namespace
+
+namespace Chaos {
+namespace {
+std::array<std::atomic<uint64_t>, static_cast<size_t>(Site::Count)> g_delays {};
+} // namespace
+
+void Delay(Site site) noexcept {
+	thread_local uint64_t state = 0;
+	if (state == 0) {
+		state = g_seed.load(std::memory_order_relaxed) ^
+		        (std::hash<std::thread::id> {}(std::this_thread::get_id()) * 0x9e3779b97f4a7c15ull) ^
+		        NowNs();
+		state |= 1;
+	}
+	// xorshift64*
+	state ^= state >> 12u;
+	state ^= state << 25u;
+	state ^= state >> 27u;
+	const uint64_t r = (state * 0x2545f4914f6cdd1dull) ^ (static_cast<uint64_t>(site) << 56u);
+	if ((r & 7u) == 0) {
+		// A short spin: a few cache-line hand-offs to a preemption's worth.
+		const auto until = NowNs() + ((r >> 8u) % 20'000u);
+		while (NowNs() < until) {
+			KYTY_PREPARE_PAUSE();
+		}
+	} else if ((r & 63u) == 1) {
+		std::this_thread::yield();
+	} else if ((r & 1023u) == 2) {
+		std::this_thread::sleep_for(std::chrono::microseconds(200));
+	} else {
+		return;
+	}
+	g_delays[static_cast<size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t Delays(Site site) noexcept {
+	return g_delays[static_cast<size_t>(site)].load(std::memory_order_relaxed);
+}
+
+void Checked() noexcept {
+	static uint64_t checked = 0; // the command thread's
+	static uint64_t last_ns = 0;
+	checked++;
+	const auto now = NowNs();
+	if (last_ns == 0) {
+		last_ns = now;
+	}
+	if (now - last_ns < 5'000'000'000ull) {
+		return;
+	}
+	last_ns = now;
+	std::printf("PREPARE_CHAOS seed=%llu checked=%llu claim=%llu publish=%llu commit_wait=%llu "
+	            "adopt=%llu release=%llu slot_reuse=%llu snapshot_retire=%llu decode_post=%llu "
+	            "decode_sync=%llu\n",
+	            static_cast<unsigned long long>(g_seed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(checked),
+	            static_cast<unsigned long long>(Delays(Site::WorkerClaim)),
+	            static_cast<unsigned long long>(Delays(Site::WorkerPublish)),
+	            static_cast<unsigned long long>(Delays(Site::CommitWait)),
+	            static_cast<unsigned long long>(Delays(Site::Adopt)),
+	            static_cast<unsigned long long>(Delays(Site::Release)),
+	            static_cast<unsigned long long>(Delays(Site::SlotReuse)),
+	            static_cast<unsigned long long>(Delays(Site::SnapshotRetire)),
+	            static_cast<unsigned long long>(Delays(Site::DecodePost)),
+	            static_cast<unsigned long long>(Delays(Site::DecodeSync)));
+	std::fflush(stdout);
+}
+} // namespace Chaos
 
 bool OnWorker() noexcept {
 	return t_worker;
@@ -461,7 +532,9 @@ void Worker::Loop() {
 		Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
 		const auto start = NowNs();
 		while (done != posted) {
+			Chaos::Point(Chaos::Site::WorkerClaim);
 			m_run(m_context, ++done);
+			Chaos::Point(Chaos::Site::WorkerPublish);
 			m_done.store(done, std::memory_order_release);
 		}
 		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
@@ -515,9 +588,11 @@ void Worker::LoopPool() {
 		if (pool.m_claim != nullptr && !pool.ClaimSlot(claimed + 1)) {
 			continue; // the overflow worker has it
 		}
+		Chaos::Point(Chaos::Site::WorkerClaim);
 		Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
 		const auto start = NowNs();
 		m_run(m_context, claimed + 1);
+		Chaos::Point(Chaos::Site::WorkerPublish);
 		pool.m_done[claimed % pool.m_slots].store(claimed + 1, std::memory_order_release);
 		// This worker's job count (BenchMetrics' prep_jobs; nothing waits on it in pool mode).
 		m_done.store(m_done.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -548,9 +623,11 @@ void Worker::LoopOverflow() {
 			}
 		}
 		if (sequence != 0) {
+			Chaos::Point(Chaos::Site::WorkerClaim);
 			Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
 			const auto start = NowNs();
 			m_run(m_context, sequence);
+			Chaos::Point(Chaos::Site::WorkerPublish);
 			pool.m_done[(sequence - 1) % pool.m_slots].store(sequence, std::memory_order_release);
 			m_done.store(m_done.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 			m_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
