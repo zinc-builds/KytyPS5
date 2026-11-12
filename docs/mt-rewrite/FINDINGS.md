@@ -1943,6 +1943,123 @@ direct calls drain the recorder, which then holds more work. Remaining direct ca
 downloads, the tiler's buffer path, `CopyImage`, the fault buffer) drain ~15 ms/s; image churn
 (~0.37 ms per frame) is next.
 
+### Frame pacing: which guest frames miss a refresh, and why (Track R, 2026-11-12)
+
+**Tools.** `KYTY_FRAME_DIAG=1` (off by default; it reads `/proc` twice per frame and was not
+A/B-measured, so use it to attribute, not to compare FPS):
+- One `GFRAME` line per guest flip, on the command thread when it decodes the flip, for the work
+  since the previous one. Its wall time is compared with its measured parts:
+  - busy: CPU, run-queue delay, waits on the GPU timeline and on the render-context mutex;
+  - no guest work: `cmd_idle_ns` (nothing queued) and `cmd_blocked_ns` (only blocked submissions);
+  - the remainder: other sleeps (prepare-worker, recorder and scheduler waits that slept),
+    not attributed.
+  The waits are elapsed times and can include wake-up delay that the run-queue figure also
+  counts, so the parts can overlap; the remainder is printed signed.
+  The prepare/recorder waits are printed separately. They are partly spins inside the CPU time,
+  so they are not added.
+- One `FRAME` line per presented flip (the refreshes the viewer saw).
+- One `GIDLE` line per wait for guest work of 1 ms or more. It shows the game's submitting thread's
+  waits inside the gap, by kind (equeue, sleep, condition, mutex, semaphore, event flag; timed at
+  the emulator's implementations), and its last wait before the gap ended. When that was a
+  condition, it also names the thread that signalled it and that thread's own last wait. `wake_ms`
+  is the time from the guest's submission to the command thread taking it.
+- With `KYTY_GPU_WAIT_DIAG=1 KYTY_OFFCPU_SAMPLE=1 KYTY_OFFCPU_THREAD=<name prefix>`, the off-CPU
+  sampler watches that game thread, only while the command thread has no work.
+- `tools/astro-bench/framediag.py` summarises the lines. `framemodel.py` replays the guest frames'
+  walls against 60 Hz vblanks (display queue depth 2), sorts slow frames by first matching cause,
+  and estimates what-ifs.
+
+**Only per-guest-frame boundaries attribute work.** A presented frame that takes two refreshes
+spans more guest work than one that takes one, so per-presented-frame counts are larger in slow
+frames by construction and explain nothing. The first version of this table did that.
+
+**Current `dev` (3fcb4824, PGO, Sky Garden, level frames 1000–1600):**
+
+| layout | wall | busy | no guest work | frames with >2 ms no guest work | presented 2+ refreshes (replay) |
+|---|---|---|---|---|---|
+| default | 17.70 ms | 16.51 | 1.01 | 23.8% | 6.2% (6.2%) |
+| `KYTY_GUEST_PCORE_NAMES=Draw` | 16.91 ms | 16.45 | 0.21 | 4.8% | 1.7% (2.0%) |
+
+- Two of the four runs were disturbed by other load on the machine and are left out of the table:
+  the command thread's run-queue delay was 0.6–0.7 ms per frame instead of 0.02–0.04 (the
+  compositor shares its CPU).
+- In the default run, 21.5% of all frames were slow (over 19 ms) because the command thread had
+  no guest work (4.1 ms of it on average); slow frames from more command-thread CPU were 2.3%.
+- Before early submit (#108), on an older `dev` with the first version of this diagnostic, 7.0% of
+  presented frames took two refreshes; with it, 3.0%. Those runs inferred the no-guest-work time
+  as a remainder, which undercounted it, so their idle figures are not comparable.
+
+**Why the game is late: its render workers wait for an efficiency core.**
+- **The chain** (`GIDLE`, `dev` with early submit):
+  - In the gaps, the submitting thread (`DrawThread`) waits on a game condition variable: 425 of
+    512 ms of wait.
+  - Its signallers are the game's `Draw Geometry`, `Draw Extra Geom` and `Draw Shadow` threads,
+    ~0.5 ms before `DrawThread` submits.
+  - Those had last blocked ~10 ms earlier.
+  - The command thread takes the submission ~10 µs after it arrives.
+- **Off-CPU** (`KYTY_OFFCPU_THREAD=DrawThread`): while the command thread has no work,
+  `DrawThread` is asleep 86% of the time, all in `futex`.
+- **No emulator event in the measured chain.** No equeue (flip, vblank, EOP), sleep or label wait
+  appears in the gaps, so the game is not seen waiting for the 2.6 ms flip completion. Not ruled
+  out: waits inside guest read faults are not timed (none was the last wait before a submission);
+  the absolute-time condition wait and `sceKernelSleep` were timed only from the second round on.
+  The placement experiments below (render workers moved, no-guest-work time gone) are the
+  stronger evidence.
+- **Run queues** (`/proc/<tid>/schedstat` over 10 s, default layout):
+  - The 7 `Draw*` workers run 27% of a CPU between them and wait runnable 73%: 2.7 times longer
+    than they run.
+  - They share CPUs 12–18 with 11 `tbb_thead` workers (4.6 CPUs running, 3.9 waiting), 19
+    `Havok` workers and the rest.
+  - The game's threads run ~7 CPUs' worth and wait ~7 more.
+  - `DrawThread` (on the performance cores by default) never waits.
+  - With `KYTY_GUEST_PCORE_NAMES=Draw` the `Draw*` workers run on the emulator's performance CPUs
+    and never wait.
+- **A/B of record:** `ab.sh --pair --window 1000-1600 -n 3`, same binary, `KYTY_FRAME_DIAG=1` on
+  both sides. With `KYTY_GUEST_PCORE_NAMES=Draw`:
+  - FPS +2.05% (2–3 sd), `cmd_ns` +0.7% (noise);
+  - presented 2+ refreshes 3.9% → 1.5% (means of 3 runs);
+  - no-guest-work remainder 0.25 → 0.05 ms per frame (the earlier, undercounting measure).
+- Not tested cleanly: giving the game the prepare workers' SMT siblings (CPUs 7 and 9). The one
+  run was disturbed, and those CPUs also run the emulator's other threads.
+- `KYTY_SUBMIT_SCAN=0` was worse in one run: 56.4 FPS and 6.3% two-refresh frames, against 57.5
+  and 4.3%.
+- The emulator ignores guest thread priorities on Linux (`PthreadSetprio` maps them only on
+  Windows), so the game's render workers compete equally with its job pool.
+
+**The periodic prepare spike: most likely a host daemon on the SMT siblings (not isolated).**
+- **The signature:** pairs of slow frames every 2.000 s of wall time. The prepare workers' busy
+  time rises 21 → 29 ms, the command thread waits ~4.5 ms for them, and every per-draw cost rises
+  ~25% with the same draws.
+- **The likely cause:** CoolerControl (`coolercontrold`, thread `ccio-nct6798`, polling the
+  NCT6798 sensor chip) runs at that period on CPU 11 and CPU 7. Those are the SMT siblings of the
+  command thread (CPU 10) and of a prepare worker (CPU 6). Per 20 ms `perf stat`: the command and
+  prepare threads lose ~30% IPC at an unchanged clock (cycles/ref-cycles flat).
+- **The mechanism reproduces:** a synthetic load on CPU 11 (memory copies at 25% duty) raised
+  `cmd_ns` 33%; compute-only at 25%, 5%. The daemon itself was not stopped (a system setting
+  outside this work), so the attribution is the best-supported one, not an isolation.
+- **The game is not doing more:** its CPU use per wall-ms is unchanged in those frames.
+- If it is the daemon, the fix is the host's (its poll rate or CPU affinity). In the replay,
+  removing those frames takes 6.2% → 5.7%. Real systems run such services, so the numbers of
+  record keep these frames.
+
+**What-ifs (replay of the default run, estimates: the rest of each frame is assumed unchanged).**
+Share of presented frames taking 2+ refreshes:
+
+| change | mean wall | 2+ refreshes |
+|---|---|---|
+| as measured | 17.70 ms | 6.2% |
+| no periodic prepare spike | 17.64 | 5.7% |
+| no waiting for guest work | 16.69 | 1.0% |
+| command-thread CPU −0.5 ms per frame | 17.20 | 3.5% |
+| CPU −1.0 ms | 16.70 | 1.3% |
+| CPU −1.5 ms | 16.20 | 0.7% |
+| CPU −0.5 ms and no waiting for guest work | 16.19 | 0.7% |
+
+- Pacing depends on how the slow frames are spread, not only on the mean. The two scenarios
+  above at ~16.7 ms land at 1.0% and 1.3%.
+- p99 = 1 refresh (under 1% here) is reached by removing the waits for guest work together with
+  ~0.5 ms of CPU, or by ~1.5 ms of CPU alone.
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
@@ -2064,6 +2181,10 @@ downloads, the tiler's buffer path, `CopyImage`, the fault buffer) drain ~15 ms/
   (`~/AI/emu/tracy-build` has binaries); export with `tracy-csvexport`. Tracy renames the main
   thread, so match the process by command line (`^\./kyty_emulator --game`), never by name.
 - Thread name `KytyGpuCmd` for the GPU thread (top/perf/taskset).
+- `KYTY_FRAME_DIAG=1`: `GFRAME` lines per guest flip, `FRAME` lines per presented flip, `GIDLE`
+  lines per wait of the command thread for guest work of 1 ms or more (FINDINGS, "Frame pacing");
+  `tools/astro-bench/framediag.py` and `framemodel.py` read them. `KYTY_OFFCPU_THREAD=<name>`
+  points `KYTY_OFFCPU_SAMPLE` at a game thread.
 - `KYTY_TIME_DIAG=1` (costs ~1 FPS while on): one `TIMEDIAG` line per second: vblanks, flips on screen with their interval
   in ms and in vblanks (`flip_vbl`, the real-speed check), flip modes, the game's clock and
   video-out calls per second with their top call sites (`eboot.bin+0x…`), and the sites read

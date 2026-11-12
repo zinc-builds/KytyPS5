@@ -2,7 +2,12 @@
 
 #include "common/stallDiag.h"
 
+#include "common/frameDiag.h"
+
 #include <algorithm>
+#if defined(__linux__)
+#include <sys/uio.h>
+#endif
 #include <array>
 #include <cinttypes>
 #include <cstdarg>
@@ -140,7 +145,7 @@ int ReadFile(int fd, char* buffer, size_t size) {
 	return static_cast<int>(n);
 }
 
-void SampleThread(pid_t tid, uintptr_t stack_top) {
+void SampleThread(pid_t tid, uintptr_t stack_base, uintptr_t stack_top, bool idle_only) {
 	pthread_setname_np(pthread_self(), "KytyOffCpuDiag");
 	char path[64];
 	std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", static_cast<int>(tid));
@@ -158,6 +163,10 @@ void SampleThread(pid_t tid, uintptr_t stack_top) {
 		std::this_thread::sleep_for(std::chrono::microseconds(200));
 		if (ReadFile(stat_fd, buffer, sizeof(buffer)) == 0) {
 			return;
+		}
+		// With KYTY_FRAME_DIAG=1, a game thread is sampled only while the command thread has no work.
+		if (idle_only && !Common::FrameDiag::CmdIdle()) {
+			continue;
 		}
 		const char* close = std::strrchr(buffer, ')');
 		const char  state = close != nullptr && close[1] == ' ' ? close[2] : '?';
@@ -186,10 +195,17 @@ void SampleThread(pid_t tid, uintptr_t stack_top) {
 		if (count == 9) {
 			const auto* sp    = reinterpret_cast<const uintptr_t*>(values[7]);
 			int         found = 0;
-			// Only words inside the thread's own stack.
-			const auto words = sp != nullptr && values[7] < stack_top
-			                       ? std::min<uintptr_t>(1024, (stack_top - values[7]) / sizeof(uintptr_t))
-			                       : 0;
+			// Only words inside the thread's own stack (a signal handler's stack is elsewhere),
+			// copied with process_vm_readv: the thread may have exited and its stack gone.
+			const auto in_stack = sp != nullptr && values[7] >= stack_base && values[7] < stack_top
+			                          ? std::min<uintptr_t>(1024, (stack_top - values[7]) / sizeof(uintptr_t))
+			                          : 0;
+			std::array<uintptr_t, 1024> copy {};
+			iovec local {copy.data(), in_stack * sizeof(uintptr_t)};
+			iovec remote {const_cast<uintptr_t*>(sp), in_stack * sizeof(uintptr_t)};
+			const auto read  = in_stack != 0 ? process_vm_readv(getpid(), &local, 1, &remote, 1, 0) : 0;
+			const auto words = read > 0 ? static_cast<uintptr_t>(read) / sizeof(uintptr_t) : 0;
+			sp               = copy.data();
 			for (uintptr_t i = 0; i < words && found < 6; i++) {
 				const auto value = sp[i];
 				if (value > text_begin && value < text_end) {
@@ -210,25 +226,59 @@ void SampleThread(pid_t tid, uintptr_t stack_top) {
 
 } // namespace
 
-void SetCommandThread() noexcept {
+namespace {
+
+const char* OffCpuThread() noexcept {
+	static const char* name = std::getenv("KYTY_OFFCPU_THREAD");
+	return name != nullptr && name[0] != '\0' ? name : nullptr;
+}
+
+// A game thread runs on its guest stack (stack_base/stack_size given); the command thread on its
+// native one (stack_size 0: read from pthread).
+void StartSampler(bool idle_only, uintptr_t guest_base = 0, size_t guest_size = 0) {
 #if defined(__linux__)
 	const char* value = std::getenv("KYTY_OFFCPU_SAMPLE");
 	if (!Enabled() || value == nullptr || value[0] == '0') {
 		return;
 	}
-	const auto     tid       = static_cast<pid_t>(syscall(SYS_gettid));
-	uintptr_t      stack_top = 0;
+	const auto     tid        = static_cast<pid_t>(syscall(SYS_gettid));
+	uintptr_t      stack_base = 0;
+	uintptr_t      stack_top  = 0;
 	pthread_attr_t attr;
-	if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+	if (guest_size != 0) {
+		stack_base = guest_base;
+		stack_top  = guest_base + guest_size;
+	} else if (pthread_getattr_np(pthread_self(), &attr) == 0) {
 		void*  base = nullptr;
 		size_t size = 0;
 		if (pthread_attr_getstack(&attr, &base, &size) == 0) {
-			stack_top = reinterpret_cast<uintptr_t>(base) + size;
+			stack_base = reinterpret_cast<uintptr_t>(base);
+			stack_top  = stack_base + size;
 		}
 		pthread_attr_destroy(&attr);
 	}
-	std::thread([tid, stack_top] { SampleThread(tid, stack_top); }).detach();
+	std::thread([=] { SampleThread(tid, stack_base, stack_top, idle_only); }).detach();
+#else
+	(void)idle_only;
+	(void)guest_base;
+	(void)guest_size;
 #endif
+}
+
+} // namespace
+
+void SetCommandThread() noexcept {
+	if (OffCpuThread() == nullptr) {
+		StartSampler(false);
+	}
+}
+
+void SetGuestThread(const std::string& name, uintptr_t stack_base, size_t stack_size) noexcept {
+	static std::atomic<bool> started {false};
+	const char* prefix = OffCpuThread();
+	if (prefix != nullptr && name.rfind(prefix, 0) == 0 && !started.exchange(true)) {
+		StartSampler(Common::FrameDiag::Enabled(), stack_base, stack_size);
+	}
 }
 
 int Mode() noexcept {

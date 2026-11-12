@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/gpuWaitDiag.h"
+#include "common/frameDiag.h"
 #include "common/benchMetrics.h"
 #include "common/kernelStats.h"
 #include "common/stallDiag.h"
@@ -26,6 +27,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -464,14 +466,23 @@ void GuestGpu::ThreadRun(void* data) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         should_stop = false;
+		uint64_t                     idle_start  = 0;
+		uint64_t                     idle_end    = 0;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (idle_start == 0 && Common::FrameDiag::Enabled()) {
+					Common::FrameDiag::OnCmdIdleBegin();
+					idle_start = Common::FrameDiag::NowNs();
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdNoWork);
 				Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+			}
+			if (idle_start != 0) {
+				idle_end = Common::FrameDiag::NowNs();
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -494,6 +505,8 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					{
+						Common::FrameDiag::Scope       frame_diag(Common::FrameDiag::Counter::CmdBlocks,
+						                                          Common::FrameDiag::Counter::CmdBlockedNs);
 						Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdBlocked);
 						Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Idle);
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
@@ -512,6 +525,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 			}
+		}
+		if (idle_start != 0) {
+			Common::FrameDiag::OnCmdIdle(idle_start, idle_end); // printed outside the queue lock
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
@@ -1445,6 +1461,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		const int count = m_renderer.GetVideoOut().DisplayBufferAddresses(
 		    handle, buffers.data(), static_cast<int>(buffers.size()));
 		FrameSkip::OnFlip(buffers.data(), count);
+	}
+	if (Common::FrameDiag::Enabled()) {
+		Common::FrameDiag::OnGuestFlip(PerformanceOverlayFlipCount());
 	}
 }
 
