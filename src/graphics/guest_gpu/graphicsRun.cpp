@@ -3,6 +3,7 @@
 #include <pthread.h>
 #endif
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/memDiag.h"
 
@@ -443,6 +444,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::HybridAffinity::ApplyToGpuThread();
 #endif
 	g_gpu_state = gpu;
+	FrameSkip::Init();
 	Common::StallDiag::SetCommandThread();
 	Common::KernelStats::SetCommandThread();
 	Common::BenchMetrics::RegisterThread(Common::BenchMetrics::Role::Cmd);
@@ -948,6 +950,16 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// Frame skipping (frameSkip.h): classifies the draw, and drops it in a skipped frame. A dropped
+// draw inside an open occlusion query counts as visible.
+bool CommandProcessor::SkipDraw(bool indirect, bool indirect_count) {
+	if (!FrameSkip::OnDraw(m_ctx, m_sh_ctx, indirect, indirect_count)) {
+		return false;
+	}
+	m_renderer.GetOcclusionQueries().NoteSkippedDraw();
+	return true;
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	auto& executor           = m_renderer.GetRenderExecutor();
 	args.index_type_and_size = m_index_type_and_size;
@@ -957,6 +969,10 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
+	}
+	// After the instance count: a dropped draw leaves the same register state behind.
+	if (FrameSkip::Active() && SkipDraw(false, false)) {
+		return;
 	}
 	executor.QueueDrawIndex(CurrentBuffer(), args);
 }
@@ -1045,6 +1061,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
+	if (FrameSkip::Active()) {
+		// Classified only: frame skipping never drops an indirect draw.
+		(void)SkipDraw(true, count_addr != nullptr);
+	}
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
 	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
@@ -1098,6 +1118,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 	EXIT_NOT_IMPLEMENTED(IsAsyncComputeQueue());
+	if (FrameSkip::SkippingDraws()) {
+		return;
+	}
 	m_renderer.GetRenderExecutor().ProcessPssr(CurrentBuffer(), request);
 }
 
@@ -1120,6 +1143,9 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
+	}
+	if (FrameSkip::Active() && SkipDraw(false, false)) {
+		return;
 	}
 	executor.QueueDrawAuto(CurrentBuffer(), args);
 }
@@ -1312,6 +1338,12 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	GetScheduler().Flush();
+	if (FrameSkip::Active()) {
+		std::array<uint64_t, 16> buffers {};
+		const int count = m_renderer.GetVideoOut().DisplayBufferAddresses(
+		    handle, buffers.data(), static_cast<int>(buffers.size()));
+		FrameSkip::OnFlip(buffers.data(), count);
+	}
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {

@@ -1621,6 +1621,29 @@ What this means:
 
 `dev` 458607ad (everything through #11): 24.20 / 24.41 / 24.22 FPS, worst_ms ~52–54, low1 ~19.
 
+### Game speed is frame-locked; optional frame skipping (Track S, 2026-11-12)
+
+- **The game steps a fixed amount per flip.** The game logs `SubLevelLocator sublevel_locator_veg_chibi … 6->7` ~850 flips after `StartLevel` in every bench log from 15 to 59 FPS (≈280 logs), while the wall time to it runs from 57.6 s down to 17.4 s. At 15 FPS each frame spans 4 vblanks, so it counts flips, not vblanks or measured time. The eboot has ~150 sites that load the literal 1/60 (`eboot+0x834aeb0`) as a per-update step (for example `eboot+0xf182f7`, `+0x40040fd`). So game speed = flips/s ÷ 60: 0.82× at 49 FPS. No boot argument changes the step, and the clock reads don't feed it. `eboot+0xe07df0` is the audio subsystem timing its stages.
+- **Check it on any bench log** with `tools/re/gamespeed.py /tmp/bench-<label>.log`.
+- **`--frame-skip auto`** (off by default; docs/frame-skip.md) drops the draws of some frames and still flips on every vblank. On `dev` 891ff146, Sky Garden frames 1000–1600:
+
+| | Flips/s (game speed) | Shown/s | Worst gap between shown images |
+|---|---|---|---|
+| Off | 49.4 (0.82×) | 49 | 1–3 vblanks |
+| Auto, two runs | 57.4 / 58.8 (0.96× / 0.98×) | ~28 / ~29 | 3 vblanks (6–7 only in level-start stalls) |
+
+- **Why auto stops short of 1.0× today:** a skipped frame still costs the command thread ~8 ms. Most of that is the ~620 draws a frame it must keep: atomic feedback writes into three 128-byte buffers the CPU reads back, and storage-image writes. A drawn frame costs ~22 ms, so with at most one skipped frame in a row the skip share sits at its 50% cap. The gap closes as the base frame rate rises. `KYTY_FRAME_SKIP_MAX=2` lifts the cap and trades smoothness for speed.
+
+### Dynamic resolution reacts to skipped frames (Track S, 2026-11-12)
+
+With frame skipping on, Sky Garden's main pass sometimes moves from its 1920×1080 targets to 2432×1368 ones: 35 of 600 frames in one run, not seen in the mode-off diagnostic runs. The game's dynamic resolution sees cheap frames and raises the resolution.
+
+The emulator writes guest GPU timestamps when the command thread decodes the packet: RELEASE_MEM/EOP `kRefClk` from the host TSC (`Sync::ReadReferenceClock`), and the AMPR time-counter writes. A skipped frame's "GPU time" is therefore its short decode time. It is not traced which of these the game's dynamic resolution reads.
+
+Two effects:
+- A target unused while the scene sits at another resolution is not a "periodic" target. Frame skipping's keep rule uses write runs for this reason.
+- Raised resolution adds host GPU work to the drawn frames.
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:

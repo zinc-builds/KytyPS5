@@ -89,6 +89,7 @@ public:
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
 	                uint32_t interrupt_context_id);
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
+	bool SkipDraw(bool indirect, bool indirect_count);
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);

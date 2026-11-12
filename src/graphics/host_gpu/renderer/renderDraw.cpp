@@ -11,6 +11,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1310,6 +1311,41 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	if (FrameSkip::Active()) {
+		// Frame skipping keeps draws whose shaders write memory, and drops a shader combination
+		// only once it was inspected here.
+		bool image_writes  = false;
+		bool buffer_writes = false; // from shader metadata, whatever the descriptors hold now
+		bool known         = true;
+		bool atomic_only   = true;
+		std::array<FrameSkip::WrittenRange, 4> ranges {};
+		int                                    range_count = 0;
+		for (const auto* stage: stages) {
+			const auto& program = stage->runtime->module->info;
+			known         = known && !program.has_address_writes && !program.info.uses_dma;
+			buffer_writes = buffer_writes || program.has_address_writes;
+			for (const auto& image: program.info.images) {
+				image_writes = image_writes || image.written || image.atomic;
+			}
+			for (const auto& meta: program.info.buffers) {
+				if (!meta.written && !meta.atomic) {
+					continue;
+				}
+				buffer_writes = true;
+				atomic_only   = atomic_only && meta.atomic && !meta.plain_access;
+				if (meta.descriptor_index >= stage->buffer_sources.size()) {
+					known = false;
+					continue;
+				}
+				const auto& source = stage->buffer_sources[meta.descriptor_index];
+				if (source.size != 0 && range_count < static_cast<int>(ranges.size())) {
+					ranges[range_count++] = {source.address, source.size};
+				}
+			}
+		}
+		FrameSkip::NoteCommittedDraw(buffer.GetShaders(), state.ps_active, buffer_writes,
+		                             image_writes, atomic_only, known, ranges.data(), range_count);
 	}
 	if (shader_write_stages || HasAtomicWrites()) {
 		// Guest ranges of the draw's buffer accesses: atomics to buffers the stage accesses only

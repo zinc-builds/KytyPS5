@@ -26,6 +26,10 @@ enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
+// Frame skipping (docs/frame-skip.md): off, or auto (skip drawing frames when the GPU command
+// thread falls behind the vblank rate, so the game keeps its speed).
+enum class FrameSkipMode { Off, Auto };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -91,6 +95,7 @@ struct ConfigOptions {
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
+	FrameSkipMode          frame_skip                  = FrameSkipMode::Off;
 	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
@@ -163,6 +168,7 @@ bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
+FrameSkipMode GetFrameSkipMode();
 bool LodStatsEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();

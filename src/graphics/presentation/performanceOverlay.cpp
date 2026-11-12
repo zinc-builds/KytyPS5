@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
+#include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "kernel/memory.h"
@@ -906,6 +907,12 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			ImGui::TextColored(Color(BAD), "No frames for %.0f s", shown.stalled_s);
 		} else {
 			ImGui::TextDisabled("Waiting for frames");
+		}
+		if (FrameSkip::Enabled()) {
+			// Frame skipping: the FPS above counts flips (game ticks); this many were drawn.
+			const auto skip = FrameSkip::GetOverlayStats();
+			ImGui::TextDisabled("Frame skip: %.0f shown/s, %.0f skipped/s, worst gap %u", skip.shown_per_s,
+			                    skip.skipped_per_s, skip.worst_gap);
 		}
 		DrawFrameGraph(shown.history, shown.history_count, (details ? 330.0f : 260.0f) * scale,
 		               46.0f * scale);

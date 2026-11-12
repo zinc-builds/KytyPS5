@@ -38,6 +38,8 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(int handle, int index);
+	// The port's registered display-buffer addresses, up to `max`; returns the count.
+	int DisplayBufferAddresses(int handle, uint64_t* out, int max);
 
 	[[nodiscard]] Impl& State() noexcept;
 

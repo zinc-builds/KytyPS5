@@ -217,6 +217,10 @@ bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
 }
 
+FrameSkipMode GetFrameSkipMode() {
+	return g_config->frame_skip;
+}
+
 bool LodStatsEnabled() {
 	return g_config->lod_stats_enabled;
 }
