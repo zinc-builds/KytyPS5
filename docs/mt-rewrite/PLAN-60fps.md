@@ -460,7 +460,7 @@ open PR is a weak signal.
 | bd41e2f6 | Texture views past MAX_MIP | **Later.** Alone, it stops ASTRO BOT booting (upstream issues #2222, #1993); wait for #2172 upstream |
 | #2119 | Async shader compile | **Later**, rebuilt on our prepare workers: it skips draws, holds frames for up to 3 s, and clashes with the worker pipeline key (18 hunks) |
 | 8dbee863 | Relaxed float option (native min/max/med3, no input denormal flush) | **Later / declined for now:** inexact, like the fused MAD we declined |
-| 0ec2cd5d | Writes re-queue only DMA-accessed BDA pages | **Not taken.** Ported and screened same-binary: cycles/draw +0.3% `~`, ipd +7.6% `!`, prepare_ns +29%, cmd sys −12% `!`. The uploads move to bind time on the workers; pre-staging stays (local branch `tmp/u-bda-port`) |
+| 0ec2cd5d | Writes re-queue only DMA-accessed BDA pages | **Not taken.** Ported and screened same-binary: cycles/draw +0.3% `~`, ipd +7.6% `!`, prepare_ns +29%, cmd sys −12% `!`. The uploads move to bind time on the workers (local branch `tmp/u-bda-port`). Pre-staging was then built and parked as well (FINDINGS "BDA pre-staging") |
 | eb3e86d5 `--native-rt`, b727a1fa | Host ray tracing; empty-scissor draw skip | Only if Sky Garden uses them (not checked) |
 | e5c35553, 79a04b9a, 7d4e0d9b, b510053e, 1b59ee62 set, 7ae328b3, aecd70b6 | Tracker, submit cadence, upload batch, kernel locks, executor targets, image page buckets | Ours is equivalent or supersedes them |
 | PSSR DLSS/FSR, readback changes | — | Off our path |
