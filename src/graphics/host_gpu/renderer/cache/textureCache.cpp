@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "common/frameDiag.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -228,6 +229,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	Common::FrameDiag::Add(Common::FrameDiag::Counter::TextureCreates);
 	RegisterImage(id);
 	return id;
 }

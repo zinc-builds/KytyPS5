@@ -408,8 +408,35 @@ std::string Line(uint64_t frames, double t, uint64_t draws) {
 	return out;
 }
 
+int ThreadId(Role role) {
+	return g_threads[static_cast<int>(role)].tid.load(std::memory_order_acquire);
+}
+
+uint64_t Value(Counter counter) {
+	return Detail::g_counters[static_cast<int>(counter)].load(std::memory_order_relaxed);
+}
+
+uint64_t PrepareBusyNs() {
+	uint64_t busy = 0;
+	for (int i = 0; i < MaxWorkers; i++) {
+		if (const auto* b = g_worker_busy[i].load(std::memory_order_acquire); b != nullptr) {
+			busy += b->load(std::memory_order_relaxed);
+		}
+	}
+	return busy;
+}
+
 #else // KYTY_BENCH_METRICS
 
+int ThreadId(Role) {
+	return 0;
+}
+uint64_t Value(Counter) {
+	return 0;
+}
+uint64_t PrepareBusyNs() {
+	return 0;
+}
 void RegisterThread(Role) {}
 void RegisterPrepareWorker(uint32_t, const std::atomic<uint64_t>*, const std::atomic<uint64_t>*) {}
 std::string BuildLine() {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/frameDiag.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/alignment.h"
@@ -972,6 +973,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	Common::FrameDiag::Add(Common::FrameDiag::Counter::BufferCreates);
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;

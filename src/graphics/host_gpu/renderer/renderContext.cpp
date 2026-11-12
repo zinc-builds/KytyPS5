@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/frameDiag.h"
 #include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
@@ -164,7 +165,17 @@ void RenderContextMutex::Lock() {
 		}
 		m_owner_active.store(false, std::memory_order_release);
 	}
-	m_mutex.lock();
+	if (Common::FrameDiag::Enabled()) {
+		if (!m_mutex.try_lock()) {
+			const auto start = Common::FrameDiag::NowNs();
+			m_mutex.lock();
+			Common::FrameDiag::Add(Common::FrameDiag::Counter::MutexWaits);
+			Common::FrameDiag::Add(Common::FrameDiag::Counter::MutexWaitNs,
+			                       Common::FrameDiag::NowNs() - start);
+		}
+	} else {
+		m_mutex.lock();
+	}
 	m_owner_mutex = true;
 }
 
@@ -501,6 +512,8 @@ bool RenderContext::ScanAsyncWritesAtSubmit() {
 	if (mode == SubmitScanMode::Off) {
 		return false;
 	}
+	const Common::FrameDiag::Scope frame_diag(Common::FrameDiag::Counter::SubmitScans,
+	                                          Common::FrameDiag::Counter::SubmitScanNs);
 	g_scan_pages.store(&m_page_manager, std::memory_order_release);
 	if (mode == SubmitScanMode::On) {
 		return LibKernel::Memory::ScanAsyncGuestWritesAtSubmit(WantsAsyncScan);
@@ -565,6 +578,8 @@ static void ReportSubmitScans() {
 }
 
 void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
+	const Common::FrameDiag::Scope frame_diag(Common::FrameDiag::Counter::Collects,
+	                                          Common::FrameDiag::Counter::CollectNs);
 	// A pending request (a satisfied wait published guest data, maybe in another submission
 	// that is now blocked) needs a full scan: only a full scan settles it.
 	if (m_async_collect_requested) {
@@ -689,6 +704,8 @@ void RenderContext::PrepareBda() {
 }
 
 void RenderContext::RunGarbageCollector() {
+	const Common::FrameDiag::Scope frame_diag(Common::FrameDiag::Counter::GcRuns,
+	                                          Common::FrameDiag::Counter::GcNs);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
