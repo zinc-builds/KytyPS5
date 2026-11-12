@@ -1800,19 +1800,20 @@ void RenderExecutor::RebindResidentImage(PreparedBindings& prepared, uint32_t in
 		stats.null_slots++;
 		return;
 	}
+	// The proposal's copy of the record's serial: the skip check then reads one line of the record.
 	const WorkerTextureRecord* record = nullptr;
 	if (slots.proposals != nullptr && index < slots.proposals->size()) {
-		const auto* candidate = (*slots.proposals)[index].record;
-		if (candidate != nullptr && binding.source == candidate->serial) {
-			record = candidate;
+		const auto& proposal = (*slots.proposals)[index];
+		if (proposal.record != nullptr && binding.source == proposal.serial) {
+			record = proposal.record;
 		}
 	}
 	const bool listed = !m_resident_conflicts.empty() &&
 	                    std::ranges::find(m_resident_conflicts, binding.image_id) !=
 	                        m_resident_conflicts.end();
 	ResidentStore::Skip skip;
-	const bool predicted =
-	    record != nullptr && !listed && store.TrySkip(*record, binding.image_id, now, cache, skip);
+	const bool predicted = record != nullptr && !listed &&
+	                       store.TrySkip(*record, binding.source, binding.image_id, now, cache, skip);
 	const bool verify = ResidentTexturesVerify();
 	if (predicted) {
 		(skip.global ? stats.skip_global : stats.skip_image)++;
@@ -2064,17 +2065,21 @@ void RenderExecutor::EndResidentCommit(std::span<PreparedBindings* const> stages
 				case Slots::Skip: settled = settled && same; break;
 				case Slots::Conflict: settled = false; break;
 				case Slots::Acquired: {
+					const auto& binding = prepared->images[i];
 					const WorkerTextureRecord* record = nullptr;
 					if (slots.proposals != nullptr && i < slots.proposals->size()) {
-						record = (*slots.proposals)[i].record;
+						const auto& proposal = (*slots.proposals)[i];
+						if (proposal.record != nullptr && binding.source == proposal.serial) {
+							record = proposal.record;
+						}
 					}
-					const auto& binding = prepared->images[i];
-					if (record == nullptr || binding.source != record->serial) {
+					if (record == nullptr) {
 						settled = false;
 						break;
 					}
 					auto& image = cache.GetImage(binding.image_id);
-					settled     = store.Remember(*record, image, binding.image_id, slots.elements[i],
+					settled     = store.Remember(*record, binding.source, image, binding.image_id,
+					                             slots.elements[i],
 					                             binding.layout == image.ReadLayout(), end) &&
 					          settled;
 					break;
