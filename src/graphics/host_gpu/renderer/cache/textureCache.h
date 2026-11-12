@@ -67,6 +67,8 @@ public:
 	// GcTick, are what a resolve would give again while both hold (stage binding-set reuse).
 	[[nodiscard]] uint64_t BindingEpoch() const { return m_registration_generation; }
 	[[nodiscard]] uint64_t GcTick() const { return m_gc_tick; }
+	// Color clears MaterializeColorClear found work for (KYTY_RUN_STATE=verify).
+	[[nodiscard]] uint64_t ColorClearWork() const { return m_color_clear_work; }
 	[[nodiscard]] bool RefindExactImage(ImageId id, GuestRange data, const ImageDesc* found,
 	                                    uint32_t metadata_base_layer, uint64_t& generation);
 	void                        UpdateImage(ImageId id);
@@ -265,6 +267,7 @@ private:
 	// Page-table searches made by FindImagesInRegion; tests read it to see a lookup skip one.
 	mutable uint64_t m_region_queries = 0;
 	uint64_t                                                         m_registration_generation = 1;
+	uint64_t                                                         m_color_clear_work        = 0;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

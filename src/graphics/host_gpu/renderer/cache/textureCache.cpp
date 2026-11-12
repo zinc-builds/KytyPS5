@@ -1108,7 +1108,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
-		m_surface_metas.erase(range.address);
+		m_color_clear_work += m_surface_metas.erase(range.address);
 		if (range.size == 0 || view.level_count != 1) {
 			return;
 		}
@@ -1141,6 +1141,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto hazard     = DrawPrepare::HazardGeneration();
 	const auto checks     = m_buffer_cache.ColorChecksGeneration();
 	const bool idle       = MaterializeColorClearSlices(id, desc, metadata_base_layer, memoizable);
+	m_color_clear_work += idle ? 0 : 1;
 	if (hit && !idle) {
 		EXIT("KYTY_COLOR_CLEAR_MEMO=verify: a remembered color clear of 0x%016" PRIx64
 		     " had work to do\n",

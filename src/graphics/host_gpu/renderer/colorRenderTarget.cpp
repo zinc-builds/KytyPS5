@@ -481,7 +481,8 @@ void RenderExecutor::ResolveProposedDepthTarget(CommandBuffer&                 b
 		BindRenderTarget(r.image_id);
 		return;
 	}
-	const auto run_id = record->image_id;
+	const auto run_id    = record->image_id;
+	const auto run_check = run ? TakeRunResolveCheck(run_id) : RunResolveCheck {};
 	if (record->resolved) {
 		const auto& found       = record->desc;
 		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
@@ -522,6 +523,11 @@ void RenderExecutor::ResolveProposedDepthTarget(CommandBuffer&                 b
 		EXIT("KYTY_RUN_STATE=verify: the depth target of a run is image %u, not %u\n",
 		     static_cast<uint32_t>(r.image_id.index), static_cast<uint32_t>(run_id.index));
 	}
+	if (run && !(TakeRunResolveCheck(run_id) == run_check)) {
+		EXIT("KYTY_RUN_STATE=verify: the skipped resolve of the depth target (image %u) had work "
+		     "to do\n",
+		     static_cast<uint32_t>(run_id.index));
+	}
 	if (WorkerTargetsVerify()) {
 		const auto&     hw = buffer.GetRegisters();
 		RenderDepthInfo check;
@@ -561,7 +567,8 @@ void RenderExecutor::ResolveProposedColorTarget(CommandBuffer&                 b
 		BindRenderTarget(r.image_id);
 		return;
 	}
-	const auto run_id = record->info.image_id;
+	const auto run_id    = record->info.image_id;
+	const auto run_check = run ? TakeRunResolveCheck(run_id) : RunResolveCheck {};
 	if (record->resolved) {
 		const auto& found       = record->info.desc;
 		const bool  color_clear = found.info.metadata.kind == ImageMetadataKind::Dcc ||
@@ -605,6 +612,13 @@ void RenderExecutor::ResolveProposedColorTarget(CommandBuffer&                 b
 	if (run && r.image_id != run_id) {
 		EXIT("KYTY_RUN_STATE=verify: color target slot %u of a run is image %u, not %u\n", slot,
 		     static_cast<uint32_t>(r.image_id.index), static_cast<uint32_t>(run_id.index));
+	}
+	// The skipped resolve must have had no effect at all: no clear, refresh, store, registration
+	// or state change.
+	if (run && !(TakeRunResolveCheck(run_id) == run_check)) {
+		EXIT("KYTY_RUN_STATE=verify: the skipped resolve of color target slot %u (image %u) had "
+		     "work to do\n",
+		     slot, static_cast<uint32_t>(run_id.index));
 	}
 	if (WorkerTargetsVerify()) {
 		const auto& hw   = buffer.GetRegisters();

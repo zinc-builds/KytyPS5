@@ -470,6 +470,18 @@ int RenderExecutor::RunStateMode() {
 	return mode;
 }
 
+RenderExecutor::RunResolveCheck RenderExecutor::TakeRunResolveCheck(ImageId id) const {
+	auto&       cache = m_context.GetTextureCache();
+	const auto& image = cache.GetImage(id);
+	return {CurrentRunEpochs(),
+	        cache.ColorClearWork(),
+	        image.settled.load(std::memory_order_acquire),
+	        image.target_settled.load(std::memory_order_acquire),
+	        image.backing.state.layout,
+	        image.backing.state.access_mask,
+	        image.backing.subresource_states.size()};
+}
+
 RenderExecutor::RunEpochs RenderExecutor::CurrentRunEpochs() const {
 	auto& texture_cache = m_context.GetTextureCache();
 	return {GuestSyncEpoch::g_epoch.load(std::memory_order_acquire), DrawPrepare::HazardGeneration(),
@@ -1117,6 +1129,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	} else {
 		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
+	// The resolves above hold under these epochs; the next draw may skip them only if nothing
+	// moves them for the rest of this commit (its bindings, clears, stores).
+	if (m_committing != 0) {
+		m_run_resolved     = CurrentRunEpochs();
+		m_run_resolved_set = true;
+	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {state.color_info.data(), state.color_count};
@@ -1685,8 +1703,10 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
 	KYTY_PROFILER_FUNCTION();
 	if (queued == nullptr) {
 		// A direct draw ends any run.
-		m_committing = 0;
-		m_run_ok     = false;
+		m_committing       = 0;
+		m_run_ok           = false;
+		m_run.sequence     = 0;
+		m_run_resolved_set = false;
 	}
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1787,8 +1807,10 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args,
                               QueuedDraw* queued) {
 	KYTY_PROFILER_FUNCTION();
 	if (queued == nullptr) {
-		m_committing = 0;
-		m_run_ok     = false;
+		m_committing       = 0;
+		m_run_ok           = false;
+		m_run.sequence     = 0;
+		m_run_resolved_set = false;
 	}
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2285,9 +2307,14 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	} else {
 		(void)DrawAuto(buffer, queued.auto_args, &queued);
 	}
-	// What the next draw of a run compares with.
-	m_run.sequence = RunStateMode() != 0 ? sequence : 0;
-	m_run.epochs   = CurrentRunEpochs();
+	// What the next draw of a run compares with: the epochs its target resolves held under,
+	// unless something moved them after (then the run ends here).
+	const auto epochs  = CurrentRunEpochs();
+	m_run.sequence     = RunStateMode() != 0 && m_run_resolved_set && m_run_resolved == epochs
+	                         ? sequence
+	                         : 0;
+	m_run.epochs       = epochs;
+	m_run_resolved_set = false;
 	m_run_ok       = false;
 	m_committing   = 0;
 	m_adopted_buffers  = nullptr;

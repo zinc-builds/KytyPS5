@@ -617,6 +617,21 @@ private:
 	bool     m_run_ok     = false; // the draw being committed continues the run
 	uint64_t m_run_verified = 0;   // KYTY_RUN_STATE=verify: run target paths checked
 	uint64_t m_committing = 0;     // its queue sequence (0: a direct draw)
+	// The epochs right after the committing draw resolved its targets: the next draw continues
+	// the run only if they still hold when this one is done.
+	RunEpochs m_run_resolved {};
+	bool      m_run_resolved_set = false;
+	// KYTY_RUN_STATE=verify: what a run's skipped target resolve must leave unchanged.
+	struct RunResolveCheck {
+		RunEpochs        epochs;
+		uint64_t         color_clear_work = 0;
+		uint8_t          settled = 0, target_settled = 0;
+		vk::ImageLayout  layout {};
+		vk::AccessFlags2 access {};
+		size_t           subresources = 0;
+		bool             operator==(const RunResolveCheck&) const = default;
+	};
+	[[nodiscard]] RunResolveCheck TakeRunResolveCheck(ImageId id) const;
 	[[nodiscard]] static int RunStateMode();
 	[[nodiscard]] RunEpochs  CurrentRunEpochs() const;
 	[[nodiscard]] bool       RunTargetsValid() const {
