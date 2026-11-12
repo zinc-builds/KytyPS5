@@ -1580,6 +1580,35 @@ How it was measured:
 | `hw_check` (per-draw register validation, reads the register copy) | 7.5 | 2.8 | to be skipped under B4's register change flags |
 | Recorder ring (Reserve, WaitDone) | 1.9 | 2.0 | |
 
+### Commit-side prefetch: early hand-off lines don't buy cycles (Track R, 2026-11-12)
+
+The question was whether the command thread's cross-core hand-off loads cost cycles because they are late. The test: while committing queued draw N, the command thread prefetches what it will read for the draws behind it, one pointer level per draw of distance. Prototype on branch `trackR/commit-prefetch` (`KYTY_COMMIT_PREFETCH=1`, `KYTY_COMMIT_PREFETCH_LEVELS` bit mask), not merged. The levels:
+- 1: slot N+3's lines the commit reads (B4's hand-off map; not the register snapshot, which the command thread owns);
+- 2: what slot N+2 points at: proposal arrays, log and buffer vectors, target records;
+- 4: texture records of N+1;
+- 8: images of N.
+
+Records and images that the previous draw also proposed are skipped by a pointer compare: only 0.76 new records and 3.2 new images per draw remain.
+
+PGO, same binary (dev ab68b255 + the prototype), frames 1000–1600, `KYTY_BENCH_PMU=1`, n=3 each, interleaved. Changes vs off:
+
+| Command thread, per draw | all (15) | without images (7) | slot only (3) |
+|---|---|---|---|
+| `cmd_ns` (off 3203) | −0.44% ±0.44 | +0.09% ±0.64 | −0.05% ±0.85 |
+| cycles (off 14413) | −0.56% ±0.33 | +0.02% | −0.25% |
+| instructions (off 21715) | +2.66% | +1.74% | +1.04% |
+| forwarded snoop-hit loads (off 29.4) | −29.0% | −29.6% | −26.0% |
+| L2 misses (off 47.9) | −21.2% | −19.4% | −16.2% |
+| L3 misses (off 7.3) | −8.4% | +0.9% | +0.1% |
+| memory-bound cycles | −4.7% | −3.3% | −6.6% |
+
+- **Removing the snoop-hit loads did not save cycles.** The slot levels alone (3) cut forwarded snoop hits by 26% (29.4 → 21.8 per draw, 7.6 fewer), against 29% (8.5 fewer) with all levels. Memory-bound cycles fall 3–7%, yet total cycles and `cmd_ns` don't move.
+  - The likeliest reading is that out-of-order execution already hid most of these loads' latency, so the ~55 cycles per snoop-hit load estimated in "Where the command thread's cycles go" overstates their cost.
+  - The other reading is that the prefetch's own instructions cancel the saving. These runs can't tell the two apart. Level 3 adds ~225 instructions per draw (+1.04%), takes most of the snoop reduction, and moves cycles by −0.25%, within noise. Either way, the snoop-hit loads it removed were worth no more than those instructions cost.
+- **So judge hand-off work by lines and copies removed, not by snoop counts.** These measurements test early arrival by prefetch, not by a layout change. A layout that only makes the same lines arrive earlier would be expected to save little too. Removing the lines, or the work that reads them, is what can save cycles.
+- An earlier version, which prefetched every image and record with no pointer compare, also took a third of the snoop hits for ~690 more instructions per draw: cycles −0.97%. Prefetch in the prepare worker, so the line sits in the worker's cache, changed nothing measurable.
+- Draws already prepared at distance d when draw N commits: d1 81%, d2 66%, d3 57%.
+
 ### Build modes: PGO + ThinLTO (Track P, 2026-11-11)
 
 The research pass (branch `research/60fps-gap`) found PGO + ThinLTO worth +12.5% with no source
