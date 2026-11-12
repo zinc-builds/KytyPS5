@@ -22,10 +22,10 @@
 namespace Libs::Graphics::FrameSkip {
 
 namespace Detail {
-bool g_active   = false;
-bool g_enabled  = false;
-bool g_diag     = false;
-bool g_skipping = false;
+std::atomic<bool> g_active {false};
+std::atomic<bool> g_enabled {false};
+std::atomic<bool> g_diag {false};
+bool              g_skipping = false;
 } // namespace Detail
 
 namespace {
@@ -45,7 +45,7 @@ constexpr double   RATE_DECAY      = 0.95; // diagnostic write rate
 constexpr uint64_t SMALL_TILED_READBACK_TEXELS = 64 * 64;
 // Feed-forward margin below the vblank period, and the most frames ever skipped.
 constexpr double MARGIN        = 0.05;
-constexpr double MAX_SKIP_RATE = 0.5;
+constexpr int    MAX_CONSECUTIVE = 4; // KYTY_FRAME_SKIP_MAX range
 // A frame this many vblank periods long is a stall (loading, shader compiles): not a reason to
 // skip, and its missed vblanks are not counted.
 constexpr double STALL_PERIODS = 4.0;
@@ -97,8 +97,17 @@ struct State {
 
 	// Command thread.
 	std::unordered_map<uint64_t, Target> targets;
-	uint64_t                             last_key     = ~uint64_t {0};
-	Target*                              last_target  = nullptr;
+	// The last draw's attachments and shader combination (draws come in runs).
+	std::array<uint64_t, 9>              last_keys {};
+	std::array<Target*, 9>               last_targets {};
+	int                                  last_count   = -1;
+	uint64_t                             last_shader  = 0;
+	bool                                 last_shader_keep = true;
+	// Shader combinations drawn in a drawn frame: their side effects are known one flip later.
+	std::unordered_set<uint64_t>         known_shaders;
+	std::vector<uint64_t>                seen_shaders, seen_shaders_prev;
+	int                                  max_consecutive = 1;
+	int                                  consecutive     = 0;
 	uint64_t                             frames       = 0; // flips
 	uint64_t                             drawn_frames = 0;
 	Clock::time_point                    last_flip {};
@@ -169,8 +178,14 @@ uint64_t ShaderKey(const HW::Shader& sh) {
 	       (vs.es_regs.data_addr * 0xc2b2ae3d27d4eb4full);
 }
 
-TargetInfo DrawTarget(const HW::Context& ctx) {
-	TargetInfo info;
+// Every attachment the draw writes: the enabled color slots, and the depth target when depth
+// writes are on.
+struct Attachments {
+	std::array<TargetInfo, 9> list {};
+	int                       count = 0;
+};
+
+void DrawAttachments(const HW::Context& ctx, Attachments& out) {
 	const uint32_t mask = ctx.GetRenderTargetMask();
 	for (uint32_t slot = 0; slot < 8; slot++) {
 		if (((mask >> (slot * 4u)) & 0xfu) == 0) {
@@ -180,15 +195,16 @@ TargetInfo DrawTarget(const HW::Context& ctx) {
 		if (rt.base.addr == 0 || rt.info.format == Prospero::ChannelLayout::kInvalid) {
 			continue;
 		}
+		auto& info  = out.list[out.count++];
 		info.key    = rt.base.addr;
 		info.width  = rt.attrib2.width + 1;
 		info.height = rt.attrib2.height + 1;
 		info.format = static_cast<uint32_t>(rt.info.format);
 		info.tiled  = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
-		return info;
 	}
 	const auto& depth = ctx.GetDepthRenderTarget();
 	if (ctx.GetDepthControl().z_write_enable && depth.z_write_base_addr != 0) {
+		auto& info  = out.list[out.count++];
 		info.key    = depth.z_write_base_addr;
 		info.width  = depth.size.x_max + 1;
 		info.height = depth.size.y_max + 1;
@@ -196,7 +212,6 @@ TargetInfo DrawTarget(const HW::Context& ctx) {
 		info.tiled  = true;
 		info.depth  = true;
 	}
-	return info;
 }
 
 Target& FindTarget(State& s, const TargetInfo& info) {
@@ -378,10 +393,16 @@ void Init() {
 	s.log            = log != nullptr && *log == '1';
 	s.period_ms      = 1000.0 / static_cast<double>(::Config::GetVblankFrequency());
 
-	Detail::g_enabled = s.mode != Mode::Off;
-	Detail::g_diag    = diag != nullptr && *diag == '1';
-	Detail::g_active  = Detail::g_enabled || Detail::g_diag;
-	if (Detail::g_enabled) {
+	if (const char* max = std::getenv("KYTY_FRAME_SKIP_MAX"); max != nullptr) {
+		s.max_consecutive = std::clamp(std::atoi(max), 1, MAX_CONSECUTIVE);
+	}
+
+	const bool enabled = s.mode != Mode::Off;
+	const bool diag_on = diag != nullptr && *diag == '1';
+	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
+	Detail::g_diag.store(diag_on, std::memory_order_relaxed);
+	Detail::g_active.store(enabled || diag_on, std::memory_order_relaxed);
+	if (enabled) {
 		std::printf("Frame skip: %s\n", s.mode == Mode::Auto ? "auto" : "every n-th frame (test)");
 	}
 	s.report_start = Clock::now();
@@ -393,8 +414,9 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 	s.frame_indirect += indirect ? 1u : 0u;
 	s.frame_indirect_count += indirect_count ? 1u : 0u;
 
-	const auto info = DrawTarget(ctx);
-	if (info.key == 0) {
+	Attachments attachments;
+	DrawAttachments(ctx, attachments);
+	if (attachments.count == 0) {
 		// No render target: it exists for its side effects.
 		s.frame_untargeted++;
 		if (Detail::g_skipping) {
@@ -402,20 +424,46 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 		}
 		return false;
 	}
-	Target* t = s.last_target;
-	if (info.key != s.last_key) {
-		t             = &FindTarget(s, info);
-		s.last_key    = info.key;
-		s.last_target = t;
+	bool same = attachments.count == s.last_count;
+	for (int i = 0; same && i < attachments.count; i++) {
+		same = attachments.list[i].key == s.last_keys[i];
 	}
-	t->draws++;
+	if (!same) {
+		s.last_count = attachments.count;
+		for (int i = 0; i < attachments.count; i++) {
+			s.last_keys[i]    = attachments.list[i].key;
+			s.last_targets[i] = &FindTarget(s, attachments.list[i]);
+		}
+	}
+	bool keep = indirect;
+	for (int i = 0; i < attachments.count; i++) {
+		s.last_targets[i]->draws++;
+		keep = keep || s.last_targets[i]->keep;
+	}
+
+	// Shader combinations: a skipped frame drops only those already drawn in a drawn frame (whose
+	// buffer and image writes the commit has reported) and found to have none.
+	const uint64_t shader = ShaderKey(sh);
 	if (!Detail::g_skipping) {
+		if (shader != s.last_shader) {
+			s.last_shader      = shader;
+			s.last_shader_keep = true; // re-evaluated in the next skipped frame
+			if (!s.known_shaders.contains(shader)) {
+				s.seen_shaders.push_back(shader);
+			}
+		}
 		return false;
 	}
-	if (t->keep || (!s.side_shaders.empty() && s.side_shaders.contains(ShaderKey(sh))) ||
-	    (!s.keep_list.empty() && s.keep_list.contains(sh.GetPs().ps_regs.data_addr))) {
+	if (shader != s.last_shader) {
+		s.last_shader      = shader;
+		s.last_shader_keep = !s.known_shaders.contains(shader) || s.side_shaders.contains(shader) ||
+		                     (!s.keep_list.empty() && s.keep_list.contains(sh.GetPs().ps_regs.data_addr));
+	}
+	if (keep || s.last_shader_keep) {
 		s.frame_kept++;
-		t->diag_kept++;
+		for (int i = 0; i < attachments.count; i++) {
+			s.last_targets[i]->diag_kept++;
+		}
 		return false;
 	}
 	s.frame_dropped++;
@@ -566,8 +614,14 @@ void OnFlip(const uint64_t* display_buffers, int display_buffer_count) {
 			return s.drawn_frames - kv.second.last_frame > 4096 && kv.second.first_frame + 4096 < s.drawn_frames;
 		});
 	}
-	s.last_key    = ~uint64_t {0};
-	s.last_target = nullptr;
+	s.last_count  = -1;
+	s.last_shader = 0;
+	// Shader combinations drawn in the frame before this one have been committed by now.
+	for (const auto shader: s.seen_shaders_prev) {
+		s.known_shaders.insert(shader);
+	}
+	s.seen_shaders_prev.swap(s.seen_shaders);
+	s.seen_shaders.clear();
 
 	if (Detail::g_diag) {
 		s.diag_frames++;
@@ -617,23 +671,27 @@ void OnFlip(const uint64_t* display_buffers, int display_buffer_count) {
 		const double target    = s.period_ms * (1.0 - MARGIN);
 		const double skipped_c = s.cost_skipped > 0.0 ? s.cost_skipped : s.cost_drawn * 0.25;
 		const double saving    = std::max(s.cost_drawn - skipped_c, 0.1 * s.period_ms);
-		const double share     = std::clamp((s.cost_drawn - target) / saving, 0.0, MAX_SKIP_RATE);
+		// At most max_consecutive skipped frames between drawn ones.
+		const double max_share = static_cast<double>(s.max_consecutive) /
+		                         static_cast<double>(s.max_consecutive + 1);
+		const double share     = std::clamp((s.cost_drawn - target) / saving, 0.0, max_share);
 		// Feedback: a vblank that passed without a flip is a game tick lost. Each one asks for a
 		// skip soon, and raises the share for a while (the CPU cost misses pipeline waits).
 		const uint64_t misses_total = s.misses_total.load(std::memory_order_relaxed);
 		const uint64_t misses       = misses_total - s.misses_seen;
 		s.misses_seen               = misses_total;
 		s.bias = std::clamp(s.bias * 0.99 + (stall ? 0.0 : 0.05 * static_cast<double>(std::min<uint64_t>(misses, 2))),
-		                    0.0, MAX_SKIP_RATE);
-		s.credit = std::min(s.credit + std::min(share + s.bias, MAX_SKIP_RATE), 1.5);
+		                    0.0, max_share);
+		s.credit = std::min(s.credit + std::min(share + s.bias, max_share), 1.5);
 		if (misses != 0 && !stall) {
 			s.credit = std::max(s.credit, 1.0);
 		}
-		skip = !skipped && !stall && s.credit >= 1.0;
+		skip = s.consecutive < s.max_consecutive && !stall && s.credit >= 1.0;
 		if (skip) {
 			s.credit -= 1.0;
 		}
 	}
+	s.consecutive      = skip ? s.consecutive + 1 : 0;
 	Detail::g_skipping = skip;
 }
 

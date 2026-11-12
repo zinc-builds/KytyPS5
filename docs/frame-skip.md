@@ -2,7 +2,7 @@
 
 An optional mode, **off by default**, for scenes or machines where the emulator cannot keep up
 with the display. Games like Astro Bot advance their simulation by a fixed step per flip, so
-every vblank the emulator misses makes the game run slower (at 50 FPS, Astro Bot runs at 0.83×).
+every vblank the emulator misses makes the game run slower (at 49 FPS, Astro Bot runs at 0.82×).
 With frame skipping on, the emulator now and then drops the *drawing* of a frame but still runs
 everything else in it, so the game gets its flip on every vblank and keeps its speed; the screen
 shows fewer distinct images instead.
@@ -14,17 +14,19 @@ kyty_emulator --game … --frame-skip auto      # or --frame-skip=auto; KYTY_FRA
 ```
 
 `KYTY_FRAME_SKIP` (`auto`, `off`, or `n` ≥ 2 to skip every n-th frame for testing) overrides the
-flag. The performance overlay (`--perf-overlay`) shows frames shown and skipped per second and the
+flag. `KYTY_FRAME_SKIP_MAX=<1-4>` (default 1) is the most frames skipped in a row: on a slower
+machine, 2 trades smoothness for full speed. The performance overlay (`--perf-overlay`) shows frames shown and skipped per second and the
 worst gap between shown images, in vblanks; its FPS keeps counting flips (game ticks).
 
 ## When it skips
 
-Only when behind, never two frames in a row, never across a stall (a frame longer than four
+Only when behind, at most `KYTY_FRAME_SKIP_MAX` frames in a row (default 1), never across a stall (a frame longer than four
 vblank periods: loading, shader compiles). At every flip the GPU command thread:
 
 1. measures its own CPU time for the frame just finished, separately for drawn and skipped frames;
 2. computes the share of frames to skip so the average fits the vblank period with 5% margin:
-   `(1 − f)·drawn + f·skipped ≤ 0.95·period`, capped at 50%; zero when a drawn frame fits;
+   `(1 − f)·drawn + f·skipped ≤ 0.95·period`, capped at max/(max+1) (50% by default); zero when
+   a drawn frame fits;
 3. adds feedback: each vblank that passed without a flip (a lost game tick) asks for a skip soon
    and raises the share for a while (it decays with a ~70-frame half-life);
 4. spaces skips evenly by accumulating the share.
@@ -35,13 +37,16 @@ A skipped frame still runs: register and context state, compute dispatches, DMA 
 label writes, interrupts and end-of-pipe events, waits, the flip (on its vblank, presenting no new
 image), occlusion-query dumps. The game sees exactly the same command stream completing.
 
-It drops draws, PSSR passes, and the presentation of its image, **except** draws into:
+It drops draws, PSSR passes, and the presentation of its image, **except** these draws (a draw
+is kept if any of its color or depth attachments, or its shaders, call for it):
 
 | Kept | Why | How it is found |
 |---|---|---|
 | Render targets refreshed every few frames (shadow caches, probes, impostors) | Later frames reuse them without redrawing; a skipped refresh would stay stale until the next one | Each target's write runs over drawn frames: three runs of one or two frames in a row make it periodic, until a run of 8 |
 | New render targets (first 8 drawn frames) | A one-off render (a baked cube map) must not land in a skipped frame | First sight |
 | Draws whose shaders write buffers or storage images | Their writes outlive the frame: the CPU or a later pass may read them | The draw commit reports the shader combination (ES/GS/PS addresses); later draws of it are kept |
+| Shader combinations not yet drawn in a drawn frame | Their side effects are not known yet | Dropped only once the commit has seen them |
+| Indirect draws | They patch shader registers that later draws inherit | Never dropped (3 a frame in Sky Garden) |
 | Targets the CPU reads back (`--readback-tiled-images`, `--readback-linear-images`) | The texture cache writes them back to guest memory after each submit | The same size/tiling rule as the texture cache |
 | Draws with no render target | They exist only for their side effects | No color or depth target bound |
 | `KYTY_FRAME_SKIP_KEEP=<addr>,…` | Manual: a target base address or pixel-shader address | Found with the diagnostic below |
@@ -49,7 +54,8 @@ It drops draws, PSSR passes, and the presentation of its image, **except** draws
 Video-out buffers are never kept: they are only scanned out, and a skipped frame does not present.
 Occlusion queries: a dropped draw inside an open query counts one visible sample, so objects are
 not culled because their draw was skipped (without `--occlusion-queries` every query already reads
-as visible). New targets are kept until ~45 drawn frames have shown them to be every-frame ones.
+as visible). A dropped draw still resolves a pending indirect instance count, so later draws see
+the same register state as with the mode off.
 
 A target is not "periodic" just because it goes unused for a while: dynamic resolution moves the
 scene between differently sized targets, and each is redrawn every frame while in use.
@@ -90,3 +96,15 @@ shown and skipped frames, missed vblanks, dropped and kept draws, gaps between s
 
 `tools/re/gamespeed.py /tmp/bench-<label>.log` (any `garden.sh` log) prints Astro Bot's game speed
 from an event the game logs itself; see `tools/astro-bench/README.md`.
+
+## Measured on Astro Bot, Sky Garden (`dev` 891ff146, frames 1000–1600)
+
+| | Flips/s (game speed) | Shown/s | Worst gap between shown images |
+|---|---|---|---|
+| Off | 49.4 (0.82×) | 49 | 1–3 vblanks |
+| Auto, two runs | 57.4 / 58.8 (0.96× / 0.98×) | ~28 / ~29 | 3 vblanks (6–7 only in level-start stalls) |
+
+Auto does not reach 1.0× at this base speed. A drawn frame costs the command thread ~22 ms. A
+skipped frame still costs ~8 ms, most of it the ~620 draws it keeps for their feedback writes. With
+one skip at most between drawn frames, the share sits at its 50% cap. The shortfall shrinks as the
+base frame rate rises; `KYTY_FRAME_SKIP_MAX=2` trades smoothness for speed.

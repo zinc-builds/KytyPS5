@@ -961,9 +961,6 @@ bool CommandProcessor::SkipDraw(bool indirect, bool indirect_count) {
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
-	if (FrameSkip::Active() && SkipDraw(false, false)) {
-		return;
-	}
 	auto& executor           = m_renderer.GetRenderExecutor();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
@@ -972,6 +969,10 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
+	}
+	// After the instance count: a dropped draw leaves the same register state behind.
+	if (FrameSkip::Active() && SkipDraw(false, false)) {
+		return;
 	}
 	executor.QueueDrawIndex(CurrentBuffer(), args);
 }
@@ -1060,8 +1061,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
-	if (FrameSkip::Active() && SkipDraw(true, count_addr != nullptr)) {
-		return;
+	if (FrameSkip::Active()) {
+		// Classified only: frame skipping never drops an indirect draw.
+		(void)SkipDraw(true, count_addr != nullptr);
 	}
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
 	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
@@ -1135,15 +1137,15 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
-	if (FrameSkip::Active() && SkipDraw(false, false)) {
-		return;
-	}
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
 			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
 		}
 		args.instance_count = NumInstances();
+	}
+	if (FrameSkip::Active() && SkipDraw(false, false)) {
+		return;
 	}
 	executor.QueueDrawAuto(CurrentBuffer(), args);
 }
