@@ -101,6 +101,8 @@ public:
 	// Verify mode, around one transition: whether it changed the tracked image state.
 	void               SaveState(const Image& image);
 	[[nodiscard]] bool StateChanged(const Image& image) const;
+	[[nodiscard]] const VulkanImageState& SavedState() const { return m_saved_state; }
+	[[nodiscard]] size_t SavedSubresources() const { return m_saved_subresources.size(); }
 
 private:
 	static constexpr uint64_t AgeTicks = 8;

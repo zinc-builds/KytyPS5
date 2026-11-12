@@ -6588,6 +6588,26 @@ public:
               "an unchanged record did not skip to its element");
       Samples("skipped element", skipped, color, view);
 
+      // The image leaves its read layout after the prediction and before the commit (a copy
+      // source in an alias copy, say): the skip moves it back.
+      const auto late = Draw(texture, true, Nothing, [&] {
+        texture_cache.GetImage(color).Transit(
+            vk::ImageLayout::eGeneral,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+            ImageSubresourceRange{0, 1, 0, 1});
+      });
+      Require(name, "late transit",
+              Kind() == Slots::Skip && late == first &&
+                  texture_cache.GetImage(color).backing.state.layout ==
+                      texture_cache.GetImage(color).ReadLayout(),
+              "a skipped image that left its read layout after the prediction was not moved "
+              "back");
+      Samples("late transit element", late, color, view);
+      // Its counters moved, so the next draw acquires again, sharing the element.
+      const auto reacquired = Draw(texture, true, Nothing, Nothing);
+      Require(name, "acquired again", Kind() == Slots::Acquired && reacquired == first,
+              "a record acquired again did not share its view's element");
+
       // The reused set, settled: skipped whole, with no per-slot work.
       reused = true;
       const auto whole = Draw(texture, true, Nothing, Nothing);

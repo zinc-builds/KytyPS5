@@ -1775,6 +1775,9 @@ bool RenderExecutor::BeginResidentImages(PreparedBindings& prepared, ResidentSto
 	slots.kinds.assign(count, PreparedBindings::ResidentSlots::None);
 	slots.verify.assign(count, 0);
 	slots.elements.assign(count, 0);
+	if (ResidentTexturesVerify()) {
+		slots.versions.assign(count, 0);
+	}
 	slots.words.resize(program.bindings.ResidentWords());
 	return false;
 }
@@ -1820,7 +1823,8 @@ void RenderExecutor::RebindResidentImage(PreparedBindings& prepared, uint32_t in
 			binding.image_view    = skip.view;
 			return;
 		}
-		slots.verify[index] = Slots::Predicted;
+		slots.verify[index]   = Slots::Predicted;
+		slots.versions[index] = skip.version;
 	}
 	// The classic acquisition, as RebindImages does it, then an element for its view.
 	bool  again = false;
@@ -1917,7 +1921,10 @@ void RenderExecutor::EndResidentImages(PreparedBindings& prepared) {
 		const uint32_t high = word + 1u < slots.words.size() ? slots.words[word + 1u] : 0u;
 		data[word / 2u]     = slots.words[word] | high << 16u;
 	}
-	slots.layout_epoch = Image::read_layout_epoch.load(std::memory_order_relaxed);
+	// As of the prediction (BeginResidentImages), not now: an acquisition in this RebindImages,
+	// or RebindBuffers' alias copies, can take a predicted image out of its read state (as a
+	// copy source, say), and the commit then moves it back (CommitResidentImage).
+	slots.layout_epoch = slots.rebind.layout;
 }
 
 void RenderExecutor::CommitResidentImage(PreparedBindings& prepared, uint32_t index) {
@@ -1985,18 +1992,39 @@ void RenderExecutor::CommitResidentImage(PreparedBindings& prepared, uint32_t in
 	binding.layout = image.backing.state.layout;
 	if (ResidentTexturesVerify()) {
 		const auto& program = prepared.runtime->module->info;
-		const char* what    = predicted && barrier                 ? "the transition recorded a barrier"
-		                      : predicted && store.StateChanged(image) ? "the transition changed the image state"
+		// A skip moves its image back too if any image left its read state since the
+		// prediction (the Skip branch above), so then the transition may do work.
+		const bool late = predicted && Image::read_layout_epoch.load(std::memory_order_relaxed) !=
+		                                   slots.layout_epoch;
+		if (late && (barrier || store.StateChanged(image))) {
+			store.GetStats().late_transits++;
+		}
+		const char* what    = predicted && !late && barrier ? "the transition recorded a barrier"
+		                      : predicted && !late && store.StateChanged(image)
+		                          ? "the transition changed the image state"
 		                                                           : store.CheckElement(slots.elements[index], image,
 		                                                                                binding.image_id,
 		                                                                                binding.image_view,
 		                                                                                binding.layout);
 		if (what != nullptr) {
+			const auto& saved = store.SavedState();
 			EXIT("KYTY_RESIDENT_TEXTURES=verify: stage %u slot %u (%s, predicted %d): %s: image "
-			     "0x%016" PRIx64 " layout %u\n",
+			     "0x%016" PRIx64 " layout %u; before: layout %u access 0x%" PRIx64
+			     " stage 0x%" PRIx64 " reads_visible %d"
+			     " subresource states %zu; depth %d metadata %u version %u (predicted %u); read "
+			     "layout epoch moved since RebindImages %d\n",
 			     static_cast<uint32_t>(program.stage), index,
 			     kind == Slots::Conflict ? "conflict" : "acquired", predicted, what,
-			     image.info.data.address, static_cast<uint32_t>(binding.layout));
+			     image.info.data.address, static_cast<uint32_t>(binding.layout),
+			     static_cast<uint32_t>(saved.layout),
+			     static_cast<uint64_t>(static_cast<VkAccessFlags2>(saved.access_mask)),
+			     static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(saved.pl_stage)),
+			     saved.reads_visible ? 1 : 0,
+			     store.SavedSubresources(), image.info.IsDepth() ? 1 : 0,
+			     static_cast<uint32_t>(binding.desc.info.metadata.kind),
+			     image.residency_version.load(std::memory_order_relaxed),
+			     predicted ? slots.versions[index] : 0u,
+			     Image::read_layout_epoch.load(std::memory_order_relaxed) != slots.layout_epoch ? 1 : 0);
 		}
 	}
 }

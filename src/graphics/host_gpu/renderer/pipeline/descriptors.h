@@ -121,6 +121,7 @@ struct PreparedBindings {
 		std::vector<uint8_t>                kinds;    // per image
 		std::vector<uint8_t>                verify;   // per image
 		std::vector<uint32_t>               elements; // per image
+		std::vector<uint32_t>               versions; // per image, verify: a skip's residency_version
 		std::vector<uint16_t>               words;    // resident images, then samplers
 		uint64_t                            layout_epoch   = 0; // read_layout_epoch at RebindImages
 		bool                                samplers_valid = false;
