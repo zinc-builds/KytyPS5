@@ -13,7 +13,7 @@
 // vblank; the screen shows fewer distinct images. See docs/frame-skip.md.
 //
 // A skipped frame keeps the draws whose results outlive the frame (render targets not redrawn
-// every frame, draws that write buffers or storage images, targets the CPU reads back, entries
+// every frame, targets the CPU reads back, shaders that write buffers or storage images, entries
 // of KYTY_FRAME_SKIP_KEEP) and draws with no render target. KYTY_FRAME_SKIP_DIAG=1 reports those
 // classes per render target, with the mode on or off.
 //
@@ -57,8 +57,15 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 // port's registered buffer addresses (scan-out only, never kept).
 void OnFlip(const uint64_t* display_buffers, int display_buffer_count);
 
-// Any thread: a draw whose shaders write buffers or storage images (its target is kept).
-void NoteSideEffectDraw(const HW::Context& ctx, bool buffer_writes, bool image_writes);
+// Any thread (the draw commit): a draw whose shaders write buffers or storage images. Skipped
+// frames keep the draws of that shader combination. `ranges` are the written buffer ranges when
+// `known` (no raw-address or indirect writes); `atomic_only` when every buffer write is atomic.
+struct WrittenRange {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+void NoteSideEffectDraw(const HW::Shader& sh, bool buffer_writes, bool image_writes, bool atomic_only,
+                        bool known, const WrittenRange* ranges, int range_count);
 
 // Presenter thread: a main-port flip reached the screen at `vblank`; `presented` is false for a
 // skipped frame (no new image).

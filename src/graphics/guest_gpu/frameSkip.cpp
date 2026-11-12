@@ -56,7 +56,6 @@ struct Target {
 	uint32_t height       = 0;
 	uint32_t format       = 0;
 	bool     depth        = false;
-	bool     side_effects = false; // a draw into it writes buffers or storage images
 	bool     readback     = false; // the texture cache writes it back for the CPU
 	bool     keep_listed  = false; // KYTY_FRAME_SKIP_KEEP
 	bool     display      = false; // a video-out buffer (scan-out only)
@@ -65,6 +64,21 @@ struct Target {
 	uint64_t diag_frames = 0;
 	uint64_t diag_draws  = 0;
 	uint64_t diag_kept   = 0;
+};
+
+struct SideDraw {
+	uint64_t     key = 0, ps = 0, gs = 0;
+	bool         buffer = false, image = false, atomic_only = false, known = false;
+	int          range_count = 0;
+	WrittenRange ranges[4] {};
+};
+
+struct SideShader {
+	uint64_t ps = 0, gs = 0;
+	uint64_t draws = 0, image_draws = 0, atomic_only_draws = 0, unknown_draws = 0;
+	uint64_t readback_hits = 0;
+	std::vector<WrittenRange>    ranges; // the first few distinct ones
+	std::unordered_set<uint64_t> pages;  // diagnostic: written 4 KiB pages (capped)
 };
 
 struct State {
@@ -92,9 +106,11 @@ struct State {
 	uint32_t frame_indirect = 0, frame_indirect_count = 0, frame_untargeted = 0;
 
 	// Side-effect draws reported from the commit side, merged at the next flip.
-	std::mutex            side_mutex;
-	std::vector<uint64_t> side_pending;
-	uint64_t              side_buffer_draws = 0, side_image_draws = 0;
+	std::mutex             side_mutex;
+	std::vector<SideDraw>  side_pending;
+	std::vector<uint64_t>  readback_pending; // diagnostic: 4 KiB pages
+	std::unordered_map<uint64_t, SideShader> side_shaders; // command thread
+	uint64_t side_buffer_draws = 0, side_image_draws = 0, readbacks = 0, readback_hits = 0;
 
 	// Presenter thread.
 	uint64_t last_vblank       = 0;
@@ -102,7 +118,7 @@ struct State {
 
 	// Report counters (any thread).
 	std::atomic<uint64_t> flips {0}, skipped {0}, shown {0}, misses {0}, dropped_draws {0},
-	    kept_draws {0}, cpu_readbacks {0};
+	    kept_draws {0};
 	std::atomic<uint64_t> misses_total {0}; // monotonic, for the feedback
 	std::atomic<uint32_t> worst_gap {0};
 	std::array<std::atomic<uint64_t>, 5> gap_hist {}; // 1, 2, 3, 4, 5+ vblanks
@@ -138,6 +154,13 @@ struct TargetInfo {
 	bool     tiled  = false;
 	bool     depth  = false;
 };
+
+// The draw's shader combination, as the command processor's registers name it.
+uint64_t ShaderKey(const HW::Shader& sh) {
+	const auto& vs = sh.GetVs();
+	return sh.GetPs().ps_regs.data_addr ^ (vs.gs_regs.data_addr * 0x9e3779b97f4a7c15ull) ^
+	       (vs.es_regs.data_addr * 0xc2b2ae3d27d4eb4full);
+}
 
 TargetInfo DrawTarget(const HW::Context& ctx) {
 	TargetInfo info;
@@ -190,7 +213,7 @@ Target& FindTarget(State& s, const TargetInfo& info) {
 
 void Decide(Target& t) {
 	const bool every_frame = t.rate >= EVERY_FRAME_RATE;
-	t.keep = !t.display && (t.keep_listed || t.side_effects || t.readback || !every_frame);
+	t.keep = !t.display && (t.keep_listed || t.readback || !every_frame);
 }
 
 const char* ClassOf(const Target& t) {
@@ -199,9 +222,6 @@ const char* ClassOf(const Target& t) {
 	}
 	if (t.keep_listed) {
 		return "keep-list";
-	}
-	if (t.side_effects) {
-		return "side-effects";
 	}
 	if (t.readback) {
 		return "cpu-readback";
@@ -225,13 +245,40 @@ void ParseKeepList(State& s, const char* list) {
 void DiagReport(State& s) {
 	const double frames = static_cast<double>(std::max<uint64_t>(s.diag_frames, 1));
 	std::printf("FSDIAG frames=%" PRIu64 " draws_frame=%.0f indirect_frame=%.1f "
-	            "indirect_gpu_count_frame=%.1f untargeted_frame=%.1f side_buffer_draws=%" PRIu64
-	            " side_image_draws=%" PRIu64 " cpu_readbacks=%" PRIu64 " targets=%zu\n",
+	            "indirect_gpu_count_frame=%.1f untargeted_frame=%.1f side_buffer_draws_frame=%.1f"
+	            " side_image_draws_frame=%.1f cpu_readback_faults=%" PRIu64
+	            " in_draw_written_pages=%" PRIu64 " targets=%zu side_shaders=%zu\n",
 	            s.diag_frames, static_cast<double>(s.diag_draws) / frames,
 	            static_cast<double>(s.diag_indirect) / frames,
 	            static_cast<double>(s.diag_indirect_count) / frames,
-	            static_cast<double>(s.diag_untargeted) / frames, s.side_buffer_draws,
-	            s.side_image_draws, s.cpu_readbacks.exchange(0), s.targets.size());
+	            static_cast<double>(s.diag_untargeted) / frames,
+	            static_cast<double>(s.side_buffer_draws) / frames,
+	            static_cast<double>(s.side_image_draws) / frames, s.readbacks, s.readback_hits,
+	            s.targets.size(), s.side_shaders.size());
+	std::vector<std::pair<uint64_t, SideShader*>> shaders;
+	for (auto& [key, side]: s.side_shaders) {
+		if (side.draws != 0) {
+			shaders.emplace_back(key, &side);
+		}
+	}
+	std::sort(shaders.begin(), shaders.end(),
+	          [](const auto& a, const auto& b) { return a.second->draws > b.second->draws; });
+	for (const auto& [key, side]: shaders) {
+		std::string ranges;
+		for (const auto& r: side->ranges) {
+			char buf[64];
+			std::snprintf(buf, sizeof(buf), " 0x%" PRIx64 "+0x%" PRIx64, r.address, r.size);
+			ranges += buf;
+		}
+		std::printf("FSDIAG side ps=0x%" PRIx64 " gs=0x%" PRIx64 " draws_frame=%.1f image=%" PRIu64
+		            " atomic_only=%" PRIu64 " unknown_range=%" PRIu64 " readback_hits=%" PRIu64
+		            " ranges:%s\n",
+		            side->ps, side->gs, static_cast<double>(side->draws) / frames, side->image_draws,
+		            side->atomic_only_draws, side->unknown_draws, side->readback_hits, ranges.c_str());
+		side->draws = side->image_draws = side->atomic_only_draws = side->unknown_draws = 0;
+		side->readback_hits = 0;
+	}
+	s.readbacks = s.readback_hits = 0;
 	std::vector<std::pair<uint64_t, const Target*>> rows;
 	for (const auto& [key, t]: s.targets) {
 		if (t.diag_draws != 0) {
@@ -351,7 +398,8 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 	if (!Detail::g_skipping) {
 		return false;
 	}
-	if (t->keep || (!s.keep_list.empty() && s.keep_list.contains(sh.GetPs().ps_regs.data_addr))) {
+	if (t->keep || (!s.side_shaders.empty() && s.side_shaders.contains(ShaderKey(sh))) ||
+	    (!s.keep_list.empty() && s.keep_list.contains(sh.GetPs().ps_regs.data_addr))) {
 		s.frame_kept++;
 		t->diag_kept++;
 		return false;
@@ -360,17 +408,29 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 	return true;
 }
 
-void NoteSideEffectDraw(const HW::Context& ctx, bool buffer_writes, bool image_writes) {
-	const auto info = DrawTarget(ctx);
-	auto&      s    = S();
+void NoteSideEffectDraw(const HW::Shader& sh, bool buffer_writes, bool image_writes, bool atomic_only,
+                        bool known, const WrittenRange* ranges, int range_count) {
+	SideDraw draw;
+	draw.key         = ShaderKey(sh);
+	draw.ps          = sh.GetPs().ps_regs.data_addr;
+	draw.gs          = sh.GetVs().gs_regs.data_addr;
+	draw.buffer      = buffer_writes;
+	draw.image       = image_writes;
+	draw.atomic_only = atomic_only;
+	draw.known       = known;
+	draw.range_count = std::min(range_count, 4);
+	std::copy_n(ranges, draw.range_count, draw.ranges);
+	auto&            s = S();
 	std::scoped_lock lock(s.side_mutex);
-	s.side_pending.push_back(info.key);
-	s.side_buffer_draws += buffer_writes ? 1u : 0u;
-	s.side_image_draws += image_writes ? 1u : 0u;
+	s.side_pending.push_back(draw);
 }
 
-void NoteCpuReadback(uint64_t /*vaddr*/) {
-	S().cpu_readbacks.fetch_add(1, std::memory_order_relaxed);
+void NoteCpuReadback(uint64_t vaddr) {
+	auto&            s = S();
+	std::scoped_lock lock(s.side_mutex);
+	if (s.readback_pending.size() < 65536) {
+		s.readback_pending.push_back(vaddr >> 12u);
+	}
 }
 
 void NoteFlipDone(uint64_t vblank, bool presented) {
@@ -415,12 +475,47 @@ void OnFlip(const uint64_t* display_buffers, int display_buffer_count) {
 	// Side-effect draws the commit side saw since the last flip.
 	{
 		std::scoped_lock lock(s.side_mutex);
-		for (const auto key: s.side_pending) {
-			if (auto it = s.targets.find(key); it != s.targets.end()) {
-				it->second.side_effects = true;
+		for (const auto& draw: s.side_pending) {
+			auto& side = s.side_shaders[draw.key];
+			side.ps    = draw.ps;
+			side.gs    = draw.gs;
+			side.draws++;
+			side.image_draws += draw.image ? 1u : 0u;
+			side.atomic_only_draws += draw.buffer && draw.atomic_only ? 1u : 0u;
+			side.unknown_draws += draw.buffer && !draw.known ? 1u : 0u;
+			s.side_buffer_draws += draw.buffer ? 1u : 0u;
+			s.side_image_draws += draw.image ? 1u : 0u;
+			if (!Detail::g_diag) {
+				continue;
+			}
+			for (int i = 0; i < draw.range_count; i++) {
+				const auto& r = draw.ranges[i];
+				if (side.ranges.size() < 4 &&
+				    std::none_of(side.ranges.begin(), side.ranges.end(), [&](const auto& x) {
+					    return x.address == r.address && x.size == r.size;
+				    })) {
+					side.ranges.push_back(r);
+				}
+				for (uint64_t page = r.address >> 12u; page <= (r.address + r.size - 1) >> 12u &&
+				                                       side.pages.size() < 16384;
+				     page++) {
+					side.pages.insert(page);
+				}
 			}
 		}
 		s.side_pending.clear();
+		for (const auto page: s.readback_pending) {
+			s.readbacks++;
+			bool hit = false;
+			for (auto& [key, side]: s.side_shaders) {
+				if (side.pages.contains(page)) {
+					side.readback_hits++;
+					hit = true;
+				}
+			}
+			s.readback_hits += hit ? 1u : 0u;
+		}
+		s.readback_pending.clear();
 	}
 	for (int i = 0; i < display_buffer_count; i++) {
 		if (auto it = s.targets.find(display_buffers[i]); it != s.targets.end()) {

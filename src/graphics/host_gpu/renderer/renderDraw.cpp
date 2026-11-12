@@ -1313,16 +1313,36 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (FrameSkip::Active()) {
-		// Draws whose shaders write memory outlive their frame: frame skipping keeps their target.
+		// Draws whose shaders write memory outlive their frame: frame skipping keeps them.
 		bool image_writes = false;
+		bool known        = true;
+		bool atomic_only  = true;
+		std::array<FrameSkip::WrittenRange, 4> ranges {};
+		int                                    range_count = 0;
 		for (const auto* stage: stages) {
-			for (const auto& image: stage->runtime->module->info.info.images) {
+			const auto& program = stage->runtime->module->info;
+			known = known && !program.has_address_writes && !program.info.uses_dma;
+			for (const auto& image: program.info.images) {
 				image_writes = image_writes || image.written || image.atomic;
+			}
+			for (const auto& meta: program.info.buffers) {
+				if (!meta.written && !meta.atomic) {
+					continue;
+				}
+				atomic_only = atomic_only && meta.atomic && !meta.plain_access;
+				if (meta.descriptor_index >= stage->buffer_sources.size()) {
+					known = false;
+					continue;
+				}
+				const auto& source = stage->buffer_sources[meta.descriptor_index];
+				if (source.size != 0 && range_count < static_cast<int>(ranges.size())) {
+					ranges[range_count++] = {source.address, source.size};
+				}
 			}
 		}
 		if (shader_write_stages || image_writes) {
-			FrameSkip::NoteSideEffectDraw(buffer.GetRegisters(), static_cast<bool>(shader_write_stages),
-			                              image_writes);
+			FrameSkip::NoteSideEffectDraw(buffer.GetShaders(), static_cast<bool>(shader_write_stages),
+			                              image_writes, atomic_only, known, ranges.data(), range_count);
 		}
 	}
 	if (shader_write_stages || HasAtomicWrites()) {
