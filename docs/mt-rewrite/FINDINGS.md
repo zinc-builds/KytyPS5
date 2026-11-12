@@ -1789,6 +1789,25 @@ target and 8M pipeline-key checks); the level renders the same as a plain build.
 
 ### Tooling notes
 
+- **The shader store survives unrelated rebuilds** (`_PipelineCache/<title>.shaders` in the
+  install dir). Its header no longer holds the executable's build time.
+  - **What the key holds:**
+    - a manual format number;
+    - a hash of the sources that decide what the store records: `src/graphics/shader`, the guest
+      format and register definitions, `pipelineCache.h/.cpp`, `pipelineSerialization.cpp` and
+      `renderTarget.h` (listed in `CMakeLists.txt`, hashed at build time);
+    - `sizeof(GraphicsPipelineKey)`;
+    - the device and the switches that change generated code (SPIR-V profile, limits, subgroup
+      sizes, the buffer cache's page table geometry, `KYTY_MASKED_SELECTS`,
+      `KYTY_BDA_STATS=access`).
+  - **Measured:**
+    - a rebuild after editing `libAudio.cpp` reloaded 352 programs, 459 modules and 384
+      pipelines in 194 ms;
+    - an edit under `src/graphics/shader` and `KYTY_MASKED_SELECTS=0` both started cold.
+  - **Manual override:** `KYTY_SHADER_CACHE_STAMP=N` (from upstream #2178) replaces the source
+    hash with N.
+  - **When adding a source that changes generated code outside those files,** add it to the list
+    or bump the format number.
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or
   missing trace data". Off-CPU time came from Tracy zones instead.
 - RenderDoc 1.46 cannot run the emulator. It lacks `VK_KHR_wayland_surface` (use
@@ -2269,7 +2288,7 @@ efficiency cores changes the game's pace from batch to batch, so only arms of on
   (`PIPESTATS kind=… vs=<module id> ps=<module id> exec=… Register_Count=… Binary_Size=…` on
   NVIDIA), with the module ids `KYTY_GPU_TIME=draws` and `KYTY_SPV_DUMP` use.
 - `KYTY_MASKED_SELECTS=0` (Track G): vertex shaders keep every EXEC select. For A/B only, in
-  an install dir of its own: the shader store doesn't record the setting.
+  an install dir of its own (the store records the setting, so switching it recompiles).
 - Core layout: `KYTY_GUEST_THREAD_CPUS=<list>|none` (where the game's threads run, default the
   efficiency cores but the recorder's), `KYTY_GUEST_PCORE_PRIORITY=<n>|off` (game threads at
   guest priority n or above stay on the performance cores; default: the graphics submitter's

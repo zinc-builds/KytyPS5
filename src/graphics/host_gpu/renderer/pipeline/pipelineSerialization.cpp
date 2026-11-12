@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
@@ -41,11 +42,22 @@ struct Frame {
 // Bump to discard every existing store by hand (a change the source hash cannot see).
 constexpr uint32_t kShaderStoreFormat = 1;
 
+// KYTY_SHADER_CACHE_STAMP=N (N > 0) replaces the source hash with N: a manual key, to keep a store
+// across a source change known not to alter what it records, or to discard one by changing N.
+// Change N whenever the shader recompiler changes, or the stored programs no longer match the code.
+uint64_t ManualStamp() {
+	static const uint64_t stamp = [] {
+		const char* env = std::getenv("KYTY_SHADER_CACHE_STAMP");
+		return env != nullptr && env[0] != '\0' ? std::strtoull(env, nullptr, 10) : uint64_t {0};
+	}();
+	return stamp;
+}
+
 // What every record depends on besides its own fields. A store is reused only when all of it
 // matches, so a rebuild that leaves these alone keeps the store:
 //  - KYTY_SHADER_STORE_SOURCE_HASH: the sources that turn guest code into the stored modules and
 //    keys (CMakeLists.txt lists them: the recompiler, its IR and serialization, the guest format
-//    and register definitions, the pipeline cache and this file);
+//    and register definitions, the pipeline cache and this file), or KYTY_SHADER_CACHE_STAMP;
 //  - sizeof(GraphicsPipelineKey): pipeline records are its raw bytes;
 //  - the device and the switches that change generated code: the SPIR-V profile, the shared
 //    memory limit, the host subgroup sizes, the buffer cache's page table geometry, masked selects
@@ -56,11 +68,12 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	const uint32_t bda_access     = MemDiag::BdaStatsMode() == 2 ? 1u : 0u;
 	const uint32_t masked_selects = ShaderRecompiler::MaskedSelectsEnabled() ? 1u : 0u;
 	const uint32_t wave64         = graphics.SupportsComputeWave64() ? 1u : 0u;
-	const uint64_t source_hash    = KYTY_SHADER_STORE_SOURCE_HASH;
+	const uint32_t manual         = ManualStamp() != 0 ? 1u : 0u;
+	const uint64_t source_hash    = manual != 0 ? ManualStamp() : KYTY_SHADER_STORE_SOURCE_HASH;
 	const uint64_t key_size       = sizeof(GraphicsPipelineKey);
 	const uint32_t page_bits      = BufferCache::CACHING_PAGEBITS;
 	const uint64_t page_count     = BufferCache::CACHING_NUMPAGES;
-	IoAll(header, kShaderStoreFormat, source_hash, key_size, properties.vendorID,
+	IoAll(header, kShaderStoreFormat, manual, source_hash, key_size, properties.vendorID,
 	      properties.deviceID, SpirvProfile(graphics), properties.limits.maxComputeSharedMemorySize,
 	      graphics.subgroup_size, wave64, page_bits, page_count, masked_selects, bda_access);
 	return std::move(header.bytes);
