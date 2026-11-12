@@ -63,6 +63,16 @@ void DeferredRecorder::Publish() {
 	}
 }
 
+void DeferredRecorder::PublishAndWake() {
+	Publish();
+	// Pairs with the recorder's seq_cst sleeping store and published load: either it sees what
+	// was published, or this sees it asleep.
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	if (m_sleeping.load(std::memory_order_relaxed)) {
+		Wake();
+	}
+}
+
 void DeferredRecorder::Wake() {
 	m_sleeping.store(false, std::memory_order_seq_cst);
 	Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::Wake);

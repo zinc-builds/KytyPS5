@@ -32,6 +32,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -2205,11 +2206,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			buffer.EndRendering();
 			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
 			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));
-			buffer.Handle().pipelineBarrier(
-			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
-			        vk::PipelineStageFlagBits::eAllGraphics |
-			        vk::PipelineStageFlagBits::eComputeShader,
-			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
+			buffer.RecordQueued([barrier, shader_stages](vk::CommandBuffer cb) {
+				cb.pipelineBarrier(vk::PipelineStageFlagBits::eHost |
+				                       vk::PipelineStageFlagBits::eTransfer |
+				                       vk::PipelineStageFlagBits::eAllGraphics |
+				                       vk::PipelineStageFlagBits::eComputeShader,
+				                   shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0,
+				                   nullptr);
+			});
 		}
 
 		auto& shadow = descriptors.resident;
@@ -2393,8 +2397,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			bound.PushConstants(buffer, pipeline.pipeline_layout, pipeline.push_stages, 0,
 			                    sizeof(push_data), push_data.dwords.data());
 		} else {
-			buffer.BindingHandle().pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
-			                        sizeof(push_data), push_data.dwords.data());
+			buffer.RecordBinding(
+			    sizeof(push_data),
+			    [&](std::byte* out) { std::memcpy(out, push_data.dwords.data(), sizeof(push_data)); },
+			    [layout = pipeline.pipeline_layout, stages = pipeline.push_stages](
+			        vk::CommandBuffer cb, const std::byte* values) {
+				    cb.pushConstants(layout, stages, 0, sizeof(push_data), values);
+			    });
 		}
 	}
 
@@ -2402,9 +2411,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (pipeline.uses_push_descriptors && graphics) {
 			bound.PushDescriptors(buffer, pipeline.pipeline_layout, m_descriptor_writes);
 		} else if (pipeline.uses_push_descriptors) {
-			buffer.BindingHandle().pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                                     static_cast<uint32_t>(m_descriptor_writes.size()),
-			                                     m_descriptor_writes.data());
+			const auto writes = std::span<const vk::WriteDescriptorSet> {m_descriptor_writes};
+			buffer.RecordBinding(
+			    DescriptorWritesSize(writes),
+			    [writes](std::byte* data) { CopyDescriptorWrites(writes, data); },
+			    [pipeline_bind_point, layout = pipeline.pipeline_layout,
+			     count = static_cast<uint32_t>(writes.size())](vk::CommandBuffer cb,
+			                                                   const std::byte* data) {
+				    cb.pushDescriptorSetKHR(pipeline_bind_point, layout, 0, count,
+				                            reinterpret_cast<const vk::WriteDescriptorSet*>(data));
+			    });
 		} else {
 			if (graphics) {
 				bound.ForgetLayout();
@@ -2432,8 +2448,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				device.updateDescriptorSets(static_cast<uint32_t>(m_descriptor_writes.size()),
 				                            m_descriptor_writes.data(), 0, nullptr);
-				buffer.BindingHandle().bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
-				                                   0, 1, &set, 0, nullptr);
+				buffer.RecordBinding([pipeline_bind_point, layout = pipeline.pipeline_layout,
+				                      set](vk::CommandBuffer cb) {
+					cb.bindDescriptorSets(pipeline_bind_point, layout, 0, 1, &set, 0, nullptr);
+				});
 			}
 		}
 	}

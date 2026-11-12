@@ -1,5 +1,7 @@
 #include "common/gpuWaitDiag.h"
 
+#include "common/stallDiag.h"
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -79,6 +81,8 @@ struct State {
 	uint64_t                                   early       = 0;
 	std::unordered_map<uint64_t, SiteTotal>    sites;
 	std::unordered_map<uint64_t, StackTotal>   stacks;
+	std::array<std::pair<uint64_t, uint64_t>, static_cast<size_t>(Driver::Count)> driver {};
+	std::unordered_map<uint64_t, SiteTotal>    direct_sites; // ns = drain wait
 	std::unordered_map<uint64_t, SiteTotal>    sched_sites;  // backlog = ahead, idle = gpu_done
 	std::unordered_map<uint64_t, StackTotal>   sched_stacks;
 	uint64_t                                   sched_waits   = 0;
@@ -350,6 +354,42 @@ void NoteWait(uint64_t tick, uint64_t current, uint64_t known, uint64_t start_ns
 	}
 }
 
+bool DriverStats() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRIVER_STATS");
+		return Enabled() && value != nullptr && value[0] != '0';
+	}();
+	return enabled;
+}
+
+DriverScope::DriverScope(Driver kind) noexcept: m_kind(kind) {
+	if (DriverStats() && StallDiag::OnCommandThread()) {
+		m_start = NowNs();
+	}
+}
+
+void NoteDriver(Driver kind, uint64_t ns) noexcept {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	auto&           d = s.driver[static_cast<size_t>(kind)];
+	d.first++;
+	d.second += ns;
+}
+
+void NoteDirectRecord(const std::source_location& site, uint64_t drain_ns) noexcept {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	auto&           t = s.direct_sites[SiteKey(site)];
+	if (t.n == 0) {
+		t.file     = site.file_name();
+		t.function = site.function_name();
+		t.line     = site.line();
+	}
+	t.n++;
+	t.ns += drain_ns;
+	t.idle += drain_ns != 0 ? 1 : 0; // drains that waited
+}
+
 void NoteSchedulerWait(uint64_t start_ns, uint64_t end_ns, bool gpu_done, uint32_t ahead,
                        const std::source_location& site) noexcept {
 	std::array<void*, StackDepth + StackSkip> raw {};
@@ -476,6 +516,35 @@ void Report() noexcept {
 		            static_cast<double>(t->distance) / n, 100.0 * static_cast<double>(t->current) / n,
 		            static_cast<double>(t->age_ns) / 1e3 / n, 100.0 * static_cast<double>(t->idle) / n,
 		            t->function);
+	}
+	if (DriverStats()) {
+		static constexpr std::array<const char*, static_cast<size_t>(Driver::Count)> names = {
+		    "submit", "queue_submit", "refresh", "begin_command", "image_create", "image_create_dedicated",
+		    "image_delete", "buffer_create", "buffer_create_dedicated", "buffer_delete"};
+		std::string line = "DRIVER";
+		for (size_t i = 0; i < names.size(); i++) {
+			char text[96];
+			std::snprintf(text, sizeof(text), " %s=%.0f/%.3fms", names[i],
+			              static_cast<double>(s.driver[i].first) / secs,
+			              static_cast<double>(s.driver[i].second) / 1e6 / secs);
+			line += text;
+		}
+		std::printf("%s\n", line.c_str());
+		s.driver = {};
+		std::vector<const SiteTotal*> direct;
+		for (const auto& [key, t]: s.direct_sites) {
+			direct.push_back(&t);
+		}
+		std::sort(direct.begin(), direct.end(), [](const auto* a, const auto* b) { return a->n > b->n; });
+		for (size_t i = 0; i < direct.size() && i < 20; i++) {
+			const auto* t    = direct[i];
+			const char* file = std::strstr(t->file, "src/");
+			std::printf("DRIVERSITE %s:%u direct_s=%.0f drained_s=%.0f drain_ms_s=%.3f fn=%s\n",
+			            file != nullptr ? file : t->file, t->line, static_cast<double>(t->n) / secs,
+			            static_cast<double>(t->idle) / secs, static_cast<double>(t->ns) / 1e6 / secs,
+			            t->function);
+		}
+		s.direct_sites.clear();
 	}
 	std::printf("SCHEDWAIT waits_s=%.0f wait_ms_s=%.2f\n", static_cast<double>(s.sched_waits) / secs,
 	            static_cast<double>(s.sched_wait_ns) / 1e6 / secs);

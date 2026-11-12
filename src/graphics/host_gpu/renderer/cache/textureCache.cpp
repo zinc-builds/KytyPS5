@@ -326,7 +326,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	m_download_images.erase(id);
 	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
-		m_surface_metas.erase(image.info.metadata.range.address);
+		// Only the last image to acquire an HTile range releases its clear state.
+		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
+		if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
+			m_surface_metas.erase(metadata);
+		}
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -1842,6 +1846,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 				if (inserted && image.info.htile_initial_clear) {
 					metadata->second.clear_mask.set();
 				}
+				metadata->second.owner = id;
 			}
 			return image.FindView(desc.view_info);
 		}
@@ -1860,6 +1865,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 			if (inserted && image.info.htile_initial_clear) {
 				metadata->second.clear_mask.set();
 			}
+			metadata->second.owner = id;
 		}
 		return image.FindView(desc.view_info);
 	}
@@ -1887,6 +1893,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		metadata->second.owner = id;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2043,21 +2050,31 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		CommitGpuWrite(image);
 		return;
 	}
-	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
+	const auto barriers = image.TransitBarriers(vk::ImageLayout::eTransferDstOptimal,
+	                                            vk::AccessFlagBits2::eTransferWrite, {});
 	auto native_range = range;
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
-	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &clear.color, 1, &native_range);
-	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
-		                                        vk::ImageLayout::eTransferDstOptimal,
-		                                        &clear.depthStencil, 1, &native_range);
-	}
+	command.RecordQueued(
+	    barriers.size() * sizeof(vk::ImageMemoryBarrier2),
+	    [&](std::byte* out) {
+		    std::memcpy(out, barriers.data(), barriers.size() * sizeof(vk::ImageMemoryBarrier2));
+	    },
+	    [count = static_cast<uint32_t>(barriers.size()), target = image.backing.image, clear,
+	     native_range,
+	     color = range.aspectMask == vk::ImageAspectFlagBits::eColor](vk::CommandBuffer cb,
+	                                                                  const std::byte* data) {
+		    Image::RecordBarriers(cb, reinterpret_cast<const vk::ImageMemoryBarrier2*>(data), count);
+		    if (color) {
+			    cb.clearColorImage(target, vk::ImageLayout::eTransferDstOptimal, &clear.color, 1,
+			                       &native_range);
+		    } else {
+			    cb.clearDepthStencilImage(target, vk::ImageLayout::eTransferDstOptimal,
+			                              &clear.depthStencil, 1, &native_range);
+		    }
+	    });
 	CommitGpuWrite(image);
 }
 
@@ -2394,18 +2411,13 @@ void TextureCache::RunGarbageCollector() {
 		}
 		age = std::min(age, tick);
 		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
-			candidates.push_back(id);
-			return candidates.size() == deletions;
-		});
+		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
@@ -2415,18 +2427,11 @@ void TextureCache::RunGarbageCollector() {
 				TouchImage(*owner);
 				continue;
 			}
-			if (owner->IsGpuModified()) {
-				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
-				if (safe && !pressured) {
-					continue;
-				}
-				if (safe && !DownloadImageMemory(id)) {
-					continue;
-				}
+			if (owner->SafeToDownload() &&
+			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
+				continue;
 			}
+			--deletions;
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {

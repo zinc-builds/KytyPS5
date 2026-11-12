@@ -1060,23 +1060,30 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// One barrier pair for the whole batch: the global barriers cover every destination.
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		const auto native = command.Handle();
-		if (!m_upload_batch.open) {
-			m_upload_batch.open = true;
-			const vk::MemoryBarrier before {
-			    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-			                     vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
-			    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
-			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-			                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1,
-			                       &before, 0, nullptr, 0, nullptr);
-		}
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
+		const bool open = !m_upload_batch.open;
+		m_upload_batch.open = true;
+		command.RecordQueued(
+		    copies.size() * sizeof(vk::BufferCopy),
+		    [&](std::byte* out) { std::memcpy(out, copies.data(), copies.size() * sizeof(vk::BufferCopy)); },
+		    [open, source, dst = buffer.Handle(), count = static_cast<uint32_t>(copies.size())](
+		        vk::CommandBuffer native, const std::byte* data) {
+			    if (open) {
+				    const vk::MemoryBarrier before {
+				        .srcAccessMask = vk::AccessFlagBits::eMemoryRead |
+				                         vk::AccessFlagBits::eMemoryWrite |
+				                         vk::AccessFlagBits::eTransferRead |
+				                         vk::AccessFlagBits::eTransferWrite,
+				        .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+				    native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+				                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {},
+				                           1, &before, 0, nullptr, 0, nullptr);
+			    }
+			    native.copyBuffer(source, dst, count,
+			                      reinterpret_cast<const vk::BufferCopy*>(data));
+		    });
 	} else if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |
@@ -1087,17 +1094,25 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		before.buffer              = buffer.Handle();
 		before.offset              = 0;
 		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		command.RecordQueued(
+		    copies.size() * sizeof(vk::BufferCopy),
+		    [&](std::byte* out) { std::memcpy(out, copies.data(), copies.size() * sizeof(vk::BufferCopy)); },
+		    [before, after, source, dst = buffer.Handle(),
+		     count = static_cast<uint32_t>(copies.size())](vk::CommandBuffer native,
+		                                                   const std::byte* data) {
+			    native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                           vk::PipelineStageFlagBits::eTransfer,
+			                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0,
+			                           nullptr);
+			    native.copyBuffer(source, dst, count, reinterpret_cast<const vk::BufferCopy*>(data));
+			    native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                           vk::PipelineStageFlagBits::eAllCommands,
+			                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0,
+			                           nullptr);
+		    });
 		if (m_last_upload_async && AsyncUploadVerifyEnabled()) {
 			VerifyAsyncUpload(buffer, copies, total_size);
 		}
@@ -1949,7 +1964,7 @@ struct PageState {
 
 // Command thread only from here on.
 struct Totals {
-	uint64_t uploads = 0, bytes = 0, pages = 0;
+	uint64_t calls = 0, uploads = 0, bytes = 0, pages = 0; // calls: PrepareBda
 	uint64_t source_bytes[SOURCES + 1] {}; // + not queued by any source this PrepareBda
 	uint64_t repeat_pages = 0;             // uploaded earlier in the same frame
 	uint64_t sampled = 0, sampled_first = 0, changed_bytes = 0, changed_lines = 0, span_bytes = 0;
@@ -2114,6 +2129,9 @@ void Print(double seconds, uint64_t frames) {
 	            static_cast<double>(t.repeat_pages) / seconds, kb(t.source_bytes[0]),
 	            kb(t.source_bytes[1]), kb(t.source_bytes[2]), kb(t.source_bytes[3]),
 	            kb(t.source_bytes[4]));
+	std::printf(" prepare_bda_s=%.0f prepare_bda_per_frame=%.1f",
+	            static_cast<double>(t.calls) / seconds,
+	            frames != 0 ? static_cast<double>(t.calls) / static_cast<double>(frames) : 0.0);
 	const auto compared = t.sampled - t.sampled_first;
 	const auto per      = [compared](uint64_t v) {
         return compared != 0 ? static_cast<double>(v) / static_cast<double>(compared) : 0.0;
@@ -2168,6 +2186,7 @@ RangeSet BufferCache::TakeBdaSync() {
 
 void BufferCache::BdaStatsTick() {
 	using Clock = std::chrono::steady_clock;
+	BdaStats::g_totals.calls++; // once per PrepareBda
 	static Clock::time_point last        = Clock::now();
 	static uint64_t          last_frames = MemDiag::g_flips.load(std::memory_order_relaxed);
 	const auto               now         = Clock::now();
@@ -2257,9 +2276,11 @@ void BufferCache::EndUploadBatch() {
 		    .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                                 vk::PipelineStageFlagBits::eAllCommands,
-		                                 vk::DependencyFlags {}, 1, &after, 0, nullptr, 0, nullptr);
+		command.RecordQueued([after](vk::CommandBuffer native) {
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlags {}, 1,
+			                       &after, 0, nullptr, 0, nullptr);
+		});
 	}
 	m_upload_batch = {};
 }

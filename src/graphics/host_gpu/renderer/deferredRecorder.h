@@ -59,8 +59,12 @@ public:
 
 	// Makes the queued commands visible to the recording thread.
 	void Publish();
+	// Publish, and wake the recording thread for certain (a fence; WaitDone's handshake) without
+	// waiting: for queued work something else will wait on, such as a submission.
+	void PublishAndWake();
 
 	// Publishes, then waits until every queued command is recorded.
+	[[nodiscard]] bool Idle() const noexcept { return m_write == m_done.load(std::memory_order_acquire); }
 	void Drain() {
 		if (m_write != m_done.load(std::memory_order_acquire)) {
 			DrainSlow();

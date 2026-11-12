@@ -94,9 +94,11 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-12 | A CP label store skips its one-page `PAGEMAP_SCAN` when the label's page still holds a current token (its marks were cleared when that token was made; stores since stay marked, so the next peek collects and the next scan reports them): label-store scans ~67k → ~5.9k/s, ~70 more collections/s from peeks that now see a store (`KYTY_LABEL_SCAN_SKIP=0` scans always; Track K; gate.sh, same binary, 3 runs a side: `cmd_ns` −2.4% ± 0.5, `cmd_sns` −20.4% ± 1.8, FPS +2.0% ± 0.6; `KYTY_ASYNC_WP_VERIFY` 0 lost). Not done: one lock for the label store's protect and backing store (~4 locked operations per store, ~4 ns/draw, no system calls) | | | | |
 | 2026-11-12 | A resumed submission no longer scans for guest writes at its start when the packet it stopped at collects on its own once satisfied (WAIT_REG_MEM, MEM_SEMAPHORE wait, REWIND; a predication wait still scans): ~520 scans/s fewer on the GPU thread (`KYTY_RESUME_SCAN=1` scans; `=verify` counts the write-watched pages the skip defers, ~175k/s, written while blocked, collected at the wait's release or the next scan; Track K; a pending collection request still forces a full scan; gate.sh, same binary, 3 runs a side: `cmd_ns` −1.3% ± 0.4, `cmd_sns` −19.2% ± 2.6, FPS +2.0% ± 0.7; `KYTY_ASYNC_WP_VERIFY` 0 lost) | | | | |
 | 2026-11-12 | Early submit (`KYTY_EARLY_SUBMIT`, Track W): where a packet already drains, the open command buffer is submitted if the GPU has finished everything earlier and the buffer is ≥300 µs old, so the end-of-frame GPU work no longer waits for the guest's command buffer to end. Same binary, `KYTY_EARLY_SUBMIT=0` as reference, PGO, frames 1000–1600 (gate.sh): FPS +5.00% ±0.39 (ref 55.66 / 54.32; on dev ab68b255+#107; +3.62% on a6a007df), `cmd_ns` +0.4% (noise; ~5.5 extra submits per frame); command-thread GPU wait 0.62 → 0.08 ms/frame, flip completion 4.25 → 2.39 ms after decode | 57.92 / 57.56 | 303.3k / 299.7k | 33.5 / 36.2 (max 66.8) | 27.2 / 27.4 |
+| 2026-11-12 | Per-draw scheduler retirement no longer waits for the priority-operation thread (#112, Track W; `KYTY_RETIRE_NOWAIT=0` restores): when a free tick's normal operation still has a priority operation of that tick or earlier queued or running, it stays queued for a later call; explicit `PopPendingOperations` callers still wait. In every such wait the GPU had already finished the tick. Same binary, PGO, frames 1000–1600 (gate.sh): `cmd_ns` −1.11% ±0.37, FPS −0.39% (noise; the freed time became waiting for guest work, `no_work` 4.4–7.9%); blocking `WaitPriorityOperations` 13.9 → 0.1–0.6 ms/s | – | – | – | – |
 | 2026-11-12 | Hand-off stages after A, not kept (Track B4; PMU builds, frames 1000–1600, 3 runs a side). **B**, slot laid out by writer (command-thread post fields, the worker's ready side with the pool's done flag moved into the slot, worker bulk, commit-side vectors on separate lines) and `Pool::Post` reading `m_spinning` only when a worker sleeps: command-thread snoop-hit loads 37.2 → 36.5 per draw (estimate −4 to −5), workers 23.4 → 24.9, cycles/draw −1.51%±0.80 against dev (no switch; noise), so not merged (branch trackB/slot-header). **D**, `FindBuffers` swapping the worker's buffer-source vectors instead of copying them: cycles +0.06%±0.55, `cmd_ns` +0.27% (same binary, `KYTY_BUFFER_SOURCES_SWAP=0`); the copy's cost was reading the worker-written lines, which the swap still does (branch trackB/handoff-copies). **C** not built: a cycles profile with LBR callers puts all hand-off copies left on the command thread at ~1.5% of its cycles (`FindBuffers` ~0.8%, texture binding assignment ~0.6%, `PostQueuedDraw` ~0.2%); the large `color_info`/`depth_info` copies are the worker's stores, which the command thread only reads. As Track R's prefetch showed (snoop-hit loads −26–29%, cycles flat), loads that only arrive from another core are mostly overlapped; stage A paid because it deleted a copy, its stores and ~38 L1 misses. The command thread's largest copy is now `BufferCache::UploadCopies` (CPU-dirty buffer uploads through `CopySparseMemory`/`TryReadFast`), ~5% of its cycles, and the prepare wait's spinning in `Pool::Wait` ~6% | – | – | – | – |
 | 2026-11-12 | Cache-operation drains: **parked, not built** (Track B4; diagnostics `KYTY_CACHE_OP_KEEP`, `KYTY_GAP_STATS` on branch trackB/drain-rule, Track B's probe on trackB/drain-probe). The guest synchronizes in one cluster between draw groups, typically `EVENT_WRITE` PS_PARTIAL_FLUSH and writebacks, `WRITE_DATA`, `RELEASE_MEM`, `WAIT_REG_MEM` on that label, `ACQUIRE_MEM`, then a decode-time indirect register load, and each of these packets drains. Signatures of the packets between consecutive queued draws (1.5M gaps): 80.7% hold nothing that drains, 18.1% only decode-time reads; drains 12.46 per 1,000 draws. Keeping the queue across cache operations alone: 12.46 (measured same binary, 3 runs a side: drains/kdraw 12.18 → 12.20, `cmd_ns` −0.15%±1.4, `wait_prep` −3.5%±4.7, all noise; the drain moves to `WRITE_DATA`); plus `WRITE_DATA`/`RELEASE_MEM` as ordered queue items: 11.80; plus a `WAIT_REG_MEM` on a label a pending item stores, resolved against the item's value: 8.60 (−31%). Left: guest commands 2.5, dispatches 2.4, occlusion dumps ~1.6 per kdraw. Soundness: GPU-written pages are read-watched, so a decode-time read of a committed draw's write faults and downloads; only still-queued draws are uncovered. A decode-time read follows the cluster in 8.2 of the 12.5 drains per kdraw, so a kept cluster needs a read check on almost every occurrence: (A) wait for the pre-mark draws' preparation and drain only if the read meets their prepared write set, or (B) a write summary at post (target ranges from the registers, a per-shader-address memo of "writes no memory but targets"), falling back to A; backstop: at commit, a pre-mark draw's writes against the pages read after its mark (exit under verify). Track B's probe: 0 of ~340k decode-time reads touched a page the drained draws wrote, 0 touched any page ever GPU-written. Value: the removed drains carry ~20% of the prepare wait (~40 ns/draw, ~0.24 ms per guest frame) as an upper bound; with A about the refill part only (~18 ns/draw, ~0.1 ms). Not built: three ordering mechanisms plus a read check for 0.1–0.24 ms per frame | – | – | – | – |
 | 2026-11-12 | Overflow prepare worker (Track B4): with free lanes, a third worker on the SMT sibling of the last worker's core (CPU 7 here; the emulator's other threads now stay off both workers' siblings) takes only draws at least 3 past the oldest untaken one, so it never holds a draw the command thread wants next (per-slot claim words; the regular workers skip what it took). Same binary, PGO, frames 1000–1600, 3 runs a side (`KYTY_PREPARE_OVERFLOW=0` as reference): cycles/draw −3.10%±0.83 (!), `wait_prep` 204 → 132 ns/draw (−34%±8, !), `cmd_ns` −2.25%±0.77 (?), FPS +2.5%±1.2 (?); per guest frame (`KYTY_FRAME_DIAG` replay): prepare/recorder waits 1.22 → 0.85 ms, command-thread work 16.67 → 16.28 ms, wall 17.38 → 17.08 ms, guest-late idle 0.35 → 0.46 ms, frames taking 2+ refreshes 3.9% → 2.5%; command thread's effective clock 5.045 → 5.015 GHz; `prep_ns` +7% (the sibling worker is slower). Not kept, same binary, plain build, frames 200–500: the worker siblings freed alone (`KYTY_FREE_PREPARE_SIBLINGS=1`) prepare −4%, waits −0.24 ms/frame, wall +0.16 ms (guest-late +0.08), 2+ refreshes unchanged; the overflow worker on an E-core of its own (18, game threads on 12–17) waits −0.22/−0.38 ms/frame (k=5/3) but guest-late idle +0.5/+0.7 ms/frame and FPS −2.8%/−6.4% (the game's threads use all seven E-cores, ~45% each; a shared E-core preempts the worker); on CPU 7 with only that CPU reserved: weaker (waits −0.32 ms/frame). Workers spinning 500 µs instead of 50 before sleeping (`KYTY_PREPARE_SPIN_US`; all workers are asleep at ~22% of the first posts after a drain): wait unchanged, `cmd_ns` +2.7% (!), FPS −4% (!) | – | – | – | – |
+| 2026-11-12 | The command thread's direct Vulkan calls move to the recording thread (Track W; `KYTY_DIRECT_RECORD=1` / `KYTY_SUBMIT_THREAD=0` restore them): the compute dispatch path (binds, barriers, dispatch, the deferred chain barrier), `EndRendering`, `Image::Transit`, draw and atomic-batch write barriers, stream/upload copies and fills, the tiler's image record, transfer clears; and `vkEndCommandBuffer`/`vkQueueSubmit`/`vkBeginCommandBuffer`, with the tick still taken on the command thread. Same binary, both switches as reference, PGO, frames 1000–1600: `cmd_ns` −4.72% ±0.37, cycles/draw −3.99%, FPS +1.31% ±0.39; command-thread CPU 16.3–16.8 → 15.7–15.9 ms per guest frame; recorder drains back to baseline. The dispatch path alone made the remaining direct calls drain the recorder (`wait_rec` 30 → 108 ns/draw); submit alone drained it too | 58.80 / 56.83 | 309.6k / 298.7k | 31.9 / 35.0 (max 50.1) | 35.3 / 29.9 |
 | 2026-11-12 | Decode thread, stage 1 (Track B4; `KYTY_DECODE_THREAD=1|verify`, off by default; docs/mt-rewrite/decode-thread.md): the PM4 loop runs on a decode thread across the packets that keep the draw queue and posts queued draws; every other packet is a sync the GPU thread runs after committing what was posted, then it goes on with the packets itself up to the next draw (without that, every non-draw packet was a round trip: 122k syncs/s, the GPU thread idle 33 ms/s; with it 5.2k/s, ~88 per frame, ~1.1 µs each on its critical path). Same binary, PGO, frames 1000–1600, 3 runs a side, decode thread on the emulator's P-cores: `cmd_ns` −2.24%±0.48 (!), cycles/draw −2.49% (!), instructions/draw −8.0% (!), `wait_prep` +40 ns/draw (!); per guest frame (`KYTY_FRAME_DIAG`): command thread busy 16.39 → 16.06 ms, no guest work 0.39 → 0.60 ms, frames taking 2+ refreshes 2.2% → 1.6%; effective clock unchanged. On CPU 9 (worker 8's sibling): `wait_prep` +71 ns, no gain; on an E-core shared with the game: −27% FPS (the decode thread cannot keep up). Verify (a shadow single-thread decode on the GPU thread compares every posted draw's registers and arguments, the state and order at every sync): clean over frames 0–1600 on PGO, plain and with resident textures (8.8M draws, 146k syncs, 0 guest races); with frame skip every draw synced, so the decode thread now steps aside while frame skipping. Of the ~8% of instructions moved, only ~2.5% of cycles came off: the `wait_prep` rise and cross-core reads of decode-written slots are next, before the default flips; placement is decided with Track R's thread map | – | – | – | – |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
@@ -1580,7 +1582,59 @@ PrepareBda's uploads, measured on a plain build in Sky Garden:
 - Queue to upload took a median of 7.7 s, a p10 of 1.3 ms and a p90 of 31 s: mostly pages PrepareBda doesn't take, which a bind uploads much later.
 - Today this is harmless, because uploads read guest memory at upload time.
 - **Anyone who copies guest data earlier than its use** (pre-staging, worker-side copies, snapshots at a collection) must re-arm write tracking on what they copy, or they will upload stale bytes. That holds even where the guest orders its write before the draw with a label and a wait, because that wait's collection doesn't see unwatched pages.
-- Probe and page versions: branch `trackB/bda-prestage`, `KYTY_BDA_LEAD_STATS`. The pre-staging design that would re-arm tracking is under review with Track K.
+- Probe and page versions: branch `trackB/bda-prestage`, `KYTY_BDA_LEAD_STATS`. Pre-staging, which re-arms tracking, was then built and parked: see the next entry.
+
+### BDA pre-staging: correct, but tracking the pages costs more than copying them (Track B + Track K, 2026-11-12)
+
+PrepareBda's guest→staging copy was moved to a stager thread. The thread arms each queued range (`LibKernel::Memory::ArmStaged`, #116) and copies its pages into a host-visible arena ahead of the draw. PrepareBda then records GPU copies from the arena for the pages whose version is still the one copied. Design: `docs/mt-rewrite/bda-prestage-design.md`. **Parked, unmerged:** branch `trackB/bda-prestage-pr`, kill switch `KYTY_BDA_PRESTAGE=0|1|verify|strict`.
+
+**Correctness: the strongest evidence we have for the asynchronous write tracker.** In `verify` mode, every staged page used is compared with guest memory at use. A difference is classified by whether the page still holds an unconsumed write mark (`PeekAsyncGuestWrites`):
+- **marked:** a store after the last collection. It has no ordering against this draw: every legitimate ordering goes through a collection (submit scan; a wait, semaphore or rewind satisfied by a guest value; a collecting resume), and that collection consumes the mark and moves the version first.
+- **unmarked:** a real loss.
+
+For every marked difference, the page's next use must see a newer version (the "loop" check). Plain build, Sky Garden 1000–1600:
+
+| Run | Unmarked | Marked | Loop closed / open |
+|---|---|---|---|
+| verify | **0** | 41 | 41 / 0 |
+| `--frame-skip auto` | **0** | 12 | 12 / 0 |
+| `KYTY_RESIDENT_TEXTURES=1` | **0** | 14 | 14 / 0 |
+| fault injected (`KYTY_BDA_PRESTAGE_DROP_ARM=1000`: the arm is skipped) | **8 caught** (copies 0.8–14 ms old) | 11 | 11 / 0 |
+
+- With `DROP_ARM=64`, the stale copies crashed the game during loading (a host SIGSEGV at a guest address).
+- The unit test (`virtual_memory_allocation_tests --bda-prestage-only`) catches a stale copy used 1.5 s after staging.
+- **Marked differences:** 1–4 pages/s out of ~150k compared. Size: median 1.4 KB, range 1 byte to 2.1 KB.
+  - **55% hit one buffer at 0x55aaf0000:** ~37 contiguous pages of floats, all rewritten together ~10 ms after staging (per-frame animation or particle data).
+  - A one-byte flag at offset 0x740 of page 0x50ecf3000 recurs (01 → 00), most likely a guest-side status word.
+  - The rest is spread over ~10 buffers.
+- The PGO build was not run.
+
+**Performance: a regression.** Same binary, `KYTY_BDA_PRESTAGE=0` vs on, 3 runs a side, plain build: `cmd_ns` **+4.6% ±0.5 `!`**, cycles/draw +0.0% `~`, `cmd_sns` +60% `!`, ipd +2.4% `!`, FPS **−7.0% `!`**.
+
+| | Effect | Why |
+|---|---|---|
+| Saved | memcpy 7.9% → 3.0% of the command thread's user samples. With the stager on a P-core, cycles/draw −3.3 to −3.5% | 63–72% of PrepareBda's ~1 GB/s served from staging (E-core), 95–99% (P-core) |
+| Kernel | `cmd_sns` 238 → 387 (E-core) / ~500 ns/draw (P-core) | Collection scans go from 5.0k to 14.4k calls/s (+25 ms/s, ≈ +95 ns/draw): #116 must scan every chunk that holds staged pages, and 8–12k pages stay staged at any time. Voluntary context switches go from 369 to 8,640/s (the command thread blocks on the stager's mutex) |
+| GPU | `KYTY_GPU_TIME` busy 627 → 660 ms/s (+5%) | Staged runs were copied from the host-visible arena on the universal queue, not through the transfer queue into a device ring |
+| User | Take 1.7% of the command thread | A per-page hash map and its allocations |
+| FPS | −5.5 to −7% at every placement | Not core competition (see below). GPU time and the command thread's kernel time |
+
+**Placement** (stager busy share and the share of bytes it serves, at ~1 GB/s):
+
+| Stager CPU | Busy | Served | FPS (54.5 off) |
+|---|---|---|---|
+| E-core 18, shared with the game | 34–36% | 63–72% | 51.5 |
+| CPU 4 | 18.7% | 95% | 51.5 |
+| CPU 9 | 20.3% | 99% | 51.3 |
+
+On an E-core, the misses come from lag: pages re-queued 0.3–5 ms before use that the stager hasn't reached yet. Coalescing the inbox and skipping copies that are still current raised the served share from ~40% to ~70%.
+
+**Conclusion: for the pages the game rewrites every frame, tracking them costs more than copying them.** A staged copy is only safe if the page is re-armed, and every armed page has to be scanned at every collection.
+- Fixing the GPU path and the lock would at best leave ~−1% `cmd_ns`, possibly flat, against carrying a second writer of guest-data copies with its own validation rule.
+- Upstream's alternative (0ec2cd5d, Track U) was flat too.
+- The next question is the reverse: leave those pages unwatched and treat them as dirty at every use ("hot-dirty", Track K + Track B).
+
+**#116 stays in dev** (`ArmStaged`/`Unstage`, versions bumped where a write mark is consumed, staged chunks in every scan). With nothing staged it is neutral (gate.sh, `cmd_ns` −0.05%). Its arm API has no caller on dev; Track K may reuse the page versions. `pageVersions.h` is on dev; its bump hooks in `MemoryTracker`, `NoteGpuWrite` and the backing-store writes are only on the parked branch.
 
 ### The command thread's own data misses, by level (Track B, 2026-11-12)
 
@@ -1818,6 +1872,26 @@ ran ~54.8 FPS: the command thread just became less busy (95.5% → 93.6%). `KYTY
   `CollectAsyncWrites`). Making it asynchronous is worth little now; re-check with
   `KYTY_GPU_WAIT_DIAG=1` (`GPUWAITSITE`) if it grows as the command thread gets cheaper.
 
+### Driver work on the command thread (Track W, 2026-11-12)
+
+`KYTY_DRIVER_STATS=1` (with `KYTY_GPU_WAIT_DIAG=1`), an LBR profile of the command thread and
+`KYTY_KERNEL_STATS`, PGO `dev` 245d7f2b, 58.5 FPS: user 899 ms/s, sys 63 ms/s (47 timed by the
+emulator's own syscall sites, ~16 untimed: driver ioctls, page faults); 6.0% of user samples
+are in the NVIDIA driver (~0.9 ms per guest frame).
+
+| Path | Per frame | Command-thread ms/frame |
+|---|---|---|
+| Texture-cache images: `FindImage` creates ~2 per frame, all VMA dedicated; deferred `TextureCache::DeleteImage` frees them in retirement | 2 + 2 | 0.20 + 0.17 (mostly kernel) |
+| Direct recording (dispatches, barriers, `EndRendering`, clears, descriptor sets) | ~1,700 calls | ~0.45 driver user time, plus 0.15 recorder drains before them |
+| `Submit` (drain, end, `vkQueueSubmit`) + `BeginCommand` | 29 | 0.18 + 0.07 |
+| `MasterSemaphore::Refresh` | ~620 | 0.06 |
+
+Moving direct recording and submission to the recording thread (progress row above) removes
+~0.75 ms per frame of command-thread CPU. The two only pay together: with one moved, the other's
+direct calls drain the recorder, which then holds more work. Remaining direct calls (readback
+downloads, the tiler's buffer path, `CopyImage`, the fault buffer) drain ~15 ms/s; image churn
+(~0.37 ms per frame) is next.
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
@@ -2001,6 +2075,13 @@ ran ~54.8 FPS: the command thread just became less busy (95.5% → 93.6%). `KYTY
 - Early submission (Track W): `KYTY_EARLY_SUBMIT=0` submits only where guest command buffers end
   (and at the existing internal flushes); `KYTY_EARLY_SUBMIT_US=<µs>` sets the minimum age of the
   open command buffer (default 300). With `KYTY_GPU_WAIT_DIAG`, `GPUWAIT` shows `early_submits_s`.
+- Driver work (Track W): `KYTY_DRIVER_STATS=1` with `KYTY_GPU_WAIT_DIAG=1` prints a `DRIVER`
+  line per second (calls/s and ms/s of the command thread's submit, `vkQueueSubmit`, semaphore
+  refresh, command-buffer begin, image and buffer create (dedicated or not) and delete) and
+  `DRIVERSITE` lines: direct recordings (`CommandBuffer::Handle`/`BindingHandle`) per call site,
+  how many found the recorder busy and the drain time. `KYTY_DIRECT_RECORD=1` records the converted
+  sites directly on the command thread again; `KYTY_SUBMIT_THREAD=0` ends, submits and begins
+  command buffers there again.
 - Critical path: `KYTY_STALL_DIAG=1` prints a `STALL` line once per second with the GPU command
   thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
   GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)

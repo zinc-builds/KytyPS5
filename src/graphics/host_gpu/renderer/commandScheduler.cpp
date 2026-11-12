@@ -68,6 +68,9 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 		found = search(0, m_hint);
 	}
 	if (!found) {
+		if (m_recorder != nullptr) {
+			m_recorder->Drain();
+		}
 		found           = Grow();
 		m_ticks[*found] = m_master.CurrentTick();
 	}
@@ -93,6 +96,11 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	m_command.m_recorder = m_recorder.get();
+	m_command_pool.SetRecorder(m_recorder.get());
+	if (const char* queued = std::getenv("KYTY_SUBMIT_THREAD");
+	    m_recorder != nullptr && (queued == nullptr || queued[0] != '0')) {
+		m_queued_submit = true;
+	}
 	if (const char* retire = std::getenv("KYTY_RETIRE_NOWAIT"); retire != nullptr && retire[0] == '0') {
 		m_retire_nowait = false;
 	}
@@ -413,18 +421,37 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
+	Common::GpuWaitDiag::DriverScope driver_scope(Common::GpuWaitDiag::Driver::BeginCommand);
 	m_command.m_buffer = m_command_pool.Commit();
-	m_command.Begin();
+	if (m_queued_submit) {
+		// Begun by the recording thread, before anything queued for it.
+		m_command.m_dispatch_barrier_pending = false;
+		m_recorder->Record(m_command.m_buffer,
+		                   [device = m_graphics.device,
+		                    period = m_graphics.physical_device_properties.limits.timestampPeriod](
+		                       vk::CommandBuffer cb) {
+			                   vk::CommandBufferBeginInfo begin_info {};
+			                   begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			                   EXIT_NOT_IMPLEMENTED(cb.begin(&begin_info) != vk::Result::eSuccess);
+			                   VulkanDiagnostics::BeginCommandBuffer(device, period, cb);
+		                   });
+	} else {
+		m_command.Begin();
+		VulkanDiagnostics::BeginCommandBuffer(
+		    m_graphics.device, m_graphics.physical_device_properties.limits.timestampPeriod,
+		    m_command.m_buffer);
+	}
 	m_command_begin = std::chrono::steady_clock::now().time_since_epoch().count();
-	VulkanDiagnostics::BeginCommandBuffer(
-	    m_graphics.device, m_graphics.physical_device_properties.limits.timestampPeriod,
-	    m_command.m_buffer);
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	Common::GpuWaitDiag::DriverScope driver_scope(Common::GpuWaitDiag::Driver::Submit);
+	if (m_queued_submit) {
+		return SubmitQueued(submit);
+	}
 
 	// The command pool and buffer are the recording thread's until it is done.
 	(void)m_command.Handle();
@@ -463,6 +490,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		Common::GpuWaitDiag::DriverScope queue_scope(Common::GpuWaitDiag::Driver::QueueSubmit);
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
@@ -475,6 +503,59 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
+	m_command.m_buffer = nullptr;
+	return tick;
+}
+
+uint64_t CommandScheduler::SubmitQueued(SubmitInfo submit) {
+	// The tick is taken here, in submission order: only this thread submits on this timeline, and
+	// the recording thread submits in queue order. A host wait for it before the recording thread
+	// has submitted is a wait-before-signal, which timeline semaphores allow; the PublishAndWake below
+	// guarantees the submission follows.
+	if (m_next_wait_value != 0) {
+		submit.AddWait(m_next_wait_semaphore, m_next_wait_value, vk::PipelineStageFlagBits::eTransfer);
+		m_next_wait_value = 0;
+	}
+	const auto tick = m_master.NextTick();
+	submit.AddSignal(m_master.Handle(), tick);
+	m_command.FlushDispatchBarrier();
+	m_command.EndRendering();
+	m_recorder->Record(m_command.m_buffer, [submit, tick, &graphics = m_graphics,
+	                                        &master = m_master](vk::CommandBuffer cb) {
+		VulkanDiagnostics::EndCommandBuffer(cb);
+		EXIT_NOT_IMPLEMENTED(cb.end() != vk::Result::eSuccess);
+		vk::TimelineSemaphoreSubmitInfo timeline_info {};
+		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+		vk::SubmitInfo submit_info {};
+		submit_info.pNext                = &timeline_info;
+		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+		submit_info.commandBufferCount   = 1;
+		submit_info.pCommandBuffers      = &cb;
+		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+		const auto diag_start = master.WaitDiag() ? Common::GpuWaitDiag::NowNs() : 0;
+		vk::Result result;
+		{
+			Common::LockGuard lock(graphics.queue_mutex);
+			result = graphics.queue.submit(1, &submit_info, nullptr);
+		}
+		if (result != vk::Result::eSuccess) {
+			EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
+		}
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+		if (diag_start != 0) {
+			Common::GpuWaitDiag::NoteSubmit(
+			    tick, diag_start, Common::GpuWaitDiag::NowNs(),
+			    Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws));
+		}
+	});
+	// A host wait for this tick may follow at once: the recorder must not sleep through it.
+	m_recorder->PublishAndWake();
 	m_command.m_buffer = nullptr;
 	return tick;
 }

@@ -64,6 +64,43 @@ void NoteEarlySubmit() noexcept;
 // The command thread registers itself (for the off-CPU sampler).
 void SetCommandThread() noexcept;
 
+// KYTY_DRIVER_STATS=1 (with KYTY_GPU_WAIT_DIAG): wall time of the command thread's own driver
+// paths, per kind, and its direct recordings (CommandBuffer::Handle/BindingHandle) per call site
+// with the recorder drain they waited for. DRIVER / DRIVERSITE lines once per second.
+enum class Driver : uint8_t {
+	Submit,         // CommandScheduler::Submit (recorder drain, vkEndCommandBuffer, vkQueueSubmit)
+	QueueSubmit,    // of which vkQueueSubmit
+	Refresh,        // MasterSemaphore::Refresh (vkGetSemaphoreCounterValue)
+	BeginCommand,   // CommandScheduler::BeginCommand (pool search, vkBeginCommandBuffer)
+	ImageCreate,    // GraphicContext::CreateImage (vmaCreateImage)
+	ImageCreateDedicated,
+	ImageDelete,
+	BufferCreate,   // Buffer (vmaCreateBuffer)
+	BufferCreateDedicated,
+	BufferDelete,
+	Count
+};
+[[nodiscard]] bool DriverStats() noexcept;
+void NoteDriver(Driver kind, uint64_t ns) noexcept;
+void NoteDirectRecord(const std::source_location& site, uint64_t drain_ns) noexcept;
+// Times its scope on the command thread when KYTY_DRIVER_STATS is on.
+class DriverScope final {
+public:
+	explicit DriverScope(Driver kind) noexcept;
+	~DriverScope() {
+		if (m_start != 0) {
+			NoteDriver(m_kind, NowNs() - m_start);
+		}
+	}
+	void SetKind(Driver kind) noexcept { m_kind = kind; }
+	DriverScope(const DriverScope&)            = delete;
+	DriverScope& operator=(const DriverScope&) = delete;
+
+private:
+	Driver   m_kind;
+	uint64_t m_start = 0;
+};
+
 // Called by the command thread; prints once per second.
 void Report() noexcept;
 

@@ -88,6 +88,8 @@ private:
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
+		// Growing the pool allocates from it: the recording thread must not be using it then.
+		void SetRecorder(DeferredRecorder* recorder) noexcept { m_recorder = recorder; }
 
 	private:
 		static constexpr size_t GrowStep = 4;
@@ -100,6 +102,7 @@ private:
 		std::vector<vk::CommandBuffer> m_buffers;
 		std::vector<uint64_t>          m_ticks;
 		size_t                         m_hint = 0;
+		DeferredRecorder*              m_recorder = nullptr;
 	};
 
 	enum class OperationState { Open, Draining, Closed };
@@ -110,6 +113,7 @@ private:
 	};
 
 	void BeginNext();
+	uint64_t SubmitQueued(SubmitInfo submit);
 	void PopPendingOperations(bool wait_priority);
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -140,6 +144,9 @@ private:
 	vk::Semaphore                m_next_wait_semaphore  = nullptr;
 	uint64_t                     m_next_wait_value      = 0;
 	bool                         m_retire_nowait        = true;
+	// KYTY_SUBMIT_THREAD (on with a recording thread; =0 off): the recording thread ends, submits
+	// and begins command buffers, in order with the commands queued for them.
+	bool                         m_queued_submit        = false;
 	int64_t                      m_command_begin        = 0;  // steady_clock ticks at BeginCommand
 	int64_t                      m_early_submit_age     = -1; // steady_clock ticks; < 0: off
 };
