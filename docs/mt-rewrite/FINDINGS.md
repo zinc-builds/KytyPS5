@@ -18,7 +18,7 @@ configuration is enough. Before that, noise was about ±0.3 FPS with two runs pe
 | + `--amd-cpu` rewriting EXTRQ (1.4 M SIGILL/s → 0) | 13.5 |
 | + PR #1307 userfaultfd write tracking (`astro-uffd`) | 14.1 |
 | + hybrid-CPU pinning (`common/hybridAffinity.h`) | 16.4 |
-| + AMD-exact VRSQRTPS kept as default (77k SIGILL/s) | 15.9–16.0 |
+| + `--amd-cpu`'s VRSQRTPS rewrite kept (a float-precision 1/√x, not AMD's table; 77k SIGILL/s) | 15.9–16.0 |
 
 `dev` = `astro-uffd` = everything above. ~5,800 draws/frame, ~93k draws/s, ~130k write-tracking
 faults/s.
@@ -493,7 +493,12 @@ shared. Write-fault SIGBUS is ~3% of tbb time. SIGILL from the 1,088 VRSQRTPS si
 After C2 the SIGILL traps (~123k/s) are the main signal source on guest threads.
 - **Ceiling:** `KYTY_AMD_SKIP_RSQRT=1` (host-precision VRSQRTPS, no traps) against the default on
   `dev` 74b1d351: 26.48 / 26.25 vs 25.79 / 26.05 FPS, at most **+1.7%**. Draws per frame also
-  change (5,400 vs 5,490): the precision changes game state, so AMD-exact results stay.
+  change (5,400 vs 5,490): the precision changes game state, so the rewrite stays under
+  `--amd-cpu`. (The rewrite is not AMD's approximation either. It computes 1/√x in double
+  precision and rounds to float, so it is within about half a float ulp of the exact value
+  (~2⁻²⁴ relative), where the instruction only promises 1.5·2⁻¹² and AMD and Intel hardware each
+  return their own table's approximation. Corrected 2026-11-12; earlier notes called it
+  "AMD-exact".)
 - **Why they trap:** all 1,088 sites are 4-byte `vrsqrtps xmm, xmm` in 472 functions with an
   indirect jump the patcher can't resolve, so it may not move neighbouring instructions to fit a
   5-byte jump.

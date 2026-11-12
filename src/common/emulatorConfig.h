@@ -30,6 +30,13 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 // thread falls behind the vblank rate, so the game keeps its speed).
 enum class FrameSkipMode { Off, Auto };
 
+// Guest instructions the host CPU lacks (docs/mt-rewrite/README.md, "Playing with the fast build"):
+// Auto rewrites the AMD-only instructions CPUID says the host lacks (SSE4a EXTRQ/INSERTQ, RDPID,
+// CLWB) at load and nothing on a host that has them all; On (--amd-cpu) also rewrites VRSQRTPS to
+// a deterministic reciprocal square root; Off (--no-amd-cpu) rewrites nothing, and the host traps
+// and emulates each missing instruction.
+enum class AmdCpuMode { Auto, Off, On };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -70,7 +77,7 @@ struct ConfigOptions {
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
-	bool                   amd_cpu_enabled             = false;
+	AmdCpuMode             amd_cpu_mode                = AmdCpuMode::Auto;
 	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
@@ -135,7 +142,7 @@ bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
-bool     AmdCpuEnabled();
+AmdCpuMode GetAmdCpuMode();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();
 bool     PsnEmulationEnabled();

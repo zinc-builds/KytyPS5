@@ -5,6 +5,7 @@
 #include "loader/guestInstructionPatcher.h"
 
 #include "common/assert.h"
+#include "common/envSwitch.h"
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 
@@ -923,14 +924,14 @@ void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerato
 void CollectAmdInstructions(const DecodedFunction&                   function,
                             std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                             GuestInstructionPatchResult&             result,
-                            GuestInstructionHostFeatures             host_features) {
+                            GuestInstructionHostFeatures host_features, bool rsqrt) {
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
 		// Local knob: KYTY_AMD_SKIP_RSQRT=1 keeps VRSQRTPS on the host's precision, so --amd-cpu only
 		// removes the SSE4a/RDPID/CLWB traps (about 2-3% faster in Astro Bot's Sky Garden).
-		static const bool skip_rsqrt = std::getenv("KYTY_AMD_SKIP_RSQRT") != nullptr;
-		if (!skip_rsqrt && instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+		static const bool skip_rsqrt = Common::EnvFlag("KYTY_AMD_SKIP_RSQRT");
+		if (rsqrt && !skip_rsqrt && instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
 		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
 		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&
 		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -1023,7 +1024,7 @@ bool NeedsTrapRedZoneProtection(const DecodedCodeInstruction& decoded) {
 
 void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunction& function,
                                  const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                                 GuestInstructionPatchResult&                   result) {
+                                 GuestInstructionPatchResult& result, bool strict) {
 	for (const auto& [address, rewrite]: rewrite_sites) {
 		if (rewrite.replacement == InstructionReplacement::None ||
 		    rewrite.replacement == InstructionReplacement::ReadTimeStampCounter ||
@@ -1032,8 +1033,10 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 		}
 		const auto& decoded = function.instructions.at(address);
 		if (NeedsTrapRedZoneProtection(decoded)) {
-			if (rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot) {
-				// Leaving an unsupported instruction unchanged still traps with a live red zone.
+			// Leaving an unsupported instruction unchanged still traps with a live red zone. In
+			// automatic mode (not strict) the site stays as it is, as without the patcher, and
+			// counts as skipped.
+			if (strict && rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot) {
 				EXIT("AMD CPU compatibility: cannot safely trap %s at %p (guest red zone is "
 				     "live)\n",
 				     ZydisMnemonicGetString(decoded.instruction.mnemonic),
@@ -1541,7 +1544,8 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
                                                    GuestInstructionHostFeatures host_features,
-                                                   u64                          tsc_multiplier) {
+                                                   u64 tsc_multiplier, bool amd_rsqrt,
+                                                   bool amd_strict) {
 	GuestInstructionPatchResult result {};
 	const bool                  tsc_only = !protect_memory && !emulate_amd;
 	if (tsc_only && tsc_multiplier == 0) {
@@ -1596,14 +1600,14 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
 		if (emulate_amd) {
-			CollectAmdInstructions(function, rewrite_sites, result, host_features);
+			CollectAmdInstructions(function, rewrite_sites, result, host_features, amd_rsqrt);
 		}
 		if (tsc_multiplier != 0) {
 			CollectTscInstructions(function, rewrite_sites, result);
 		}
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result, tsc_multiplier);
-			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
+			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result, amd_strict);
 		}
 	}
 	const auto trampoline_addr =

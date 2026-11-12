@@ -1,12 +1,18 @@
 #!/bin/bash
-# pgo-train.sh [commit]: train a PGO profile for <commit> (default origin/dev) on the Sky Garden
-# bench and print its path, ~/.cache/kyty-pgo/<sha>.profdata. A trained commit is reused.
+# pgo-train.sh [commit]: train a PGO profile for <commit> (default origin/dev) on the bench and
+# print its path, ~/.cache/kyty-pgo/<sha>.profdata (default training set) or
+# <sha>-<set>.profdata (another set). A trained commit and set is reused.
 #   1. builds the instrumented emulator (KYTY_BUILD_MODE=pgogen refbuild.sh, shared build cache),
-#   2. under one exclusive bench-lock hold: a short warm-up run (shader cache), then the measured
-#      garden.sh run with KYTY_PGO_DUMP (the emulator writes its counters every 10 s),
-#   3. merges the newest whole dump into <sha>.profdata.
-# It moves current.profdata (a link) to the new profile when <commit> is on origin/dev and is not
-# older than the commit current.profdata was trained on; KYTY_PGO_CURRENT=0 never moves it.
+#   2. under one exclusive bench-lock hold, for each training level: a short warm-up run (shader
+#      cache), then a garden.sh run with KYTY_PGO_DUMP (the emulator writes its counters every 10 s),
+#   3. merges each level's newest whole dump into one profile (counts add up across levels).
+# KYTY_PGO_LEVELS: the training set, "level[:A-B] ..." (garden.sh's GARDEN_LEVEL names and frame
+#   windows; default window 1000-1600 for aerial_garden, 200-1000 for others). Default: the set in
+#   DEFAULT_LEVELS below. KYTY_PGO_SET names a non-default set (default: a hash of the list).
+#   <profile>.levels records the set.
+# It moves current.profdata (a link) to the new profile when <commit> is on origin/dev, the set is
+# the default one, and <commit> is not older than the commit current.profdata was trained on;
+# KYTY_PGO_CURRENT=0 never moves it.
 # Use the profile through KYTY_BUILD_MODE=pgo with refbuild.sh and build.sh (see build.sh).
 # One trainer per commit (a lock in the profile store); a second caller waits and reuses it.
 # Runs land in /tmp/garden-pgo-{warm,train}-<sha8>.out. About 10 minutes cold; see "Build modes"
@@ -18,14 +24,23 @@ bench=$repo/tools/astro-bench
 . "$bench/buildmode.sh"
 rev=${1:-origin/dev}
 sha=$(git -C "$repo" rev-parse --verify --quiet "$rev^{commit}") || { echo "pgo-train: unknown commit $rev" >&2; exit 1; }
+DEFAULT_LEVELS="aerial_garden"
+levels=${KYTY_PGO_LEVELS:-$DEFAULT_LEVELS}
+levels=$(xargs <<<"$levels") # normalize spaces
 dir=$KYTY_PGO_DIR
-out=$dir/$sha.profdata
+if [ "$levels" = "$DEFAULT_LEVELS" ]; then
+	name=$sha default_set=1
+else
+	name=$sha-${KYTY_PGO_SET:-$(sha1sum <<<"$levels" | cut -c1-8)} default_set=0
+	[[ "$name" =~ ^[0-9a-f]{40}-[A-Za-z0-9._-]+$ ]] || { echo "pgo-train: bad KYTY_PGO_SET" >&2; exit 1; }
+fi
+out=$dir/$name.profdata
 mkdir -p "$dir"
 log() { echo "pgo-train: $*" >&2; }
 
 # current.profdata -> <sha>.profdata: move it forward along origin/dev only.
 update_current() {
-	[ "${KYTY_PGO_CURRENT:-1}" = 0 ] && return 0
+	[ "${KYTY_PGO_CURRENT:-1}" = 0 ] || [ "$default_set" = 0 ] && return 0
 	git -C "$repo" merge-base --is-ancestor "$sha" origin/dev 2>/dev/null || return 0
 	exec 6>"$dir/current.lock"
 	flock 6
@@ -44,8 +59,8 @@ update_current() {
 
 if [ -f "$out" ]; then update_current; echo "$out"; exit 0; fi
 [ -n "$KYTY_BENCH_LOCKED" ] && { echo "pgo-train: call it outside any bench-lock hold (it builds, then runs)" >&2; exit 1; }
-exec 7>"$dir/$sha.lock"
-flock 7 # one trainer per commit; later callers wait and reuse its profile
+exec 7>"$dir/$name.lock"
+flock 7 # one trainer per commit and set; later callers wait and reuse its profile
 if [ -f "$out" ]; then update_current; echo "$out"; exit 0; fi
 
 t0=$SECONDS
@@ -54,7 +69,7 @@ t_build=$((SECONDS - t0))
 grep -q KYTY_PGO_DUMP "$inst/kyty_emulator" || { echo "pgo-train: $sha predates KYTY_PGO_DUMP; cannot train it" >&2; exit 1; }
 log "instrumented build ${t_build}s (lock wait included): $inst"
 
-tmp=$dir/$sha.tmp.$$
+tmp=$dir/$name.tmp.$$
 rm -rf "$tmp"; mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT
 . "$bench/benchlock.sh"
@@ -69,26 +84,44 @@ label=${sha:0:8}
 # A fresh binary starts with a cold shader store: warm it first, so the profile is the level, not
 # shader compiles. The exit-hook profiles of these runs go to the scratch dir, not the install.
 export KYTY_INSTALL=$inst LLVM_PROFILE_FILE=$tmp/exit-%p.profraw
-GARDEN_FRAMES=0-150 GARDEN_WINDOW='' "$bench/garden.sh" "pgo-warm-$label" --amd-cpu > "/tmp/garden-pgo-warm-$label.out" 2>&1 ||
-	log "warm-up run failed (/tmp/garden-pgo-warm-$label.out); training anyway"
-sleep 3
-KYTY_PGO_DUMP=$tmp/train "$bench/garden.sh" "pgo-train-$label" --amd-cpu > "/tmp/garden-pgo-train-$label.out" 2>&1 || {
-	echo "pgo-train: training run failed: $(tail -3 "/tmp/garden-pgo-train-$label.out")" >&2
-	exit 1
-}
+i=0
+for entry in $levels; do
+	i=$((i + 1))
+	lvl=${entry%%:*} win=${entry#*:}
+	[ "$win" = "$entry" ] && { [ "$lvl" = aerial_garden ] && win=1000-1600 || win=200-1000; }
+	tag=$label-$i-$lvl
+	GARDEN_LEVEL=$lvl GARDEN_FRAMES=0-150 GARDEN_WINDOW='' "$bench/garden.sh" "pgo-warm-$tag" --amd-cpu \
+		> "/tmp/garden-pgo-warm-$tag.out" 2>&1 || log "warm-up run failed (/tmp/garden-pgo-warm-$tag.out); training anyway"
+	sleep 3
+	GARDEN_LEVEL=$lvl GARDEN_FRAMES=$win KYTY_PGO_DUMP=$tmp/train-$i "$bench/garden.sh" "pgo-train-$tag" --amd-cpu \
+		> "/tmp/garden-pgo-train-$tag.out" 2>&1 || {
+		echo "pgo-train: training run on $lvl failed: $(tail -3 "/tmp/garden-pgo-train-$tag.out")" >&2
+		exit 1
+	}
+	log "$lvl: $(head -1 "/tmp/garden-pgo-train-$tag.out" | cut -c1-120)"
+	sleep 3
+done
 exec 9>&-
 unset KYTY_BENCH_LOCKED
 t_run=$((SECONDS - t1))
-log "runs ${t_run}s: $(head -1 "/tmp/garden-pgo-train-$label.out")"
+log "runs ${t_run}s"
 
-# The two dump files alternate; a kill during a write truncates one. Take the newest that merges.
-merged=
-for f in $(ls -t "$tmp"/train.*.profraw 2>/dev/null); do
-	if llvm-profdata merge -o "$tmp/out.profdata" "$f" 2>/dev/null; then merged=$f; break; fi
-	log "skipping unreadable dump $f"
+# The two dump files of a run alternate; a kill during a write truncates one. Take each run's
+# newest file that reads, then add the runs up.
+picked=()
+for n in $(seq "$i"); do
+	ok=
+	for f in $(ls -t "$tmp"/train-"$n".*.profraw 2>/dev/null); do
+		if llvm-profdata merge -o "$tmp/check.profdata" "$f" 2>/dev/null; then ok=$f; break; fi
+		log "skipping unreadable dump $f"
+	done
+	[ -n "$ok" ] || { echo "pgo-train: no readable dump for run $n in $tmp" >&2; exit 1; }
+	picked+=("$ok")
 done
-[ -n "$merged" ] || { echo "pgo-train: no readable dump in $tmp" >&2; exit 1; }
+llvm-profdata merge -o "$tmp/out.profdata" "${picked[@]}"
+echo "$levels" > "$tmp/out.levels"
+mv "$tmp/out.levels" "$out.levels"
 mv "$tmp/out.profdata" "$out"
-log "profile $(sha256sum "$out" | cut -c1-12) from $(basename "$merged"); total $((SECONDS - t0))s"
+log "profile $(sha256sum "$out" | cut -c1-12) from ${#picked[@]} run(s) ($levels); total $((SECONDS - t0))s"
 update_current
 echo "$out"

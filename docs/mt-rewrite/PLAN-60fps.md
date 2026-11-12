@@ -290,7 +290,7 @@ tools/astro-bench/gate.sh mylabel --new-install "$new"     # once, before merge
   A new profile changes every compile command, so the first build with it recompiles everything;
   `refbuild.sh` and `build.sh` with the same profile then share ccache entries.
 - The profile is trained on Sky Garden frames 0–1600 only. Other levels run code paths it saw
-  rarely or never, so a play build may gain less there (see "Building the fast binary" in
+  rarely or never, so a play build may gain less there (see "Playing with the fast build" in
   `docs/mt-rewrite/README.md`).
 
 ## Bench metrics and A/B (Track T, 2026-11-11)

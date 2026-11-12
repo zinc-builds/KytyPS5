@@ -61,7 +61,10 @@ static void PrintUsage() {
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
 	         "                                       (PSSR uses linear scaling). Default: off.\n");
-	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --amd-cpu                            Rewrite every AMD-only instruction the host lacks,\n"
+	         "                                       and VRSQRTPS. Default: auto (only what the host\n"
+	         "                                       lacks, no VRSQRTPS); KYTY_AMD_CPU=auto|0|1.\n");
+	::printf("  --no-amd-cpu                         Rewrite nothing; the host traps missing instructions.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
@@ -109,6 +112,27 @@ static bool ParseFrameSkip(const std::string& value, Config::FrameSkipMode& out)
 		out = Config::FrameSkipMode::Auto;
 	} else {
 		::printf("invalid frame skip mode: %s (off or auto)\n", value.c_str());
+		return false;
+	}
+	return true;
+}
+
+// KYTY_AMD_CPU (used when neither --amd-cpu nor --no-amd-cpu is given): auto, 1/on/true or
+// 0/off/false. Anything else is an error, not a silent default.
+static bool ParseAmdCpuEnv(Config::AmdCpuMode& out) {
+	const char* env = std::getenv("KYTY_AMD_CPU");
+	if (env == nullptr) {
+		return true;
+	}
+	const std::string_view value(env);
+	if (value == "auto" || value.empty()) {
+		out = Config::AmdCpuMode::Auto;
+	} else if (value == "1" || value == "on" || value == "true") {
+		out = Config::AmdCpuMode::On;
+	} else if (value == "0" || value == "off" || value == "false") {
+		out = Config::AmdCpuMode::Off;
+	} else {
+		::printf("invalid KYTY_AMD_CPU: %s (auto, 1 or 0)\n", env);
 		return false;
 	}
 	return true;
@@ -208,7 +232,6 @@ static constexpr Flag FLAGS[] = {
     {"--no-splash", &ConfigOptions::splash_enabled, false},
     {"--vr", &ConfigOptions::vr_enabled},
     {"--trinity", &ConfigOptions::pro_enabled},
-    {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
     {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
@@ -237,6 +260,7 @@ static constexpr Flag FLAGS[] = {
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
+	bool amd_cpu_from_flag = false;
 
 	for (int i = 1; i < argc; i++) {
 		std::string arg = std::string(argv[i]);
@@ -244,6 +268,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--help" || arg == "-h") {
 			show_help = true;
+			continue;
+		}
+
+		if (arg == "--amd-cpu" || arg == "--no-amd-cpu") {
+			options.config.amd_cpu_mode =
+			    arg == "--amd-cpu" ? Config::AmdCpuMode::On : Config::AmdCpuMode::Off;
+			amd_cpu_from_flag = true;
 			continue;
 		}
 
@@ -444,6 +475,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 	if (options.config.gpu_assisted_validation_enabled) {
 		options.config.vulkan_validation_enabled = true;
+	}
+	if (!amd_cpu_from_flag && !ParseAmdCpuEnv(options.config.amd_cpu_mode)) {
+		return false;
 	}
 
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());

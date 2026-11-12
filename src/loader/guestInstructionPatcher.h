@@ -59,11 +59,14 @@ void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks. A nonzero
 // tsc_multiplier rewrites RDTSC/RDTSCP to return host TSC * tsc_multiplier >> 32.
+// emulate_amd rewrites the AMD-only instructions the host lacks (host_features), and VRSQRTPS when
+// amd_rsqrt is set. amd_strict (explicit --amd-cpu) aborts on a site that can only trap while the
+// guest red zone is live (Windows); otherwise such a site is left as it is and counted as skipped.
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
     bool protect_memory, bool emulate_amd,
     GuestInstructionHostFeatures host_features  = GetGuestInstructionHostFeatures(),
-    uint64_t                     tsc_multiplier = 0);
+    uint64_t tsc_multiplier = 0, bool amd_rsqrt = true, bool amd_strict = true);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);

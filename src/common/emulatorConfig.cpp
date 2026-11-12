@@ -117,8 +117,8 @@ bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
 }
 
-bool AmdCpuEnabled() {
-	return g_config->amd_cpu_enabled;
+AmdCpuMode GetAmdCpuMode() {
+	return g_config->amd_cpu_mode;
 }
 
 bool GuestTscEnabled() {

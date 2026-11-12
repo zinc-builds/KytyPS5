@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -1686,8 +1687,56 @@ uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+namespace {
+
+// What the AMD instruction patcher does in this run (Config::AmdCpuMode against the host's CPUID),
+// decided once and logged once.
+struct AmdPatchPlan {
+	bool enabled = false; // rewrite AMD-only instructions the host lacks
+	bool rsqrt   = false; // also VRSQRTPS
+	bool strict  = false; // abort on a site that cannot be patched safely (explicit --amd-cpu)
+};
+
+const AmdPatchPlan& GetAmdPatchPlan() {
+	static const AmdPatchPlan plan = [] {
+		const auto  host = GetGuestInstructionHostFeatures();
+		std::string missing;
+		for (const auto& [name, present]: {std::pair {"SSE4a", host.sse4a}, {"RDPID", host.rdpid},
+		                                   {"CLWB", host.clwb}}) {
+			if (!present) missing += std::string(missing.empty() ? "" : ", ") + name;
+		}
+		const std::string has_all = "the host has SSE4a, RDPID and CLWB";
+		AmdPatchPlan      result;
+		std::string       text;
+		switch (Config::GetAmdCpuMode()) {
+			case Config::AmdCpuMode::On:
+				result = {true, true, true};
+				text   = "on (--amd-cpu): rewrites VRSQRTPS" +
+				       (missing.empty() ? "; " + has_all : " and what the host lacks (" + missing + ")");
+				break;
+			case Config::AmdCpuMode::Off:
+				text = "off (--no-amd-cpu): rewrites nothing" +
+				       (missing.empty() ? "; " + has_all
+				                        : "; the host lacks " + missing + ", which trap and are emulated");
+				break;
+			case Config::AmdCpuMode::Auto:
+				result = {!missing.empty(), false, false};
+				text   = missing.empty() ? "auto: rewrites nothing; " + has_all
+				                         : "auto: rewrites what the host lacks (" + missing +
+				                             "); VRSQRTPS stays native";
+				break;
+		}
+		Log::WriteToConsoleAndLog(fmt::format("AMD CPU compatibility: mode {}\n", text));
+		return result;
+	}();
+	return plan;
+}
+
+} // namespace
+
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
+	const auto load_start = std::chrono::steady_clock::now();
 
 	EXIT_IF(program == nullptr || program->base_vaddr != 0 || program->base_size != 0 ||
 	        program->elf == nullptr);
@@ -1711,7 +1760,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-	const bool emulate_amd = Config::AmdCpuEnabled();
+	const auto& amd_plan    = GetAmdPatchPlan();
+	const bool  emulate_amd = amd_plan.enabled;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else
@@ -1846,7 +1896,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(
 			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
-			    GetGuestInstructionHostFeatures(), tsc_multiplier);
+			    GetGuestInstructionHostFeatures(), tsc_multiplier, amd_plan.rsqrt, amd_plan.strict);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -1890,13 +1940,21 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                      : skipped == found ? "not patched"
 			                      : skipped != 0     ? "partially patched"
 			                                         : "patched";
-			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "AMD CPU compatibility: {} {} ({}); loaded in {} ms\n", module_name, status, details,
+			    std::chrono::duration_cast<std::chrono::milliseconds>(
+			        std::chrono::steady_clock::now() - load_start)
+			        .count()));
 		}
 	}
 
 	if (!is_shared) {
 		SetupTlsHandler(program);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Loader: {} loaded in {} ms\n", Common::PathToString(program->file_name.filename()),
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+		                                                          load_start)
+		        .count()));
 	}
 
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);

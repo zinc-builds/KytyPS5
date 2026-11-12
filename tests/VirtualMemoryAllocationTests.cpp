@@ -5480,6 +5480,15 @@ void TestPackedBitField(bool insert) {
 		          output[5] == 0x3f8000003f800000 && output[6] == 0 && output[7] == 0,
 		      "mixed native/fallback AMD instructions lost their results");
 	}
+	// Automatic mode (no --amd-cpu): what the host lacks is rewritten, VRSQRTPS is not collected.
+	std::memcpy(reinterpret_cast<void*>(mapping), mixed_original.data(), mixed_original.size());
+	register_module(code_size);
+	const auto automatic = Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts,
+	                                                      false, true, {}, 0, false, false);
+	Check(test,
+	      automatic.extrq.found == 1 && automatic.extrq.native == 1 &&
+	          automatic.reciprocal_sqrt.found == 0 && automatic.reciprocal_sqrt.trapped == 0,
+	      "automatic AMD mode rewrote VRSQRTPS or missed EXTRQ");
 	std::printf("[host]    %-48s ok (all 4096 length/index pairs)\n", test);
 }
 
