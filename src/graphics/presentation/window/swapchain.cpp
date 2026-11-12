@@ -437,8 +437,9 @@ private:
 			if (!ok) {
 				return false;
 			}
-			m_flip = flip;
-			m_out  = out;
+			m_flip  = flip;
+			m_out   = out;
+			m_taken = 0;
 		}
 		return PerformanceOverlayFlipCount() >= m_flip;
 	}

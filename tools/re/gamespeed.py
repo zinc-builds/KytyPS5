@@ -60,9 +60,15 @@ def check(path):
             out.append('  window 1000-1600: %.1f flips/s -> game speed %.2fx' % (fps, fps / 60))
     rows = [d for i, d in skip if i > start][10:]
     if rows:
-        avg = lambda k: sum(float(d.get(k, 0)) for d in rows) / len(rows)
+        def num(v):
+            try:
+                return float(v)
+            except ValueError:
+                return None
+        keys = [k for k in rows[0] if num(rows[0][k]) is not None]
+        avg = lambda k: sum(num(d.get(k, '0')) or 0.0 for d in rows) / len(rows)
         out.append('  FRAMESKIP (%d s, from 10 s into the level): ' % len(rows) +
-                   ' '.join('%s=%.2f' % (k, avg(k)) for k in rows[0]))
+                   ' '.join('%s=%.2f' % (k, avg(k)) for k in keys))
     return '\n'.join(out)
 
 
