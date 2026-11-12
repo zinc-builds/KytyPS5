@@ -429,11 +429,16 @@ public:
 #endif
 	}
 
-	void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	// `ranged`: the caller advances only the ranged epoch (GuestSyncEpoch::AdvanceRanged) and
+	// records the store by guest range. Readers through another view of the same bytes would
+	// miss that, so a ranged store into an aliased range also advances the unranged epoch, around
+	// the copy and under the lock that keeps the views from changing meanwhile.
+	void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged = false) {
 		LogAliasWrite(vaddr, size);
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		std::lock_guard lock(m_mutex);
 		const TranslationWrite translation_write;
+		const AliasedStore     aliased(*this, ranged, vaddr, size);
 		const auto*     source = static_cast<const uint8_t*>(data);
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
@@ -446,13 +451,14 @@ public:
 
 	// One aligned 4- or 8-byte store (a label: the guest may see it and reuse the label at
 	// once, so the bytes must not be written twice as memcpy may).
-	bool StoreLabel(uint64_t vaddr, uint64_t value, uint64_t size) {
+	bool StoreLabel(uint64_t vaddr, uint64_t value, uint64_t size, bool ranged = false) {
 		if ((size != 4 && size != 8) || (vaddr & (size - 1)) != 0) {
 			return false;
 		}
 		LogAliasWrite(vaddr, size);
-		std::shared_lock lock(m_mutex);
-		auto             it = m_maps.upper_bound(vaddr);
+		std::shared_lock   lock(m_mutex);
+		const AliasedStore aliased(*this, ranged, vaddr, size);
+		auto               it = m_maps.upper_bound(vaddr);
 		if (it == m_maps.begin()) {
 			return false;
 		}
@@ -1381,6 +1387,30 @@ private:
 		bool write_protected = false;
 	};
 
+	// A backing store (under m_mutex, shared or exclusive): when the caller records it by range
+	// and the range is aliased, advances the unranged epoch before and after it.
+	class AliasedStore {
+	public:
+		AliasedStore(const GuestBackingStore& store, bool ranged, uint64_t vaddr, uint64_t size)
+		    : m_unranged(ranged && store.m_alias_count.load(std::memory_order_relaxed) != 0 &&
+		                 store.RangeAliasedUnlocked(vaddr, size)) {
+			Graphics::DrawPrepare::AliasStats::Note(Graphics::DrawPrepare::AliasStats::RangedStore,
+			                                        m_unranged);
+			if (m_unranged) {
+				Graphics::GuestSyncEpoch::Advance();
+			}
+		}
+		~AliasedStore() {
+			if (m_unranged) {
+				Graphics::GuestSyncEpoch::Advance();
+			}
+		}
+		KYTY_CLASS_NO_COPY(AliasedStore);
+
+	private:
+		bool m_unranged;
+	};
+
 	// Under m_mutex.
 	[[nodiscard]] bool RangeAliasedUnlocked(uint64_t vaddr, uint64_t size) const {
 		const auto end = vaddr + size;
@@ -1917,7 +1947,7 @@ public:
 #endif
 
 	// Writes the backed bytes of a range that holds no private mappings.
-	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged) {
 		if (!Owns(vaddr, size)) {
 			return false;
 		}
@@ -1925,16 +1955,17 @@ public:
 		if (OverlapsPrivateUnlocked(vaddr, size)) {
 			return false;
 		}
-		m_backing->WriteBacking(vaddr, data, size);
+		m_backing->WriteBacking(vaddr, data, size, ranged);
 		return true;
 	}
 
-	bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
+	bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size, bool ranged) {
 		if (!Owns(vaddr, size)) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
-		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->StoreLabel(vaddr, value, size);
+		return !OverlapsPrivateUnlocked(vaddr, size) &&
+		       m_backing->StoreLabel(vaddr, value, size, ranged);
 	}
 
 	bool TryStoreLabelsBacking(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,

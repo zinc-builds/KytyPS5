@@ -168,6 +168,8 @@ enum class Verdict : uint8_t {
 	Stored,     // an emulator store (a readback publication) overlapped its reads
 	GpuDirty,   // bytes it read are GPU-dirty now: the command thread would have waited
 };
+// Whether any guest bytes are mapped at two guest addresses (LibKernel::Memory::AnyGuestAliases).
+[[nodiscard]] bool AnyAliases() noexcept;
 // `has_gpu_dirty_bytes(vaddr, size)`: BufferCache::HasGpuDirtyBytes.
 template <typename HasGpuDirtyBytes>
 [[nodiscard]] Verdict Adoption(const Stamps& stamps, const Log& log,
@@ -189,6 +191,16 @@ template <typename HasGpuDirtyBytes>
 	for (const auto& read: log.reads) {
 		if (has_gpu_dirty_bytes(read.first, read.second)) {
 			return Verdict::GpuDirty;
+		}
+	}
+	// The walker's raw loads land only in `pages` unless the page is read-watched, which a
+	// GPU-dirty page is; but not the other guest views of its bytes. With aliases, check the
+	// pages too (HasGpuDirtyBytes looks through the other views).
+	if (AnyAliases()) [[unlikely]] {
+		for (const auto page: log.pages) {
+			if (has_gpu_dirty_bytes(page << 12u, 0x1000)) {
+				return Verdict::GpuDirty;
+			}
 		}
 	}
 	return Verdict::Usable;

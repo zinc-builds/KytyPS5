@@ -274,6 +274,10 @@ void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+bool AnyAliases() noexcept {
+	return LibKernel::Memory::AnyGuestAliases();
+}
+
 uint64_t GpuWriteSequence() noexcept {
 	return g_gpu_written.Sequence();
 }

@@ -2832,6 +2832,26 @@ void TestAliasedViewsInHazardChecks() {
 			                                                                     size);
 		                   }) == DP::Verdict::GpuDirty,
 		      "a draw reading GPU-dirty bytes through B was adopted");
+		// Bytes already GPU-dirty through A before the post, read through B by the walker into
+		// its page log only (B's page is not read-watched, so no exact read is logged).
+		DP::Log walked;
+		walked.pages = {(va_b + 0x40) >> 12u};
+		Check(test,
+		      DP::Adoption(stamps(), walked,
+		                   [&](uint64_t vaddr, uint64_t size) {
+			                   return Libs::Graphics::BufferCache::DirtyInAnyView(modified, {}, vaddr,
+			                                                                     size);
+		                   }) == DP::Verdict::GpuDirty,
+		      "a draw whose walker read GPU-dirty bytes through B, page log only, was adopted");
+		DP::Log unrelated;
+		unrelated.pages = {va_c >> 12u};
+		Check(test,
+		      DP::Adoption(stamps(), unrelated,
+		                   [&](uint64_t vaddr, uint64_t size) {
+			                   return Libs::Graphics::BufferCache::DirtyInAnyView(modified, {}, vaddr,
+			                                                                     size);
+		                   }) == DP::Verdict::Usable,
+		      "a draw whose walker read only unaliased, clean pages was rejected");
 	}
 	// A GPU write into the unaliased page leaves draws reading other bytes alone (ranged).
 	if (DP::RangedGpuWritesEnabled()) {

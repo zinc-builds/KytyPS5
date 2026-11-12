@@ -897,29 +897,25 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+static bool AliasHazardChecks() noexcept;
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged) {
 	// Emulator stores into guest memory (downloads, labels) change bytes without a guest write.
 	// Advance on both sides so no reader pairs the old bytes with the new epoch, or the reverse.
-	// A ranged store is recorded by its guest range; readers through another view of the same
-	// bytes would miss it, so a store into an aliased range advances the unranged epoch.
-	const bool wants_ranged = ranged || Graphics::GuestSyncEpoch::g_stores_ranged;
-	const bool aliased      = wants_ranged && GuestRangeAliased(vaddr, size);
-	Graphics::DrawPrepare::AliasStats::Note(Graphics::DrawPrepare::AliasStats::RangedStore, aliased);
+	// A ranged store into an aliased range also advances the unranged epoch, under the backing
+	// store's lock (GuestBackingStore::WriteBacking).
+	const bool ranged_store = ranged || Graphics::GuestSyncEpoch::g_stores_ranged;
 	const auto advance =
-	    wants_ranged && !aliased
-	        ? Graphics::GuestSyncEpoch::AdvanceRanged
-	        : Graphics::GuestSyncEpoch::Advance;
+	    ranged_store ? Graphics::GuestSyncEpoch::AdvanceRanged : Graphics::GuestSyncEpoch::Advance;
 	advance();
-	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size,
+	                                                            ranged_store && AliasHazardChecks());
 	advance();
 	return written;
 }
 
 bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
-	const bool aliased =
-	    Graphics::GuestSyncEpoch::g_stores_ranged && GuestRangeAliased(vaddr, size);
-	Graphics::DrawPrepare::AliasStats::Note(Graphics::DrawPrepare::AliasStats::RangedStore, aliased);
-	const bool ranged = Graphics::GuestSyncEpoch::g_stores_ranged && !aliased;
+	const bool ranged  = Graphics::GuestSyncEpoch::g_stores_ranged;
 	const auto advance = [ranged] {
 		if (ranged) {
 			Graphics::GuestSyncEpoch::AdvanceRanged();
@@ -928,7 +924,8 @@ bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 		}
 	};
 	advance();
-	const bool written = g_guest_address_space->TryStoreLabelBacking(vaddr, value, size);
+	const bool written = g_guest_address_space->TryStoreLabelBacking(vaddr, value, size,
+	                                                                 ranged && AliasHazardChecks());
 	advance();
 	return written;
 }
