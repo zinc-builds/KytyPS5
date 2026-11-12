@@ -1,5 +1,7 @@
 # Eboot reverse-engineering helpers (Track S)
 
+Addresses below are for the Astro Bot dump (PPSA21567) eboot.
+
 - `zx.cpp`: list/extract files from the `.zar` dump. Build against a build dir's zarchive and zstd:
   `clang++ -O2 -std=c++20 zx.cpp -I<build>/_deps/zarchive_source-src/include <build>/3rdparty/libzarchive.a <build>/_deps/zstd-build/lib/libzstd.a -o zx`;
   `zx PPSA21567.zar ls ""`, `zx PPSA21567.zar get eboot.bin out.bin`.
