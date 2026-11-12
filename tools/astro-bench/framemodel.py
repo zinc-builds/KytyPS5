@@ -60,7 +60,7 @@ def load(log, a, b):
 
 
 def busy(r):
-    """Command-thread CPU, run-queue delay and its GPU and mutex waits, ms (disjoint)."""
+    """Command-thread CPU, run-queue delay and its GPU and mutex waits, ms (the waits are elapsed times and can overlap the run-queue delay)."""
     return (r["cmd_cpu_ns"] + r.get("cmd_runq_ns", 0) + r.get("cmd_gpu_wait_ns", 0) +
             r.get("mutex_wait_ns", 0)) / 1e6
 

@@ -62,7 +62,7 @@ def parse(log, prefix):
 
 def demand(r):
     """The command thread's busy time in the frame, ms: CPU, run-queue delay, GPU and mutex waits
-    (disjoint; the prepare/recorder waits are partly spins inside the CPU time, so not added)."""
+    (the waits can overlap the run-queue delay; the prepare/recorder waits are partly spins inside the CPU time, so not added)."""
     return (r.get("cmd_cpu_ns", 0) + r.get("cmd_gpu_wait_ns", 0) + r.get("mutex_wait_ns", 0) +
             r.get("cmd_runq_ns", 0)) / 1e6
 
