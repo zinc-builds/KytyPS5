@@ -98,8 +98,17 @@ enum class GuestWait : uint8_t { Equeue, Sleep, Cond, Mutex, Sema, EventFlag, Co
 
 class GuestWaitScope {
 public:
-	explicit GuestWaitScope(GuestWait kind, uint64_t ident = 0) noexcept;
-	~GuestWaitScope();
+	// Inline so that the disabled path costs a guard check, not a call.
+	explicit GuestWaitScope(GuestWait kind, uint64_t ident = 0) noexcept: m_ident(ident), m_kind(kind) {
+		if (Enabled()) {
+			Begin();
+		}
+	}
+	~GuestWaitScope() {
+		if (Enabled()) {
+			End();
+		}
+	}
 	// For waits whose ident is known only after they return (equeue: the first event's filter and
 	// ident).
 	void SetIdent(uint64_t ident) noexcept { m_ident = ident; }
@@ -107,6 +116,9 @@ public:
 	GuestWaitScope& operator=(const GuestWaitScope&) = delete;
 
 private:
+	void Begin() noexcept;
+	void End() noexcept;
+
 	uint64_t  m_start = 0;
 	uint64_t  m_ident = 0;
 	GuestWait m_kind;

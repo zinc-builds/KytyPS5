@@ -2933,6 +2933,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Cond, reinterpret_cast<uintptr_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3230,7 +3231,9 @@ static void* RunThread(void* arg) {
 	}
 #if defined(__linux__)
 	Common::HybridAffinity::ApplyToGuestThread(thread->name);
-	Common::GpuWaitDiag::SetGuestThread(thread->name);
+	Common::GpuWaitDiag::SetGuestThread(thread->name,
+	                                    reinterpret_cast<uintptr_t>(thread->attr->stack_addr),
+	                                    static_cast<size_t>(thread->attr->stack_size));
 #endif
 #endif
 
@@ -3870,6 +3873,7 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sleep, static_cast<uint64_t>(seconds) * 1000000u);
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
 	return OK;
 }

@@ -32,7 +32,7 @@ KV = re.compile(r"(\S+?)=(\S+)")
 CAUSES = [
     ("draws", "draws"), ("disp", "dispatches"), ("cmd_cpu_ns", "cmd CPU"),
     ("cmd_gpu_wait_ns", "cmd GPU wait"), ("cmd_idle_ns", "cmd no guest work"), ("cmd_blocked_ns", "cmd only blocked work"),
-    ("other_ns", "cmd other sleeps"), ("prep_wait_ns", "prepare wait"), ("rec_wait_ns", "recorder wait"),
+    ("other_ns", "cmd remainder (other sleeps)"), ("prep_wait_ns", "prepare wait"), ("rec_wait_ns", "recorder wait"),
     ("mutex_wait_ns", "mutex wait"), ("cmd_runq_ns", "run-queue delay"), ("cmd_ics", "preemptions"),
     ("cmd_vcs", "voluntary switches"), ("gc_ns", "GC"), ("collect_ns", "write collection"),
     ("submit_scan_ns", "submit scans"), ("shader_ns", "shader compile"), ("pipeline_ns", "pipeline compile"),
@@ -101,9 +101,10 @@ def report(frames, presented, label):
         print(f"{label}: {n} frames, too few")
         return
     for r in frames:
-        # The wall time not measured as busy or waiting for guest work: other sleeps.
-        r["other_ns"] = max(0.0, r["ms"] * 1e6 - demand(r) * 1e6 - r.get("cmd_idle_ns", 0) -
-                            r.get("cmd_blocked_ns", 0))
+        # The wall time not measured as busy or waiting for guest work: other sleeps (negative:
+        # the elapsed waits overlap the run-queue delay; framemodel.py).
+        r["other_ns"] = (r["ms"] * 1e6 - demand(r) * 1e6 - r.get("cmd_idle_ns", 0) -
+                         r.get("cmd_blocked_ns", 0))
     ms = [r["ms"] for r in frames]
     print(f"\n=== {label}: {n} guest frames, mean {st.mean(ms):.2f} ms ({1000 / st.mean(ms):.1f} FPS), "
           f"p50 {pct(ms, 50):.1f}, p90 {pct(ms, 90):.1f}, p99 {pct(ms, 99):.1f}, max {max(ms):.1f} ms")

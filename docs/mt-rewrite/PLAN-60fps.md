@@ -469,14 +469,15 @@ open PR is a weak signal.
 
 The target is p99 = 1 refresh (`flip_vbl` p99 1), not only the mean. On current `dev`
 (Sky Garden, 1000–1600) 6.2% of presented frames take two refreshes.
-- **The main cause is the game, not our pipeline.** The command thread has no guest work 1.0 ms
-  per frame. The game's render workers (`Draw*`) wait for an efficiency core 2.7 times longer than
-  they run.
+- **The main cause is the game's render workers waiting for a core.** The command thread has no
+  guest work 1.0 ms per frame. The game's render workers (`Draw*`) wait for an efficiency core 2.7
+  times longer than they run; moving them removes the waiting (below).
 - **Putting them on the performance cores** (`KYTY_GUEST_PCORE_NAMES=Draw`): FPS +2.05%,
   two-refresh frames 3.9% → 1.5% (A/B, n=3). A default change is proposed, not made.
 - **Next:** the replay estimates that removing the remaining waits plus ~0.5 ms of command-thread
   CPU, or ~1.5 ms of CPU alone, reaches under 1%.
-- **The periodic 2 s spike is a host daemon** on the command thread's SMT sibling, not ours.
+- **The periodic 2 s spike is most likely a host daemon** on the command thread's SMT sibling (not
+  isolated; a synthetic load there reproduces the slowdown).
 
 FINDINGS, "Frame pacing", has the tables. Judge pacing changes with `KYTY_FRAME_DIAG=1` and
 `framemodel.py` besides `cmd_ns`, and attribute work only per guest frame (`GFRAME`), never per

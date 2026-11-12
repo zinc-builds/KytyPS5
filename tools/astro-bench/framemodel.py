@@ -10,21 +10,24 @@ display. The share of presented frames that take two or more refreshes is what t
 on Sky Garden the replay of the measured walls matched the measured share within ~0.5 points
 (FINDINGS, "Frame pacing").
 
-A frame's wall time splits into disjoint measured parts and a remainder:
+A frame's wall time is compared with its measured parts:
   - busy: command-thread CPU time, run-queue delay, and its blocking waits on the GPU timeline and
     the render-context mutex;
   - no guest work: waiting with nothing queued (cmd_idle_ns), and with only blocked submissions
     queued (cmd_blocked_ns);
-  - other sleeps: the remainder (prepare-worker, recorder and scheduler waits that slept, and any
-    wait not instrumented); not attributed.
+  - the remainder, other sleeps (prepare-worker, recorder and scheduler waits that slept, and any
+    wait not instrumented). The waits are elapsed times, so they can include wake-up delay that
+    the run-queue figure also counts: the parts can overlap, and the remainder is printed signed
+    (a negative mean is overlap, not time).
 The prepare/recorder waits (prep_wait_ns, rec_wait_ns) are shown separately: they are partly spins
-inside the CPU time and partly sleeps inside the remainder, so they are not added.
+inside the CPU time and partly sleeps inside the remainder.
 
 What-ifs edit the per-frame walls and replay them; they assume the rest of the frame stays as it
 was, so they are estimates, not measurements:
   - a cause removed: the slow frames of one class set to the window's median wall, or the measured
     no-guest-work time removed from every frame;
-  - a uniform cut of the command thread's CPU per frame, bounded by each frame's CPU time.
+  - a uniform cut of the command thread's CPU per frame, bounded by each frame's CPU time;
+every edited frame stays between zero and its measured wall time.
 """
 import math
 import os
@@ -68,8 +71,8 @@ def idle(r):
 
 
 def other(r):
-    """The wall time not measured as busy or idle, ms (other sleeps)."""
-    return max(0.0, r["ms"] - busy(r) - idle(r))
+    """The wall time not measured as busy or idle, ms: other sleeps, or overlap if negative."""
+    return r["ms"] - busy(r) - idle(r)
 
 
 def waits(r):
@@ -131,7 +134,7 @@ def main():
     n = len(frames)
     m = lambda f: st.mean(f(r) for r in frames)  # noqa: E731
     print(f"level frames {a}-{b}: {n} guest frames; wall mean {m(lambda r: r['ms']):.2f} ms = command thread busy "
-          f"{m(busy):.2f} + no guest work {m(idle):.2f} + other sleeps {m(other):.2f}")
+          f"{m(busy):.2f} + no guest work {m(idle):.2f} + remainder {m(other):+.2f} (other sleeps; negative = overlap)")
     print(f"  busy = CPU {m(lambda r: r['cmd_cpu_ns']) / 1e6:.2f} + run queue {m(lambda r: r.get('cmd_runq_ns', 0)) / 1e6:.2f}"
           f" + GPU waits {m(lambda r: r.get('cmd_gpu_wait_ns', 0)) / 1e6:.2f} + mutex waits {m(lambda r: r.get('mutex_wait_ns', 0)) / 1e6:.2f};"
           f" waiting for the prepare workers/recorder (spin or sleep, overlaps) {m(waits):.2f}")
@@ -143,19 +146,23 @@ def main():
         sel = [r for r in slow if cls(r) == name]
         print(f"  {100 * count / n:5.1f}%  {name}: wall {st.mean(r['ms'] for r in sel):.1f} ms, busy "
               f"{st.mean(busy(r) for r in sel):.1f}, no guest work {st.mean(idle(r) for r in sel):.1f}, "
-              f"other sleeps {st.mean(other(r) for r in sel):.1f}, prepare wait {st.mean(r['prep_wait_ns'] for r in sel) / 1e6:.2f}")
+              f"remainder {st.mean(other(r) for r in sel):+.1f}, prepare wait {st.mean(r['prep_wait_ns'] for r in sel) / 1e6:.2f}")
 
     med = st.median(wall)
-    def cut(r, c):
-        return r["ms"] - min(c, r["cmd_cpu_ns"] / 1e6)
+    def cut(r, c, no_idle=False):
+        """The frame without c ms of its CPU (and its waits for guest work), never below 0."""
+        less = min(c, r["cmd_cpu_ns"] / 1e6)
+        if no_idle:
+            less += min(idle(r), r["ms"] - less)
+        return r["ms"] - less
     rows = [
         ("as measured", wall),
         ("no periodic prepare-wait spike", [med if cls(r) == "prepare wait >3 ms" and r["ms"] > 19 else r["ms"] for r in frames]),
         ("no shader/pipeline compiles", [med if cls(r) == "shader/pipeline compile" and r["ms"] > 19 else r["ms"] for r in frames]),
-        ("no waiting for guest work", [r["ms"] - idle(r) for r in frames]),
+        ("no waiting for guest work", [cut(r, 0.0, True) for r in frames]),
     ]
     rows += [(f"CPU -{c} ms per frame", [cut(r, c) for r in frames]) for c in (0.5, 1.0, 1.5, 2.0)]
-    rows += [(f"CPU -{c} ms, no waiting for guest work", [cut(r, c) - idle(r) for r in frames]) for c in (0.5, 1.0)]
+    rows += [(f"CPU -{c} ms, no waiting for guest work", [cut(r, c, True) for r in frames]) for c in (0.5, 1.0)]
     print(f"\nreplay (depth {DEPTH}): presented frames taking 2+ refreshes; what-ifs are estimates")
     for name, walls in rows:
         print(f"  {name:40s} mean {st.mean(walls):5.2f} ms -> {100 * replay(walls):5.1f}%")

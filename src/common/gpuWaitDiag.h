@@ -66,8 +66,8 @@ void NoteEarlySubmit() noexcept;
 void SetCommandThread() noexcept;
 // KYTY_OFFCPU_THREAD=<name prefix> (with KYTY_OFFCPU_SAMPLE=1): sample the first game thread
 // whose name starts with it instead of the command thread; with KYTY_FRAME_DIAG=1 only while the
-// command thread has no work. Call from a game thread once it has its name.
-void SetGuestThread(const std::string& name) noexcept;
+// command thread has no work. Call from a game thread once it has its name, with its guest stack.
+void SetGuestThread(const std::string& name, uintptr_t stack_base, size_t stack_size) noexcept;
 
 // KYTY_DRIVER_STATS=1 (with KYTY_GPU_WAIT_DIAG): wall time of the command thread's own driver
 // paths, per kind, and its direct recordings (CommandBuffer::Handle/BindingHandle) per call site

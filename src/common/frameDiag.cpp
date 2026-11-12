@@ -330,17 +330,14 @@ GuestThread* Self() {
 
 } // namespace
 
-GuestWaitScope::GuestWaitScope(GuestWait kind, uint64_t ident) noexcept: m_ident(ident), m_kind(kind) {
+void GuestWaitScope::Begin() noexcept {
 	// Only the outermost wait of a thread counts (a timed wait may be built on another).
-	if (Enabled() && t_guest_depth++ == 0) {
+	if (t_guest_depth++ == 0) {
 		m_start = NowNs();
 	}
 }
 
-GuestWaitScope::~GuestWaitScope() {
-	if (!Enabled()) {
-		return;
-	}
+void GuestWaitScope::End() noexcept {
 	t_guest_depth--;
 	if (m_start == 0) {
 		return;
@@ -366,7 +363,8 @@ void OnGuestSubmit(bool graphics) noexcept {
 	if (!Enabled() || !graphics) {
 		return;
 	}
-	g_submitter.store(Self(), std::memory_order_relaxed);
+	// Release: the thread record (tid, name) is complete before a reader can see it.
+	g_submitter.store(Self(), std::memory_order_release);
 	g_last_submit_ns.store(NowNs(), std::memory_order_relaxed);
 }
 
@@ -407,7 +405,7 @@ void OnGuestCondSignal(const void* cond) noexcept {
 	} else {
 		slot.last_ident.store(~uint64_t {0}, std::memory_order_relaxed);
 	}
-	slot.thread.store(self, std::memory_order_relaxed);
+	slot.thread.store(self, std::memory_order_release);
 	slot.ns.store(NowNs(), std::memory_order_relaxed);
 	slot.cond.store(key, std::memory_order_release);
 }
@@ -425,7 +423,7 @@ void OnCmdIdleBegin() noexcept {
 		return;
 	}
 	g_cmd_idle.store(true, std::memory_order_relaxed);
-	g_idle_sub = g_submitter.load(std::memory_order_relaxed);
+	g_idle_sub = g_submitter.load(std::memory_order_acquire);
 	if (g_idle_sub != nullptr) {
 		for (int k = 0; k < kKinds; k++) {
 			g_idle_short_ns[k]    = g_idle_sub->short_ns[k].load(std::memory_order_relaxed);
@@ -444,7 +442,7 @@ void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept {
 	if (end_ns - start_ns < kIdleMinNs) {
 		return;
 	}
-	auto* sub = g_submitter.load(std::memory_order_relaxed);
+	auto* sub = g_submitter.load(std::memory_order_acquire);
 	if (sub == nullptr) {
 		return;
 	}
@@ -508,7 +506,12 @@ void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept {
 	    n < static_cast<int>(sizeof(line))) {
 		auto& slot = CondSlot(last_ident & mask);
 		if (slot.cond.load(std::memory_order_acquire) == (last_ident & mask)) {
-			const auto* sig      = slot.thread.load(std::memory_order_relaxed);
+			// Acquire: whichever signaller's record this is, it is complete (slot fields may still
+			// mix two signals; the line is diagnostic).
+			const auto* sig      = slot.thread.load(std::memory_order_acquire);
+			if (sig == nullptr) {
+				return;
+			}
 			const auto  sig_ns   = slot.ns.load(std::memory_order_relaxed);
 			const auto  sig_last = slot.last_ident.load(std::memory_order_relaxed);
 			const auto  s_start  = slot.last_start.load(std::memory_order_relaxed);

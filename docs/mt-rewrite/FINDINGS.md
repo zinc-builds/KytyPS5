@@ -1947,11 +1947,13 @@ downloads, the tiler's buffer path, `CopyImage`, the fault buffer) drain ~15 ms/
 **Tools.** `KYTY_FRAME_DIAG=1` (off by default; it reads `/proc` twice per frame and was not
 A/B-measured, so use it to attribute, not to compare FPS):
 - One `GFRAME` line per guest flip, on the command thread when it decodes the flip, for the work
-  since the previous one. Its wall time splits into disjoint measured parts:
+  since the previous one. Its wall time is compared with its measured parts:
   - busy: CPU, run-queue delay, waits on the GPU timeline and on the render-context mutex;
   - no guest work: `cmd_idle_ns` (nothing queued) and `cmd_blocked_ns` (only blocked submissions);
-  - other sleeps: the rest (prepare-worker, recorder and scheduler waits that slept), not
-    attributed.
+  - the remainder: other sleeps (prepare-worker, recorder and scheduler waits that slept),
+    not attributed.
+  The waits are elapsed times and can include wake-up delay that the run-queue figure also
+  counts, so the parts can overlap; the remainder is printed signed.
   The prepare/recorder waits are printed separately. They are partly spins inside the CPU time,
   so they are not added.
 - One `FRAME` line per presented flip (the refreshes the viewer saw).
@@ -1996,9 +1998,12 @@ frames by construction and explain nothing. The first version of this table did 
   - The command thread takes the submission ~10 µs after it arrives.
 - **Off-CPU** (`KYTY_OFFCPU_THREAD=DrawThread`): while the command thread has no work,
   `DrawThread` is asleep 86% of the time, all in `futex`.
-- **No emulator event in the chain.** No equeue (flip, vblank, EOP), sleep or label wait appears
-  in the gaps, so the game is not waiting for the 2.6 ms flip completion. Waits inside guest read
-  faults are not timed, but none was the last wait before a submission.
+- **No emulator event in the measured chain.** No equeue (flip, vblank, EOP), sleep or label wait
+  appears in the gaps, so the game is not seen waiting for the 2.6 ms flip completion. Not ruled
+  out: waits inside guest read faults are not timed (none was the last wait before a submission);
+  the absolute-time condition wait and `sceKernelSleep` were timed only from the second round on.
+  The placement experiments below (render workers moved, no-guest-work time gone) are the
+  stronger evidence.
 - **Run queues** (`/proc/<tid>/schedstat` over 10 s, default layout):
   - The 7 `Draw*` workers run 27% of a CPU between them and wait runnable 73%: 2.7 times longer
     than they run.
@@ -2020,17 +2025,21 @@ frames by construction and explain nothing. The first version of this table did 
 - The emulator ignores guest thread priorities on Linux (`PthreadSetprio` maps them only on
   Windows), so the game's render workers compete equally with its job pool.
 
-**The periodic prepare spike is a host daemon.**
+**The periodic prepare spike: most likely a host daemon on the SMT siblings (not isolated).**
 - **The signature:** pairs of slow frames every 2.000 s of wall time. The prepare workers' busy
   time rises 21 → 29 ms, the command thread waits ~4.5 ms for them, and every per-draw cost rises
   ~25% with the same draws.
-- **It is a host daemon:** CoolerControl (`coolercontrold`, thread `ccio-nct6798`, polling the
-  NCT6798 sensor chip) runs on CPU 11 and CPU 7. Those are the SMT siblings of the command thread
-  (CPU 10) and of a prepare worker (CPU 6). Per 20 ms `perf stat`: the command and prepare threads
-  lose ~30% IPC at an unchanged clock (cycles/ref-cycles flat).
+- **The likely cause:** CoolerControl (`coolercontrold`, thread `ccio-nct6798`, polling the
+  NCT6798 sensor chip) runs at that period on CPU 11 and CPU 7. Those are the SMT siblings of the
+  command thread (CPU 10) and of a prepare worker (CPU 6). Per 20 ms `perf stat`: the command and
+  prepare threads lose ~30% IPC at an unchanged clock (cycles/ref-cycles flat).
+- **The mechanism reproduces:** a synthetic load on CPU 11 (memory copies at 25% duty) raised
+  `cmd_ns` 33%; compute-only at 25%, 5%. The daemon itself was not stopped (a system setting
+  outside this work), so the attribution is the best-supported one, not an isolation.
 - **The game is not doing more:** its CPU use per wall-ms is unchanged in those frames.
-- The fix is the host's: the daemon's poll rate or CPU affinity. In the replay, removing those
-  frames takes 6.2% → 5.7%.
+- If it is the daemon, the fix is the host's (its poll rate or CPU affinity). In the replay,
+  removing those frames takes 6.2% → 5.7%. Real systems run such services, so the numbers of
+  record keep these frames.
 
 **What-ifs (replay of the default run, estimates: the rest of each frame is assumed unchanged).**
 Share of presented frames taking 2+ refreshes:
