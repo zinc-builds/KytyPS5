@@ -637,7 +637,10 @@ private:
 	[[nodiscard]] static int RunStateMode();
 	[[nodiscard]] RunEpochs  CurrentRunEpochs() const;
 	[[nodiscard]] bool       RunTargetsValid() const {
-		return m_run_ok && m_run.targets.sequence != 0 && m_run.targets.sequence + 1 == m_committing;
+		// Rechecked at every use: an epoch move since the run check (this draw's preliminary
+		// work, an earlier target's resolve, another thread's store) ends the shortcut.
+		return m_run_ok && m_run.targets.sequence != 0 && m_run.targets.sequence + 1 == m_committing &&
+		       m_run.epochs == CurrentRunEpochs();
 	}
 	[[nodiscard]] bool TryRunTargets(RenderColorInfo* colors, uint32_t color_count,
 	                                 RenderDepthInfo& depth, vk::ImageAspectFlags& feedback_aspects,

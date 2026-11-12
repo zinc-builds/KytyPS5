@@ -1108,6 +1108,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.mrt_mask == 0) {
 		state.color_info.Construct(0);
 	}
+	// The resolves below hold under the epochs taken before the first of them; the next draw may
+	// skip them only if nothing moves those epochs until this commit is done (another target's
+	// resolve, this draw's bindings and clears, any thread's store).
+	if (m_committing != 0) {
+		m_run_resolved     = CurrentRunEpochs();
+		m_run_resolved_set = true;
+	}
 	const auto* targets  = m_adopted_targets;
 	uint32_t    proposal = 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -1133,12 +1140,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	} else {
 		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
-	// The resolves above hold under these epochs; the next draw may skip them only if nothing
-	// moves them for the rest of this commit (its bindings, clears, stores).
-	if (m_committing != 0) {
-		m_run_resolved     = CurrentRunEpochs();
-		m_run_resolved_set = true;
-	}
+
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {state.color_info.data(), state.color_count};
