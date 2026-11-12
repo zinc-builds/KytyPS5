@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "common/frameDiag.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -277,6 +278,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sema, reinterpret_cast<uintptr_t>(sem));
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -613,6 +615,7 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sema, reinterpret_cast<uintptr_t>(sem));
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -628,11 +631,13 @@ int KYTY_SYSV_ABI sem_trywait(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sema, reinterpret_cast<uintptr_t>(sem));
 	const int result = SemTimedwaitImpl(sem, &usec);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
 int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abstime) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sema, reinterpret_cast<uintptr_t>(sem));
 	uint32_t micros = 0;
 	if (!AbsTimespecToMicros(abstime, &micros)) {
 		return SetErrnoReturn(POSIX_EINVAL);
@@ -686,6 +691,7 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sema, reinterpret_cast<uintptr_t>(sem));
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }

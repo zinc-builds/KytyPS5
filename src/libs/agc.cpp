@@ -1,4 +1,5 @@
 #include "libs/agc.h"
+#include "common/frameDiag.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -4131,6 +4132,7 @@ struct TessellationDriverState {
 static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	Common::FrameDiag::OnGuestSubmit();
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords});
@@ -4181,6 +4183,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 }
 
 static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
+	Common::FrameDiag::OnGuestSubmit();
 	if (acb == nullptr || size_in_dwords == 0) {
 		return;
 	}

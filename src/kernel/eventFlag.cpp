@@ -1,4 +1,5 @@
 #include "kernel/eventFlag.h"
+#include "common/frameDiag.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -285,6 +286,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
+	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::EventFlag, reinterpret_cast<uintptr_t>(ef));
 	PRINT_NAME();
 
 	if (ef == nullptr) {

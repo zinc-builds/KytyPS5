@@ -466,14 +466,23 @@ void GuestGpu::ThreadRun(void* data) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         should_stop = false;
+		uint64_t                     idle_start  = 0;
+		uint64_t                     idle_end    = 0;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (idle_start == 0 && Common::FrameDiag::Enabled()) {
+					Common::FrameDiag::OnCmdIdleBegin();
+					idle_start = Common::FrameDiag::NowNs();
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdNoWork);
 				Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+			}
+			if (idle_start != 0) {
+				idle_end = Common::FrameDiag::NowNs();
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -514,6 +523,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 			}
+		}
+		if (idle_start != 0) {
+			Common::FrameDiag::OnCmdIdle(idle_start, idle_end); // printed outside the queue lock
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
