@@ -350,6 +350,47 @@ add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+# The shader store's key (pipelineSerialization.cpp, StoreHeader): a hash of every source that
+# decides what the store records, so an unrelated rebuild keeps the store. The recompiler, its IR
+# and their serialization (src/graphics/shader); the guest register and format definitions they
+# decode with (gpu_defs.h, gpu_format.h/.cpp, hardwareContext.h); what the pipeline cache passes to
+# the recompiler and how it serializes records and graphics pipeline keys (pipelineCache.h/.cpp,
+# pipelineSerialization.cpp); and renderTarget.h, which sizes the key's color arrays. Values the
+# generated code takes from elsewhere (device limits, the buffer cache's page table geometry, the
+# environment switches) go into the store header themselves.
+file(GLOB_RECURSE kyty_shader_store_inputs CONFIGURE_DEPENDS
+	RELATIVE "${KYTY_SOURCE_DIR}"
+	"${KYTY_SOURCE_DIR}/graphics/shader/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/*.inc"
+)
+list(APPEND kyty_shader_store_inputs
+	"graphics/guest_gpu/gpu_defs.h"
+	"graphics/guest_gpu/gpu_format.h"
+	"graphics/guest_gpu/gpu_format.cpp"
+	"graphics/guest_gpu/hardwareContext.h"
+	"graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+	"graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+	"graphics/host_gpu/renderer/pipeline/pipelineSerialization.cpp"
+	"graphics/host_gpu/renderer/renderTarget.h"
+)
+list(SORT kyty_shader_store_inputs)
+set(kyty_shader_store_dir "${PROJECT_BINARY_DIR}/shader_store")
+set(kyty_shader_store_list "${kyty_shader_store_dir}/inputs.txt")
+set(kyty_shader_store_header "${kyty_shader_store_dir}/shaderStoreKey.h")
+list(JOIN kyty_shader_store_inputs "\n" kyty_shader_store_lines)
+# Rewritten only when the list changes (a file added or removed).
+file(CONFIGURE OUTPUT "${kyty_shader_store_list}" CONTENT "${kyty_shader_store_lines}\n" @ONLY NEWLINE_STYLE UNIX)
+list(TRANSFORM kyty_shader_store_inputs PREPEND "${KYTY_SOURCE_DIR}/" OUTPUT_VARIABLE kyty_shader_store_paths)
+add_custom_command(
+	OUTPUT "${kyty_shader_store_header}"
+	COMMAND ${CMAKE_COMMAND} -DLIST=${kyty_shader_store_list} -DROOT=${KYTY_SOURCE_DIR}
+	        -DOUTPUT=${kyty_shader_store_header} -P "${KYTY_SOURCE_DIR}/shader_store_key.cmake"
+	DEPENDS ${kyty_shader_store_paths} "${kyty_shader_store_list}" "${KYTY_SOURCE_DIR}/shader_store_key.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${kyty_shader_store_header}")
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
