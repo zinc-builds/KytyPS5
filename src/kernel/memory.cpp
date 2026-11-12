@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/pageVersions.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -20,8 +21,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -897,9 +900,15 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged) {
 	// Emulator stores into guest memory (downloads, labels) change bytes without a guest write.
 	// Advance on both sides so no reader pairs the old bytes with the new epoch, or the reverse.
-	const auto advance = ranged || Graphics::GuestSyncEpoch::g_stores_ranged
-	                         ? Graphics::GuestSyncEpoch::AdvanceRanged
-	                            : Graphics::GuestSyncEpoch::Advance;
+	// A ranged store is recorded by its guest range; readers through another view of the same
+	// bytes would miss it, so a store into an aliased range advances the unranged epoch.
+	const bool wants_ranged = ranged || Graphics::GuestSyncEpoch::g_stores_ranged;
+	const bool aliased      = wants_ranged && GuestRangeAliased(vaddr, size);
+	Graphics::DrawPrepare::AliasStats::Note(Graphics::DrawPrepare::AliasStats::RangedStore, aliased);
+	const auto advance =
+	    wants_ranged && !aliased
+	        ? Graphics::GuestSyncEpoch::AdvanceRanged
+	        : Graphics::GuestSyncEpoch::Advance;
 	advance();
 	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
 	advance();
@@ -907,8 +916,12 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool range
 }
 
 bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
-	const auto advance = [] {
-		if (Graphics::GuestSyncEpoch::g_stores_ranged) {
+	const bool aliased =
+	    Graphics::GuestSyncEpoch::g_stores_ranged && GuestRangeAliased(vaddr, size);
+	Graphics::DrawPrepare::AliasStats::Note(Graphics::DrawPrepare::AliasStats::RangedStore, aliased);
+	const bool ranged = Graphics::GuestSyncEpoch::g_stores_ranged && !aliased;
+	const auto advance = [ranged] {
+		if (ranged) {
 			Graphics::GuestSyncEpoch::AdvanceRanged();
 		} else {
 			Graphics::GuestSyncEpoch::Advance();
@@ -1263,6 +1276,42 @@ bool ProtectAsyncGuestPage(uint64_t page, uint64_t& token) {
 
 uint64_t GuestRemapGeneration() noexcept {
 	return g_remap_generation.load(std::memory_order_relaxed);
+}
+
+// KYTY_ALIAS_HAZARD=0: report no aliases to the hazard checks (they compare guest addresses
+// only, as before).
+static bool AliasHazardChecks() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ALIAS_HAZARD");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool AnyGuestAliases() noexcept {
+	return AliasHazardChecks() && g_guest_address_space != nullptr &&
+	       g_guest_address_space->Store().AnyAliases();
+}
+
+bool GuestRangeAliased(uint64_t vaddr, uint64_t size) {
+	return AliasHazardChecks() && g_guest_address_space != nullptr &&
+	       g_guest_address_space->Store().RangeAliased(vaddr, size);
+}
+
+void GuestAliasesOf(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+	if (AliasHazardChecks() && g_guest_address_space != nullptr) {
+		g_guest_address_space->Store().AliasesOf(vaddr, size, out);
+	}
+}
+
+void GuestAliasStats(uint64_t& views, uint64_t& ranges, uint64_t& bytes) {
+	views = ranges = bytes = 0;
+	if (g_guest_address_space != nullptr) {
+		const auto stats = g_guest_address_space->Store().GetAliasStats();
+		views            = stats.maps;
+		ranges           = stats.ranges;
+		bytes            = stats.bytes;
+	}
 }
 
 bool AsyncGuestPageUntouched(uint64_t page, uint64_t token, bool* stale) {

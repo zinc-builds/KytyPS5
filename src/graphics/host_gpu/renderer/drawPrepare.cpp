@@ -6,9 +6,11 @@
 #include "common/profiler.h"
 #include "common/stallDiag.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -258,6 +260,17 @@ void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	NoteHazard();
 	if (RangedGpuWritesEnabled()) {
 		(void)g_gpu_written.Record(vaddr, size);
+		// The bytes change under every guest view of them: record the other views too, since
+		// adoption compares guest addresses.
+		if (LibKernel::Memory::AnyGuestAliases()) {
+			thread_local std::vector<std::pair<uint64_t, uint64_t>> aliases;
+			aliases.clear();
+			LibKernel::Memory::GuestAliasesOf(vaddr, size, aliases);
+			for (const auto& [alias, bytes]: aliases) {
+				(void)g_gpu_written.Record(alias, bytes);
+			}
+			AliasStats::Note(AliasStats::GpuWrite, !aliases.empty());
+		}
 	}
 }
 
@@ -269,11 +282,55 @@ bool GpuWrittenSince(uint64_t sequence, const Log& log) {
 	return g_gpu_written.Since(sequence, [&](const StoredRange& range) { return LogHit(log, range); });
 }
 
+namespace AliasStats {
+namespace {
+std::array<std::atomic<uint64_t>, Kinds> g_aliased {};
+std::array<std::atomic<uint64_t>, Kinds> g_hit {};
+std::atomic<uint64_t>                    g_last_report_ns {0};
+} // namespace
+
+bool Enabled() noexcept {
+	static const bool enabled = std::getenv("KYTY_ALIAS_STATS") != nullptr;
+	return enabled;
+}
+
+void Note(Kind kind, bool aliased, bool hit) noexcept {
+	if (!Enabled() || !aliased) {
+		return;
+	}
+	g_aliased[kind].fetch_add(1, std::memory_order_relaxed);
+	if (hit) {
+		g_hit[kind].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void Report() {
+	const auto now  = NowNs();
+	auto       last = g_last_report_ns.load(std::memory_order_relaxed);
+	if (now - last < 5'000'000'000ull ||
+	    !g_last_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	uint64_t views = 0, ranges = 0, bytes = 0;
+	LibKernel::Memory::GuestAliasStats(views, ranges, bytes);
+	std::printf("ALIAS_STATS views=%" PRIu64 " aliased_ranges=%" PRIu64 " aliased_bytes=%" PRIu64
+	            " gpu_writes_aliased=%" PRIu64 " dirty_checks_aliased=%" PRIu64
+	            " dirty_hits_via_alias=%" PRIu64 " ranged_stores_aliased=%" PRIu64
+	            " prepared_reads_aliased=%" PRIu64 "\n",
+	            views, ranges, bytes, g_aliased[GpuWrite].load(), g_aliased[DirtyCheck].load(),
+	            g_hit[DirtyCheck].load(), g_aliased[RangedStore].load(),
+	            g_aliased[PreparedRead].load());
+	std::fflush(stdout);
+}
+} // namespace AliasStats
+
 RangedStore::RangedStore(uint64_t vaddr, uint64_t size) noexcept
     : m_outer(GuestSyncEpoch::g_stores_ranged),
       // With the walker's page log, every worker read of guest memory is logged.
-      m_ranged(ShaderRecompiler::IR::SrtWalkerPageLogEnabled() ||
-               ShaderRecompiler::IR::SrtWalkerReadsLogged(vaddr, size)) {
+      m_ranged((ShaderRecompiler::IR::SrtWalkerPageLogEnabled() ||
+                ShaderRecompiler::IR::SrtWalkerReadsLogged(vaddr, size)) &&
+               // Recorded by guest range, which readers through another view would miss.
+               !LibKernel::Memory::GuestRangeAliased(vaddr, size)) {
 	if (m_ranged) {
 		m_open = OpenStoredRange(vaddr, size);
 	}

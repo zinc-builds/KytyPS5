@@ -835,6 +835,8 @@ if(BUILD_TESTING)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME prepare_pool COMMAND $<TARGET_FILE:prepare_pool_tests>)
+	add_test(NAME alias_hazard
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --alias-hazard-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher

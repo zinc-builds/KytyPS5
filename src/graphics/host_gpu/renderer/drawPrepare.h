@@ -152,6 +152,48 @@ void                   CloseStoredRange(uint64_t open);
 // The same over a log's reads and walker pages.
 [[nodiscard]] bool StoredSince(uint64_t sequence, const Log& log);
 
+// What a draw is posted with (HazardGeneration, GuestSyncEpoch::CurrentUnranged, StoredSequence,
+// GpuWriteSequence), and whether its prepared result may be adopted at its serial position.
+struct Stamps {
+	uint64_t hazard_generation  = 0;
+	uint64_t sync_epoch         = 0;
+	uint64_t stored_sequence    = 0;
+	uint64_t gpu_write_sequence = 0;
+};
+enum class Verdict : uint8_t {
+	Usable,
+	Failed,     // the preparation could not finish on the worker
+	Epoch,      // the emulator stored into guest memory, unranged
+	GpuWritten, // bytes it read (or, unranged, any bytes) became GPU-written
+	Stored,     // an emulator store (a readback publication) overlapped its reads
+	GpuDirty,   // bytes it read are GPU-dirty now: the command thread would have waited
+};
+// `has_gpu_dirty_bytes(vaddr, size)`: BufferCache::HasGpuDirtyBytes.
+template <typename HasGpuDirtyBytes>
+[[nodiscard]] Verdict Adoption(const Stamps& stamps, const Log& log,
+                               HasGpuDirtyBytes&& has_gpu_dirty_bytes) {
+	static const bool ranged_gpu = RangedGpuWritesEnabled();
+	if (log.failed) {
+		return Verdict::Failed;
+	}
+	if (GuestSyncEpoch::CurrentUnranged() != stamps.sync_epoch) {
+		return Verdict::Epoch;
+	}
+	if (ranged_gpu ? GpuWrittenSince(stamps.gpu_write_sequence, log)
+	               : HazardGeneration() != stamps.hazard_generation) {
+		return Verdict::GpuWritten;
+	}
+	if (StoredSince(stamps.stored_sequence, log)) {
+		return Verdict::Stored;
+	}
+	for (const auto& read: log.reads) {
+		if (has_gpu_dirty_bytes(read.first, read.second)) {
+			return Verdict::GpuDirty;
+		}
+	}
+	return Verdict::Usable;
+}
+
 // An emulator store into guest memory between queued draws (a label, WRITE_DATA, an occlusion
 // dump). If every page of [vaddr, vaddr + size) is read-watched, so that a prepare worker's reads
 // of those bytes were logged, the queued draws are checked against the range (StoredSince)
@@ -201,6 +243,22 @@ private:
 	std::vector<std::unique_ptr<Entry>> m_entries;
 	size_t                              m_next = 0;
 };
+
+// KYTY_ALIAS_STATS: how often the hazard checks meet guest memory mapped at more than one guest
+// address (LibKernel::Memory::GuestRangeAliased). Noted only while aliases exist.
+namespace AliasStats {
+enum Kind : uint32_t {
+	GpuWrite,     // NoteGpuWrite of an aliased range (other views recorded too)
+	DirtyCheck,   // HasGpuDirtyBytes of an aliased range (hit: dirty through another view)
+	RangedStore,  // a ranged emulator store into an aliased range (made unranged)
+	PreparedRead, // a prepared draw's logged read of an aliased range, at adoption
+	Kinds,
+};
+[[nodiscard]] bool Enabled() noexcept;
+void               Note(Kind kind, bool aliased, bool hit = false) noexcept;
+// At most every five seconds: prints the counts, and whether any alias exists at all.
+void Report();
+} // namespace AliasStats
 
 class Worker;
 

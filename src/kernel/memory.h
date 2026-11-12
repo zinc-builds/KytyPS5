@@ -209,6 +209,15 @@ bool               ProtectAsyncGuestPage(uint64_t page, uint64_t& token);
 [[nodiscard]] bool AsyncGuestPageUntouched(uint64_t page, uint64_t token, bool* stale = nullptr);
 // Advances on remaps and zeroing: guest bytes that change without a store.
 [[nodiscard]] uint64_t GuestRemapGeneration() noexcept;
+// Guest views that share backing bytes with another view (direct memory mapped twice). Checks
+// that compare guest virtual addresses must also look at a range's other views. Any thread; no
+// alias anywhere costs one atomic load.
+[[nodiscard]] bool AnyGuestAliases() noexcept;
+[[nodiscard]] bool GuestRangeAliased(uint64_t vaddr, uint64_t size);
+// Appends the other guest views of the bytes behind [vaddr, vaddr + size) as {vaddr, size}.
+void GuestAliasesOf(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& out);
+// KYTY_ALIAS_STATS: guest views, merged aliased guest ranges and their bytes.
+void GuestAliasStats(uint64_t& views, uint64_t& ranges, uint64_t& bytes);
 // KYTY_ASYNC_WP_VERIFY: takes the ranges the emulator wrote through the backing alias.
 void TakeAliasWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 

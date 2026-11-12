@@ -691,7 +691,10 @@ public:
 		}
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
-		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode, write_protected});
+		const auto added =
+		    m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode, write_protected})
+		        .first;
+		UpdateAliasesUnlocked(&added->second);
 		// Again once the view is in: a new alias voids labels proven against the old views.
 		g_remap_generation.fetch_add(1, std::memory_order_relaxed);
 		return true;
@@ -764,11 +767,13 @@ public:
 			std::lock_guard lock(m_mutex);
 			const TranslationWrite translation_write;
 			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
+			UpdateAliasesUnlocked(nullptr);
 		}
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			std::lock_guard lock(m_mutex);
 			const TranslationWrite translation_write;
 			m_maps.emplace(old.vaddr, old);
+			UpdateAliasesUnlocked(&old);
 			return false;
 		}
 
@@ -813,6 +818,7 @@ public:
 		std::lock_guard lock(m_mutex);
 		const TranslationWrite translation_write;
 		RemoveMappingsUnlocked(vaddr, size);
+		UpdateAliasesUnlocked(nullptr);
 
 		return true;
 #endif
@@ -1306,6 +1312,65 @@ public:
 		return true;
 	}
 
+	// Guest views that share backing bytes with another view. Hazard checks that compare guest
+	// virtual addresses (DrawPrepare's ranged stores and GPU writes, BufferCache's GPU-dirty
+	// ranges) consult these: a change through one view must be seen by readers of the others.
+	// Rebuilt under m_mutex whenever the views change; without any alias the queries cost one
+	// atomic load.
+	[[nodiscard]] bool AnyAliases() const noexcept {
+		return m_alias_count.load(std::memory_order_acquire) != 0;
+	}
+	// Whether part of [vaddr, vaddr + size) shares its bytes with another guest view.
+	[[nodiscard]] bool RangeAliased(uint64_t vaddr, uint64_t size) {
+		if (!AnyAliases()) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return RangeAliasedUnlocked(vaddr, size);
+	}
+	// Appends the other guest views of the bytes behind [vaddr, vaddr + size), as guest ranges.
+	void AliasesOf(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+		if (!AnyAliases()) {
+			return;
+		}
+		std::shared_lock lock(m_mutex);
+		if (!RangeAliasedUnlocked(vaddr, size)) {
+			return;
+		}
+		ForEachSparseRange(
+		    m_maps, vaddr, size,
+		    [&](const MapEntry& self, uint64_t start, uint64_t bytes) {
+			    const auto begin = self.backing_offset + (start - self.vaddr);
+			    const auto end   = begin + bytes;
+			    // Entries are sorted by backing offset; none is longer than m_alias_max_size.
+			    auto it = std::ranges::lower_bound(
+			        m_alias_entries, begin > m_alias_max_size ? begin - m_alias_max_size : 0,
+			        {}, &MapEntry::backing_offset);
+			    for (; it != m_alias_entries.end() && it->backing_offset < end; ++it) {
+				    const auto lo = std::max(begin, it->backing_offset);
+				    const auto hi = std::min(end, it->backing_offset + it->size);
+				    if (lo < hi && it->vaddr != self.vaddr) {
+					    out.emplace_back(it->vaddr + (lo - it->backing_offset), hi - lo);
+				    }
+			    }
+		    },
+		    [](uint64_t, uint64_t) {});
+	}
+	struct AliasStats {
+		uint64_t maps          = 0;
+		uint64_t ranges        = 0; // merged guest ranges that have an alias
+		uint64_t bytes         = 0;
+		uint64_t rebuilds      = 0;
+	};
+	[[nodiscard]] AliasStats GetAliasStats() {
+		std::shared_lock lock(m_mutex);
+		AliasStats stats {m_maps.size(), m_aliased.size(), 0, m_alias_rebuilds};
+		for (const auto& [begin, end]: m_aliased) {
+			stats.bytes += end - begin;
+		}
+		return stats;
+	}
+
 private:
 	struct MapEntry {
 		uint64_t            vaddr          = 0;
@@ -1315,6 +1380,114 @@ private:
 		// Registered for userfaultfd write protection; watches on other views use mprotect.
 		bool write_protected = false;
 	};
+
+	// Under m_mutex.
+	[[nodiscard]] bool RangeAliasedUnlocked(uint64_t vaddr, uint64_t size) const {
+		const auto end = vaddr + size;
+		auto       it  = std::ranges::upper_bound(m_aliased, vaddr, {},
+		                                          &std::pair<uint64_t, uint64_t>::first);
+		if (it != m_aliased.begin() && std::prev(it)->second > vaddr) {
+			return true;
+		}
+		return it != m_aliased.end() && it->first < end;
+	}
+
+	// Under m_mutex (exclusive), after the views changed. `added`: the one view just added, if
+	// that is all that changed; removals and splits only ever take aliases away.
+	void UpdateAliasesUnlocked(const MapEntry* added) {
+		if (m_alias_count.load(std::memory_order_relaxed) == 0) {
+			if (added == nullptr) {
+				return;
+			}
+			const auto begin = added->backing_offset;
+			const auto end   = begin + added->size;
+			const bool overlaps = std::ranges::any_of(m_maps, [&](const auto& item) {
+				const auto& entry = item.second;
+				return entry.vaddr != added->vaddr && entry.backing_offset < end &&
+				       begin < entry.backing_offset + entry.size;
+			});
+			if (!overlaps) {
+				return;
+			}
+		}
+		RebuildAliasesUnlocked();
+	}
+
+	void RebuildAliasesUnlocked() {
+		m_alias_rebuilds++;
+		// Backing ranges two or more views cover.
+		std::vector<std::pair<uint64_t, int>> events;
+		events.reserve(m_maps.size() * 2);
+		for (const auto& [_, entry]: m_maps) {
+			events.emplace_back(entry.backing_offset, 1);
+			events.emplace_back(entry.backing_offset + entry.size, -1);
+		}
+		std::ranges::sort(events); // ends before starts at the same offset
+		std::vector<std::pair<uint64_t, uint64_t>> shared;
+		int                                        depth = 0;
+		uint64_t                                   open  = 0;
+		for (const auto& [offset, delta]: events) {
+			const int before = depth;
+			depth += delta;
+			if (before < 2 && depth >= 2) {
+				open = offset;
+			} else if (before >= 2 && depth < 2 && open < offset) {
+				if (!shared.empty() && shared.back().second == open) {
+					shared.back().second = offset;
+				} else {
+					shared.emplace_back(open, offset);
+				}
+			}
+		}
+		const auto previous = m_aliased;
+		m_aliased.clear();
+		m_alias_entries.clear();
+		m_alias_max_size = 0;
+		for (const auto& [_, entry]: m_maps) {
+			const auto begin = entry.backing_offset;
+			const auto end   = begin + entry.size;
+			auto it = std::ranges::upper_bound(shared, begin, {},
+			                                   &std::pair<uint64_t, uint64_t>::first);
+			if (it != shared.begin()) {
+				--it;
+			}
+			bool participates = false;
+			for (; it != shared.end() && it->first < end; ++it) {
+				const auto lo = std::max(begin, it->first);
+				const auto hi = std::min(end, it->second);
+				if (lo < hi) {
+					participates = true;
+					m_aliased.emplace_back(entry.vaddr + (lo - begin), entry.vaddr + (hi - begin));
+				}
+			}
+			if (participates) {
+				m_alias_entries.push_back(entry);
+				m_alias_max_size = std::max(m_alias_max_size, entry.size);
+			}
+		}
+		std::ranges::sort(m_aliased);
+		std::ranges::sort(m_alias_entries, {}, &MapEntry::backing_offset);
+		m_alias_count.store(m_aliased.size(), std::memory_order_release);
+		static const bool stats = std::getenv("KYTY_ALIAS_STATS") != nullptr;
+		if (stats && previous != m_aliased) {
+			uint64_t bytes = 0;
+			for (const auto& [lo, hi]: m_aliased) {
+				bytes += hi - lo;
+			}
+			std::printf("ALIAS views=%zu aliased_ranges=%zu aliased_bytes=%" PRIu64
+			            " entries=%zu rebuilds=%" PRIu64 "\n",
+			            m_maps.size(), m_aliased.size(), bytes, m_alias_entries.size(),
+			            m_alias_rebuilds);
+			for (size_t i = 0; i < m_alias_entries.size() && i < 16; i++) {
+				const auto& e = m_alias_entries[i];
+				std::printf("ALIAS view vaddr=0x%" PRIx64 " size=0x%" PRIx64 " backing=0x%" PRIx64
+				            "\n",
+				            e.vaddr, e.size, e.backing_offset);
+			}
+			std::fflush(stdout);
+		}
+	}
+
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	template <typename Func>
@@ -1661,6 +1834,13 @@ private:
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Aliases (UpdateAliasesUnlocked, under m_mutex): sorted, disjoint guest ranges whose bytes
+	// another view also maps; the views involved, by backing offset; the largest one's size.
+	std::vector<std::pair<uint64_t, uint64_t>> m_aliased;
+	std::vector<MapEntry>                      m_alias_entries;
+	uint64_t                                   m_alias_max_size = 0;
+	uint64_t                                   m_alias_rebuilds = 0;
+	std::atomic<uint64_t>                      m_alias_count {0};
 };
 
 class GuestAddressSpace {
@@ -1840,6 +2020,7 @@ public:
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	[[nodiscard]] GuestBackingStore& Backing() { return *m_backing; }
 #endif
+	[[nodiscard]] GuestBackingStore& Store() { return *m_backing; }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);

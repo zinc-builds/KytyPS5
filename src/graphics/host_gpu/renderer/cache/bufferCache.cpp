@@ -1885,9 +1885,32 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	return DirtyInAnyView(m_gpu_modified_ranges, m_inflight_ranges, vaddr, size);
+}
+
+bool BufferCache::DirtyInAnyView(const RangeSet& modified, const RangeSet& inflight,
+                                 uint64_t vaddr, uint64_t size) {
 	// Bytes of a read in flight are not in the backing store yet.
-	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
-	       (!m_inflight_ranges.Empty() && m_inflight_ranges.Intersects(vaddr, size));
+	const auto dirty = [&](uint64_t address, uint64_t bytes) {
+		return modified.Intersects(address, bytes) ||
+		       (!inflight.Empty() && inflight.Intersects(address, bytes));
+	};
+	if (dirty(vaddr, size)) {
+		return true;
+	}
+	if (!LibKernel::Memory::AnyGuestAliases()) {
+		return false;
+	}
+	// The ranges are kept by guest address: the GPU may have written these bytes through
+	// another guest view of them.
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> aliases;
+	aliases.clear();
+	LibKernel::Memory::GuestAliasesOf(vaddr, size, aliases);
+	const bool hit = std::ranges::any_of(aliases, [&](const auto& alias) {
+		return dirty(alias.first, alias.second);
+	});
+	DrawPrepare::AliasStats::Note(DrawPrepare::AliasStats::DirtyCheck, !aliases.empty(), hit);
+	return hit;
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

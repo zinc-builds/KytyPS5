@@ -2625,30 +2625,40 @@ void RenderExecutor::PrintDrainStats() {
 void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 	auto& pipelines = m_context.GetPipelineCache();
 	auto& buffers   = m_context.GetBufferCache();
-	bool  usable    = false;
-	static const bool ranged_gpu = DrawPrepare::RangedGpuWritesEnabled();
-	if (queued.log.failed) {
-		m_prepare_stat.failed++;
-	} else if (GuestSyncEpoch::CurrentUnranged() != queued.sync_epoch) {
-		// The emulator stored into guest memory, unranged, while the worker read.
-		m_prepare_stat.hazard++;
-		m_prepare_stat.hazard_epoch++;
-	} else if (ranged_gpu ? DrawPrepare::GpuWrittenSince(queued.gpu_write_sequence, queued.log)
-	                      : DrawPrepare::HazardGeneration() != queued.hazard_generation) {
-		// Bytes the worker read (or, unranged, any bytes) became GPU-written: the lookup here
-		// would have synchronized them.
-		m_prepare_stat.hazard++;
-		m_prepare_stat.hazard_gpu++;
-	} else if (DrawPrepare::StoredSince(queued.stored_sequence, queued.log)) {
+	const auto verdict = DrawPrepare::Adoption(
+	    {queued.hazard_generation, queued.sync_epoch, queued.stored_sequence,
+	     queued.gpu_write_sequence},
+	    queued.log,
+	    [&](uint64_t vaddr, uint64_t size) { return buffers.HasGpuDirtyBytes(vaddr, size); });
+	switch (verdict) {
+		case DrawPrepare::Verdict::Failed: m_prepare_stat.failed++; break;
+		case DrawPrepare::Verdict::Epoch:
+			// The emulator stored into guest memory, unranged, while the worker read.
+			m_prepare_stat.hazard++;
+			m_prepare_stat.hazard_epoch++;
+			break;
+		case DrawPrepare::Verdict::GpuWritten:
+			// Bytes the worker read (or, unranged, any bytes) became GPU-written: the lookup here
+			// would have synchronized them.
+			m_prepare_stat.hazard++;
+			m_prepare_stat.hazard_gpu++;
+			break;
 		// A readback published bytes the worker read.
-		m_prepare_stat.stored++;
-	} else if (std::ranges::any_of(queued.log.reads, [&](const auto& read) {
-		           return buffers.HasGpuDirtyBytes(read.first, read.second);
-	           })) {
+		case DrawPrepare::Verdict::Stored: m_prepare_stat.stored++; break;
 		// Here those reads would have waited for the GPU.
-		m_prepare_stat.gpu_written++;
-	} else {
-		usable = true;
+		case DrawPrepare::Verdict::GpuDirty: m_prepare_stat.gpu_written++; break;
+		case DrawPrepare::Verdict::Usable: break;
+	}
+	const bool usable = verdict == DrawPrepare::Verdict::Usable;
+	if (DrawPrepare::AliasStats::Enabled()) {
+		if (LibKernel::Memory::AnyGuestAliases()) {
+			for (const auto& read: queued.log.reads) {
+				DrawPrepare::AliasStats::Note(
+				    DrawPrepare::AliasStats::PreparedRead,
+				    LibKernel::Memory::GuestRangeAliased(read.first, read.second));
+			}
+		}
+		DrawPrepare::AliasStats::Report();
 	}
 	if (!usable) {
 		Common::BenchMetrics::Add(Common::BenchMetrics::Counter::Rejected);

@@ -4,6 +4,9 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -24,6 +27,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <semaphore>
@@ -2712,6 +2716,137 @@ void TestDirectMappingNamesTypesAndValidation() {
 	ExpectUnmapped(test, reinterpret_cast<uint64_t>(typed));
 	ExpectUnmapped(test, reinterpret_cast<uint64_t>(plain));
 	ExpectUnmapped(test, reinterpret_cast<uint64_t>(unchanged_type));
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Hazard checks compare guest virtual addresses; direct memory mapped twice puts the same bytes
+// at two. One backing page mapped at A and B: a ranged backing store published through A must
+// reject a draw prepared from B, and a GPU write through A must reach a reader of B. A third,
+// unaliased page C keeps the ranged checks precise.
+void TestAliasedViewsInHazardChecks() {
+	using namespace Libs::LibKernel::Memory;
+	namespace DP    = Libs::Graphics::DrawPrepare;
+	namespace Epoch = Libs::Graphics::GuestSyncEpoch;
+	const char*    test = "AliasedViewsInHazardChecks";
+	constexpr auto page = SceKernelPageSize;
+	int64_t        physical = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), page * 2, page,
+	                                         SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* a = nullptr;
+	void* b = nullptr;
+	void* c = nullptr;
+	CheckOk(test, KernelMapDirectMemory(&a, page, SceKernelProtCpuRw, 0, physical, page), "map A");
+	CheckOk(test, KernelMapDirectMemory(&b, page, SceKernelProtCpuRw, 0, physical, page), "map B");
+	CheckOk(test, KernelMapDirectMemory(&c, page, SceKernelProtCpuRw, 0, physical + page, page),
+	        "map C");
+	const auto va_a = reinterpret_cast<uint64_t>(a);
+	const auto va_b = reinterpret_cast<uint64_t>(b);
+	const auto va_c = reinterpret_cast<uint64_t>(c);
+	Check(test, va_a != va_b, "the two views share an address");
+
+	// KYTY_ALIAS_HAZARD=0 (the kill switch) reports no aliases: then the hazard checks below fail.
+	const char* kill = std::getenv("KYTY_ALIAS_HAZARD");
+	if (kill == nullptr || std::strcmp(kill, "0") != 0) {
+		Check(test, AnyGuestAliases() && GuestRangeAliased(va_a + 0x10, 8) &&
+		                GuestRangeAliased(va_b, page) && !GuestRangeAliased(va_c, page),
+		      "aliased views not reported, or an unaliased one reported");
+		std::vector<std::pair<uint64_t, uint64_t>> aliases;
+		GuestAliasesOf(va_b + 0x40, 0x10, aliases);
+		Check(test,
+		      aliases.size() == 1 && aliases[0].first == va_a + 0x40 && aliases[0].second == 0x10,
+		      "the other view of B's bytes is not A at the same offset");
+	}
+
+	const auto stamps = [] {
+		return DP::Stamps {DP::HazardGeneration(), Epoch::CurrentUnranged(), DP::StoredSequence(),
+		                   DP::GpuWriteSequence()};
+	};
+	const auto clean = [](uint64_t, uint64_t) { return false; };
+	// A ranged backing store as BufferCache publishes a readback (OpenStoredRange, WriteBacking
+	// ranged, CloseStoredRange).
+	const auto publish = [](uint64_t vaddr, uint64_t value) {
+		const auto open = DP::OpenStoredRange(vaddr, sizeof(value));
+		WriteBacking(vaddr, &value, sizeof(value), true);
+		DP::CloseStoredRange(open);
+	};
+
+	// 1. Prepared through B, published through A: rejected (the store falls back to the unranged
+	// epoch), and B shows the published bytes.
+	{
+		DP::Log log;
+		log.reads = {{va_b + 0x10, 8}};
+		const auto posted = stamps();
+		publish(va_a + 0x10, 0x5ca1ab1e0a11a5edull);
+		Check(test, DP::Adoption(posted, log, clean) == DP::Verdict::Epoch,
+		      "a draw prepared from B was adopted after a ranged store through A");
+		Check(test, *reinterpret_cast<volatile uint64_t*>(va_b + 0x10) == 0x5ca1ab1e0a11a5edull,
+		      "B does not show the bytes stored through A");
+	}
+	// A RangedStore scope over an aliased range is not ranged.
+	{
+		DP::RangedStore store(va_a + 0x20, 4);
+		Check(test, !store.Ranged() && !Epoch::g_stores_ranged,
+		      "a ranged store scope over aliased bytes stayed ranged");
+	}
+	// The unaliased page stays ranged: a draw reading other bytes is kept, one reading the stored
+	// bytes is rejected by range.
+	{
+		DP::Log other;
+		other.reads = {{va_c + 0x100, 8}};
+		DP::Log same;
+		same.reads        = {{va_c + 0x10, 8}};
+		const auto posted = stamps();
+		publish(va_c + 0x10, 0x0123456789abcdefull);
+		Check(test, DP::Adoption(posted, other, clean) == DP::Verdict::Usable &&
+		                DP::Adoption(posted, same, clean) == DP::Verdict::Stored,
+		      "a ranged store into unaliased bytes lost its precision");
+	}
+
+	// 2. GPU write through A, consumed through B.
+	{
+		DP::Log log;
+		log.reads         = {{va_b + 0x40, 4}};
+		const auto posted = stamps();
+		DP::NoteGpuWrite(va_a + 0x40, 0x10);
+		Check(test, DP::Adoption(posted, log, clean) == DP::Verdict::GpuWritten,
+		      "a draw prepared from B was adopted after a GPU write through A");
+		Libs::Graphics::RangeSet modified;
+		Libs::Graphics::RangeSet inflight;
+		modified.Add(va_a + 0x40, 0x10);
+		Check(test,
+		      Libs::Graphics::BufferCache::DirtyInAnyView(modified, inflight, va_b + 0x44, 4) &&
+		          !Libs::Graphics::BufferCache::DirtyInAnyView(modified, inflight, va_b + 0x80, 4) &&
+		          !Libs::Graphics::BufferCache::DirtyInAnyView(modified, inflight, va_c + 0x40, 4),
+		      "bytes GPU-written through A are not dirty through B, or other bytes are");
+		inflight.Add(va_b + 0x200, 8);
+		Check(test, Libs::Graphics::BufferCache::DirtyInAnyView({}, inflight, va_a + 0x204, 4),
+		      "bytes read back in flight through B are not dirty through A");
+		// Through the adoption check as BufferCache::HasGpuDirtyBytes answers it.
+		DP::Log fresh;
+		fresh.reads = {{va_b + 0x48, 4}};
+		Check(test,
+		      DP::Adoption(stamps(), fresh,
+		                   [&](uint64_t vaddr, uint64_t size) {
+			                   return Libs::Graphics::BufferCache::DirtyInAnyView(modified, {}, vaddr,
+			                                                                     size);
+		                   }) == DP::Verdict::GpuDirty,
+		      "a draw reading GPU-dirty bytes through B was adopted");
+	}
+	// A GPU write into the unaliased page leaves draws reading other bytes alone (ranged).
+	if (DP::RangedGpuWritesEnabled()) {
+		DP::Log other;
+		other.reads       = {{va_c + 0x800, 4}};
+		const auto posted = stamps();
+		DP::NoteGpuWrite(va_c + 0x40, 0x10);
+		Check(test, DP::Adoption(posted, other, clean) == DP::Verdict::Usable,
+		      "a GPU write into unaliased bytes rejected an unrelated draw");
+	}
+
+	// Unmapping B removes the alias.
+	CheckOk(test, KernelMunmap(va_b, page), "unmap B");
+	Check(test, !GuestRangeAliased(va_a, page), "A is still aliased after B was unmapped");
+	CheckOk(test, KernelReleaseDirectMemory(physical, page * 2), "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6059,6 +6194,10 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
+	if (argc == 2 && std::strcmp(argv[1], "--alias-hazard-only") == 0) {
+		RunTest(TestAliasedViewsInHazardChecks);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -6121,6 +6260,7 @@ int main(int argc, char** argv) {
 	RunTest(TestWindowsBackingViewPermissions);
 #endif
 	RunTest(TestDirectMappingNamesTypesAndValidation);
+	RunTest(TestAliasedViewsInHazardChecks);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
