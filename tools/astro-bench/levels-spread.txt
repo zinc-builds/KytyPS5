@@ -1,0 +1,10 @@
+# levels.sh -l: a spread of eight levels (one per world, a boss, the hub, a secret level).
+# Names are <File> entries of the dump's data/prein/product_levels.xml (tools/re/zx.cpp extracts it).
+bumper_enemy_snowy_canyon      # G1 snow
+big_hand_pirate_island         # G2
+timestop_casino                # G3
+penguin_atlantis               # G4 underwater
+rotating_level_day_and_night   # G5
+enemy_gorilla                  # boss G1
+hub_crashsite                  # hub
+voxel_world                    # secret, voxel rendering

@@ -14,6 +14,9 @@
 #   argument is added to /app0/args.txt through KYTY_APP0_OVERLAY (needs an emulator with it).
 # GARDEN_ROUTE=menu: the original route (title, save 1, galaxy map, fly to Sky Garden, dive in)
 #   driven by vpad.py. Numbers from the two routes are not interchangeable; see FINDINGS.md.
+# GARDEN_LEVEL=<name> (lvl route): boot another level (the game's "-lvl" name, e.g. a <File> from
+#   product_levels.xml; levels.sh runs a list of them). Runs of another level stay out of the
+#   result store, whose references are Sky Garden's. GARDEN_BOOT_TIMEOUT=<s> (90): time to its start.
 label=$1
 shift
 # Exclusive host-wide lock; the emulator inherits it (see benchlock.sh).
@@ -36,11 +39,13 @@ wait_log() { # wait_log <regex> <timeout_s>
 for _ in $(seq 20); do pgrep -f '^\./kyty_emulator --game' >/dev/null || break; wait_s 1; done
 pgrep -f '^\./kyty_emulator --game' >/dev/null && { echo "emulator already running" >&2; exit 1; }
 route=${GARDEN_ROUTE:-lvl}
+level=${GARDEN_LEVEL:-aerial_garden}
+[ "$route" = menu ] && [ "$level" != aerial_garden ] && { echo "GARDEN_LEVEL needs GARDEN_ROUTE=lvl" >&2; exit 1; }
 case "$route" in
 lvl)
 	# The game's args.txt plus -lvl. Kept out of the install dir: only this run sees it.
 	overlay=$(mktemp -d /tmp/kyty-app0-XXXXXX) || exit 1
-	printf '%s\r\n' "-package -sequence product -mode product -odxBinary -perfDisplay false -debugDisplay false -debugInput false -lvl aerial_garden" > "$overlay/args.txt"
+	printf '%s\r\n' "-package -sequence product -mode product -odxBinary -perfDisplay false -debugDisplay false -debugInput false -lvl $level" > "$overlay/args.txt"
 	export KYTY_APP0_OVERLAY=$overlay
 	;;
 menu) [ -p /tmp/vpad.fifo ] || { echo "vpad.py not running" >&2; exit 1; } ;;
@@ -72,8 +77,10 @@ nohup "$(dirname "$0")/run.sh" "$label" "$@" >/dev/null 2>&1 &
 run_pid=$!
 wait_s 5
 if [ "$route" = lvl ]; then
-	wait_log 'StartLevel aerial_garden|Level has started: title_controller_ship' 90 || exit 1
-	grep -q 'StartLevel aerial_garden' "$log" || {
+	# The game logs StartLevel with its short name (bumper_enemy_snowy_canyon: snowy_canyon), so
+	# any StartLevel counts: with -lvl the first level started is the one asked for.
+	wait_log "StartLevel |Level has started: title_controller_ship" "${GARDEN_BOOT_TIMEOUT:-90}" || exit 1
+	grep -q "StartLevel " "$log" || {
 		echo "booted to the title: this binary has no KYTY_APP0_OVERLAY (built before 45d400a8): run with GARDEN_ROUTE=menu" >&2
 		exit 1
 	}
@@ -93,7 +100,9 @@ else
 	wait_log 'StartLevel aerial_garden' 60 || exit 1
 fi
 # The StartLevel line itself: PERF lines strictly after it belong to the level.
-start=$(grep -n -m1 'StartLevel aerial_garden' "$log" | cut -d: -f1)
+start_re="StartLevel "
+[ "$route" = menu ] && start_re="StartLevel aerial_garden" # the world map may start first
+start=$(grep -n -m1 "$start_re" "$log" | cut -d: -f1)
 summary='{f+=$1; d+=$2; s+=$3; w+=$4; ill+=$5; wm+=$6; if ($6>wx) wx=$6; lo+=$7; n++}
 	END {if (fw != "") f = fw * n; printf "%s: fps=%.2f draws/frame=%.0f draws/s=%.0f wt_faults/s=%.0f sigill/s=%.0f worst_ms=%.1f (max %.1f) low1=%.1f (n=%d)%s\n", l, f/n, d/n, s/n, w/n, ill/n, wm/n, wx, lo/n, n, note}'
 fields() { sed -E 's/.*fps=([0-9.]+).*worst_ms=([0-9.]+) low1=([0-9.]+) draws_frame=([0-9]+) draws_s=([0-9]+).*wt_faults_s=([0-9]+).*sigill_s=([0-9]+).*/\1 \4 \5 \6 \7 \2 \3/'; }
@@ -134,9 +143,9 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	mode=$(sed -n 's/.*\bmode=\([a-z]*\).*/\1/p' <<<"$bmode") profile=$(sed -n 's/.*\bsha256=\([0-9a-f]*\).*/\1/p' <<<"$bmode")
 	extra=$(python3 -I "$(dirname "$0")/metrics.py" "$log" "$start" "$f0" "$f1" "/tmp/garden-$label.json" \
 		label="$label" window="$window" route="$route" install="$install" flags="$*" env="${kenv% }" \
-		time="$(date -Iseconds)" exe="$exe" build_mode="${mode:-plain}" profile="$profile")
+		time="$(date -Iseconds)" exe="$exe" build_mode="${mode:-plain}" profile="$profile" level="$level")
 	# Every measured run goes into the shared result store (results.sh), so references are reused.
-	case "$label" in *-warmup) ;; *) [ -f "/tmp/garden-$label.json" ] && python3 -I "$(dirname "$0")/results.py" add "/tmp/garden-$label.json" ;; esac
+	case "$label" in *-warmup) ;; *) [ "$level" = aerial_garden ] && [ -f "/tmp/garden-$label.json" ] && python3 -I "$(dirname "$0")/results.py" add "/tmp/garden-$label.json" ;; esac
 	grep '^PERF' "/tmp/garden-$label.window" | fields |
 		awk -v l="$label" -v fw="$fw" -v note=" frames=$window$extra" "$summary"
 else
