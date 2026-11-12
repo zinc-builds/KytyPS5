@@ -210,9 +210,10 @@ step 1 comes first.
   (run `setup-install.sh` once per build dir). Never build, install or benchmark in another track's
   checkout or in the user's `~/AI/emu/KytyPS5`. One `vpad.py` serves everyone: start it only if
   `/tmp/vpad.fifo` is missing.
-- **A/B with `ab.sh`, judged on instructions and cycles per draw.** `dev` moves under you: compare
-  against your merge-base (`ab.sh` builds it with `refbuild.sh`). Decide on `ipd`/`cpd` (the
-  command thread's instructions/cycles per draw), not FPS: see "Bench metrics and A/B" below.
+- **A/B with `ab.sh`, judged on the command thread's time per draw.** `dev` moves under you:
+  compare against your merge-base (`ab.sh` builds it with `refbuild.sh`). Decide on `cmd_ns`
+  (CPU ns per draw, user + sys) and `cpd` (cycles per draw), not on instructions or FPS: see
+  "Bench metrics and A/B" below.
   An FPS claim of record needs a same-batch pair in frames 1000–1600 (`gate.sh` runs it).
 - **Correctness first:** `gate.sh` before merging (screenshots against the merge-base, the verify
   modes), the touched unit tests (one suite at a time, under `MemoryMax=10G`), and a verify mode
@@ -256,10 +257,8 @@ tools/astro-bench/gate.sh mylabel --new-install "$new"     # once, before merge
   −2.5% ±0.2 (signal), cycles/draw +2.1% ±1.1 and FPS within noise (an earlier 4-run FPS batch:
   −0.2%). So the stale profile's penalty is invisible next to the ~1% layout noise on cycles and
   FPS, and plainly visible on instructions. Hence:
-  - Screen on instructions/draw in **plain** mode, or with a same-binary kill-switch A/B in any
-    mode; instruction counts do not depend on a profile there.
-  - In pgo mode, read cycles/draw and FPS with the shared profile; do not decide on its
-    instructions/draw.
+  - Decide on `cmd_ns` and cycles/draw in any mode (rule in "Bench metrics and A/B"); in pgo mode
+    with the shared profile, instructions/draw is not even a reliable work diagnostic.
   - A pgo number of record for a hot-path change can give each side its own profile (merge-base
     with its profile, branch with `pgo-train.sh HEAD`), which is what the user gets after the merge
     and a retrain. `ab.sh` refuses different profiles, so run that pair with `batch.sh` and
@@ -313,8 +312,31 @@ same hot code):
 | FPS | 0.39% | 1.1% | ~0.8% | ~0.8% |
 
 Code layout alone moves cycles, CPU time and FPS by up to ~1% between two builds of the same
-hot-path code, whatever the number of runs. Instructions per draw don't move. So a change worth
-less than ~1% is only visible in `ipd`, plus `cpd` when it is a stall fix rather than less work.
+hot-path code (more in pgo mode, where a source change also moves the profile-driven layout),
+whatever the number of runs. Instructions per draw don't move.
+
+**Which metric decides (2026-11-12).** The command thread is ~95% busy, so draws/s ≈ busy /
+`cmd_ns`. Across the stored runs, `cmd_ns` predicts draws/s best, then cycles; instructions
+predict it poorly:
+
+| runs in the store | `cmd_ns` | `cmd_cpd` | `cmd_ipd` |
+|---|---|---|---|
+| plain, 1000–1600 (n=95) | r −0.98, residual 1.9% | r −0.98, 2.4% | r −0.84, 5.9% |
+| plain, 200–500 (n=41) | r −0.95, 0.8% | r −0.85, 1.3% | r −0.45, 2.2% |
+| pgo, 200–500 (n=9) | r −0.90, 1.1% | r −0.75, 1.6% | r +0.14, 2.4% |
+
+The thread is stall-bound (IPC 1.3 on pgo builds, 1.6 on plain; see "Where the command thread's
+cycles go"), so cutting instructions often removes work that overlapped a stall:
+- resident textures cut `ipd` 10.7% but `cpd` 1.2% (`r1b-ab3`, one binary);
+- #83/#87/#88/#90 on pgo cut `ipd` 4.5% and `cpd` 0%.
+
+The rule, in any build mode:
+- **Decide on `cmd_ns` in a same-batch A/B** (sd 0.37% a run on 1000–1600, 0.77% on 200–500,
+  plus the ~0.6% layout term). It is what FPS is made of, and includes the kernel time cycles miss.
+- **Use `cpd` against a stored reference.** It is immune to clock speed: drift ~0.2% vs ~0.6% for
+  `cmd_ns`.
+- **`ipd` is a diagnostic of how much work was cut, not a gain.** A drop in `ipd` without a drop
+  in `cpd` means the code was waiting on memory anyway.
 
 **Commands.**
 - `ab.sh <label>`: screening A/B, frames 200–500 (~35 s a run instead of ~59).
@@ -332,6 +354,38 @@ less than ~1% is only visible in `ipd`, plus `cpd` when it is a stall fix rather
     `KYTY_WORKER_TARGETS_VERIFY` and `KYTY_WORKER_PIPELINE_KEY_VERIFY` (`--verify-env` adds more);
   - screenshots of level frame 600 from both sides (`GARDEN_SHOT`, saved in-emulator through
     `KYTY_SHOT_FILE`: the guest image, no desktop capture).
+
+**Where the command thread's cycles go (2026-11-12, `KYTY_BENCH_PMU=1`).** That diagnostic mode adds
+user-mode PMU events for the command thread and the prepare workers, multiplexed by the kernel, plus
+the top-down split. Its cost is ~1% of cycles, so don't A/B it against runs without it. Per draw,
+dev f1777d2f, frames 1000–1600:
+
+| | pgo cmd | plain cmd | pgo prep0 |
+|---|---|---|---|
+| cycles / instructions / IPC | 14.6k / 19.3k / 1.32 | 16.7k / 26.6k / 1.59 | 12.2k / 13.9k / 1.14 |
+| retiring | 3.0k (20%) | 4.2k (25%) | 2.6k |
+| bad speculation (branch mispredicts) | 0.7k (0.65k) | 0.7k (0.61k) | 0.24k |
+| frontend (fetch latency) | 2.5k (1.5k) | 3.6k (1.7k) | 2.0k (1.3k) |
+| backend: memory | **5.9k (41%)** | **6.4k (39%)** | 3.1k |
+| backend: core | 2.5k | 2.0k | 4.5k |
+| loads missing L1 / L2 / L3 | 364 / 56 / 9.2 | 367 / 55 / 9.0 | 166 / 22 / 2.7 |
+| loads served from another core (fwd + no-fwd) | **30 + 13** | 28 + 14 | 14 + 4 |
+| branch mispredicts, DTLB walks, machine clears | 31, 8.2, 1.5 | 30, 8.1, 2.3 | 14, 2.5, 0.7 |
+
+- Rough cost by latency share of the memory-bound cycles: the 43 cross-core loads ≈ 2.4k
+  cycles/draw (~16% of the thread, ~0.45 µs on pgo); DRAM ≈ 1.4k; L2 hits ≈ 1.9k.
+- 75% of all L2 misses are loads of lines another core holds.
+- Precise samples (`mem_load_l3_hit_retired.xsnp_fwd/no_fwd`, pgo):
+  - **about half of the command thread's cross-core loads (~22 lines/draw) hit the 24 KB
+    `QueuedDraw` slots**, spread over the worker-written `DrawRenderState`. That struct is 17 KB:
+    1.2 KB per color target, 2.1 KB per vertex stage, 1.2 KB depth;
+  - the other half hit other emulator heap memory, none of it guest memory;
+  - on the workers, 60% are reads of the 2.7 KB register snapshot the command thread copies into
+    the slot.
+- So **every byte a worker writes and the command thread then reads costs a cross-core
+  transfer**, ~55 cycles net per line. Moving work onto workers pays only if the result handed
+  back is small. Pass record ids or pointers to immutable cached records instead of copying
+  1–2 KB structs into the slot, and don't rewrite fields that didn't change.
 
 **When a same-batch FPS pair is still required:** for any FPS number written into FINDINGS.md or
 a PR title, and when the change targets waits or the GPU (cycles and instructions on the command

@@ -49,7 +49,8 @@ METRICS = [
     ("drains_kd", ("drains_per_kdraw",), "{:.2f}", (0.25, 0.25), 0.3, 0.0),
 ]
 # Shown in the verdict line, in this order.
-VERDICT = ["ipd", "cpd", "cmd_uns", "cmd_sns", "wait_prep", "wait_rec", "fps"]
+# cmd_ns decides (it predicts draws/s best); cpd against a stored reference; ipd is diagnostic.
+VERDICT = ["cmd_ns", "cpd", "cmd_sns", "ipd", "wait_prep", "wait_rec", "fps"]
 LONG_WINDOW = "1000-1600"
 
 

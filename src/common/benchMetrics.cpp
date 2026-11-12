@@ -31,10 +31,47 @@ constexpr std::array<const char*, static_cast<int>(Counter::Count)> CounterNames
     "drains",   "drain_wait_ns",   "refill_wait_ns", "steady_wait_ns", "idle_wait_ns",
     "waits",    "rec_wait_ns",     "rec_waits",      "rejected"};
 
+// KYTY_BENCH_PMU=1 (diagnostic runs): more user-mode events on the P-core PMU (cpu_core) for the
+// command thread and the prepare workers. Each opens on its own, so the kernel rotates them
+// through the general counters as needed (counts are scaled to the enabled time); the top-down
+// slots come from the fixed slots counter and PERF_METRICS, so they need no general counter.
+// Raw Golden/Raptor Cove encodings: event | umask << 8 | edge << 18 | cmask << 24.
+struct ExtraEvent {
+	const char* name;
+	uint64_t    config;
+};
+constexpr std::array<ExtraEvent, 10> ExtraEvents = {{
+    {"br_misp", 0xc5},                       // br_misp_retired.all_branches
+    {"l1_miss", 0x08d1},                     // mem_load_retired.l1_miss
+    {"l2_miss", 0x10d1},                     // mem_load_retired.l2_miss
+    {"l3_miss", 0x20d1},                     // mem_load_retired.l3_miss
+    {"xsnp_fwd", 0x04d2},                    // mem_load_l3_hit_retired.xsnp_fwd (HITM + forwarded)
+    {"xsnp_nofwd", 0x02d2},                  // mem_load_l3_hit_retired.xsnp_no_fwd
+    {"xsnp_miss", 0x01d2},                   // mem_load_l3_hit_retired.xsnp_miss
+    {"dtlb_ld_walk", 0x0e12},                // dtlb_load_misses.walk_completed
+    {"dtlb_st_walk", 0x0e13},                // dtlb_store_misses.walk_completed
+    {"mclear", 0x01c3 | 1ull << 18 | 1ull << 24}, // machine_clears.count
+}};
+// Top-down level 1 and 2, in slots (the kernel's slots/PERF_METRICS encodings).
+constexpr std::array<ExtraEvent, 9> TopdownEvents = {{
+    {"slots", 0x0400},
+    {"retiring", 0x8000},
+    {"bad_spec", 0x8100},
+    {"fe_bound", 0x8200},
+    {"be_bound", 0x8300},
+    {"heavy_ops", 0x8400},
+    {"br_mispredict", 0x8500},
+    {"fetch_lat", 0x8600},
+    {"mem_bound", 0x8700},
+}};
+
 struct ThreadSlot {
 	std::atomic<int> tid {0};
 	int              group_fd[MaxPmus] {-1, -1}; // leader: cycles; member: instructions
 	int              pmus = 0;
+	std::array<int, ExtraEvents.size()>   extra_fd {};
+	std::array<int, TopdownEvents.size()> topdown_fd {}; // [0]: the slots leader
+	bool                                  extra = false;
 };
 
 std::array<ThreadSlot, RoleCount> g_threads;
@@ -87,15 +124,24 @@ int PmuExtendedTypes(std::array<uint64_t, MaxPmus>& types) {
 	return count;
 }
 
-int OpenCounter(uint64_t config, int group_fd) {
+bool ExtraEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BENCH_PMU");
+		return value != nullptr && value[0] != '0';
+	}();
+	return enabled;
+}
+
+int OpenCounter(uint64_t config, int group_fd, uint32_t type = PERF_TYPE_HARDWARE,
+                uint64_t read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED |
+                                       PERF_FORMAT_TOTAL_TIME_RUNNING) {
 	perf_event_attr attr {};
 	attr.size           = sizeof(attr);
-	attr.type           = PERF_TYPE_HARDWARE;
+	attr.type           = type;
 	attr.config         = config;
 	attr.exclude_kernel = 1;
 	attr.exclude_hv     = 1;
-	attr.read_format    = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED |
-	                   PERF_FORMAT_TOTAL_TIME_RUNNING;
+	attr.read_format    = read_format;
 	return static_cast<int>(syscall(SYS_perf_event_open, &attr, 0, -1, group_fd, PERF_FLAG_FD_CLOEXEC));
 }
 
@@ -198,6 +244,44 @@ void Append(std::string& out, const char* fmt, auto... args) {
 	}
 }
 
+#if defined(__linux__)
+// KYTY_BENCH_PMU counts, scaled to the time each event was enabled ("<role>.x.<name>"), and the
+// top-down slots ("<role>.td.<name>"; the whole group is scheduled at once, or not at all).
+void AppendExtra(std::string& out, const ThreadSlot& slot, const char* name) {
+	for (size_t i = 0; i < ExtraEvents.size(); i++) {
+		struct {
+			uint64_t value, enabled, running;
+		} r {};
+		if (slot.extra_fd[i] < 0 || read(slot.extra_fd[i], &r, sizeof(r)) != static_cast<ssize_t>(sizeof(r))) {
+			continue;
+		}
+		const double scaled = r.running != 0 ? static_cast<double>(r.value) * static_cast<double>(r.enabled) /
+		                                           static_cast<double>(r.running)
+		                                     : 0.0;
+		Append(out, " %s.x.%s=%.0f", name, ExtraEvents[i].name, scaled);
+	}
+	if (slot.topdown_fd[0] < 0) {
+		return;
+	}
+	struct {
+		uint64_t nr, enabled, running;
+		uint64_t values[TopdownEvents.size()];
+	} g {};
+	const auto n = read(slot.topdown_fd[0], &g, sizeof(g));
+	if (n < static_cast<ssize_t>(3 * sizeof(uint64_t)) || g.nr == 0 || g.nr > TopdownEvents.size()) {
+		return;
+	}
+	// The members that opened, in order (a member that failed to open is missing from the read).
+	size_t v = 0;
+	for (size_t i = 0; i < TopdownEvents.size() && v < g.nr; i++) {
+		if (slot.topdown_fd[i] >= 0) {
+			Append(out, " %s.td.%s=%llu", name, TopdownEvents[i].name,
+			       static_cast<unsigned long long>(g.values[v++]));
+		}
+	}
+}
+#endif
+
 } // namespace
 
 void RegisterThread(Role role) {
@@ -223,6 +307,21 @@ void RegisterThread(Role role) {
 				continue;
 			}
 			slot.group_fd[p] = leader;
+		}
+	}
+	slot.extra_fd.fill(-1);
+	slot.topdown_fd.fill(-1);
+	const int core = ReadPmuType("cpu_core") >= 0 ? ReadPmuType("cpu_core") : ReadPmuType("cpu");
+	if (CountersEnabled() && ExtraEnabled() && role != Role::Rec && core >= 0) {
+		slot.extra = true;
+		const auto type = static_cast<uint32_t>(core);
+		for (size_t i = 0; i < ExtraEvents.size(); i++) {
+			slot.extra_fd[i] = OpenCounter(ExtraEvents[i].config, -1, type,
+			                               PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING);
+		}
+		slot.topdown_fd[0] = OpenCounter(TopdownEvents[0].config, -1, type);
+		for (size_t i = 1; i < TopdownEvents.size() && slot.topdown_fd[0] >= 0; i++) {
+			slot.topdown_fd[i] = OpenCounter(TopdownEvents[i].config, slot.topdown_fd[0], type);
 		}
 	}
 	slot.tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
@@ -300,6 +399,9 @@ std::string Line(uint64_t frames, double t, uint64_t draws) {
 			Append(out, " %s.cyc=%llu %s.inst=%llu %s.pmu_run=%.3f", name,
 			       static_cast<unsigned long long>(cycles), name,
 			       static_cast<unsigned long long>(instructions), name, share);
+		}
+		if (slot.extra) {
+			AppendExtra(out, slot, name);
 		}
 	}
 #endif

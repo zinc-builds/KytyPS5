@@ -17,6 +17,8 @@ Per-thread numbers (cmd = KytyGpuCmd, prep0/prep1 = KytyGpuPrep*, rec = KytyGpuR
               10 ms resolution per window edge)
   runq        ns per draw spent runnable but not running (preempted, e.g. by a build)
   busy        CPU time / wall time of the window
+  x, td       with KYTY_BENCH_PMU=1 (cmd and prep threads, P-core PMU): user-mode event counts per
+              draw, and the top-down split of the thread's cycles per draw
 Command-thread waits per draw (ns, wall time, counted only when a wait happens):
   wait_prep   prepare worker: drain + refill + steady + idle (wait_drain, wait_refill, ...)
   wait_rec    recorder
@@ -119,6 +121,21 @@ def compute(a, b, pa, pb):
             th["cyc"] = d(f"{t}.cyc") / draws
             th["ipc"] = th["inst"] / th["cyc"] if th["cyc"] else 0.0
             th["pmu_run"] = b.get(f"{t}.pmu_run", 0)
+        # KYTY_BENCH_PMU=1: event counts per draw ("x"), and the top-down split of the thread's
+        # cycles per draw ("td": level 1 retiring / bad_spec / fe_bound / be_bound, level 2
+        # heavy_ops, br_mispredict, fetch_lat, mem_bound, and core_bound = be_bound - mem_bound).
+        xs = sorted({k.split(".", 2)[2] for k in b if k.startswith(f"{t}.x.")})
+        if xs:
+            th["x"] = {n: d(f"{t}.x.{n}") / draws for n in xs}
+        slots = d(f"{t}.td.slots")
+        if slots > 0 and "cyc" in th:
+            td = {n: d(f"{t}.td.{n}") / slots * th["cyc"]
+                  for n in ("retiring", "bad_spec", "fe_bound", "be_bound", "heavy_ops",
+                            "br_mispredict", "fetch_lat", "mem_bound") if f"{t}.td.{n}" in b}
+            if "be_bound" in td and "mem_bound" in td:
+                td["core_bound"] = td["be_bound"] - td["mem_bound"]
+            th["td"] = td
+            th["slots_per_cycle"] = slots / draws / th["cyc"] if th["cyc"] else 0.0
         r["threads"][t] = th
     waits = {k: d(f"{k}_wait_ns") / draws for k in ("drain", "refill", "steady", "idle")}
     r["wait"] = {
