@@ -32,10 +32,15 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// A target counts as redrawn every frame once its write rate (an average over ~20 drawn frames)
-// reaches this; it takes ~45 consecutive drawn frames from first sight.
-constexpr double EVERY_FRAME_RATE = 0.9;
-constexpr double RATE_DECAY       = 0.95;
+// Write runs: consecutive drawn frames that write a target. A cache refreshed every few frames
+// (shadow cascades, probes, impostors) shows repeated runs of one or two frames: that target is
+// kept. A target in use is otherwise redrawn in every frame (long runs), including when dynamic
+// resolution moves the scene between targets. A target is kept for its first drawn frames too.
+constexpr uint32_t SHORT_RUN       = 2;
+constexpr uint32_t PERIODIC_RUNS   = 3; // short runs in a row that make a target periodic
+constexpr uint32_t LONG_RUN        = 8; // a run this long makes it an every-frame target again
+constexpr uint64_t NEW_FRAMES      = 8;
+constexpr double   RATE_DECAY      = 0.95; // diagnostic write rate
 // Matches TextureCache's readback rule for small tiled targets.
 constexpr uint64_t SMALL_TILED_READBACK_TEXELS = 64 * 64;
 // Feed-forward margin below the vblank period, and the most frames ever skipped.
@@ -48,7 +53,9 @@ constexpr double STALL_PERIODS = 4.0;
 enum class Mode { Off, Auto, Every };
 
 struct Target {
-	double   rate         = 0.0; // write rate over drawn frames (decaying average)
+	double   rate         = 0.0; // diagnostic: write rate over drawn frames (decaying average)
+	uint32_t run          = 0;   // current write run, in drawn frames
+	uint32_t short_runs   = 0;   // short runs in a row
 	uint64_t first_frame  = 0;   // drawn-frame index when first seen
 	uint64_t last_frame   = 0;   // drawn-frame index when last written
 	uint32_t draws        = 0;   // draws this frame
@@ -211,9 +218,16 @@ Target& FindTarget(State& s, const TargetInfo& info) {
 	return t;
 }
 
+bool Periodic(const Target& t) {
+	return t.short_runs >= PERIODIC_RUNS && t.run < LONG_RUN;
+}
+
+bool New(const Target& t) {
+	return S().drawn_frames - t.first_frame < NEW_FRAMES;
+}
+
 void Decide(Target& t) {
-	const bool every_frame = t.rate >= EVERY_FRAME_RATE;
-	t.keep = !t.display && (t.keep_listed || t.readback || !every_frame);
+	t.keep = !t.display && (t.keep_listed || t.readback || New(t) || Periodic(t));
 }
 
 const char* ClassOf(const Target& t) {
@@ -226,7 +240,7 @@ const char* ClassOf(const Target& t) {
 	if (t.readback) {
 		return "cpu-readback";
 	}
-	return t.rate >= EVERY_FRAME_RATE ? "every-frame" : "periodic";
+	return Periodic(t) ? "periodic" : New(t) ? "new" : "every-frame";
 }
 
 void ParseKeepList(State& s, const char* list) {
@@ -288,11 +302,11 @@ void DiagReport(State& s) {
 	std::sort(rows.begin(), rows.end(),
 	          [](const auto& a, const auto& b) { return a.second->diag_draws > b.second->diag_draws; });
 	for (const auto& [key, t]: rows) {
-		std::printf("FSDIAG target=0x%" PRIx64 " %ux%u fmt=%u%s class=%s rate=%.2f "
+		std::printf("FSDIAG target=0x%" PRIx64 " %ux%u fmt=%u%s class=%s rate=%.2f short_runs=%u "
 		            "written_frames=%" PRIu64 "/%" PRIu64 " draws_written_frame=%.1f kept_draws=%" PRIu64
 		            "\n",
 		            key, t->width, t->height, t->format, t->depth ? " depth" : "", ClassOf(*t),
-		            t->rate, t->diag_frames, s.diag_frames,
+		            t->rate, t->short_runs, t->diag_frames, s.diag_frames,
 		            static_cast<double>(t->diag_draws) /
 		                static_cast<double>(std::max<uint64_t>(t->diag_frames, 1)),
 		            t->diag_kept);
@@ -533,6 +547,10 @@ void OnFlip(const uint64_t* display_buffers, int display_buffer_count) {
 			t.rate             = t.rate * RATE_DECAY + (written ? 1.0 - RATE_DECAY : 0.0);
 			if (written) {
 				t.last_frame = s.drawn_frames;
+				t.run++;
+			} else if (t.run != 0) {
+				t.short_runs = t.run <= SHORT_RUN ? std::min(t.short_runs + 1, 8u) : 0;
+				t.run        = 0;
 			}
 		}
 		if (Detail::g_diag && t.draws != 0) {
