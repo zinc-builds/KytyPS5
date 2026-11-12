@@ -2002,6 +2002,10 @@ void RenderExecutor::PostQueuedDraw(const LiveRegisters& live, QueuedDraw& queue
 	}
 	queued.sequence           = sequence;
 	auto* const handoff       = m_decode_handoff;
+	// Posts come from the decode thread, or from the GPU thread while the decode thread waits
+	// at a sync.
+	EXIT_IF(handoff != nullptr && handoff->verify && !g_on_decode_thread &&
+	        !GuestGpu::IsGpuThread());
 	if (handoff != nullptr) {
 		// Not while the GPU thread waits for the workers to be idle (WaitPrepareIdle).
 		for (;;) {
@@ -2291,6 +2295,8 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring
 
 void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(m_decode_handoff != nullptr && m_decode_handoff->verify &&
+	        (g_on_decode_thread || !GuestGpu::IsGpuThread()));
 	const auto sequence = m_queued_taken + 1;
 	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
 	EXIT_IF(m_queued_posted.load(std::memory_order_acquire) < sequence ||

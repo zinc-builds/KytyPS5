@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -172,6 +173,21 @@ private:
 	std::unique_ptr<DecodeThread, DecodeThreadDeleter> m_decode;
 	// Decode thread: the handler found the packet must run on the GPU thread, and did nothing.
 	bool m_decode_bail = false;
+	// KYTY_DECODE_THREAD=verify: a shadow processor replays the decode thread's packets on the GPU
+	// thread; its draws are captured instead of queued.
+	struct ShadowDraw {
+		bool          valid   = false;
+		bool          indexed = false;
+		DrawIndexArgs index {};
+		DrawAutoArgs  automatic {};
+	};
+	bool       m_shadow = false;
+	ShadowDraw m_shadow_draw;
+	void       CopyDecodeState(const CommandProcessor& from);
+	// Empty if this processor's decode state equals `other`'s, else what differs.
+	[[nodiscard]] std::string DecodeStateDiff(const CommandProcessor& other) const;
+	// The shadow's last draw against posted draw `sequence`; empty if equal.
+	[[nodiscard]] std::string ShadowDrawDiff(const CommandProcessor& shadow, uint64_t sequence) const;
 	HW::Context    m_ctx;
 	std::optional<HW::Context> m_saved_ctx;
 	HW::UserConfig m_ucfg;

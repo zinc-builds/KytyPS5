@@ -24,6 +24,9 @@
 
 namespace Libs::Graphics {
 
+// The decode thread sets this for itself.
+inline thread_local bool g_on_decode_thread = false;
+
 class DecodeSignal {
 public:
 	// Bumps the word and wakes the waiter if it sleeps.
@@ -87,6 +90,8 @@ struct DecodeHandoff {
 	alignas(64) std::atomic<bool> posting {false};
 	alignas(64) std::atomic<bool> pause {false};
 	uint64_t spin_ns = 20'000;
+	// KYTY_DECODE_THREAD=verify: ownership asserts on the posting and committing paths.
+	bool verify = false;
 };
 
 } // namespace Libs::Graphics
