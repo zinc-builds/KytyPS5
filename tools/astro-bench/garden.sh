@@ -49,6 +49,8 @@ esac
 rm -f "$log"
 # GARDEN_SHOT=<F>: save the frame shown at level frame F as /tmp/garden-<label>-shot.png (the
 # emulator's KYTY_SHOT_FILE capture: the guest image, no overlay; needs a binary that has it).
+# KYTY_SHOT_COUNT=<n> also saves the next n-1 presented frames as <shot>.ppm-<k>.ppm (the SHOT
+# lines in the log give each one's flip number).
 shot_png=/tmp/garden-$label-shot.png
 rm -f "$shot_png"
 if [ -n "$GARDEN_SHOT" ]; then

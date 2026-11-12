@@ -7,5 +7,5 @@
   Disassemble with `objdump -D -b binary -m i386:x86-64 -M intel --start-address=A --stop-address=B eboot.img`.
 - `imports.py eboot.img`: PLT index -> NID; PLT stub address = 0x74bc460 + (index - 1453) * 16.
 - `callers.py eboot.img <target>...`: rel32 call/jmp sites; `refs.py` / `riprefs.py`: RIP-relative references.
-- `events.py`: StartLevel -> `veg_chibi 6->7` frame count and seconds across /tmp/bench-*.log (game-speed check);
-  `speed.py <bench logs>`: the same per log plus FRAMESKIP summaries.
+- `gamespeed.py [bench logs...]`: game speed from the game's own `veg_chibi 6->7` event and from
+  frames 1000-1600 (see the docstring); default all `/tmp/bench-*.log`.

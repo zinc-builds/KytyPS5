@@ -63,6 +63,12 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   from a run with `KYTY_KERNEL_STATS=1`.
 - `faultsum.py` — summarise `KYTY_FAULT_DIAG=1` output. `offcpu.py` — off-CPU time from
   `perf record -e sched:sched_switch` (needs root for tracepoints).
+- `../re/gamespeed.py [bench logs…]` — **game-speed check**. Astro Bot advances a fixed step per
+  flip, so game speed = flips/s ÷ 60. The script finds the game's own `veg_chibi … 6->7` event
+  (~850 flips after `StartLevel` in every run, ~14.2 s on a PS5) and prints the game speed over
+  the opening, over frames 1000–1600, and the `FRAMESKIP` summary if present. Runs on any
+  `/tmp/bench-<label>.log` (default: all of them). `tools/re/` also has the eboot helpers
+  (`.zar` extractor, SELF → flat image, import and caller lookups); see its README.
 - `patches/` — emk530/issue #745 game patches (NoRT, GI probes) for `--game-patch`; no CPU gain.
 
 Never run the harness while someone is playing on the same machine: it takes over the gamepad
