@@ -1,6 +1,7 @@
 #if defined(__linux__)
 #include "common/hybridAffinity.h"
 #include <pthread.h>
+#include <sys/resource.h>
 #endif
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/frameSkip.h"
@@ -1721,6 +1722,8 @@ public:
 		uint64_t              idle_sync_ns  = 0; // ... of which right after a sync's release
 		uint64_t              idle_count    = 0;
 		uint64_t              gpu_packets   = 0; // run on the GPU thread after a sync
+		std::atomic<uint64_t> decode_user_us {0}, decode_sys_us {0}; // cumulative
+		uint64_t              last_user_us = 0, last_sys_us = 0;
 		uint64_t              start_ns      = 0;
 		uint64_t              posted_start  = 0;
 	} stats;
@@ -1767,6 +1770,17 @@ void DecodeThread::Loop() {
 		g_current_execution = execution;
 		m_cp.ProcessPm4Decode(*execution);
 		g_current_execution = nullptr;
+		if (m_stats_enabled) {
+			// The decode thread's CPU time (its kernel time is not in the command thread's).
+			rusage usage {};
+			if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+				const auto us = [](const timeval& t) {
+					return static_cast<uint64_t>(t.tv_sec) * 1'000'000u + static_cast<uint64_t>(t.tv_usec);
+				};
+				stats.decode_user_us.store(us(usage.ru_utime), std::memory_order_relaxed);
+				stats.decode_sys_us.store(us(usage.ru_stime), std::memory_order_relaxed);
+			}
+		}
 		state.store(State::Finished, std::memory_order_release);
 		handoff.to_commit.Notify();
 		handoff.to_decode.Wait(
@@ -2094,6 +2108,15 @@ void DecodeThread::PrintStats(uint64_t posted) {
 		line += item;
 	}
 	std::printf("DECODE syncs by reason:%s\n", line.c_str());
+	const auto user = stats.decode_user_us.load(std::memory_order_relaxed);
+	const auto sys  = stats.decode_sys_us.load(std::memory_order_relaxed);
+	std::printf("DECODE thread cpu user_ms_s=%.1f sys_ms_s=%.1f user_ns_per_post=%.0f "
+	            "sys_ns_per_post=%.0f\n",
+	            (user - stats.last_user_us) / s / 1e3, (sys - stats.last_sys_us) / s / 1e3,
+	            (user - stats.last_user_us) * 1e3 / std::max<double>(1.0, posted - stats.posted_start),
+	            (sys - stats.last_sys_us) * 1e3 / std::max<double>(1.0, posted - stats.posted_start));
+	stats.last_user_us = user;
+	stats.last_sys_us  = sys;
 	if (verify) {
 		std::printf("DECODE verify draws=%" PRIu64 " packets=%" PRIu64 " syncs=%" PRIu64
 		            " guest_races=%" PRIu64 " (all clean so far)\n",
@@ -2117,8 +2140,10 @@ void CommandProcessor::DecodeThreadDeleter::operator()(DecodeThread* decode) con
 }
 
 void CommandProcessor::RunPacketLoop(Pm4Execution& execution) {
+	// Not with frame skipping: its draw classification is the GPU thread's, so every draw would be
+	// a sync (stage 1).
 	if (DecodeThreadMode() != 0 && !IsAsyncComputeQueue() && g_gpu_state != nullptr &&
-	    m_renderer.GetRenderExecutor().EnsurePrepareLanes()) {
+	    !FrameSkip::Active() && m_renderer.GetRenderExecutor().EnsurePrepareLanes()) {
 		if (m_decode == nullptr) {
 			m_decode.reset(new DecodeThread(*this));
 		}
