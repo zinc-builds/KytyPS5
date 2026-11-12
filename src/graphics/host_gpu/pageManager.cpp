@@ -495,6 +495,14 @@ bool PageManager::HasWriteWatched(uint64_t begin, uint64_t end) const noexcept {
 	return false;
 }
 
+uint64_t PageManager::CountWriteWatched(uint64_t begin, uint64_t end) const {
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	AppendWriteWatched(begin, end, runs);
+	uint64_t pages = 0;
+	for (const auto& [b, e]: runs) pages += (e - b) / PAGE_SIZE;
+	return pages;
+}
+
 void PageManager::AppendWriteWatched(uint64_t begin, uint64_t end,
                                      std::vector<std::pair<uint64_t, uint64_t>>& runs) const {
 	begin = Common::AlignDown(begin, PAGE_SIZE);

@@ -448,8 +448,34 @@ void RenderContext::VerifyAsyncWrites(const std::vector<std::pair<uint64_t, uint
 // threads too (submit scans): the page manager's region lookups and counters are atomic.
 static std::atomic<const PageManager*> g_scan_pages {nullptr};
 
+static thread_local bool g_wd_counting = false; // DIAG
+static uint64_t g_wd_runs[3] {}, g_wd_cover[3] {}, g_wd_empty_chunks = 0;
+static uint64_t g_wd_chunks = 0, g_wd_watched_in = 0, g_wd_full = 0, g_wd_zero_written = 0,
+                g_wd_zero_watched = 0, g_wd_written = 0, g_wd_watched_found = 0, g_wd_t0 = 0;
 static bool WantsAsyncScan(uint64_t begin, uint64_t end) {
-	return g_scan_pages.load(std::memory_order_acquire)->HasWriteWatched(begin, end);
+	const bool want = g_scan_pages.load(std::memory_order_acquire)->HasWriteWatched(begin, end);
+	if (want && g_wd_counting) {
+		g_wd_chunks++;
+		const auto in_chunk = g_scan_pages.load(std::memory_order_acquire)->CountWriteWatched(begin, end);
+		g_wd_watched_in += in_chunk;
+		g_wd_empty_chunks += in_chunk == 0;
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		g_scan_pages.load(std::memory_order_acquire)->AppendWriteWatched(begin, end, runs);
+		static constexpr uint64_t gaps[3] = {1, 16, 64};
+		for (int g = 0; g < 3; g++) {
+			uint64_t prev_end = 0;
+			for (const auto& [b, e]: runs) {
+				if (prev_end != 0 && b - prev_end < gaps[g] * TRACKER_PAGE_SIZE) {
+					g_wd_cover[g] += (b - prev_end) / TRACKER_PAGE_SIZE;
+				} else {
+					g_wd_runs[g]++;
+				}
+				g_wd_cover[g] += (e - b) / TRACKER_PAGE_SIZE;
+				prev_end = e;
+			}
+		}
+	}
+	return want;
 }
 
 ResumeScanMode GetResumeScanMode() {
@@ -641,7 +667,43 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 		}
 	} else {
 		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::CollectScan);
+		static const bool diag = std::getenv("KYTY_WAITSCAN_DIAG") != nullptr;
+		g_wd_counting = diag;
 		LibKernel::Memory::CollectAsyncGuestWrites(written, WantsAsyncScan);
+		g_wd_counting = false;
+		if (diag) {
+			uint64_t pages = 0, wpages = 0;
+			std::vector<std::pair<uint64_t, uint64_t>> w;
+			for (const auto& [b, e]: written) {
+				pages += (e - b) / TRACKER_PAGE_SIZE;
+				m_page_manager.AppendWriteWatched(b, e, w);
+			}
+			for (const auto& [b, e]: w) wpages += (e - b) / TRACKER_PAGE_SIZE;
+			g_wd_full++;
+			g_wd_written += pages;
+			g_wd_watched_found += wpages;
+			g_wd_zero_written += pages == 0;
+			g_wd_zero_watched += wpages == 0;
+			const auto now = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+			if (g_wd_t0 == 0) g_wd_t0 = now;
+			if (now - g_wd_t0 >= 1'000'000'000ull) {
+				const double f = static_cast<double>(g_wd_full);
+				std::printf("WAITSCAN full=%llu zero_written=%llu zero_watched=%llu written_per=%.1f "
+				            "watched_found_per=%.1f chunks_per=%.1f watched_in_chunks_per=%.0f\n",
+				            (unsigned long long)g_wd_full, (unsigned long long)g_wd_zero_written,
+				            (unsigned long long)g_wd_zero_watched, g_wd_written / f,
+				            g_wd_watched_found / f, g_wd_chunks / f, g_wd_watched_in / f);
+				std::printf("WAITSCAN empty_chunks_per=%.1f runs/cover per coll: g1 %.0f/%.0f g16 %.0f/%.0f g64 %.0f/%.0f\n",
+				            g_wd_empty_chunks / f, g_wd_runs[0] / f, g_wd_cover[0] / f, g_wd_runs[1] / f, g_wd_cover[1] / f,
+				            g_wd_runs[2] / f, g_wd_cover[2] / f);
+				std::fflush(stdout);
+				for (int g = 0; g < 3; g++) g_wd_runs[g] = g_wd_cover[g] = 0;
+				g_wd_empty_chunks = 0;
+				g_wd_full = g_wd_zero_written = g_wd_zero_watched = g_wd_written = 0;
+				g_wd_watched_found = g_wd_chunks = g_wd_watched_in = 0;
+				g_wd_t0 = now;
+			}
+		}
 	}
 	// KYTY_PRESTAGE_SELFTEST=1 (test only, no stager): stage up to 16 pages of the first written
 	// run each collection, and unstage them all every 16th collection, to run the arm (including

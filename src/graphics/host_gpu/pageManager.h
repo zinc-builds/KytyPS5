@@ -35,6 +35,7 @@ public:
 	// Whether any page within [begin, end) has a write watcher (lock-free, may be stale: a
 	// page gaining a watcher is write-protected after its count is published).
 	[[nodiscard]] bool HasWriteWatched(uint64_t begin, uint64_t end) const noexcept;
+	[[nodiscard]] uint64_t CountWriteWatched(uint64_t begin, uint64_t end) const; // DIAG
 
 	// Appends the runs of write-watched pages within [begin, end).
 	void AppendWriteWatched(uint64_t begin, uint64_t end,
