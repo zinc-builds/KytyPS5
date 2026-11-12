@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -278,6 +279,28 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	command_buffer.pipelineBarrier2(dependency);
 }
 
+Image::Barriers Image::TransitBarriers(vk::ImageLayout                      destination_layout,
+                                       vk::AccessFlags2                     destination_access,
+                                       std::optional<ImageSubresourceRange> range) {
+	auto barriers = GetBarriers(destination_layout, destination_access,
+	                            TransitStages(destination_access), range);
+	if (!barriers.empty()) {
+		m_scheduler.EndRendering();
+	}
+	return barriers;
+}
+
+void Image::RecordBarriers(vk::CommandBuffer cb, const vk::ImageMemoryBarrier2* barriers,
+                           uint32_t count) {
+	if (count == 0) {
+		return;
+	}
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = count;
+	dependency.pImageMemoryBarriers    = barriers;
+	cb.pipelineBarrier2(dependency);
+}
+
 bool Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range) {
 	const auto barriers = GetBarriers(destination_layout, destination_access,
@@ -286,10 +309,15 @@ bool Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		return false;
 	}
 	m_scheduler.EndRendering();
-	vk::DependencyInfo dependency {};
-	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
-	dependency.pImageMemoryBarriers    = barriers.data();
-	m_scheduler.Current().Handle().pipelineBarrier2(dependency);
+	m_scheduler.Current().RecordQueued(
+	    barriers.size() * sizeof(vk::ImageMemoryBarrier2),
+	    [&](std::byte* out) { std::memcpy(out, barriers.data(), barriers.size() * sizeof(barriers[0])); },
+	    [count = static_cast<uint32_t>(barriers.size())](vk::CommandBuffer cb, const std::byte* data) {
+		    vk::DependencyInfo dependency {};
+		    dependency.imageMemoryBarrierCount = count;
+		    dependency.pImageMemoryBarriers    = reinterpret_cast<const vk::ImageMemoryBarrier2*>(data);
+		    cb.pipelineBarrier2(dependency);
+	    });
 	return true;
 }
 

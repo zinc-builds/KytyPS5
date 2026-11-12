@@ -424,7 +424,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	RebindBuffers(bindings);
 
 	// Binds only: a deferred barrier of the previous dispatch stays pending through them.
-	const auto vk_buffer = buffer.BindingHandle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
@@ -445,7 +444,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously. Within a chain, the first one
 		// orders everything recorded before the chain against all its dispatches.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		buffer.RecordQueued([](vk::CommandBuffer cb) {
+			ShaderWriteHazardBarrier(cb, vk::PipelineStageFlagBits::eComputeShader);
+		});
 		m_dispatch_chain.hazard_barrier = true;
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
@@ -510,37 +511,43 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
-	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
-	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
-		// A single guest wave per group can run in launch order without a device-wide
-		// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
-		for (uint32_t z = 0; z < thread_group_z; ++z) {
-			for (uint32_t y = 0; y < thread_group_y; ++y) {
-				for (uint32_t x = 0; x < thread_group_x; ++x) {
-					if ((x | y | z) != 0u) {
-						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-					}
-					VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
-					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
-				}
-			}
-		}
-	} else {
-		VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
-	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-
+	const bool ordered = (mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 &&
+	                     program.info.uses_gds && group_threads <= input_info.wave_size &&
+	                     !input_info.lds_storage;
 	// The removed host fence also ordered read-only dispatches before later writers. Deferred,
 	// it is recorded before anything else that follows, unless a dispatch chains onto this one.
+	buffer.RecordQueued([vk_pipeline = pipeline.pipeline, module_id = input_info.stage.module->id,
+	                     thread_group_x, thread_group_y, thread_group_z, ordered,
+	                     close = !chains](vk::CommandBuffer cb) {
+		cb.bindPipeline(vk::PipelineBindPoint::eCompute, vk_pipeline);
+		if (ordered) {
+			// A single guest wave per group can run in launch order without a device-wide
+			// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
+			for (uint32_t z = 0; z < thread_group_z; ++z) {
+				for (uint32_t y = 0; y < thread_group_y; ++y) {
+					for (uint32_t x = 0; x < thread_group_x; ++x) {
+						if ((x | y | z) != 0u) {
+							ShaderAccessBarrier(cb, vk::PipelineStageFlagBits::eComputeShader);
+						}
+						VulkanDiagnostics::TagDispatch(cb, module_id);
+						cb.dispatchBase(x, y, z, 1, 1, 1);
+					}
+				}
+			}
+		} else {
+			VulkanDiagnostics::TagDispatch(cb, module_id);
+			cb.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
+		if (close) {
+			ShaderAccessBarrier(cb, vk::PipelineStageFlagBits::eComputeShader);
+		}
+	});
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (chains) {
 		buffer.DeferDispatchBarrier();
-	} else {
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	PrintDispatchChainStats();
 	ResetBindings();
@@ -605,23 +612,27 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
 	}
-	const auto vk_buffer = buffer.Handle();
-	if (HasStorageWrites(input_info, bindings)) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	VulkanDiagnostics::TagDispatch(vk_buffer, input_info.stage.module->id);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	buffer.RecordQueued([writes = HasStorageWrites(input_info, bindings),
+	                     vk_pipeline = pipeline.pipeline, module_id = input_info.stage.module->id,
+	                     args = args_buffer->Handle(), args_offset](vk::CommandBuffer cb) {
+		if (writes) {
+			ShaderWriteHazardBarrier(cb, vk::PipelineStageFlagBits::eComputeShader);
+		}
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask =
+		    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		cb.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                       vk::PipelineStageFlagBits::eComputeShader |
+		                       vk::PipelineStageFlagBits::eTransfer,
+		                   vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0,
+		                   nullptr);
+		cb.bindPipeline(vk::PipelineBindPoint::eCompute, vk_pipeline);
+		VulkanDiagnostics::TagDispatch(cb, module_id);
+		cb.dispatchIndirect(args, args_offset);
+		ShaderAccessBarrier(cb, vk::PipelineStageFlagBits::eComputeShader);
+	});
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
 

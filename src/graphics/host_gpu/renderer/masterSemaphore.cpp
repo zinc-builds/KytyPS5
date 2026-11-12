@@ -67,6 +67,7 @@ void MasterSemaphore::EnableWaitDiag() {
 }
 
 void MasterSemaphore::Refresh() {
+	Common::GpuWaitDiag::DriverScope driver_scope(Common::GpuWaitDiag::Driver::Refresh);
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

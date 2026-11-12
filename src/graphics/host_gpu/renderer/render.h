@@ -5,6 +5,8 @@
 #include "common/assert.h"
 #include "common/benchMetrics.h"
 #include "common/common.h"
+#include "common/gpuWaitDiag.h"
+#include "common/stallDiag.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/deferredRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
@@ -27,6 +29,7 @@
 #include <memory>
 #include <span>
 #include <unordered_map>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -118,9 +121,10 @@ public:
 
 	// For recording directly: first waits until the recording thread has recorded everything
 	// queued with Record().
-	[[nodiscard]] vk::CommandBuffer Handle() const noexcept {
+	[[nodiscard]] vk::CommandBuffer
+	Handle(const std::source_location& site = std::source_location::current()) const noexcept {
 		if (m_recorder != nullptr) {
-			m_recorder->Drain();
+			DrainForDirect(site);
 		}
 		if (m_dispatch_barrier_pending) {
 			RecordDispatchBarrier();
@@ -129,9 +133,10 @@ public:
 	}
 	// Like Handle(), but keeps a deferred dispatch barrier pending: only for a dispatch's own
 	// pipeline, descriptor and push-constant binds, which access no memory.
-	[[nodiscard]] vk::CommandBuffer BindingHandle() const noexcept {
+	[[nodiscard]] vk::CommandBuffer
+	BindingHandle(const std::source_location& site = std::source_location::current()) const noexcept {
 		if (m_recorder != nullptr) {
-			m_recorder->Drain();
+			DrainForDirect(site);
 		}
 		return m_buffer;
 	}
@@ -143,7 +148,65 @@ public:
 	void DropDispatchBarrier() const noexcept { m_dispatch_barrier_pending = false; }
 	void FlushDispatchBarrier() const noexcept {
 		if (m_dispatch_barrier_pending) {
-			(void)Handle();
+			if (m_recorder != nullptr && QueueDirectCommands()) {
+				// Queued like any other command: no wait for the recording thread.
+				m_dispatch_barrier_pending = false;
+				m_recorder->Record(m_buffer, [](vk::CommandBuffer cb) { RecordDispatchBarrierOn(cb); });
+			} else {
+				(void)Handle();
+			}
+		}
+	}
+	// KYTY_DIRECT_RECORD=1: the call sites converted to RecordQueued/RecordBinding record directly
+	// on the command thread again, after waiting for the recording thread (Handle()).
+	[[nodiscard]] static bool QueueDirectCommands() noexcept {
+		static const bool queue = [] {
+			const char* value = std::getenv("KYTY_DIRECT_RECORD");
+			return value == nullptr || value[0] != '1';
+		}();
+		return queue;
+	}
+	// A command that used to be recorded directly (Handle()): queued for the recording thread
+	// like Record(), or, with KYTY_DIRECT_RECORD=1, recorded now through Handle(). f must
+	// capture what it needs by value.
+	template <typename F>
+	void RecordQueued(F&& f) const {
+		if (QueueDirectCommands()) {
+			Record(std::forward<F>(f));
+		} else {
+			f(Handle());
+		}
+	}
+	template <typename Fill, typename F>
+	void RecordQueued(size_t size, Fill&& fill, F&& f) const {
+		if (QueueDirectCommands()) {
+			Record(size, std::forward<Fill>(fill), std::forward<F>(f));
+		} else {
+			thread_local std::vector<std::byte> data;
+			data.resize(size);
+			fill(data.data());
+			f(Handle(), data.data());
+		}
+	}
+	// Like RecordQueued, for a dispatch's own pipeline, descriptor and push-constant binds, which
+	// access no memory: a deferred dispatch barrier stays pending through them (BindingHandle()).
+	template <typename F>
+	void RecordBinding(F&& f) const {
+		if (m_recorder != nullptr && QueueDirectCommands()) {
+			m_recorder->Record(m_buffer, std::forward<F>(f));
+		} else {
+			f(BindingHandle());
+		}
+	}
+	template <typename Fill, typename F>
+	void RecordBinding(size_t size, Fill&& fill, F&& f) const {
+		if (m_recorder != nullptr && QueueDirectCommands()) {
+			m_recorder->Record(m_buffer, size, std::forward<Fill>(fill), std::forward<F>(f));
+		} else {
+			thread_local std::vector<std::byte> data;
+			data.resize(size);
+			fill(data.data());
+			f(BindingHandle(), data.data());
 		}
 	}
 	// Records f(vk::CommandBuffer) on the recording thread, in order with everything else, or now
@@ -191,7 +254,19 @@ private:
 
 	void Begin();
 	void End() const;
+	// KYTY_DRIVER_STATS: a direct recording, by call site, and the recorder drain it waited for.
+	void DrainForDirect(const std::source_location& site) const noexcept {
+		if (Common::GpuWaitDiag::DriverStats() && Common::StallDiag::OnCommandThread()) {
+			const auto start = Common::GpuWaitDiag::NowNs();
+			const bool idle  = m_recorder->Idle();
+			m_recorder->Drain();
+			Common::GpuWaitDiag::NoteDirectRecord(site, idle ? 0 : Common::GpuWaitDiag::NowNs() - start);
+			return;
+		}
+		m_recorder->Drain();
+	}
 	void RecordDispatchBarrier() const noexcept;
+	static void RecordDispatchBarrierOn(vk::CommandBuffer cb) noexcept;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;

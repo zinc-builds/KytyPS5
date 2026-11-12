@@ -61,6 +61,7 @@ public:
 	void Publish();
 
 	// Publishes, then waits until every queued command is recorded.
+	[[nodiscard]] bool Idle() const noexcept { return m_write == m_done.load(std::memory_order_acquire); }
 	void Drain() {
 		if (m_write != m_done.load(std::memory_order_acquire)) {
 			DrainSlow();

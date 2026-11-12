@@ -354,11 +354,10 @@ void TileManager::RecordImage(vk::Buffer tiled, uint64_t tiled_offset, uint64_t 
 	const auto layout = store ? vk::ImageLayout::eGeneral : image.ReadLayout();
 
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
-	image.Transit(layout,
-	              store ? vk::AccessFlagBits2::eShaderStorageWrite
-	                    : vk::AccessFlagBits2::eShaderSampledRead,
-	              std::nullopt, command);
+	auto pre = image.TransitBarriers(layout,
+	                                 store ? vk::AccessFlagBits2::eShaderStorageWrite
+	                                       : vk::AccessFlagBits2::eShaderSampledRead,
+	                                 std::nullopt);
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = store ? vk::AccessFlagBits::eShaderRead
@@ -375,55 +374,77 @@ void TileManager::RecordImage(vk::Buffer tiled, uint64_t tiled_offset, uint64_t 
 	barriers[1].buffer              = m_stream_buffer.Handle();
 	barriers[1].offset              = tiling.params_offset;
 	barriers[1].size                = tiling.params_size;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands |
-	                            vk::PipelineStageFlagBits::eHost,
-	                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers,
-	                        0, nullptr);
 
 	const vk::DescriptorBufferInfo tiled_info {tiled, descriptor_offset, range};
 	const vk::DescriptorBufferInfo params_info {m_stream_buffer.Handle(), tiling.params_offset,
 	                                            tiling.params_size};
 	const vk::DescriptorImageInfo  image_info {nullptr, view, layout};
-	std::array<vk::WriteDescriptorSet, 3> writes {};
-	writes[0].dstBinding      = store ? 0 : 1;
-	writes[0].descriptorCount = 1;
-	writes[0].descriptorType  = vk::DescriptorType::eStorageBuffer;
-	writes[0].pBufferInfo     = &tiled_info;
-	writes[1].dstBinding      = 2;
-	writes[1].descriptorCount = 1;
-	writes[1].descriptorType  = vk::DescriptorType::eUniformBuffer;
-	writes[1].pBufferInfo     = &params_info;
-	writes[2].dstBinding      = store ? 4 : 3;
-	writes[2].descriptorCount = 1;
-	writes[2].descriptorType =
-	    store ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
-	writes[2].pImageInfo = &image_info;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
-	                             static_cast<uint32_t>(writes.size()), writes.data());
 	const uint32_t image_slot = tiling.pipeline_slot % (FamilyCount * BytesPerElementCount);
-	command.bindPipeline(vk::PipelineBindPoint::eCompute,
-	                     GetImagePipeline(image_slot + (store ? 0u : FamilyCount *
-	                                                                     BytesPerElementCount)));
+	const auto     pipeline   = GetImagePipeline(
+        image_slot + (store ? 0u : FamilyCount * BytesPerElementCount));
 	const uint64_t groups   = (uint64_t {tiling.num_texels} + 63u) / 64u;
 	const uint32_t groups_y = static_cast<uint32_t>(
 	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
 	const uint32_t groups_x = static_cast<uint32_t>((groups + groups_y - 1u) / groups_y);
 	EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
-	command.dispatch(groups_x, groups_y, 1);
 
+	// Where Image::Upload leaves an uploaded image (store), or the tiled bytes readable (load).
+	Image::Barriers post;
+	vk::BufferMemoryBarrier post_buffer = barriers[0];
 	if (store) {
-		// Where Image::Upload leaves an uploaded image.
-		image.Transit(vk::ImageLayout::eGeneral,
-		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
-		              std::nullopt, command);
+		post = image.TransitBarriers(vk::ImageLayout::eGeneral,
+		                             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+		                             std::nullopt);
 	} else {
-		barriers[0].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-		barriers[0].dstAccessMask =
+		post_buffer.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+		post_buffer.dstAccessMask =
 		    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-		                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
-		                        &barriers[0], 0, nullptr);
 	}
+	const auto pre_count  = static_cast<uint32_t>(pre.size());
+	const auto post_count = static_cast<uint32_t>(post.size());
+	m_scheduler.Current().RecordQueued(
+	    (pre.size() + post.size()) * sizeof(vk::ImageMemoryBarrier2),
+	    [&](std::byte* out) {
+		    std::memcpy(out, pre.data(), pre.size() * sizeof(vk::ImageMemoryBarrier2));
+		    std::memcpy(out + pre.size() * sizeof(vk::ImageMemoryBarrier2), post.data(),
+		                post.size() * sizeof(vk::ImageMemoryBarrier2));
+	    },
+	    [pre_count, post_count, b0 = barriers[0], b1 = barriers[1], tiled_info, params_info,
+	     image_info, store, layout_handle = m_pipeline_layout, pipeline, groups_x, groups_y,
+	     post_buffer](vk::CommandBuffer command, const std::byte* data) {
+		    const auto* image_barriers = reinterpret_cast<const vk::ImageMemoryBarrier2*>(data);
+		    Image::RecordBarriers(command, image_barriers, pre_count);
+		    const vk::BufferMemoryBarrier buffer_barriers[] = {b0, b1};
+		    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands |
+		                                vk::PipelineStageFlagBits::eHost,
+		                            vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2,
+		                            buffer_barriers, 0, nullptr);
+		    std::array<vk::WriteDescriptorSet, 3> writes {};
+		    writes[0].dstBinding      = store ? 0 : 1;
+		    writes[0].descriptorCount = 1;
+		    writes[0].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		    writes[0].pBufferInfo     = &tiled_info;
+		    writes[1].dstBinding      = 2;
+		    writes[1].descriptorCount = 1;
+		    writes[1].descriptorType  = vk::DescriptorType::eUniformBuffer;
+		    writes[1].pBufferInfo     = &params_info;
+		    writes[2].dstBinding      = store ? 4 : 3;
+		    writes[2].descriptorCount = 1;
+		    writes[2].descriptorType =
+		        store ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
+		    writes[2].pImageInfo = &image_info;
+		    command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout_handle, 0,
+		                                 static_cast<uint32_t>(writes.size()), writes.data());
+		    command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+		    command.dispatch(groups_x, groups_y, 1);
+		    if (store) {
+			    Image::RecordBarriers(command, image_barriers + pre_count, post_count);
+		    } else {
+			    command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                            vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
+			                            &post_buffer, 0, nullptr);
+		    }
+	    });
 }
 
 vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,

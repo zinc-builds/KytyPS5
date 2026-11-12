@@ -2050,21 +2050,31 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		CommitGpuWrite(image);
 		return;
 	}
-	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
+	const auto barriers = image.TransitBarriers(vk::ImageLayout::eTransferDstOptimal,
+	                                            vk::AccessFlagBits2::eTransferWrite, {});
 	auto native_range = range;
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
-	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &clear.color, 1, &native_range);
-	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
-		                                        vk::ImageLayout::eTransferDstOptimal,
-		                                        &clear.depthStencil, 1, &native_range);
-	}
+	command.RecordQueued(
+	    barriers.size() * sizeof(vk::ImageMemoryBarrier2),
+	    [&](std::byte* out) {
+		    std::memcpy(out, barriers.data(), barriers.size() * sizeof(vk::ImageMemoryBarrier2));
+	    },
+	    [count = static_cast<uint32_t>(barriers.size()), target = image.backing.image, clear,
+	     native_range,
+	     color = range.aspectMask == vk::ImageAspectFlagBits::eColor](vk::CommandBuffer cb,
+	                                                                  const std::byte* data) {
+		    Image::RecordBarriers(cb, reinterpret_cast<const vk::ImageMemoryBarrier2*>(data), count);
+		    if (color) {
+			    cb.clearColorImage(target, vk::ImageLayout::eTransferDstOptimal, &clear.color, 1,
+			                       &native_range);
+		    } else {
+			    cb.clearDepthStencilImage(target, vk::ImageLayout::eTransferDstOptimal,
+			                              &clear.depthStencil, 1, &native_range);
+		    }
+	    });
 	CommitGpuWrite(image);
 }
 

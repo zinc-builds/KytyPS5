@@ -44,7 +44,11 @@ void CommandBuffer::End() const {
 
 void CommandBuffer::RecordDispatchBarrier() const noexcept {
 	m_dispatch_barrier_pending = false;
-	ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	RecordDispatchBarrierOn(m_buffer);
+}
+
+void CommandBuffer::RecordDispatchBarrierOn(vk::CommandBuffer cb) noexcept {
+	ShaderAccessBarrier(cb, vk::PipelineStageFlagBits::eComputeShader);
 }
 
 static void RecordBeginRendering(vk::CommandBuffer buffer, const RenderState& state) {
@@ -111,7 +115,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	RecordQueued([](vk::CommandBuffer cb) { cb.endRendering(); });
 	m_rendering = false;
 }
 
