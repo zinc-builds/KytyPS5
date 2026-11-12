@@ -112,10 +112,15 @@ public:
 	bool ScanAsyncWritesAtSubmit();
 	// Where the guest may have published data mid-stream (a satisfied wait), the collection
 	// can wait until the next packet that reads guest data: see CollectAsyncWritesIfRequested.
-	void RequestAsyncCollect() noexcept { m_async_collect_requested = true; }
-	[[nodiscard]] bool AsyncCollectRequested() const noexcept { return m_async_collect_requested; }
+	// Set and cleared on the GPU thread; the decode thread (KYTY_DECODE_THREAD) reads it too.
+	void RequestAsyncCollect() noexcept {
+		m_async_collect_requested.store(true, std::memory_order_relaxed);
+	}
+	[[nodiscard]] bool AsyncCollectRequested() const noexcept {
+		return m_async_collect_requested.load(std::memory_order_relaxed);
+	}
 	void CollectAsyncWritesIfRequested() {
-		if (m_async_collect_requested) {
+		if (AsyncCollectRequested()) {
 			CollectAsyncWrites();
 		}
 	}
@@ -180,7 +185,7 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
-	bool                      m_async_collect_requested = false;
+	std::atomic<bool>         m_async_collect_requested {false};
 	struct CpLabel {
 		uint64_t vaddr      = 0;
 		uint64_t value      = 0;

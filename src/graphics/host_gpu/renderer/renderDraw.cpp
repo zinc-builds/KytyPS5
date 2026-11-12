@@ -1826,11 +1826,10 @@ bool QueueableRegisters(const HW::Context& ctx, const HW::UserConfig& ucfg, cons
 
 } // namespace
 
-RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& buffer) {
+bool RenderExecutor::EnsurePrepareLanes() {
 	static const bool enabled = EnvFlag("KYTY_PREPARE_THREAD", true);
-	if (!enabled ||
-	    !QueueableRegisters(buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders())) {
-		return nullptr;
+	if (!enabled) {
+		return false;
 	}
 	if (m_prepare_lanes.empty()) {
 		const auto workers = std::max(Common::HybridAffinity::PrepareWorkerCount(), 1u);
@@ -1891,9 +1890,28 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		             : std::string(),
 		    m_prepare_verify ? " (verifying)" : ""));
 	}
-	// The ring holds one more slot than the queue, so the next one is free.
-	EXIT_IF(m_queued_count >= m_queued_draws.size());
-	return m_queued_draws[m_queued_posted % m_queued_draws.size()].get();
+	return true;
+}
+
+RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const LiveRegisters& live) {
+	// The decode thread's lanes are set up on the GPU thread before it starts.
+	if ((m_decode_handoff != nullptr ? m_prepare_lanes.empty() : !EnsurePrepareLanes()) ||
+	    !QueueableRegisters(live.registers, live.user_config, live.shaders)) {
+		return nullptr;
+	}
+	const auto posted = m_queued_posted.load(std::memory_order_relaxed);
+	const auto size   = m_queued_draws.size();
+	if (m_decode_handoff != nullptr) {
+		// The slot is free once the draw `size` before it is committed; one more stays free, as
+		// on the GPU thread.
+		m_decode_handoff->to_decode.Wait(
+		    [&] { return posted + 2 - m_queued_released.load(std::memory_order_acquire) <= size; },
+		    m_decode_handoff->spin_ns);
+	} else {
+		// The ring holds one more slot than the queue, so the next one is free.
+		EXIT_IF(posted - m_queued_taken >= size);
+	}
+	return m_queued_draws[posted % size].get();
 }
 
 namespace {
@@ -1926,7 +1944,8 @@ HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64
 		return &current->registers;
 	}
 	// Queued draws not yet committed: sequences from `oldest` on.
-	const auto oldest = m_queued_posted - m_queued_count + 1;
+	// (Committed means finished with: the GPU thread may still read a taken draw's snapshot.)
+	const auto oldest = m_queued_released.load(std::memory_order_acquire) + 1;
 	if (m_register_snapshots.empty()) {
 		m_register_snapshots.push_back(std::make_unique<RegisterSnapshot>());
 	}
@@ -1943,7 +1962,7 @@ HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64
 	if (mode == 2) {
 		for (const auto& slot: m_queued_draws) {
 			EXIT_IF(slot->registers == &snapshot->registers && slot->sequence >= oldest &&
-			        slot->sequence <= m_queued_posted);
+			        slot->sequence <= m_queued_posted.load(std::memory_order_relaxed));
 		}
 	}
 	snapshot->registers = live;
@@ -1954,16 +1973,18 @@ HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64
 	return &snapshot->registers;
 }
 
-void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
-	queued.registers = RegisterSnapshotFor(buffer.GetRegisters(), m_queued_posted + 1);
+void RenderExecutor::PostQueuedDraw(const LiveRegisters& live, QueuedDraw& queued,
+                                    CommandBuffer* commit) {
+	const auto sequence = m_queued_posted.load(std::memory_order_relaxed) + 1;
+	queued.registers    = RegisterSnapshotFor(live.registers, sequence);
 	if (RegisterSnapshotMode() == 2) {
 		if (!queued.registers_verify) {
 			queued.registers_verify = std::make_unique<HW::Context>();
 		}
-		*queued.registers_verify = buffer.GetRegisters();
+		*queued.registers_verify = live.registers;
 	}
-	queued.user_config        = buffer.GetUserConfig();
-	queued.shaders            = buffer.GetShaders();
+	queued.user_config        = live.user_config;
+	queued.shaders            = live.shaders;
 	queued.hazard_generation  = DrawPrepare::HazardGeneration();
 	queued.sync_epoch         = GuestSyncEpoch::CurrentUnranged();
 	queued.stored_sequence    = DrawPrepare::StoredSequence();
@@ -1979,21 +2000,42 @@ void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 			m_refill_asleep = sleeping == m_prepare_pool->Workers();
 		}
 	}
-	queued.sequence           = ++m_queued_posted;
+	queued.sequence           = sequence;
+	auto* const handoff       = m_decode_handoff;
+	if (handoff != nullptr) {
+		// Not while the GPU thread waits for the workers to be idle (WaitPrepareIdle).
+		for (;;) {
+			handoff->posting.store(true, std::memory_order_seq_cst);
+			if (!handoff->pause.load(std::memory_order_seq_cst)) {
+				break;
+			}
+			handoff->posting.store(false, std::memory_order_seq_cst);
+			while (handoff->pause.load(std::memory_order_acquire)) {
+				KYTY_DECODE_PAUSE();
+			}
+		}
+	}
 	// The worker finds the slot from the sequence.
-	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||
-	        (m_prepare_pool ? m_prepare_pool->Post() != queued.sequence
-	                        : PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence)));
-	m_queued_count++;
+	EXIT_IF(m_queued_draws[(sequence - 1) % m_queued_draws.size()].get() != &queued ||
+	        (m_prepare_pool ? m_prepare_pool->Post() != sequence
+	                        : PrepareWorker(sequence).Post() != PrepareJob(sequence)));
+	m_queued_posted.store(sequence, std::memory_order_release);
 	m_prepare_stat.queued++;
-	while (m_queued_count + 1 > m_queued_draws.size()) {
-		FinishQueuedDraw(buffer);
+	if (handoff != nullptr) {
+		handoff->posting.store(false, std::memory_order_release);
+		handoff->to_commit.Notify();
+	}
+	if (commit != nullptr) {
+		while (QueuedCount() + 1 > m_queued_draws.size()) {
+			FinishQueuedDraw(*commit);
+		}
 	}
 }
 
 void RenderExecutor::QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
+	const LiveRegisters live {buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders()};
 	auto* queued = args.indirect.address == 0 && args.index_count != 0 && args.instance_count != 0
-	                   ? NextQueuedDraw(buffer)
+	                   ? NextQueuedDraw(live)
 	                   : nullptr;
 	if (queued == nullptr) {
 		FinishQueuedDraws(buffer);
@@ -2003,12 +2045,13 @@ void RenderExecutor::QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& 
 	}
 	queued->indexed    = true;
 	queued->index_args = args;
-	PostQueuedDraw(buffer, *queued);
+	PostQueuedDraw(live, *queued, &buffer);
 }
 
 void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
+	const LiveRegisters live {buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders()};
 	auto* queued = args.indirect.address == 0 && args.vertex_count != 0 && args.instance_count != 0
-	                   ? NextQueuedDraw(buffer)
+	                   ? NextQueuedDraw(live)
 	                   : nullptr;
 	if (queued == nullptr) {
 		FinishQueuedDraws(buffer);
@@ -2018,10 +2061,43 @@ void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& ar
 	}
 	queued->indexed   = false;
 	queued->auto_args = args;
-	PostQueuedDraw(buffer, *queued);
+	PostQueuedDraw(live, *queued, &buffer);
+}
+
+bool RenderExecutor::TryQueueDrawIndex(const LiveRegisters& live, const DrawIndexArgs& args) {
+	auto* queued = args.indirect.address == 0 && args.index_count != 0 && args.instance_count != 0
+	                   ? NextQueuedDraw(live)
+	                   : nullptr;
+	if (queued == nullptr) {
+		return false;
+	}
+	queued->indexed    = true;
+	queued->index_args = args;
+	PostQueuedDraw(live, *queued, nullptr);
+	return true;
+}
+
+bool RenderExecutor::TryQueueDrawAuto(const LiveRegisters& live, const DrawAutoArgs& args) {
+	auto* queued = args.indirect.address == 0 && args.vertex_count != 0 && args.instance_count != 0
+	                   ? NextQueuedDraw(live)
+	                   : nullptr;
+	if (queued == nullptr) {
+		return false;
+	}
+	queued->indexed   = false;
+	queued->auto_args = args;
+	PostQueuedDraw(live, *queued, nullptr);
+	return true;
 }
 
 void RenderExecutor::WaitPrepareIdle() {
+	if (m_decode_handoff != nullptr) {
+		// No post may start until ResumePosting; one in progress finishes first.
+		m_decode_handoff->pause.store(true, std::memory_order_seq_cst);
+		while (m_decode_handoff->posting.load(std::memory_order_seq_cst)) {
+			KYTY_DECODE_PAUSE();
+		}
+	}
 	uint64_t waited = 0;
 	for (auto& lane: m_prepare_lanes) {
 		waited += lane->worker->WaitIdle();
@@ -2215,10 +2291,22 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring
 
 void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
-	const auto sequence = m_queued_posted - m_queued_count + 1;
+	const auto sequence = m_queued_taken + 1;
 	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
-	EXIT_IF(m_queued_count == 0 || queued.sequence != sequence);
-	m_queued_count--;
+	EXIT_IF(m_queued_posted.load(std::memory_order_acquire) < sequence ||
+	        queued.sequence != sequence);
+	m_queued_taken = sequence;
+	// Once this returns, the slot and its register snapshot may be reused by the poster.
+	struct Release {
+		RenderExecutor& executor;
+		uint64_t        sequence;
+		~Release() {
+			executor.m_queued_released.store(sequence, std::memory_order_release);
+			if (executor.m_decode_handoff != nullptr) {
+				executor.m_decode_handoff->to_decode.Notify();
+			}
+		}
+	} release {*this, sequence};
 	if (const auto waited = m_prepare_pool ? m_prepare_pool->Wait(sequence)
 	                                       : PrepareWorker(sequence).Wait(PrepareJob(sequence));
 	    waited != 0) {
@@ -2401,6 +2489,7 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		ResetProgramState(state);
 		pipelines.GetGraphicsPrograms(*queued.registers, queued.user_config, queued.shaders, state,
 		                              queued.resources);
+		ResumePosting();
 		return;
 	}
 	m_prepare_stat.adopted++;
@@ -2443,6 +2532,7 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		ResetProgramState(check->first);
 		pipelines.GetGraphicsPrograms(*queued.registers, queued.user_config, queued.shaders,
 		                              check->first, check->second);
+		ResumePosting();
 		if (const auto diff = ComparePrograms(state, queued.resources, check->first, check->second);
 		    !diff.empty()) {
 			EXIT("KYTY_PREPARE_VERIFY: the worker's lookup differs (%s): vs=0x%016" PRIx64

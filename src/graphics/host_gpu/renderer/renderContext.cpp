@@ -601,11 +601,11 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 	ReportPrestage();
 	// A pending request (a satisfied wait published guest data, maybe in another submission
 	// that is now blocked) needs a full scan: only a full scan settles it.
-	if (m_async_collect_requested) {
+	if (AsyncCollectRequested()) {
 		kept_only = false;
 		verify    = KeptVerify::None;
 	}
-	m_async_collect_requested = false;
+	m_async_collect_requested.store(false, std::memory_order_relaxed);
 	static std::vector<std::pair<uint64_t, uint64_t>> written;
 	static std::vector<std::pair<uint64_t, uint64_t>> watched;
 	written.clear();
