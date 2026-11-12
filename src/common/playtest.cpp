@@ -106,6 +106,8 @@ enum Field : uint32_t {
 	FPrepWaitNs,  // prepare workers (BenchMetrics)
 	FRecWaitNs,   // recorder
 	FTexUpNs,     // texture uploads: source bytes and the upload's recording (playtest's own)
+	FMisses,      // program-cache misses and their translation + compile time (playtest's own)
+	FMissNs,
 	FGcNs,
 	FCollectNs,   // write collections and submit scans
 	FTexNew,
@@ -136,7 +138,7 @@ enum Field : uint32_t {
 constexpr std::array<const char*, FFieldCount> kFieldNames {
     "cpu_ns",    "user_us",   "sys_us",   "minflt",     "majflt",      "vcs",
     "ics",       "idle_ns",   "blocked_ns", "gpu_wait_ns", "mutex_ns",   "prep_wait_ns",
-    "rec_wait_ns", "tex_up_ns", "gc_ns",   "collect_ns", "tex_new",    "tex_free",    "buf_new",
+    "rec_wait_ns", "tex_up_ns", "misses", "miss_ns", "gc_ns",   "collect_ns", "tex_new",    "tex_free",    "buf_new",
     "draws",     "disp",      "submits",  "shaders",    "shader_ns",   "pipes",
     "pipe_ns",   "tex_up_b",  "buf_up_b", "tex_dn_b",   "buf_dn_b",    "tex_evict",
     "buf_evict", "flips_rej", "late_vbl", "file_rd_b",  "underruns",   "stub_calls",
@@ -206,6 +208,8 @@ std::atomic<uint8_t>            g_stub_seen[kMaxStubs] {};
 std::atomic<uint32_t>           g_stub_calls[kMaxStubs] {};
 std::atomic<uint64_t>           g_stub_calls_total {0};
 std::atomic<uint64_t>           g_texture_upload_ns {0};
+std::atomic<uint64_t>           g_shader_misses {0};
+std::atomic<uint64_t>           g_shader_miss_ns {0};
 thread_local bool               t_in_texture_upload = false;
 std::atomic<uint32_t>           g_markers {0};
 std::atomic<uint64_t>           g_toast_until_ns {0};
@@ -372,6 +376,8 @@ void ReadCounters(FrameRec& r) noexcept {
 	                   B::Value(BM::SteadyWaitNs) + B::Value(BM::IdleWaitNs);
 	r.v[FRecWaitNs]   = B::Value(BM::RecorderWaitNs);
 	r.v[FTexUpNs]     = g_texture_upload_ns.load(std::memory_order_relaxed);
+	r.v[FMisses]      = g_shader_misses.load(std::memory_order_relaxed);
+	r.v[FMissNs]      = g_shader_miss_ns.load(std::memory_order_relaxed);
 	r.v[FDraws]       = D::Get(DC::Draws);
 	r.v[FDispatches]  = D::Get(DC::Dispatches);
 	r.v[FSubmits]     = D::Get(DC::QueueSubmits);
@@ -1081,7 +1087,7 @@ private:
 	FrameCauses Causes(const Frame& f, double upload_copy_ms) const {
 		FrameCauses c;
 		const auto& v = f.d.v;
-		c.compile     = Ms(v[FShaderNs]);
+		c.compile     = Ms(std::max(v[FMissNs], v[FShaderNs]));
 		c.pipeline    = Ms(v[FPipelineNs]);
 		c.gpu_wait    = Ms(v[FGpuWaitNs]);
 		c.no_work     = Ms(v[FIdleNs] + v[FBlockedNs]);
@@ -1128,31 +1134,58 @@ private:
 		return ms;
 	}
 
-	std::vector<Cause> Attribute(const std::vector<const Frame*>& window, const Frame& worst, uint64_t worst_from) {
+	// The usual value of each cause over a window: the median over its frames under 20 ms
+	// (remembered for the window last asked about).
+	const std::vector<double>& Baseline(const std::vector<const Frame*>& window) {
+		if (window.data() == m_base_key && window.size() == m_base_n) {
+			return m_base;
+		}
 		const auto fields = CauseFields();
-		// The usual value of each cause: the median over the window's frames under 20 ms.
-		std::vector<std::vector<double>> usual(fields.size());
-		uint64_t                         prev_t = 0;
-		for (const auto* f: window) {
-			const auto from = prev_t != 0 ? prev_t : f->d.t_ns - static_cast<uint64_t>(f->ms * 1e6);
-			prev_t          = f->d.t_ns;
-			if (f->ms >= 20.0) {
+		// Large buffer-upload copy time per frame, in one pass over the events.
+		std::vector<double>   upload(window.size(), 0.0);
+		std::vector<uint64_t> times(window.size());
+		for (size_t i = 0; i < window.size(); i++) {
+			times[i] = window[i]->d.t_ns;
+		}
+		for (const auto& e: m_events_hist) {
+			if (e.kind != static_cast<uint16_t>(Kind::BufferUpload) || (e.flags & 1) != 0) {
 				continue;
 			}
-			const auto c = Causes(*f, UploadCopyMs(from, f->d.t_ns));
+			const auto it = std::lower_bound(times.begin(), times.end(), e.t_ns);
+			if (it != times.end()) {
+				upload[static_cast<size_t>(it - times.begin())] += Ms(e.b);
+			}
+		}
+		std::vector<std::vector<double>> usual(fields.size());
+		for (size_t k = 0; k < window.size(); k++) {
+			if (window[k]->ms >= 20.0) {
+				continue;
+			}
+			const auto c = Causes(*window[k], upload[k]);
 			for (size_t i = 0; i < fields.size(); i++) {
 				usual[i].push_back(c.*(fields[i].second));
 			}
 		}
-		const auto c = Causes(worst, UploadCopyMs(worst_from, worst.d.t_ns));
+		m_base.assign(fields.size(), 0.0);
+		for (size_t i = 0; i < fields.size(); i++) {
+			auto& u = usual[i];
+			if (!u.empty()) {
+				std::nth_element(u.begin(), u.begin() + static_cast<ptrdiff_t>(u.size() / 2), u.end());
+				m_base[i] = u[u.size() / 2];
+			}
+		}
+		m_base_key = window.data();
+		m_base_n   = window.size();
+		return m_base;
+	}
+
+	std::vector<Cause> Attribute(const std::vector<const Frame*>& window, const Frame& worst, uint64_t worst_from) {
+		const auto  fields = CauseFields();
+		const auto& basev  = Baseline(window);
+		const auto  c      = Causes(worst, UploadCopyMs(worst_from, worst.d.t_ns));
 		std::vector<Cause> causes;
 		for (size_t i = 0; i < fields.size(); i++) {
-			double base = 0;
-			if (!usual[i].empty()) {
-				auto& u = usual[i];
-				std::nth_element(u.begin(), u.begin() + static_cast<ptrdiff_t>(u.size() / 2), u.end());
-				base = u[u.size() / 2];
-			}
+			const double base = basev[i];
 			Cause cause;
 			cause.key    = fields[i].first;
 			cause.ms     = c.*(fields[i].second);
@@ -1164,7 +1197,8 @@ private:
 		const auto& v = worst.d.v;
 		for (auto& cause: causes) {
 			if (cause.key == "shader compiles") {
-				cause.text = fmt::format("{} compile(s)", v[FShaders]);
+				cause.text = fmt::format("{} program-cache miss(es), of which driver compile {:.1f} ms", v[FMisses],
+				                         Ms(v[FShaderNs]));
 			} else if (cause.key == "pipeline creation") {
 				cause.text = fmt::format("{} pipeline(s)", v[FPipelines]);
 			} else if (cause.key == "command thread off-CPU") {
@@ -1198,6 +1232,7 @@ private:
 			}
 			m_incident_files++;
 		}
+		m_base_key = nullptr; // a new window
 		const uint64_t from = open_ns > 10'000'000'000ull ? open_ns - 10'000'000'000ull : 0;
 		const uint64_t to   = last_ns + 1'500'000'000ull;
 		std::vector<const Frame*> window;
@@ -1268,6 +1303,36 @@ private:
 				if (uploads.size() > 3) {
 					summary += fmt::format(" (+{} more)", uploads.size() - 3);
 				}
+			}
+			// Merged stretches: every other long frame with its own top cause.
+			std::string others;
+			int         listed = 0;
+			uint64_t    prev   = 0;
+			out += ",\"long_frames\":[";
+			for (const auto* f: window) {
+				const auto from = prev;
+				prev            = f->d.t_ns;
+				if (f->ms <= 33.4 || f->d.t_ns < open_ns - std::min<uint64_t>(open_ns, 1'000'000'000ull) ||
+				    f->d.t_ns > last_ns + 100'000'000ull || listed == 30) {
+					continue;
+				}
+				const auto fc  = Attribute(window, *f, from);
+				const auto top = fc.empty() || fc[0].excess < 1.0 ? std::string("none") : fc[0].key;
+				out += fmt::format("{}{{\"g\":{},\"ms\":{:.2f},\"cause\":\"{}\",\"excess_ms\":{:.2f}}}",
+				                   listed == 0 ? "" : ",", f->d.g, f->ms, Escape(top), fc.empty() ? 0.0 : fc[0].excess);
+				if (f != worst && listed < 30) {
+					others += fmt::format("{}{:.0f} ms {}", others.empty() ? "" : ", ", f->ms, top);
+				}
+				listed++;
+			}
+			out += "]";
+			if (!others.empty()) {
+				summary += "; other long frames: " + others;
+			}
+			if (triggers.contains("fatal")) {
+				summary = fmt::format("FATAL {}; before it: {}", detail, summary);
+			} else if (triggers.contains("new-stub")) {
+				summary = fmt::format("{}; new unresolved import: {}", summary, detail);
 			}
 			out += fmt::format(",\"primary_cause\":\"{}\",\"summary\":\"{}\",\"causes\":[",
 			                   causes.empty() || causes[0].excess < 1.0 ? "none" : Escape(causes[0].key), Escape(summary));
@@ -1381,6 +1446,9 @@ private:
 	double                        m_rss_mb         = 0;
 	uint64_t                      m_last_shot_ns   = 0;
 	std::optional<OpenIncident>   m_open;
+	const void*                   m_base_key = nullptr; // Baseline's memo
+	size_t                        m_base_n   = 0;
+	std::vector<double>           m_base;
 	int                           m_incident_count = 0;
 	int                           m_incident_files = 0;
 	int                           m_incidents_unwritten = 0;
@@ -1645,6 +1713,20 @@ void EndTextureUpload(uint64_t start, uint64_t bytes, uint32_t width, uint32_t h
 	}
 }
 
+uint64_t BeginShaderMiss() noexcept {
+	return Enabled() && g_started.load(std::memory_order_acquire) ? NowNs() : 0;
+}
+
+void EndShaderMiss(uint64_t start, uint64_t hash, const char* stage, bool injected) noexcept {
+	if (start == 0) {
+		return;
+	}
+	const auto ns = NowNs() - start;
+	g_shader_misses.fetch_add(1, std::memory_order_relaxed);
+	g_shader_miss_ns.fetch_add(ns, std::memory_order_relaxed);
+	Event(Kind::ShaderCompile, ns, hash, 0, stage, injected ? 1 : 0);
+}
+
 bool InTextureUpload() noexcept {
 	return t_in_texture_upload;
 }
@@ -1840,6 +1922,10 @@ void OnPadRead(int handle, const void* data, size_t size, int count) noexcept {
 	rec.count  = count;
 	rec.bytes  = last->bytes;
 	g_input_pending.push_back(std::move(rec));
+}
+
+bool InjectedMissPending() noexcept {
+	return Enabled() && g_inject_miss.load(std::memory_order_relaxed) != 0;
 }
 
 bool TakeInjectedMiss() noexcept {

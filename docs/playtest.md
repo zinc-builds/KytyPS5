@@ -6,15 +6,17 @@ enough context to diagnose it afterwards without a written report.
 ## Starting a session
 
 ```
-tools/playtest.sh [--level aerial_garden] [install]
+tools/playtest.sh                  # title screen, the install's save
+tools/playtest.sh aerial_garden    # straight into a level (the game's "-lvl" name)
 ```
 
-- `install`: an install dir or a build key under `~/.cache/kyty-builds` (from `refbuild.sh` or
-  `build.sh`). Default: the newest PGO install there whose binary has the recorder.
-- It runs the fast configuration (PGO build, `--amd-cpu`, the warm shader store, Mailbox
-  presentation at 60 Hz, `KYTY_GUEST_PCORE_NAMES=Draw`), turns the recorder on
-  (`KYTY_PLAYTEST=1`), samples the system every 2 s, and holds the bench lock for the session
-  (`--no-lock` doesn't), so no agent benchmark runs while the user plays.
+- It runs the newest PGO build of `dev` under `~/.cache/kyty-builds` that has the recorder
+  (`--install DIR` picks another), with `run.sh`'s flags (`--amd-cpu`, the warm shader store,
+  Mailbox at 60 Hz vblanks, 1920x1080) and the default thread placement, so what is played is
+  what the bench measures. The performance overlay stays hidden (F2 shows it); the recorder counts
+  without it.
+- It refuses to start while an agent benchmark holds the bench lock or another emulator runs,
+  waits for agent builds, and holds the lock for the session (`--no-lock` doesn't).
 - At exit it converts the screenshots to PNG, prints the one-page report and the session dir.
 - Saves are the install's own `_SaveData` (seeded from the play checkout when the install was
   built).
@@ -36,6 +38,11 @@ creations, frees and evictions, rejected flips, late vblanks, the deepest flip q
 reads, audio underruns, unresolved-import calls, emulated instructions, write faults.
 
 Per presented flip: the interval.
+
+Pad input, at the pad HLE read (`PadRead`/`PadReadState`): each state the game received that
+differs from the previous one (and one every 600 frames as a checkpoint), with the guest frame and
+the frame since the last `StartLevel` (`lg`), in `input.jsonl`: buttons, sticks, triggers and the
+whole `PadData` as hex (touch and motion included), for replay.
 
 Events (per-thread rings): shader compiles (all are shader-store misses at run time) with the
 hash, stage and time; pipeline creations with their time; texture uploads of 1 MiB or more with
@@ -86,6 +93,7 @@ to close the open incident as `fatal` and flush its files.
 | `session.json` | the emulator's view: git hash, build label, BUILD_MODE, argv, `KYTY_*`/`SDL_*`/`VK_*` env |
 | `emulator.log` | the emulator's stdout/stderr (the startup configuration report lands here) |
 | `frames.csv`, `present.csv` | every guest frame and presented flip |
+| `input.jsonl` | pad states the game read, when they change |
 | `events.jsonl` | every event and one line per incident and marker |
 | `incidents/` | `incident-NNNN.json`, `marker-NNN.json` |
 | `shots/` | `incident-NNNN.png`, `marker-NNN.png` |
@@ -103,7 +111,10 @@ tools/playtest-report.py <session dir> [--json] [--all]
 One page: length and how it ended, FPS per second of play (load seconds apart), presented frames
 at two and three refreshes, long frames, memory growth (MB/min), incidents grouped by primary cause
 with count, time lost and the worst one, markers with screenshots and the last 10 s, unresolved
-imports, other processes on the emulator's cores, and the top three things to fix.
+imports, other processes on the emulator's cores, and the top three things to fix. Each cause
+group names the targeted diagnostic run that explains it further (e.g. `KYTY_GPU_WAIT_DIAG=1` for
+GPU waits, `KYTY_FRAME_DIAG=1` for a late game, `KYTY_OFFCPU_SAMPLE=1` for off-CPU time), as a
+`levels.sh` command for the incident's level, so a follow-up never needs the user.
 
 ## Cost
 

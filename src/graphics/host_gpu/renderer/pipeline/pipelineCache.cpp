@@ -350,20 +350,6 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
-	// Every compile here missed the shader store (it warms the program cache at start).
-	struct PlaytestCompile {
-		uint64_t   start = Common::Playtest::Enabled() ? Common::FrameDiag::NowNs() : 0;
-		uint64_t   hash  = 0;
-		const char* stage = nullptr;
-		bool       injected = false;
-		~PlaytestCompile() {
-			if (start != 0) {
-				Common::Playtest::Event(Common::Playtest::Kind::ShaderCompile, Common::FrameDiag::NowNs() - start,
-				                        hash, 0, stage, injected ? 1 : 0);
-			}
-		}
-	} playtest_compile {.hash = key.hash, .stage = ShaderRecompiler::StageName(key.stage),
-	                    .injected = m_injected_miss};
 	const auto profile = SpirvProfile(m_graphics);
 	options.profile    = &profile;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
@@ -472,7 +458,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
 		auto* module = cached.FindModule<false>(runtime, push_data_cursor, resources);
-		if (module == nullptr) {
+		// Playtest fault injection: hand graphics draws to the command thread, which misses.
+		if (module == nullptr || (!std::is_same_v<InputInfo, ShaderComputeInputInfo> &&
+		                          Common::Playtest::Enabled() && Common::Playtest::InjectedMissPending())) {
 			DrawPrepare::Fail();
 			return nullptr;
 		}
@@ -487,8 +475,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, resources);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor, resources);
-			// Playtest fault injection (KYTY_PLAYTEST_INJECT=miss:...): compile this one again.
-			if (module != nullptr && Common::Playtest::Enabled() && Common::Playtest::TakeInjectedMiss()) {
+			// Playtest fault injection (KYTY_PLAYTEST_INJECT=miss:...): compile this graphics shader
+			// again.
+			if (!std::is_same_v<InputInfo, ShaderComputeInputInfo> && module != nullptr &&
+			    Common::Playtest::Enabled() && Common::Playtest::TakeInjectedMiss()) {
 				module          = nullptr;
 				m_injected_miss = true;
 			}
@@ -496,6 +486,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (module != nullptr) return bind(*module);
 	}
 
+	// A program-cache miss (the shader store warms the cache at start, so this compiles in play):
+	// translation and compilation together, timed for the playtest recorder.
+	struct PlaytestMiss {
+		uint64_t    start    = Common::Playtest::BeginShaderMiss(); // 0 when off
+		uint64_t    hash     = 0;
+		const char* stage    = nullptr;
+		bool        injected = false;
+		~PlaytestMiss() { Common::Playtest::EndShaderMiss(start, hash, stage, injected); }
+	} playtest_miss {.hash = params.hash, .stage = ShaderRecompiler::StageName(options.stage),
+	                 .injected = m_injected_miss};
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;

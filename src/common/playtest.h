@@ -33,7 +33,7 @@ void Init();
 void Shutdown() noexcept;
 
 enum class Kind : uint16_t {
-	ShaderCompile,  // a = ns, b = shader hash, c = stage; flags 1 = injected miss
+	ShaderCompile,  // a = ns (translation and compilation), b = shader hash; text = stage; flags 1 = injected
 	PipelineCreate, // a = ns, b = 0 graphics / 1 compute
 	TextureUpload,  // a = bytes, b = width | height << 32, c = vk::Format | mips << 32, d = ns
 	BufferUpload,   // a = bytes, b = ns of the staging copy; flags 1 = inside a texture upload
@@ -58,6 +58,10 @@ void Event(Kind kind, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, const char
 void EndTextureUpload(uint64_t start, uint64_t bytes, uint32_t width, uint32_t height, uint32_t format,
                       uint32_t mips, const char* format_name) noexcept;
 [[nodiscard]] bool InTextureUpload() noexcept;
+
+// Program-cache misses (command thread): translation and compilation of a shader, an event each.
+[[nodiscard]] uint64_t BeginShaderMiss() noexcept; // 0 when off
+void EndShaderMiss(uint64_t start, uint64_t hash, const char* stage, bool injected) noexcept;
 
 // Thresholds for size-gated events (bytes): callers check these before calling Event.
 inline constexpr uint64_t TextureUploadEventBytes = 1ull << 20;
@@ -86,6 +90,7 @@ void OnPadRead(int handle, const void* data, size_t size, int count) noexcept;
 // Injected faults (KYTY_PLAYTEST_INJECT, for proving the attribution): a shader lookup on the
 // command thread that should miss once (pipelineCache.cpp).
 [[nodiscard]] bool TakeInjectedMiss() noexcept;
+[[nodiscard]] bool InjectedMissPending() noexcept;
 
 // Screenshots (presentation thread). PendingShot gives the path of a requested shot, or nullptr;
 // SubmitShot hands over the copied pixels (4 bytes a pixel; layout: 0 RGBA8, 1 BGRA8, 2 A2RGB10,
