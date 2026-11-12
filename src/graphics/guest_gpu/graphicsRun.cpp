@@ -1,4 +1,5 @@
 #if defined(__linux__)
+#include "common/texBurstDiag.h"
 #include "common/hybridAffinity.h"
 #include <pthread.h>
 #include <sys/resource.h>
@@ -1465,6 +1466,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	if (Common::FrameDiag::Enabled()) {
 		Common::FrameDiag::OnGuestFlip(PerformanceOverlayFlipCount());
 	}
+	Common::TexBurstDiag::OnFlip(PerformanceOverlayFlipCount());
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {

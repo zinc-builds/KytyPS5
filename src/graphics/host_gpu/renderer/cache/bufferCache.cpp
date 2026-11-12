@@ -7,6 +7,7 @@
 #include "common/debugCounters.h"
 #include "common/gpuWaitDiag.h"
 #include "common/kernelStats.h"
+#include "common/texBurstDiag.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1017,6 +1018,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (MemDiag::BdaStatsMode() != 0 && source && g_sync_kind == MemDiag::Sync::Bda) {
 		BdaStats::NoteUpload(buffer, copies);
 	}
+	if (source && g_sync_kind == MemDiag::Sync::Image) {
+		Common::TexBurstDiag::AddBytes(true, total_size);
+	}
 	if (MemDiag::Enabled()) {
 		MemDiag::Add(MemDiag::SyncCalls0, g_sync_kind, 1);
 		if (source) {
@@ -1753,6 +1757,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
+	Common::TexBurstDiag::AddBytes(false, size);
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {

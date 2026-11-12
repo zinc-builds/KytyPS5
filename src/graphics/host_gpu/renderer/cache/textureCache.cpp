@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/texBurstDiag.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -228,6 +229,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	const Common::TexBurstDiag::Scope diag(Common::TexBurstDiag::InsertNs);
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	Common::FrameDiag::Add(Common::FrameDiag::Counter::TextureCreates);
 	RegisterImage(id);
@@ -1005,10 +1007,12 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
 		if (m_tiler.DetileToImage(source.Handle(), source_offset, destination)) {
+			Common::TexBurstDiag::NoteDetile(true);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes,
 			                           info.LinearSize());
 			return;
 		}
+		Common::TexBurstDiag::NoteDetile(false);
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
 		const auto copies = info.BufferCopies(linear.offset);
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
@@ -1073,12 +1077,21 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		Common::TexBurstDiag::NoteUpload(image.info.data.address, image.info.data.size);
+		std::pair<Buffer*, uint64_t> obtained;
+		{
+			const Common::TexBurstDiag::Scope diag(Common::TexBurstDiag::ObtainNs);
+			obtained = m_buffer_cache.ObtainBufferForImage(image.info.data.address,
+			                                               image.info.data.size);
+		}
+		const auto [source, source_offset] = obtained;
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		UploadImage(image, *source, source_offset);
+		{
+			const Common::TexBurstDiag::Scope diag(Common::TexBurstDiag::UploadNs);
+			UploadImage(image, *source, source_offset);
+		}
 		image.ClearBufferModified();
 	}
 	image.RefreshComplete();
@@ -1444,6 +1457,7 @@ bool TextureCache::RefindExactImage(ImageId id, GuestRange data, const ImageDesc
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* exact_generation) {
+	const Common::TexBurstDiag::Scope diag(Common::TexBurstDiag::FindNs);
 	if (exact_generation != nullptr) {
 		*exact_generation = 0;
 	}
@@ -2429,7 +2443,26 @@ void TextureCache::RunGarbageCollector() {
 				TouchImage(*owner);
 				continue;
 			}
-			if (owner->SafeToDownload() &&
+			// DIAG KYTY_GC_PRE120=1: the GC rule before #120 (GPU-written tiled images that are
+			// safe to download stay; others are downloaded only under pressure).
+			static const bool pre120 = [] {
+				const char* value = std::getenv("KYTY_GC_PRE120");
+				return value != nullptr && value[0] == '1';
+			}();
+			if (pre120) {
+				if (owner->IsGpuModified()) {
+					const bool safe = owner->SafeToDownload();
+					if (safe && owner->info.IsTiled()) {
+						continue;
+					}
+					if (safe && !pressured) {
+						continue;
+					}
+					if (safe && !DownloadImageMemory(id)) {
+						continue;
+					}
+				}
+			} else if (owner->SafeToDownload() &&
 			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
 				continue;
 			}

@@ -1,3 +1,4 @@
+#include "common/texBurstDiag.h"
 #include "kernel/fileSystem.h"
 
 #include "common/archive.h"
@@ -735,6 +736,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
+	Common::TexBurstDiag::NoteFileWrite(reinterpret_cast<uint64_t>(buf), bytes_read);
 
 	file->mutex.Unlock();
 
@@ -863,6 +865,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
+	Common::TexBurstDiag::NoteFileWrite(reinterpret_cast<uint64_t>(buf), bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
@@ -965,6 +968,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		uint32_t bytes = 0;
 		file->f.Read(buffer.iov_base, count, &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
+		Common::TexBurstDiag::NoteFileWrite(reinterpret_cast<uint64_t>(buffer.iov_base), bytes);
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {

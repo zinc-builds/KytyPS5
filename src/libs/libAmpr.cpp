@@ -1,3 +1,4 @@
+#include "common/texBurstDiag.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/file.h"
@@ -1127,6 +1128,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		uint64_t bytes_read = 0;
 		auto     result = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
 		                                      command.size, &bytes_read);
+		Common::TexBurstDiag::NoteFileWrite(command.destination, bytes_read);
 		static std::atomic<uint32_t> s_logged_dlc_reads {0};
 		if (host_path.filename() == "re_dlc_000.pak" && s_logged_dlc_reads.fetch_add(1) < 32) {
 			LOGF("\tAPR read dlc: id=0x%08" PRIx32 ", offset=0x%016" PRIx64 ", size=0x%016" PRIx64
