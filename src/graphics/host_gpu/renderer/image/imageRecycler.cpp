@@ -5,6 +5,7 @@
 
 #include <vk_mem_alloc.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 
@@ -26,7 +27,9 @@ bool EnvOn(const char* name) {
 ImageRecycler::ImageRecycler(GraphicContext& graphics): m_graphics(graphics) {
 	m_recycle        = EnvOn("KYTY_IMAGE_RECYCLE");
 	m_thread_destroy = EnvOn("KYTY_IMAGE_DESTROY_THREAD");
-	if (m_thread_destroy) {
+	if (m_recycle || m_thread_destroy) {
+		// Destroys what is queued (KYTY_IMAGE_DESTROY_THREAD) and enforces the pool's age limit
+		// once image churn stops.
 		m_thread = std::thread([this] { Run(); });
 	}
 }
@@ -119,11 +122,14 @@ void ImageRecycler::Flush() {
 		m_bytes = 0;
 	}
 	{
-		std::lock_guard lock(m_doomed_mutex);
+		// Take what is queued, and wait for a batch the helper already took, so the memory is
+		// free on return.
+		std::unique_lock lock(m_doomed_mutex);
 		for (auto& d: m_doomed) {
 			doomed.push_back(std::move(d));
 		}
 		m_doomed.clear();
+		m_doomed_cv.wait(lock, [this] { return !m_destroying; });
 	}
 	for (auto& d: doomed) {
 		DestroyNow(d);
@@ -169,7 +175,7 @@ void ImageRecycler::Destroy(Doomed&& doomed) {
 			std::lock_guard lock(m_doomed_mutex);
 			m_doomed.push_back(std::move(doomed));
 		}
-		m_doomed_cv.notify_one();
+		m_doomed_cv.notify_all(); // the helper, and not only a waiting Flush
 		return;
 	}
 	DestroyNow(doomed);
@@ -194,16 +200,30 @@ void ImageRecycler::Run() {
 	for (;;) {
 		{
 			std::unique_lock lock(m_doomed_mutex);
-			m_doomed_cv.wait(lock, [this] { return m_stop || !m_doomed.empty(); });
+			const bool woken = m_doomed_cv.wait_for(lock, std::chrono::seconds(1), [this] {
+				return m_stop || !m_doomed.empty();
+			});
 			if (m_doomed.empty() && m_stop) {
 				return;
 			}
+			if (!woken) {
+				lock.unlock();
+				std::lock_guard pool(m_mutex);
+				Evict(Common::GpuWaitDiag::NowNs()); // the age limit, with no churn to check it
+				continue;
+			}
 			batch.swap(m_doomed);
+			m_destroying = true;
 		}
 		for (auto& doomed: batch) {
 			DestroyNow(doomed);
 		}
 		batch.clear();
+		{
+			std::lock_guard lock(m_doomed_mutex);
+			m_destroying = false;
+		}
+		m_doomed_cv.notify_all();
 	}
 }
 

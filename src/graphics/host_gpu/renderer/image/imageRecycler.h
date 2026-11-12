@@ -16,7 +16,7 @@ namespace Libs::Graphics {
 // the tick's completion) give their Vulkan image and memory here instead of destroying them.
 // - KYTY_IMAGE_RECYCLE (default on): a later image with the same create info takes one back, so
 //   neither vkCreateImage, the allocation nor the bind happens. The pool keeps at most
-//   kMaxEntries images, kMaxBytes and kMaxAgeNs of age; the rest are destroyed.
+//   kMaxEntries images, kMaxBytes and kMaxAgeNs of age (checked at least once a second); the rest are destroyed.
 // - KYTY_IMAGE_DESTROY_THREAD (default on): views and images are destroyed on a helper thread.
 // =0 on both restores destruction in ~Image on the calling thread.
 // A recycled image's contents are undefined, as a new image's are: its tracked layout is reset to
@@ -83,7 +83,8 @@ private:
 	std::mutex              m_doomed_mutex;
 	std::condition_variable m_doomed_cv;
 	std::vector<Doomed>     m_doomed;
-	bool                    m_stop = false;
+	bool                    m_stop       = false;
+	bool                    m_destroying = false; // the helper is destroying a batch it took
 	std::thread             m_thread;
 };
 

@@ -441,9 +441,13 @@ bool UploadTouch() noexcept {
 }
 
 uint64_t ThreadMinorFaults() noexcept {
+#if defined(__linux__)
 	rusage usage {};
 	getrusage(RUSAGE_THREAD, &usage);
 	return static_cast<uint64_t>(usage.ru_minflt);
+#else
+	return 0;
+#endif
 }
 
 void NoteUpload(UploadPath path, const UploadSample& sample) noexcept {
