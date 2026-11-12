@@ -38,6 +38,11 @@ namespace Libs::Graphics {
 // write-watched pages that scan would add (stores between submit and processing).
 enum class SubmitScanMode { Off, On, Stats, Verify };
 SubmitScanMode GetSubmitScanMode();
+// KYTY_RESUME_SCAN: unset: a resumed submission whose suspending packet collects when it is
+// satisfied (WAIT_REG_MEM, MEM_SEMAPHORE wait, REWIND) does not scan at its start; 1 scans
+// as before; verify scans too and counts the write-watched pages the skip defers.
+enum class ResumeScanMode { Skip, Scan, Verify };
+ResumeScanMode GetResumeScanMode();
 
 class GuestGpu;
 
@@ -98,7 +103,10 @@ public:
 	// Call where the guest may have published new data: a submission, a satisfied wait.
 	// kept_only: no scan of its own, for a submission whose submitting thread scanned
 	// (ScanAsyncWritesAtSubmit); applies what that and other scans kept.
-	void CollectAsyncWrites(bool kept_only = false);
+	// verify (KYTY_SUBMIT_SCAN=verify, KYTY_RESUME_SCAN=verify): with kept_only, also scan and
+	// count the write-watched pages the skipped scan would have found.
+	enum class KeptVerify { None, Submit, Resume };
+	void CollectAsyncWrites(bool kept_only = false, KeptVerify verify = KeptVerify::None);
 	// KYTY_SUBMIT_SCAN (default on): a guest thread's scan before it enqueues a submission.
 	// False when it did not scan (switched off, or no asynchronous protection).
 	bool ScanAsyncWritesAtSubmit();

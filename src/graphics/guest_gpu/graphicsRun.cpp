@@ -234,7 +234,7 @@ void CommandProcessor::BufferWait() {
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
-		SuspendPm4();
+		SuspendPm4(true);
 		return;
 	}
 	// The guest may have written data before marking the rewind valid.
@@ -266,7 +266,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	const T value = *addr;
 	if (!TestWaitRegMemValue(value, ref, mask, func)) {
-		SuspendPm4();
+		SuspendPm4(true);
 		return;
 	}
 	// The value may publish data the guest wrote after submitting; collect those writes before
@@ -291,7 +291,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 		*counter = write ? 1u : *counter + 1u;
 		m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
 	} else if (*counter == 0) {
-		SuspendPm4();
+		SuspendPm4(true);
 	} else {
 		(*counter)--;
 		m_renderer.NoteGpuWrite(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
@@ -571,7 +571,19 @@ bool GuestGpu::Process(Submission& submission) {
 	// are collected where the command buffer can first depend on them: a satisfied wait on a
 	// guest-written value, a semaphore wait or a rewind (RequestAsyncCollect), or a resumed
 	// submission (its later processing scans here). See FINDINGS "Submit-time collection".
-	m_renderer.CollectAsyncWrites(submission.submit_scanned);
+	// A resumed submission re-runs the packet it stopped at first. When that packet collects on
+	// its own once satisfied (ResumeCollects: WAIT_REG_MEM, MEM_SEMAPHORE wait, REWIND), stores
+	// made while it was blocked are collected there, or published nothing (the wait skip for
+	// the processor's own labels), so only kept writes are taken here (KYTY_RESUME_SCAN=1 scans).
+	const auto resume_mode = GetResumeScanMode();
+	const bool resume_skip = !submission.submit_scanned && submission.execution.ResumeCollects() &&
+	                         resume_mode != ResumeScanMode::Scan;
+	m_renderer.CollectAsyncWrites(
+	    submission.submit_scanned || resume_skip,
+	    submission.submit_scanned && GetSubmitScanMode() == SubmitScanMode::Verify
+	        ? RenderContext::KeptVerify::Submit
+	    : resume_skip && resume_mode == ResumeScanMode::Verify ? RenderContext::KeptVerify::Resume
+	                                                            : RenderContext::KeptVerify::None);
 	submission.submit_scanned = false;
 
 	switch (submission.type) {
@@ -629,9 +641,10 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	g_current_execution->m_chain       = chain;
 }
 
-void CommandProcessor::SuspendPm4() {
+void CommandProcessor::SuspendPm4(bool resume_collects) {
 	EXIT_IF(g_current_execution == nullptr);
-	g_current_execution->m_suspended = true;
+	g_current_execution->m_suspended       = true;
+	g_current_execution->m_resume_collects = resume_collects;
 }
 
 // Packets that read no guest data through the caches, so a requested collection of guest writes

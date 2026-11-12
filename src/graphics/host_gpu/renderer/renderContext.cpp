@@ -452,6 +452,20 @@ static bool WantsAsyncScan(uint64_t begin, uint64_t end) {
 	return g_scan_pages.load(std::memory_order_acquire)->HasWriteWatched(begin, end);
 }
 
+ResumeScanMode GetResumeScanMode() {
+	static const ResumeScanMode mode = [] {
+		const char* value = std::getenv("KYTY_RESUME_SCAN");
+		if (value == nullptr) {
+			return ResumeScanMode::Skip;
+		}
+		const std::string_view v(value);
+		return v == "1" ? ResumeScanMode::Scan
+		       : v == "verify" ? ResumeScanMode::Verify
+		                       : ResumeScanMode::Skip;
+	}();
+	return mode;
+}
+
 SubmitScanMode GetSubmitScanMode() {
 	static const SubmitScanMode mode = [] {
 		const char* value = std::getenv("KYTY_SUBMIT_SCAN");
@@ -478,6 +492,8 @@ std::mutex                      g_submit_stats_mutex;
 std::array<SubmitScanThread, 8> g_submit_stats {};
 uint64_t                        g_submit_deferred_pages = 0; // verify: watched pages P1 defers
 uint64_t                        g_submit_verify_scans   = 0;
+uint64_t                        g_resume_deferred_pages = 0; // KYTY_RESUME_SCAN=verify
+uint64_t                        g_resume_verify_scans   = 0;
 } // namespace
 
 bool RenderContext::ScanAsyncWritesAtSubmit() {
@@ -512,7 +528,8 @@ bool RenderContext::ScanAsyncWritesAtSubmit() {
 
 static void ReportSubmitScans() {
 	if (GetSubmitScanMode() != SubmitScanMode::Stats &&
-	    GetSubmitScanMode() != SubmitScanMode::Verify) {
+	    GetSubmitScanMode() != SubmitScanMode::Verify &&
+	    GetResumeScanMode() != ResumeScanMode::Verify) {
 		return;
 	}
 	static auto last = std::chrono::steady_clock::now();
@@ -524,11 +541,16 @@ static void ReportSubmitScans() {
 	last                 = now;
 	char line[1024];
 	int  n = std::snprintf(line, sizeof(line),
-	                       "SUBMITSCAN deferred_watched_pages_s=%.0f verify_scans_s=%.0f",
+	                       "SUBMITSCAN deferred_watched_pages_s=%.0f verify_scans_s=%.0f "
+	                       "resume_deferred_watched_pages_s=%.0f resume_verify_scans_s=%.0f",
 	                       static_cast<double>(g_submit_deferred_pages) / seconds,
-	                       static_cast<double>(g_submit_verify_scans) / seconds);
+	                       static_cast<double>(g_submit_verify_scans) / seconds,
+	                       static_cast<double>(g_resume_deferred_pages) / seconds,
+	                       static_cast<double>(g_resume_verify_scans) / seconds);
 	g_submit_deferred_pages = 0;
 	g_submit_verify_scans   = 0;
+	g_resume_deferred_pages = 0;
+	g_resume_verify_scans   = 0;
 	std::lock_guard lock(g_submit_stats_mutex);
 	for (auto& entry: g_submit_stats) {
 		if (entry.calls != 0 && n < static_cast<int>(sizeof(line)) - 96) {
@@ -542,7 +564,13 @@ static void ReportSubmitScans() {
 	std::fflush(stdout);
 }
 
-void RenderContext::CollectAsyncWrites(bool kept_only) {
+void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
+	// A pending request (a satisfied wait published guest data, maybe in another submission
+	// that is now blocked) needs a full scan: only a full scan settles it.
+	if (m_async_collect_requested) {
+		kept_only = false;
+		verify    = KeptVerify::None;
+	}
 	m_async_collect_requested = false;
 	static std::vector<std::pair<uint64_t, uint64_t>> written;
 	static std::vector<std::pair<uint64_t, uint64_t>> watched;
@@ -552,22 +580,25 @@ void RenderContext::CollectAsyncWrites(bool kept_only) {
 	if (kept_only) {
 		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::CollectKept);
 		LibKernel::Memory::TakeKeptAsyncGuestWrites(written);
-		if (GetSubmitScanMode() == SubmitScanMode::Verify) {
+		if (verify != KeptVerify::None) {
 			// What the GPU thread's own scan would add here: watched pages written after the
-			// submit scan. The scan's finds are handled too, as without KYTY_SUBMIT_SCAN.
+			// submit scan, or while a resumed submission was blocked. The scan's finds are
+			// handled too, as without the skip.
+			const bool resume = verify == KeptVerify::Resume;
 			std::vector<std::pair<uint64_t, uint64_t>> late;
 			std::vector<std::pair<uint64_t, uint64_t>> late_watched;
 			LibKernel::Memory::CollectAsyncGuestWrites(late, WantsAsyncScan);
 			for (const auto& [begin, end]: late) {
 				m_page_manager.AppendWriteWatched(begin, end, late_watched);
 			}
-			g_submit_verify_scans++;
+			(resume ? g_resume_verify_scans : g_submit_verify_scans)++;
 			for (const auto& [begin, end]: late_watched) {
-				g_submit_deferred_pages += (end - begin) / TRACKER_PAGE_SIZE;
+				(resume ? g_resume_deferred_pages : g_submit_deferred_pages) +=
+				    (end - begin) / TRACKER_PAGE_SIZE;
 				static uint32_t logged = 0;
 				if (logged < 64) {
 					logged++;
-					std::printf("SUBMITSCAN deferred: 0x%llx+0x%llx\n",
+					std::printf("SUBMITSCAN %s deferred: 0x%llx+0x%llx\n", resume ? "resume" : "submit",
 					            static_cast<unsigned long long>(begin),
 					            static_cast<unsigned long long>(end - begin));
 				}

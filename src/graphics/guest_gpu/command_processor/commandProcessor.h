@@ -35,6 +35,9 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Suspended at a packet that, once satisfied, requests the collection its release needs
+	// (KYTY_RESUME_SCAN).
+	[[nodiscard]] bool ResumeCollects() const noexcept { return m_resume_collects; }
 
 private:
 	friend class CommandProcessor;
@@ -47,8 +50,9 @@ private:
 	std::vector<BufferCursor> m_buffer_stack;
 	std::span<const uint32_t> m_next_buffer;
 	bool                      m_chain         = false;
-	bool                      m_suspended     = false;
-	bool                      m_made_progress = false;
+	bool                      m_suspended       = false;
+	bool                      m_made_progress   = false;
+	bool                      m_resume_collects = false;
 };
 
 class CommandProcessor {
@@ -125,7 +129,9 @@ public:
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
-	void SuspendPm4();
+	// resume_collects: the suspending packet runs again on resume and, when satisfied, requests
+	// the collection its release needs (RequestAsyncCollect), so the resume needs no scan.
+	void SuspendPm4(bool resume_collects = false);
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
