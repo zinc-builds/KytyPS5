@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""hitches.py <label|log> [--frames A-B] [--load-mb N] [--list]: long frames in a garden.sh run
+"""hitches.py <label|log> [--frames A-B] [--load-mb N] [--load-before F] [--list]: long frames in a garden.sh run
 made with KYTY_FRAME_DIAG=1.
 
 Reads the GFRAME lines (one per guest flip, its wall time in ms=) of the level: level frame 0 is
 the first PERF frame after the StartLevel line, as in garden.sh's window. Level-load frames, those
-that uploaded at least --load-mb (default 1024) of textures and buffers (tex_up_b + buf_up_b), are
-listed apart and not counted. Prints one line:
+before level frame --load-before (default 150) that uploaded at least --load-mb (default 1024) of
+textures and buffers (tex_up_b + buf_up_b), are listed apart and not counted; a streaming burst
+later in the level counts however large. Prints one line:
 
   HITCH <label>: frames=<n> over50=<n> over100=<n> worst=<ms> (f=<level frame>) load=<ms@f,...>
 
@@ -23,6 +24,7 @@ def main():
     src = args[0]
     frames = (0, 1 << 62)
     load_mb = 1024.0
+    load_before = 150
     show = False
     i = 1
     while i < len(args):
@@ -32,6 +34,9 @@ def main():
             i += 2
         elif args[i] == '--load-mb':
             load_mb = float(args[i + 1])
+            i += 2
+        elif args[i] == '--load-before':
+            load_before = int(args[i + 1])
             i += 2
         elif args[i] == '--list':
             show = True
@@ -68,7 +73,7 @@ def main():
             continue
         ms = float(d['ms'])
         up = (float(d.get('tex_up_b', 0)) + float(d.get('buf_up_b', 0))) / 1048576.0
-        if up >= load_mb:
+        if up >= load_mb and lf < load_before:
             loads.append((lf, ms))
         else:
             counted.append((lf, ms, d))
