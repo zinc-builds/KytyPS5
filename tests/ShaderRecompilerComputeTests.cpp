@@ -11,6 +11,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -60,6 +61,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
+#include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/dialog.h"
@@ -1121,6 +1123,7 @@ void EnsureConfigInitialized() {
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
     ShaderInit();
     config_initialized = true;
   }
@@ -5874,6 +5877,124 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
+      constexpr uint64_t prot_owner_offset = 0x4800000;
+      constexpr uint64_t prot_owner_size = 2 * BufferCache::CACHING_PAGESIZE;
+      constexpr uint64_t prot_fault_offset =
+          prot_owner_offset + BufferCache::CACHING_PAGESIZE;
+      constexpr uint64_t prot_read_offset = prot_fault_offset - 12;
+      constexpr uint64_t prot_rel_read = prot_read_offset - prot_owner_offset;
+      constexpr uint32_t prot_fill_value = 0x5aa55aa5u;
+      const std::array<uint32_t, 3> prot_payload{0x31415926u, 0x2718281au,
+                                                 0x3b5d3b11u};
+      const std::filesystem::path prot_read_path =
+          std::filesystem::temp_directory_path() /
+          fmt::format(
+              "kyty-protread-cache-{}.bin",
+              std::chrono::steady_clock::now().time_since_epoch().count());
+      Common::File prot_read_file;
+      uint32_t prot_wrote = 0;
+      uint32_t prot_bytes = 0;
+      Require(name, "protected-read fixture",
+              prot_read_file.Create(prot_read_path),
+              "the protected-read fixture file could not be created");
+      prot_read_file.Write(prot_payload.data(), sizeof(prot_payload),
+                           &prot_wrote);
+      Require(name, "protected-read fixture size",
+              prot_wrote == sizeof(prot_payload),
+              "the protected-read fixture file was not written");
+      std::memset(memory + prot_owner_offset, 0, prot_owner_size);
+      MarkGpuWrite(base + prot_owner_offset, prot_owner_size);
+      cache.FillBuffer(base + prot_owner_offset, prot_owner_size,
+                       prot_fill_value, false);
+      const auto prot_owner =
+          BufferCacheTestAccess::PageOwner(cache, base + prot_owner_offset);
+      LibKernel::Memory::InstallGpuResources(&resources);
+
+      namespace FileSystem = LibKernel::FileSystem;
+
+      constexpr uint64_t kernel_read_offset = prot_fault_offset - sizeof(uint32_t);
+      FileSystem::Mount(prot_read_path.parent_path(), "/protread");
+      const auto kernel_path = "/protread/" + prot_read_path.filename().string();
+      const int  kernel_fd   = FileSystem::KernelOpen(kernel_path.c_str(), 0, 0);
+      Require(name, "kernel-read open", kernel_fd >= 3, "open protected-read fixture");
+      for (const bool partial_gpu_range: {false, true}) {
+        std::memset(memory + kernel_read_offset, 0, sizeof(prot_payload));
+        if (partial_gpu_range) {
+          resources.UnmapMemory(base + prot_owner_offset, BufferCache::CACHING_PAGESIZE);
+        }
+        MarkGpuWrite(base + prot_fault_offset, BufferCache::CACHING_PAGESIZE);
+        cache.FillBuffer(base + prot_fault_offset, BufferCache::CACHING_PAGESIZE,
+                         prot_fill_value, false);
+        Require(name, "kernel-read setup",
+                resources.IsMapped(base + kernel_read_offset, sizeof(prot_payload)) ==
+                        !partial_gpu_range &&
+                    cache.IsRegionGpuModified(base + prot_fault_offset, 1) &&
+                    cache.HasGpuDirtyBytes(base + prot_fault_offset, 1) &&
+                    !cache.IsRegionCpuModified(base + prot_fault_offset, 1),
+                "kernel-read fixture is not GPU-written and watched");
+        const auto kernel_bytes = FileSystem::KernelPread(
+            kernel_fd, memory + kernel_read_offset, sizeof(prot_payload), 0);
+        Require(name, "kernel-read bytes",
+                kernel_bytes == sizeof(prot_payload) &&
+                    std::memcmp(memory + kernel_read_offset, prot_payload.data(),
+                                sizeof(prot_payload)) == 0,
+                "KernelPread lost protected guest bytes");
+        Require(
+            name, "kernel-read invalidation",
+            !cache.IsRegionGpuModified(base + kernel_read_offset, sizeof(prot_payload)) &&
+                !cache.HasGpuDirtyBytes(base + kernel_read_offset, sizeof(prot_payload)) &&
+                cache.IsRegionCpuModified(base + kernel_read_offset, 1) &&
+                cache.IsRegionCpuModified(base + prot_fault_offset, 1),
+            "KernelPread did not establish CPU ownership");
+        if (partial_gpu_range) {
+          resources.MapMemory(base + prot_owner_offset, BufferCache::CACHING_PAGESIZE);
+        }
+        const auto [kernel_buffer, kernel_buffer_offset] =
+            cache.ObtainBuffer(base + prot_owner_offset, prot_owner_size, false);
+        for (size_t word = 0; word < prot_payload.size(); ++word) {
+          Require(name, "kernel-read re-upload",
+                  ReadNativeValue(*kernel_buffer,
+                                  kernel_buffer_offset + kernel_read_offset -
+                                      prot_owner_offset + word * sizeof(uint32_t)) ==
+                      prot_payload[word],
+                  "the next Buffer lookup served stale KernelPread bytes");
+        }
+      }
+      Require(name, "kernel-read close", FileSystem::KernelClose(kernel_fd) == 0,
+              "close protected-read descriptor");
+      FileSystem::Umount("/protread");
+      std::memset(memory + prot_read_offset, 0, sizeof(prot_payload));
+      MarkGpuWrite(base + prot_owner_offset, prot_owner_size);
+      cache.FillBuffer(base + prot_owner_offset, prot_owner_size, prot_fill_value, false);
+      prot_read_file.Seek(0);
+      prot_read_file.Read(memory + prot_read_offset, sizeof(prot_payload),
+                          &prot_bytes);
+      Require(name, "protected-read bytes",
+              prot_bytes == sizeof(prot_payload) &&
+                  std::memcmp(memory + prot_read_offset, prot_payload.data(),
+                              sizeof(prot_payload)) == 0,
+              "the kernel file read did not recover from the watched page");
+      Require(name, "protected-read invalidation",
+              !cache.IsRegionGpuModified(base + prot_read_offset, 1) &&
+                  !cache.HasGpuDirtyBytes(base + prot_read_offset, 1) &&
+                  cache.IsRegionCpuModified(base + prot_read_offset, 1),
+              "recovery wrote the guest bytes without invalidating the Buffer");
+      const auto [prot_buffer, prot_buffer_offset] =
+          cache.ObtainBuffer(base + prot_owner_offset, prot_owner_size, false);
+      Require(
+          name, "protected-read re-upload",
+          prot_buffer == &cache.GetBuffer(prot_owner) &&
+              ReadNativeValue(*prot_buffer,
+                              prot_buffer_offset + prot_rel_read) ==
+                  prot_payload[0] &&
+              ReadNativeValue(*prot_buffer, prot_buffer_offset + prot_rel_read +
+                                                4) == prot_payload[1] &&
+              ReadNativeValue(*prot_buffer, prot_buffer_offset + prot_rel_read +
+                                                8) == prot_payload[2],
+          "the next Buffer lookup still served pre-read native bytes");
+      prot_read_file.Close();
+      std::filesystem::remove(prot_read_path);
+      LibKernel::Memory::InstallGpuResources(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
@@ -6440,6 +6561,168 @@ public:
             "a metadata write-only fill was not consumed as a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // The fault scan reports each set page once and leaves the pages past its records set.
+  void CheckFaultBufferScan() {
+    constexpr const char *name = "FaultBufferScan";
+    constexpr u32 words = 2048;
+    constexpr u32 records = 1024; // Record 0 holds the count.
+    const vk::DescriptorSetLayoutBinding bindings[]{
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}};
+    vk::DescriptorSetLayoutCreateInfo descriptors{};
+    descriptors.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+    descriptors.bindingCount = 2;
+    descriptors.pBindings = bindings;
+    vk::DescriptorSetLayout descriptor_layout = nullptr;
+    RequireVk(name, "descriptors",
+              m_device.createDescriptorSetLayout(&descriptors, nullptr, &descriptor_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &descriptor_layout;
+    vk::PipelineLayout layout = nullptr;
+    RequireVk(name, "layout", m_device.createPipelineLayout(&layout_info, nullptr, &layout),
+              "vkCreatePipelineLayout");
+    const auto module = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_device);
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "pipeline",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+    m_device.destroyShaderModule(module, nullptr);
+
+    const auto bitmap = [](const auto &pages) {
+      std::vector<u32> ret(words, 0);
+      for (const auto page : pages) {
+        ret[page / 32] |= 1u << (page % 32);
+      }
+      return ret;
+    };
+    // Scans a bitmap of the pages and checks the records and the bits left.
+    const auto scan = [&](const char *stage, const std::vector<u32> &pages) {
+      auto fault = CreateStorageBuffer(name, bitmap(pages), words);
+      auto output = CreateStorageBuffer(name, {}, records * 2);
+      const vk::DescriptorBufferInfo infos[]{{fault.buffer, 0, fault.size},
+                                             {output.buffer, 0, output.size}};
+      std::array<vk::WriteDescriptorSet, 2> writes{};
+      for (u32 i = 0; i < writes.size(); i++) {
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+        writes[i].pBufferInfo = &infos[i];
+      }
+      auto cmd = BeginCommands(name, stage);
+      cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+      cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+      cmd.dispatch(words / 4 / 64, 1, 1);
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0,
+                          nullptr);
+      EndSubmitAndFree(name, stage, cmd);
+
+      const auto left = ReadBuffer(name, fault, words);
+      const auto out = ReadBuffer(name, output, records * 2);
+      DestroyBuffer(&fault);
+      DestroyBuffer(&output);
+      const auto stored = std::min(out[0], records - 1);
+      std::set<u32> unreported(pages.begin(), pages.end());
+      bool reported_once = stored == std::min<size_t>(pages.size(), records - 1);
+      for (u32 i = 1; i <= stored; i++) {
+        const uint64_t record = out[i * 2] | (uint64_t{out[i * 2 + 1]} << 32);
+        const auto page = static_cast<u32>(record >> BufferCache::CACHING_PAGEBITS);
+        reported_once &= unreported.erase(page) == 1;
+      }
+      Require(name, stage, reported_once && left == bitmap(unreported),
+              "the scan lost, repeated or kept a reported page");
+    };
+    // Bits in each word of a block, several in one word, and in the last word.
+    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17, 2047 * 32 + 31});
+    // 1200 pages, two per word, overflow the 1023 records; an odd record count leaves a word
+    // partly reported.
+    std::vector<u32> overflow;
+    for (u32 i = 0; i < 600; i++) {
+      overflow.push_back((3 * i + 1) * 32 + i % 31);
+      overflow.push_back((3 * i + 1) * 32 + 31);
+    }
+    scan("overflow", overflow);
+
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(layout, nullptr);
+    m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A scan past its records creates buffers only for the records it stored, and the next scan
+  // reports the pages left.
+  void CheckFaultRecordsOverflow() {
+    constexpr const char *name = "FaultRecordsOverflow";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    constexpr u32 pages = 1216;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), pages * page, page, 0,
+                &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, pages * page, 0x3, 0, direct,
+                                                         32 * page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, pages * page);
+    // Faults the first `count` pages, a multiple of 32, then scans and processes the records.
+    const auto scan = [&](u32 count) {
+      const auto command = scheduler.Current().Handle();
+      if (count != 0) {
+        command.fillBuffer(cache.GetFaultBuffer()->Handle(), BufferCache::PageIndex(base) / 8,
+                           count / 8, ~0u);
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask =
+            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0,
+                                nullptr, 0, nullptr);
+      }
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+    };
+    // Area 1 keeps 32 records, more than the overflowing scan of area 0 counts past its own; read
+    // as a record, area 1's count is address 32, which no buffer can cover.
+    for (u32 area = 0; area < 8; area++) {
+      scan(area == 1 ? 32 : 0);
+    }
+    scan(pages);
+    scan(0);
+    bool reported = true;
+    for (u32 i = 0; i < pages; i++) {
+      reported &= static_cast<bool>(BufferCacheTestAccess::PageOwner(cache, base + i * page));
+    }
+    Require(name, "pages left", reported, "the pages past the records were not reported later");
+    context.UnmapMemory(base, pages * page);
+    scheduler.Finish();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, pages * page) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, pages * page) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckBdaSyncUploads() {
@@ -8925,10 +9208,6 @@ public:
       constexpr uint64_t added_stencil_depth_offset = 0x60000;
       constexpr uint64_t added_stencil_offset = 0x70000;
       constexpr uint64_t added_stencil_size = 0x10000;
-      constexpr float added_stencil_depth_value = 0.75f;
-      std::memcpy(memory + added_stencil_depth_offset,
-                  &added_stencil_depth_value,
-                  sizeof(added_stencil_depth_value));
       auto depth_only_source = MakeLinearDesc(
           base + added_stencil_depth_offset, 0x10000, vk::Format::eD32Sfloat,
           Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
@@ -9808,6 +10087,37 @@ public:
           name, "metadata buffer fill state",
           texture_cache.IsMetaCleared(base + metadata_b, 0),
           "BufferCache fill did not publish an exact-address metadata clear");
+
+      // A dynamic-resolution depth target keeps its HTile range at every extent; freeing the
+      // superseded image must leave its successor's consumed clear state alone.
+      constexpr uint64_t shared_htile = 0x13200;
+      auto retired_depth = MakeMetadataDepth(0x12400, shared_htile);
+      auto live_depth = MakeMetadataDepth(0x12500, shared_htile);
+      const auto retired_id = texture_cache.FindImage(retired_depth);
+      const auto live_id = texture_cache.FindImage(live_depth);
+      (void)texture_cache.FindDepthTarget(retired_id, retired_depth);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      const bool live_consumed = texture_cache.TouchMeta(base + shared_htile, 0, false);
+      TextureCacheTestAccess::DeleteImage(texture_cache, retired_id);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      Require(name, "superseded HTile image release",
+              live_consumed && !texture_cache.IsMetaCleared(base + shared_htile, 0),
+              "freeing a superseded depth image re-armed its successor's HTile clear");
+      // Reacquiring through a fast path must take the range back too: freeing the image it
+      // superseded must not re-arm the reacquirer's consumed clear.
+      auto other_depth = MakeMetadataDepth(0x12600, shared_htile);
+      const auto other_id = texture_cache.FindImage(other_depth);
+      (void)texture_cache.FindDepthTarget(other_id, other_depth);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      (void)texture_cache.TouchMeta(base + shared_htile, 0, false);
+      TextureCacheTestAccess::DeleteImage(texture_cache, other_id);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      Require(name, "reacquired HTile owner",
+              !texture_cache.IsMetaCleared(base + shared_htile, 0),
+              "freeing an image re-armed the HTile clear of the image that reacquired the range");
+      TextureCacheTestAccess::DeleteImage(texture_cache, live_id);
+      Require(name, "HTile owner release", !texture_cache.IsMeta(base + shared_htile),
+              "freeing the HTile owner kept its clear state");
 
       // R-Type Final 3 reuses an old color allocation inside a new stencil plane,
       // with the same metadata address changing from DCC to HTile.
@@ -11367,45 +11677,16 @@ public:
       if (!texture_cache.GetImage(combined_destination_image).IsGpuModified()) {
         texture_cache.MarkGpuWritten(combined_destination_image);
       }
-      constexpr float stale_added_stencil_depth = 0.125f;
-      Libs::LibKernel::Memory::WriteBacking(
-          combined_destination.info.data.address, &stale_added_stencil_depth,
-          sizeof(stale_added_stencil_depth));
-      const auto depth_gc_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, std::array{combined_destination_image}, 81, 0);
       texture_cache.RunGarbageCollector();
-      float depth_before_completion = 0.0f;
-      Libs::LibKernel::Memory::TryReadBacking(
-          combined_destination.info.data.address, &depth_before_completion,
-          sizeof(depth_before_completion));
-      const bool depth_image_retired = !TextureCacheTestAccess::Contains(
-          texture_cache, combined_destination_image);
-      const bool depth_proxy_retired = !texture_cache.FindImageFromRange(
-          base + added_stencil_offset, added_stencil_size, false);
-      Require(
-          name, "depth/stencil deferred pressure retirement",
-          depth_image_retired && depth_proxy_retired &&
-              scheduler.CurrentTick() == depth_gc_tick &&
-              depth_before_completion == stale_added_stencil_depth,
-          fmt::format(
-              "GC failed to retire/defer depth: image={} proxy={} tick={}/{} "
-              "depth={}/{}",
-              depth_image_retired, depth_proxy_retired, scheduler.CurrentTick(),
-              depth_gc_tick, depth_before_completion, stale_added_stencil_depth)
-              .c_str());
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
-      float depth_after_completion = 0.0f;
-      Libs::LibKernel::Memory::TryReadBacking(
-          combined_destination.info.data.address, &depth_after_completion,
-          sizeof(depth_after_completion));
-      Require(name, "depth/stencil depth-plane preservation",
-              depth_after_completion == added_stencil_depth_value,
-              "GC discarded the current depth plane of a depth/stencil "
-              "image");
+      Require(name, "depth/stencil pressure retention",
+              TextureCacheTestAccess::Contains(texture_cache,
+                                               combined_destination_image),
+              "GC retired a GPU depth/stencil image whose stencil it cannot "
+              "download");
 
-      constexpr size_t gc_depth_pair_count = 6;
+      constexpr size_t gc_depth_pair_count = 11;
       constexpr uint64_t gc_depth_pair_offset = 0x350000;
       constexpr uint64_t gc_depth_pair_stride = 0x1000;
       std::array<ImageId, gc_depth_pair_count> gc_depth_images{};
@@ -11439,7 +11720,7 @@ public:
                               [](ImageId image) { return bool{image}; }) &&
               std::ranges::all_of(gc_stencil_images,
                                   [](ImageId image) { return bool{image}; }),
-          "failed to create six depth/stencil association pairs");
+          "failed to create eleven depth/stencil association pairs");
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_depth_lru, 81, UINT64_MAX);
       texture_cache.RunGarbageCollector();
@@ -11454,7 +11735,7 @@ public:
       }
       Require(name, "depth/stencil GC traversal budget", gc_depth_budget,
               "recursive association deletion stopped LRU traversal or "
-              "exceeded the ten-entry deletion budget");
+              "exceeded the ten-retirement budget");
 
       constexpr uint64_t large_offset = 0x400000;
       constexpr uint32_t large_width = 4096;
@@ -11467,18 +11748,19 @@ public:
           base + large_offset, large_size, vk::Format::eR8G8B8A8Unorm,
           Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
           {large_width, large_height, 1}, 1, 4, 1);
-      const auto RunLargeReadback = [&](uint32_t clear_value) {
-        const auto image = texture_cache.FindImage(large_desc);
-        Require(name, "near-capacity image clear",
+      const auto RunPressureReadback = [&](TextureCache::ImageDesc desc,
+                                           uint32_t clear_value) {
+        const auto image = texture_cache.FindImage(desc);
+        const auto size = desc.info.data.size;
+        Require(name, "pressure readback image clear",
                 texture_cache.ClearImageFromBuffer(
-                    command, large_desc.info.data.address,
-                    large_desc.info.data.size, clear_value),
-                "failed to write the near-capacity readback source image");
+                    command, desc.info.data.address, size, clear_value),
+                "failed to write the readback source image");
         const std::array<uint64_t, 3> sample_offsets{
-            0, large_size / 2, large_size - sizeof(uint32_t)};
+            0, size / 2, size - sizeof(uint32_t)};
         constexpr uint32_t stale = 0;
         for (const auto offset : sample_offsets) {
-          Libs::LibKernel::Memory::WriteBacking(base + large_offset + offset,
+          Libs::LibKernel::Memory::WriteBacking(desc.info.data.address + offset,
                                                 &stale, sizeof(stale));
         }
         TextureCacheTestAccess::ConfigureGarbageCollection(
@@ -11488,31 +11770,82 @@ public:
         const auto handle =
             BufferCacheTestAccess::DownloadBuffer(resources.GetBufferCache())
                 .Handle();
-        Require(
-            name, "near-capacity deferred retirement",
-            !TextureCacheTestAccess::Contains(texture_cache, image) &&
-                scheduler.CurrentTick() == tick,
-            "near-capacity readback was rejected or synchronously submitted");
+        Require(name, "pressure readback deferred retirement",
+                !TextureCacheTestAccess::Contains(texture_cache, image) &&
+                    scheduler.CurrentTick() == tick,
+                "readback was rejected or synchronously submitted");
         scheduler.Finish();
         scheduler.DrainPriorityOperations();
         bool content = true;
         for (const auto offset : sample_offsets) {
           uint32_t value = 0;
-          Libs::LibKernel::Memory::TryReadBacking(base + large_offset + offset,
-                                                  &value, sizeof(value));
+          Libs::LibKernel::Memory::TryReadBacking(
+              desc.info.data.address + offset, &value, sizeof(value));
           content &= value == clear_value;
         }
-        Require(
-            name, "near-capacity readback content", content,
-            "near-capacity image readback did not publish its GPU contents");
+        Require(name, "pressure readback content", content,
+                "image readback did not publish its GPU contents");
         return handle;
       };
-      const auto large_download = RunLargeReadback(0xa5a5a5a5u);
-      const auto reused_large_download = RunLargeReadback(0x5a5a5a5au);
+      const auto large_download = RunPressureReadback(large_desc, 0xa5a5a5a5u);
+      const auto reused_large_download =
+          RunPressureReadback(large_desc, 0x5a5a5a5au);
       Require(name, "near-capacity shared download reuse",
               large_download == reused_large_download,
               "successive near-capacity image transfers replaced the shared "
               "download buffer");
+
+      constexpr uint64_t gc_kept_offset = 0x2e40000;
+      constexpr uint64_t gc_kept_stride = 0x1000;
+      // Ten GPU images kept before pressure, then ten heap-referenced clean
+      // images, ahead of one clean image within the ten-retirement budget.
+      constexpr size_t gc_kept_count = 20;
+      std::array<ImageId, gc_kept_count + 1> gc_kept_lru{};
+      for (size_t index = 0; index < gc_kept_lru.size(); index++) {
+        auto desc = MakeLinearDesc(
+            base + gc_kept_offset + index * gc_kept_stride, sizeof(uint32_t),
+            vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+        gc_kept_lru[index] = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(gc_kept_lru[index], desc);
+        if (index < gc_kept_count / 2) {
+          texture_cache.MarkGpuWritten(gc_kept_lru[index]);
+        } else if (index < gc_kept_count) {
+          texture_cache.GetImage(gc_kept_lru[index]).heap_refs.fetch_add(1u);
+        }
+      }
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, gc_kept_lru, 17, UINT64_MAX);
+      texture_cache.RunGarbageCollector();
+      Require(name, "kept images outside the deletion budget",
+              !TextureCacheTestAccess::Contains(texture_cache,
+                                                gc_kept_lru.back()) &&
+                  std::ranges::all_of(
+                      std::span(gc_kept_lru).first(gc_kept_count),
+                      [&](ImageId image) {
+                        return TextureCacheTestAccess::Contains(texture_cache,
+                                                                image);
+                      }),
+              "kept GPU or heap-referenced images spent the deletion budget "
+              "of the aged clean image behind them");
+
+      auto gc_tiled = MakeLinearDesc(
+          base + 0x2f00000, 256 * 256 * sizeof(uint32_t),
+          vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm,
+          Prospero::ImageType::kColor2D, {256, 256, 1}, 1, 4, 1);
+      gc_tiled.type = BindingType::Storage;
+      gc_tiled.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      gc_tiled.info.UpdateSize();
+      gc_tiled.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      (void)RunPressureReadback(gc_tiled, 0x3c5a3c5au);
+      auto gc_depth = MakeLinearDesc(
+          base + 0x2f40000, 64 * 64 * sizeof(float), vk::Format::eD32Sfloat,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {64, 64, 1}, 1, 4, 1);
+      gc_depth.type = BindingType::DepthTarget;
+      gc_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      gc_depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      (void)RunPressureReadback(gc_depth, std::bit_cast<uint32_t>(0.75f));
 
       constexpr uint64_t tile_alias_offset = 0x2000000;
       constexpr uint64_t tile_alias_size = 0x400000;
@@ -25029,6 +25362,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMP_GT_F16:
   case Opcode::V_CMP_LG_F16:
   case Opcode::V_CMP_GE_F16:
+  case Opcode::V_CMP_U_F16:
   case Opcode::V_CMP_NGT_F16:
   case Opcode::V_CMP_NEQ_F16:
   case Opcode::V_CMP_NLT_F16:
@@ -30685,6 +31019,34 @@ TestCase VectorCvtF16U16ByteSource() {
   return test;
 }
 
+TestCase VectorCvtF16I16ByteSource() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 8, 0xa5a55a5au);
+  u32 index = 0;
+  for (u32 sext : {0u, 1u}) {
+    for (u32 input : {0x123456ffu, 0x12345680u, 0x1234567fu}) {
+      AppendSMovLiteral(&code, 106, input);
+      // Convert byte0 of vcc_lo, zero- then sign-extended, to FP16 word0 while
+      // preserving word1 of v8.
+      code.insert(code.end(), {0x7e10a2f9u, 0x0080146au | (sext << 19u)});
+      AppendStoreVgpr(&code, 8, index++);
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorCvtF16I16ByteSource";
+  test.code = std::move(code);
+  test.expected = {0xa5a55bf8u, 0xa5a55800u, 0xa5a557f0u,
+                   0xa5a5bc00u, 0xa5a5d800u, 0xa5a557f0u};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_CVT_F16_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertSToF"};
+  return test;
+}
+
 TestCase VectorCvtU16F16Sdwa() {
   using O = ShaderOpcode;
 
@@ -35216,6 +35578,93 @@ TestCase VectorVopcCmpNltF16CapturedSdwaAndEdges() {
                   O::V_CMP_NLT_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_CMP_NLT_F16", cases.size()}};
   test.required_spirv = {"OpFUnordGreaterThanEqual"};
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorVopcCmpUF16CapturedSdwaAndEdges() {
+  using O = ShaderOpcode;
+  enum Encoding { Captured, Compact, Vop3NegAbs, HighWord, SdwaNegAbs };
+  struct CompareCase {
+    u32 packed; // Two-operand forms compare low half against high half.
+    u32 expected;
+    Encoding encoding = Compact;
+    u32 exec = 1;
+  };
+  const std::array<CompareCase, 16> cases{{
+      {0x3c003c00u, 0}, // Equal
+      {0x3c007e00u, 1}, // Quiet NaN in src0
+      {0x7e003c00u, 1}, // Quiet NaN in src1
+      {0x3c007c01u, 1}, // Signaling NaN in src0
+      {0x7c013c00u, 1}, // Signaling NaN in src1
+      {0xfe007fffu, 1}, // NaN in both
+      {0xfc007c00u, 0}, // Infinities are ordered.
+      {0x03ff8001u, 0}, // Denormals are ordered.
+      {0x7e003c00u, 0, Captured}, // Self-compare ignores the upper half.
+      {0x3c007e00u, 1, Captured},
+      {0x3c007e00u, 0, Captured, 0}, // Inactive lane contributes no mask bit.
+      {0x3c00fe00u, 1, Vop3NegAbs}, // -abs(NaN) stays NaN.
+      {0x3c00bc00u, 0, Vop3NegAbs},
+      {0x7e003c00u, 1, HighWord},
+      {0x3c007e00u, 0, HighWord},
+      {0x3c00fe00u, 1, SdwaNegAbs},
+  }};
+  constexpr u32 sentinel = 0x89abcdefu;
+  TestCase test;
+  test.name = "VectorVopcCmpUF16CapturedSdwaAndEdges";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.packed);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  code.push_back(EncodeSMovB32(22, 2)); // Preserve the input buffer descriptor.
+  code.push_back(EncodeSMovB32(23, 3));
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    const bool writes_vcc = entry.encoding == Captured || entry.encoding == Compact;
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 23, 30); // Runtime input prevents constant folding.
+    AppendVMovU32(&code, 1, entry.packed >> 16u);
+    for (u32 reg : {3u, 106u, 107u}) {
+      AppendSMovLiteral(&code, reg, sentinel);
+    }
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
+    switch (entry.encoding) {
+    case Captured: code.push_back(0x7dd02f17u); break; // v_cmp_u_f16 vcc, v23, v23
+    case Compact: code.push_back(EncodeVopc(0xe8, Vgpr(23), 1)); break;
+    case Vop3NegAbs:
+      AppendVop3(&code, 0xe8, 2, Vgpr(23), Vgpr(1), 0, 1, 0, false, 0, 1);
+      break;
+    case HighWord:
+      code.push_back(EncodeVopc(0xe8, 249, 23));
+      code.push_back(EncodeVopcSdwa(23, 2, 1, 5, 5));
+      break;
+    case SdwaNegAbs:
+      code.push_back(EncodeVopc(0xe8, 249, 1));
+      code.push_back(EncodeVopcSdwa(23, 2, 1, 6, 6, 0, 0, 1, 1));
+      break;
+    }
+    code.push_back(EncodeSMovB32(20, writes_vcc ? 106 : 2));
+    code.push_back(EncodeSMovB32(21, 3)); // Wave32 must preserve adjacent SGPR.
+    code.push_back(EncodeSMovB32(24, 126));
+    code.push_back(EncodeSMovB32(25, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    code.push_back(EncodeSMovB32(2, 22));
+    code.push_back(EncodeSMovB32(3, 23));
+    const u32 out = static_cast<u32>(cases.size()) + i * 6u;
+    AppendStoreSgprPair(&code, 20, out);
+    AppendStoreSgprPair(&code, 24, out + 2u);
+    AppendStoreSgprPair(&code, 106, out + 4u);
+    test.expected.insert(test.expected.end(),
+                         {entry.expected, sentinel, entry.exec, 0u,
+                          writes_vcc ? entry.expected : sentinel, sentinel});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMP_U_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMP_U_F16", cases.size()}};
+  test.required_spirv = {"OpIsNan"};
   test.compute_info.wave_size = 32;
   test.has_compute_info = true;
   return test;
@@ -49113,6 +49562,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtF16U16ByteSource);
+  AddCase(VectorCvtF16I16ByteSource);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
   AddCase(VectorMinMaxMed3F16Ops);
@@ -49237,6 +49687,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpxNeU16SdwaCompactVop3ExecMask);
   AddCase(VectorVopcCmpNgtF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
+  AddCase(VectorVopcCmpUF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxNleF16CapturedSdwaExecMask);
   AddCase(VectorCompareInvertedMaskSelect);
@@ -56389,6 +56840,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVop3FloatCompareNegSourceModifier());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cmp-u-f16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpUF16CapturedSdwaAndEdges());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cmp-nlt-f16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpNltF16CapturedSdwaAndEdges());
@@ -57150,6 +57606,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
+    vulkan.CheckFaultBufferScan();
+    vulkan.CheckFaultRecordsOverflow();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -57419,6 +57877,8 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckFaultBufferScan();
+  vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckTextureLookupReuse();
   vulkan.CheckResidentTextureBindings();

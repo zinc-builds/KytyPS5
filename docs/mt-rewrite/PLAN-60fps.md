@@ -426,6 +426,45 @@ layout noise.
 - Cost: ~200 lines plus 2–5 per switch. Worth building when Track B's run-level commit cuts
   (each kill-switched, ~150–270 ns/draw) need FPS numbers of record.
 
+## Upstream (Track U, 2026-11-12)
+
+Upstream is `KytyPS5/KytyPS5` `main`. It is **read-only for us**: we fetch it, but never push, comment,
+react or open PRs there.
+
+**The divergence.** Our merge-base is `182161eb` (2026-11-06). Six days later, upstream was 69 commits
+ahead (`e35360fa`; 117 files, +9.7k/−3.3k), almost all by the maintainer. `dev` was 126 commits ahead
+(182 files, +28.5k). 60 files had changed on both sides. A trial `git merge upstream/main` conflicts
+in 28 files, 89 hunks, ~4,100 lines:
+- kernel memory ~1,470 lines: `memoryAddressSpace.inc` 14 hunks, `memory.cpp` 10;
+- caches ~1,400 lines: `bufferCache.cpp` 6 hunks / 1,063 lines, `textureCache.cpp/.h` 10, `regionManager.h` 4;
+- draw and pipeline ~400 lines; recompiler ~190; tests ~440.
+
+**Decision:** we accept the divergence in kernel memory and the buffer cache and take fixes by
+cherry-pick (`-x`, upstream authors credited). We don't merge the whole tree. Upstream is
+reworking the same two areas in its own way:
+- a lock-free page table for backing reads and split operation/state locks (1b59ee62, fc1369e6),
+  where our `TryReadFast` already covers the hot path;
+- BDA sync and faults (b510053e ≈ our `KYTY_UPLOAD_BATCH`; 0ec2cd5d).
+
+Nobody upstream threads the command processor: #937 has been idle since 2026-10-11, and #2119 is
+still unmerged. The maintainer often re-implements a PR as its own commit and closes the PR, so an
+open PR is a weak signal.
+
+| Candidate | What | Status |
+|---|---|---|
+| #2141, fd04c3fa + f314e86b, 16a7bbe3, 2d84e36b, b9cb08d3, HLE/opcode fixes | File reads into GPU-protected pages (ASTRO BOT assert), fault-bitmap scan, texture GC, HTile clear state, TTAS spin lock, small HLE | Track U PR A |
+| 0b82396f | `uses_dma` from live IR: fewer `PrepareBda` calls | Track U PR B, alone |
+| 937b3766 | Present without the video-out port locks: may change the game's pace | Track U PR C, alone, judged by Track R |
+| f399d481 | Console FP environment (MXCSR FTZ/DAZ, x87 CW) for guest threads | Track U PR D, alone, last |
+| #2178 | `KYTY_SHADER_CACHE_STAMP` manual store key | Handed to Track R (override for the source-hash key) |
+| bd41e2f6 | Texture views past MAX_MIP | **Later.** Alone, it stops ASTRO BOT booting (upstream issues #2222, #1993); wait for #2172 upstream |
+| #2119 | Async shader compile | **Later**, rebuilt on our prepare workers: it skips draws, holds frames for up to 3 s, and clashes with the worker pipeline key (18 hunks) |
+| 8dbee863 | Relaxed float option (native min/max/med3, no input denormal flush) | **Later / declined for now:** inexact, like the fused MAD we declined |
+| 0ec2cd5d | Writes re-queue only DMA-accessed BDA pages | **Not taken.** Ported and screened same-binary: cycles/draw +0.3% `~`, ipd +7.6% `!`, prepare_ns +29%, cmd sys −12% `!`. The uploads move to bind time on the workers; pre-staging stays (local branch `tmp/u-bda-port`) |
+| eb3e86d5 `--native-rt`, b727a1fa | Host ray tracing; empty-scissor draw skip | Only if Sky Garden uses them (not checked) |
+| e5c35553, 79a04b9a, 7d4e0d9b, b510053e, 1b59ee62 set, 7ae328b3, aecd70b6 | Tracker, submit cadence, upload batch, kernel locks, executor targets, image page buckets | Ours is equivalent or supersedes them |
+| PSSR DLSS/FSR, readback changes | — | Off our path |
+
 ## Status
 
 | Track | Current step | Notes |
