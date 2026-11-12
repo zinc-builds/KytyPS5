@@ -236,8 +236,71 @@ bool StoredSince(uint64_t sequence, const Log& log) {
 	return g_stored.Since(sequence, [&](const StoredRange& range) { return LogHit(log, range); });
 }
 
-Worker::Worker(Run run, void* context, uint32_t index)
-    : m_run(run), m_context(context), m_index(index), m_thread([this] { Loop(); }) {}
+Pool::Pool(uint32_t slots): m_slots(slots), m_done(std::make_unique<std::atomic<uint64_t>[]>(slots)) {
+	for (uint32_t i = 0; i < slots; i++) {
+		m_done[i].store(0, std::memory_order_relaxed);
+	}
+}
+
+uint64_t Pool::Post() {
+	// No fence, as Worker::Post: a worker that goes to sleep without seeing this post is woken by
+	// Wait. Wake one sleeper only if every worker is busy or asleep.
+	const auto sequence = ++m_posted_local;
+	EXIT_IF(sequence > m_slots && !Done(sequence - m_slots));
+	m_posted.store(sequence, std::memory_order_release);
+	if (m_spinning.load(std::memory_order_relaxed) == 0) {
+		for (auto* worker: m_workers) {
+			if (worker->m_sleeping.load(std::memory_order_relaxed)) {
+				worker->Wake();
+				break;
+			}
+		}
+	}
+	return sequence;
+}
+
+void Pool::WakeAll() {
+	for (auto* worker: m_workers) {
+		worker->Wake();
+	}
+}
+
+uint64_t Pool::Wait(uint64_t sequence) {
+	if (Done(sequence)) {
+		return 0;
+	}
+	const auto start = NowNs();
+	Common::StallDiag::Scope stall(Common::StallDiag::Cause::CmdPrepare);
+	WakeAll();
+	for (uint32_t spins = 0; !Done(sequence); spins++) {
+		if ((spins & 1023u) == 1023u) {
+			WakeAll();
+		}
+		if (spins < 16384) {
+			KYTY_PREPARE_PAUSE();
+		} else {
+			std::this_thread::yield();
+		}
+	}
+	return NowNs() - start;
+}
+
+uint64_t Pool::WaitIdle() {
+	uint64_t waited = 0;
+	const auto posted = m_posted_local;
+	for (auto sequence = posted > m_slots ? posted - m_slots + 1 : 1; sequence <= posted; sequence++) {
+		waited += Wait(sequence);
+	}
+	return waited;
+}
+
+Worker::Worker(Run run, void* context, uint32_t index, Pool* pool)
+    : m_run(run), m_context(context), m_index(index), m_pool(pool) {
+	if (pool != nullptr) {
+		pool->m_workers.push_back(this);
+	}
+	m_thread = std::thread([this] { Loop(); });
+}
 
 Worker::~Worker() {
 	WaitIdle();
@@ -305,6 +368,10 @@ void Worker::Loop() {
 		    static_cast<Role>(static_cast<int>(Role::Prep0) + static_cast<int>(m_index)));
 	}
 	Common::BenchMetrics::RegisterPrepareWorker(m_index, &m_busy_ns, &m_done);
+	if (m_pool != nullptr) {
+		LoopPool();
+		return;
+	}
 	uint64_t done = 0;
 	for (;;) {
 		auto posted = m_posted.load(std::memory_order_acquire);
@@ -345,6 +412,60 @@ void Worker::Loop() {
 			m_run(m_context, ++done);
 			m_done.store(done, std::memory_order_release);
 		}
+		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+	}
+}
+
+void Worker::LoopPool() {
+	auto& pool = *m_pool;
+	for (;;) {
+		auto claimed = pool.m_claimed.load(std::memory_order_acquire);
+		if (claimed >= pool.m_posted.load(std::memory_order_acquire)) {
+			if (m_stop.load(std::memory_order_acquire)) {
+				return;
+			}
+			// Draws arrive every few microseconds: spin a while before sleeping.
+			pool.m_spinning.fetch_add(1, std::memory_order_relaxed);
+			const auto start = std::chrono::steady_clock::now();
+			auto       stall = Common::StallDiag::Now();
+			for (uint32_t spins = 1;; spins++) {
+				KYTY_PREPARE_PAUSE();
+				if (pool.m_claimed.load(std::memory_order_relaxed) <
+				        pool.m_posted.load(std::memory_order_acquire) ||
+				    m_stop.load(std::memory_order_relaxed)) {
+					pool.m_spinning.fetch_sub(1, std::memory_order_relaxed);
+					break;
+				}
+				if ((spins & 255u) == 0 &&
+				    std::chrono::steady_clock::now() - start > std::chrono::microseconds(50)) {
+					Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSpin, stall);
+					stall = Common::StallDiag::Now();
+					pool.m_spinning.fetch_sub(1, std::memory_order_relaxed);
+					m_sleeping.store(true, std::memory_order_seq_cst);
+					if (pool.m_claimed.load(std::memory_order_seq_cst) >=
+					        pool.m_posted.load(std::memory_order_seq_cst) &&
+					    !m_stop.load(std::memory_order_seq_cst)) {
+						m_sleeping.wait(true, std::memory_order_seq_cst);
+					}
+					m_sleeping.store(false, std::memory_order_relaxed);
+					Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSleep, stall);
+					stall = 0;
+					break;
+				}
+			}
+			Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSpin, stall);
+			continue;
+		}
+		if (!pool.m_claimed.compare_exchange_weak(claimed, claimed + 1, std::memory_order_acq_rel,
+		                                          std::memory_order_relaxed)) {
+			continue;
+		}
+		Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
+		const auto start = NowNs();
+		m_run(m_context, claimed + 1);
+		pool.m_done[claimed % pool.m_slots].store(claimed + 1, std::memory_order_release);
+		// This worker's job count (BenchMetrics' prep_jobs; nothing waits on it in pool mode).
+		m_done.store(m_done.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
 	}
 }
