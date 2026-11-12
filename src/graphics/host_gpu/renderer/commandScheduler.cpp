@@ -100,7 +100,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 			const char* age_us = std::getenv("KYTY_EARLY_SUBMIT_US");
 			m_early_submit_age = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 			                         std::chrono::microseconds(
-			                             age_us != nullptr ? std::strtoll(age_us, nullptr, 10) : 150))
+			                             age_us != nullptr ? std::strtoll(age_us, nullptr, 10) : 300))
 			                         .count();
 		}
 	}

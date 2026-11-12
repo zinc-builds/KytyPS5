@@ -35,7 +35,7 @@ public:
 	// this at packets where nothing is held open across command buffers (no queued draw,
 	// dispatch chain or atomic batch). When every earlier submission has finished on the GPU
 	// (it would sit idle) and the open command buffer has been recording for at least
-	// KYTY_EARLY_SUBMIT_US µs (default 150), it is submitted now rather than when the guest's
+	// KYTY_EARLY_SUBMIT_US µs (default 300), it is submitted now rather than when the guest's
 	// command buffer ends. Returns whether it submitted.
 	bool           SubmitIfGpuIdle();
 	// Sets the early-submission age in µs (< 0: off), for tests.
