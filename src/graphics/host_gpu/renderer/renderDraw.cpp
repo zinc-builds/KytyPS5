@@ -1344,8 +1344,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 				}
 			}
 		}
-		FrameSkip::NoteCommittedDraw(buffer.GetShaders(), buffer_writes, image_writes, atomic_only,
-		                             known, ranges.data(), range_count);
+		FrameSkip::NoteCommittedDraw(buffer.GetShaders(), state.ps_active, buffer_writes,
+		                             image_writes, atomic_only, known, ranges.data(), range_count);
 	}
 	if (shader_write_stages || HasAtomicWrites()) {
 		// Guest ranges of the draw's buffer accesses: atomics to buffers the stage accesses only

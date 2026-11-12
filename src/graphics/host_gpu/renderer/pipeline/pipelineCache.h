@@ -284,6 +284,14 @@ public:
 	// A draw's stages, indexed like GraphicsPipelineKey::stage_ids.
 	using GraphicsResources = std::array<StageResources, 4>;
 
+	// The color slots the pixel shader exports to, and whether it runs at all (DrawRenderState::
+	// ps_active). Also used by frame skipping to name a draw's active shaders.
+	struct PixelOutput {
+		uint32_t color_output_mask = 0;
+		bool     active            = false;
+	};
+	static PixelOutput PixelOutputs(const HW::Context& context, const HW::Shader& shaders);
+
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
 	// The same from given registers, materializing into `resources`, which must outlive the

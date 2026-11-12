@@ -712,16 +712,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	                    state, m_graphics_resources);
 }
 
-void PipelineCache::GetGraphicsPrograms(const HW::Context& context,
-                                        const HW::UserConfig& user_config,
-                                        const HW::Shader& shaders, DrawRenderState& state,
-                                        GraphicsResources& resources) {
-	const bool  worker            = DrawPrepare::OnWorker();
-	const auto& sh                = context.GetShaderRegisters();
-	const auto& vertex_regs       = shaders.GetVs();
-	const auto& pixel_regs        = shaders.GetPs();
-	auto&       vertex_info       = state.vertex_info;
-	auto&       pixel_info        = state.ps_input_info;
+PipelineCache::PixelOutput PipelineCache::PixelOutputs(const HW::Context& context,
+                                                       const HW::Shader&  shaders) {
+	const auto& sh                  = context.GetShaderRegisters();
 	const bool  object_primitive_id = context.HasObjectPrimitiveIdOutput();
 	const auto  write_mask          = context.GetRenderTargetMask() & sh.m_cbShaderMask;
 	uint32_t    color_output_mask   = object_primitive_id ? 1u << 7u : 0;
@@ -737,10 +730,25 @@ void PipelineCache::GetGraphicsPrograms(const HW::Context& context,
 	const auto& db = sh.db_shader_control;
 	// Without color outputs, a pixel shader still runs for its depth or coverage side effects.
 	const bool pixel_active =
-	    pixel_regs.ps_regs.data_addr != 0 &&
+	    shaders.GetPs().ps_regs.data_addr != 0 &&
 	    (color_output_mask != 0 || db.shader_kill_enable || db.shader_z_export_enable ||
 	     db.shader_mask_export_enable || db.shader_dual_export_enable ||
 	     db.shader_execute_on_noop || sh.AlphaToMask());
+	return {color_output_mask, pixel_active};
+}
+
+void PipelineCache::GetGraphicsPrograms(const HW::Context& context,
+                                        const HW::UserConfig& user_config,
+                                        const HW::Shader& shaders, DrawRenderState& state,
+                                        GraphicsResources& resources) {
+	const bool  worker            = DrawPrepare::OnWorker();
+	const auto& sh                = context.GetShaderRegisters();
+	const auto& vertex_regs       = shaders.GetVs();
+	const auto& pixel_regs        = shaders.GetPs();
+	auto&       vertex_info       = state.vertex_info;
+	auto&       pixel_info        = state.ps_input_info;
+	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
+	const auto [color_output_mask, pixel_active] = PixelOutputs(context, shaders);
 	state.ps_active = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	state.vertex_stage_count = tess_active ? 3u : 1u;

@@ -61,16 +61,16 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 // port's registered buffer addresses (scan-out only, never kept).
 void OnFlip(const uint64_t* display_buffers, int display_buffer_count);
 
-// The draw commit, for every draw it inspects: whether its shaders write buffers or storage
-// images. Skipped frames drop a shader combination only after it was inspected and found to have
+// The draw commit, for every draw it inspects: whether its active shaders (`ps_active`: the
+// pixel shader runs) write buffers or storage images. Skipped frames drop a shader combination only after it was inspected and found to have
 // none. `ranges` are the written buffer ranges when `known` (no raw-address or indirect writes);
 // `atomic_only` when every buffer write is atomic.
 struct WrittenRange {
 	uint64_t address = 0;
 	uint64_t size    = 0;
 };
-void NoteCommittedDraw(const HW::Shader& sh, bool buffer_writes, bool image_writes, bool atomic_only,
-                       bool known, const WrittenRange* ranges, int range_count);
+void NoteCommittedDraw(const HW::Shader& sh, bool ps_active, bool buffer_writes, bool image_writes,
+                       bool atomic_only, bool known, const WrittenRange* ranges, int range_count);
 
 // Presenter thread: a main-port flip reached the screen at `vblank`; `presented` is false for a
 // skipped frame (no new image).

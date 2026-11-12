@@ -2,6 +2,7 @@
 
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include <algorithm>
 #include <array>
@@ -170,10 +171,12 @@ struct TargetInfo {
 	bool     depth  = false;
 };
 
-// The draw's shader combination, as the command processor's registers name it.
-uint64_t ShaderKey(const HW::Shader& sh) {
+// The draw's active shader combination. A bound pixel shader that does not run (no outputs,
+// DrawRenderState::ps_active false) is not part of it: the commit inspects only active stages.
+uint64_t ShaderKey(const HW::Shader& sh, bool ps_active) {
 	const auto& vs = sh.GetVs();
-	return sh.GetPs().ps_regs.data_addr ^ (vs.gs_regs.data_addr * 0x9e3779b97f4a7c15ull) ^
+	return (ps_active ? sh.GetPs().ps_regs.data_addr : 0) ^
+	       (vs.gs_regs.data_addr * 0x9e3779b97f4a7c15ull) ^
 	       (vs.es_regs.data_addr * 0xc2b2ae3d27d4eb4full);
 }
 
@@ -452,7 +455,7 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 	if (!Detail::g_skipping) {
 		return false;
 	}
-	const uint64_t shader = ShaderKey(sh);
+	const uint64_t shader = ShaderKey(sh, PipelineCache::PixelOutputs(ctx, sh).active);
 	if (shader != s.last_shader) {
 		s.last_shader      = shader;
 		s.last_shader_keep = !s.known_shaders.contains(shader) || s.side_shaders.contains(shader) ||
@@ -469,11 +472,11 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 	return true;
 }
 
-void NoteCommittedDraw(const HW::Shader& sh, bool buffer_writes, bool image_writes, bool atomic_only,
-                       bool known, const WrittenRange* ranges, int range_count) {
+void NoteCommittedDraw(const HW::Shader& sh, bool ps_active, bool buffer_writes, bool image_writes,
+                       bool atomic_only, bool known, const WrittenRange* ranges, int range_count) {
 	// Draws come in runs of one shader combination: report a write-free one once per run.
 	thread_local uint64_t last_clean = 0;
-	const uint64_t        key        = ShaderKey(sh);
+	const uint64_t        key        = ShaderKey(sh, ps_active);
 	if (!buffer_writes && !image_writes) {
 		if (key == last_clean) {
 			return;
