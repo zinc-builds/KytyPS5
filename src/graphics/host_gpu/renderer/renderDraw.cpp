@@ -1315,14 +1315,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (FrameSkip::Active()) {
 		// Frame skipping keeps draws whose shaders write memory, and drops a shader combination
 		// only once it was inspected here.
-		bool image_writes = false;
-		bool known        = true;
-		bool atomic_only  = true;
+		bool image_writes  = false;
+		bool buffer_writes = false; // from shader metadata, whatever the descriptors hold now
+		bool known         = true;
+		bool atomic_only   = true;
 		std::array<FrameSkip::WrittenRange, 4> ranges {};
 		int                                    range_count = 0;
 		for (const auto* stage: stages) {
 			const auto& program = stage->runtime->module->info;
-			known = known && !program.has_address_writes && !program.info.uses_dma;
+			known         = known && !program.has_address_writes && !program.info.uses_dma;
+			buffer_writes = buffer_writes || program.has_address_writes;
 			for (const auto& image: program.info.images) {
 				image_writes = image_writes || image.written || image.atomic;
 			}
@@ -1330,7 +1332,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 				if (!meta.written && !meta.atomic) {
 					continue;
 				}
-				atomic_only = atomic_only && meta.atomic && !meta.plain_access;
+				buffer_writes = true;
+				atomic_only   = atomic_only && meta.atomic && !meta.plain_access;
 				if (meta.descriptor_index >= stage->buffer_sources.size()) {
 					known = false;
 					continue;
@@ -1341,8 +1344,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 				}
 			}
 		}
-		FrameSkip::NoteCommittedDraw(buffer.GetShaders(), static_cast<bool>(shader_write_stages),
-		                             image_writes, atomic_only, known, ranges.data(), range_count);
+		FrameSkip::NoteCommittedDraw(buffer.GetShaders(), buffer_writes, image_writes, atomic_only,
+		                             known, ranges.data(), range_count);
 	}
 	if (shader_write_stages || HasAtomicWrites()) {
 		// Guest ranges of the draw's buffer accesses: atomics to buffers the stage accesses only
