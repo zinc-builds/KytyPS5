@@ -1909,7 +1909,9 @@ void DecodeThread::Run(Pm4Execution& exec, GuestGpu* gpu_state) {
 				verified = posted;
 			}
 		}
-		if (executor.CommitPosted(m_cp.CurrentBuffer())) {
+		// With verify, only what the shadow decode has checked.
+		if (executor.CommitPosted(m_cp.CurrentBuffer(),
+		                          verify ? verified : executor.QueuedPosted())) {
 			after_sync = false;
 			continue;
 		}

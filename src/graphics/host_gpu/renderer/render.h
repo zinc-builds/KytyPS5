@@ -305,12 +305,12 @@ public:
 	// Set while a decode thread posts (nullptr otherwise); the GPU thread commits with
 	// CommitPosted.
 	void SetDecodeHandoff(DecodeHandoff* handoff) { m_decode_handoff = handoff; }
-	// GPU thread: commits the posted draws, if any. False if none was posted.
-	bool CommitPosted(CommandBuffer& buffer) {
-		if (QueuedCount() == 0) {
+	// GPU thread: commits the posted draws through `through`, if any. False if none.
+	bool CommitPosted(CommandBuffer& buffer, uint64_t through) {
+		if (m_queued_taken >= through) {
 			return false;
 		}
-		while (QueuedCount() != 0) {
+		while (m_queued_taken < through) {
 			FinishQueuedDraw(buffer);
 		}
 		return true;
