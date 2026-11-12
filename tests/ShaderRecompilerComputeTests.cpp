@@ -55547,6 +55547,23 @@ static void CheckRangedStore() {
   const bool quiet = !DP::StoredSince(DP::StoredSequence(), label);
   Require("RangedStore", "open store", open_seen && closed_seen && quiet,
           "a store open at post time escaped adoption, or a later post still saw it");
+  // GPU writes by range (KYTY_RANGED_GPU_HAZARD): a mark after the post rejects only draws whose
+  // reads or walker pages it overlaps; one before the post rejects nothing.
+  if (DP::RangedGpuWritesEnabled()) {
+    DP::Log reads_log;
+    reads_log.reads = label;
+    const auto gpu_posted = DP::GpuWriteSequence();
+    const auto generation = DP::HazardGeneration();
+    DP::NoteGpuWrite(kWatched + 0x10u, 8);
+    const bool gpu_seen = DP::GpuWrittenSince(gpu_posted, reads_log) &&
+                          DP::GpuWrittenSince(gpu_posted, pages_log) &&
+                          !DP::GpuWrittenSince(gpu_posted, other_log);
+    const bool gpu_quiet = !DP::GpuWrittenSince(DP::GpuWriteSequence(), pages_log);
+    Require("RangedStore", "gpu writes", gpu_seen && gpu_quiet &&
+                                             DP::HazardGeneration() != generation,
+            "a GPU write over read bytes or pages was missed, an unrelated draw was hit, or the "
+            "generation did not move");
+  }
   std::printf("[host]    RangedStore                      ok\n");
 }
 

@@ -1831,13 +1831,14 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 }
 
 void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
-	queued.registers         = buffer.GetRegisters();
-	queued.user_config       = buffer.GetUserConfig();
-	queued.shaders           = buffer.GetShaders();
-	queued.hazard_generation = DrawPrepare::HazardGeneration();
-	queued.sync_epoch        = GuestSyncEpoch::CurrentUnranged();
-	queued.stored_sequence   = DrawPrepare::StoredSequence();
-	queued.sequence          = ++m_queued_posted;
+	queued.registers          = buffer.GetRegisters();
+	queued.user_config        = buffer.GetUserConfig();
+	queued.shaders            = buffer.GetShaders();
+	queued.hazard_generation  = DrawPrepare::HazardGeneration();
+	queued.sync_epoch         = GuestSyncEpoch::CurrentUnranged();
+	queued.stored_sequence    = DrawPrepare::StoredSequence();
+	queued.gpu_write_sequence = DrawPrepare::GpuWriteSequence();
+	queued.sequence           = ++m_queued_posted;
 	// The worker finds the slot from the sequence.
 	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||
 	        PrepareWorker(queued.sequence).Post() != PrepareJob(queued.sequence));
@@ -2115,7 +2116,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " worker_busy=%.1f%% (workers=%zu) texture_resolves=%" PRIu64
 			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%"
 			            " hazard_gpu=%" PRIu64 " hazard_epoch=%" PRIu64
-			            " kept_by_ranged=%" PRIu64 " walker_pages=%.2f pages_hist=%" PRIu64 "/%" PRIu64
+			            " kept_by_ranged=%" PRIu64 " kept_by_gpu_range=%" PRIu64 " walker_pages=%.2f pages_hist=%" PRIu64 "/%" PRIu64
 			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
@@ -2128,6 +2129,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            100.0 * static_cast<double>(stat.binding_reuses) /
 			                static_cast<double>(std::max<uint64_t>(stat.binding_sets, 1)),
 			            stat.hazard_gpu, stat.hazard_epoch, stat.kept_by_ranged,
+			            stat.kept_by_gpu_range,
 			            static_cast<double>(stat.walker_pages) /
 			                static_cast<double>(std::max<uint64_t>(stat.adopted, 1)),
 			            stat.page_buckets[0], stat.page_buckets[1], stat.page_buckets[2],
@@ -2184,18 +2186,19 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 	auto& pipelines = m_context.GetPipelineCache();
 	auto& buffers   = m_context.GetBufferCache();
 	bool  usable    = false;
+	static const bool ranged_gpu = DrawPrepare::RangedGpuWritesEnabled();
 	if (queued.log.failed) {
 		m_prepare_stat.failed++;
-	} else if (DrawPrepare::HazardGeneration() != queued.hazard_generation ||
-	           GuestSyncEpoch::CurrentUnranged() != queued.sync_epoch) {
-		// GPU-written bytes appeared, or the emulator stored into guest memory, while the
-		// worker read: the lookup here would have seen them.
+	} else if (GuestSyncEpoch::CurrentUnranged() != queued.sync_epoch) {
+		// The emulator stored into guest memory, unranged, while the worker read.
 		m_prepare_stat.hazard++;
-		if (DrawPrepare::HazardGeneration() != queued.hazard_generation) {
-			m_prepare_stat.hazard_gpu++;
-		} else {
-			m_prepare_stat.hazard_epoch++;
-		}
+		m_prepare_stat.hazard_epoch++;
+	} else if (ranged_gpu ? DrawPrepare::GpuWrittenSince(queued.gpu_write_sequence, queued.log)
+	                      : DrawPrepare::HazardGeneration() != queued.hazard_generation) {
+		// Bytes the worker read (or, unranged, any bytes) became GPU-written: the lookup here
+		// would have synchronized them.
+		m_prepare_stat.hazard++;
+		m_prepare_stat.hazard_gpu++;
 	} else if (DrawPrepare::StoredSince(queued.stored_sequence, queued.log)) {
 		// A readback published bytes the worker read.
 		m_prepare_stat.stored++;
@@ -2220,6 +2223,9 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 	if (m_prepare_stats) {
 		if (DrawPrepare::StoredSequence() != queued.stored_sequence) {
 			m_prepare_stat.kept_by_ranged++;
+		}
+		if (DrawPrepare::HazardGeneration() != queued.hazard_generation) {
+			m_prepare_stat.kept_by_gpu_range++;
 		}
 		auto pages = queued.log.pages;
 		std::ranges::sort(pages);
