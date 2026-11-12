@@ -426,6 +426,17 @@ layout noise.
 - Cost: ~200 lines plus 2–5 per switch. Worth building when Track B's run-level commit cuts
   (each kill-switched, ~150–270 ns/draw) need FPS numbers of record.
 
+## Frame pacing (Track R, 2026-11-12)
+
+The target is p99 = 1 refresh (`flip_vbl` p99 1), not only the mean. On Sky Garden 1000–1600
+(before early submit) 7.0% of presented frames took two refreshes. A replay of the measured guest
+frames against the display (`tools/astro-bench/framemodel.py`, within 0.5 points of the measured
+share) says p99 = 1 needs a mean guest frame of ~16.0–16.4 ms: ~1.5 ms less command-thread work
+per frame, or ~1 ms with the guest-late idle gone; the periodic prepare spike and compiles are
+small. FINDINGS, "Frame pacing", has the cause and headroom tables. Judge pacing changes with
+`KYTY_FRAME_DIAG=1` and `framemodel.py` besides `cmd_ns`, and attribute work only per guest frame
+(`GFRAME`), never per presented frame.
+
 ## Status
 
 | Track | Current step | Notes |
