@@ -29,6 +29,10 @@ enum class Counter {
 	BufferCreates,
 	CmdGpuWaits,  // the command thread blocked on the GPU timeline (MasterSemaphore::Wait)
 	CmdGpuWaitNs,
+	CmdIdles,     // the command thread waited for guest work (nothing queued)
+	CmdIdleNs,
+	CmdBlocks,    // the command thread waited with only blocked submissions queued
+	CmdBlockedNs,
 	Count
 };
 
@@ -36,7 +40,12 @@ namespace Detail {
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 } // namespace Detail
 
-[[nodiscard]] bool Enabled() noexcept;
+[[nodiscard]] bool ReadEnabled() noexcept;
+// Inline so that the disabled path costs a guard check, not a call.
+[[nodiscard]] inline bool Enabled() noexcept {
+	static const bool enabled = ReadEnabled();
+	return enabled;
+}
 
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	if (Enabled()) {

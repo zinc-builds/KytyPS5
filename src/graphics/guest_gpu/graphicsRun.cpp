@@ -500,6 +500,8 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					{
+						Common::FrameDiag::Scope       frame_diag(Common::FrameDiag::Counter::CmdBlocks,
+						                                          Common::FrameDiag::Counter::CmdBlockedNs);
 						Common::StallDiag::Scope       stall(Common::StallDiag::Cause::CmdBlocked);
 						Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Idle);
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
