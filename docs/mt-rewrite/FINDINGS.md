@@ -1541,6 +1541,24 @@ Results (plain build, same binary, mode on vs off):
   - elements: ~1.08k alive (peak 1.5k), ~470k one-draw conflict elements per run, 127 samplers.
 - **Off mode** against the merge-base: `cmd_ns` −0.94% ±0.98 `~`, `cpd` −0.22% `~`, `ipd` +0.74% `!` (two binaries).
 
+### Run-level commit: parked, instruction cuts that don't become cycles (Track B, 2026-11-12)
+
+A draw that continues a run (same target registers, nothing drawn in between, no run epoch moved) skips work the previous draw already did. Three pieces were built, verified, and parked on branches:
+
+| Piece | Branch | Hit rate | ipd | cpd | FPS |
+|---|---|---|---|---|---|
+| Run-level render targets (#89, draft) | `trackB/run-targets` | 86% of draws continue a run; 42% keep their targets | −4.64% ±0.12 `!` | −1.23% ±1.00 `~` | −0.3% `~` |
+| + a depth target tracked per subresource keeps the run (`Image::TransitKeeps`) | `trackB/run-target-regs` | targets kept 41% → 75% | −1.16% ±0.25 `!` | −0.93% ±1.28 `~` | +2.9% `~` |
+| + the pipeline by interned worker key id (cut 3, `KYTY_PIPELINE_IDS`) | `trackB/pipeline-ids` | 68.5% of draws reuse the last pipeline | −1.13% ±0.15 `!` | +0.46% ±0.89 `~` | −1.3% `~` |
+
+- All are same-binary A/Bs through the kill switch, 4 runs a side, frames 200–500, plain build. Verify is clean for each (1.5M run draws).
+- **Conclusion:** instruction cuts of 1–5% on the command thread land at 0 to −1.2% cycles. The thread is ~41% memory-stalled, and the removed work overlapped the stalls. Resident textures showed the same pattern (−10% instructions, −2.5% cycles).
+- **When to revisit:** after B4's hand-off stages B–D and the prefetch change the stall picture. Measure all three together, same binary, on the PGO build.
+- **Correctness lessons** (Sol, three rounds on #89):
+  - **The run baseline must be the epochs from before the first target resolve.** It must also be rechecked at every skip. Otherwise an epoch move during the commit (this draw's bindings marking a target's metadata GPU-written; another thread's store) is absorbed and a later draw skips a needed color clear.
+  - **Verify must assert the skipped work had no effect at all** (clear work, stores by this thread, flags, layout), not only that it found the same image. The global guest-sync epoch also moves for the priority thread's stores, so verify counts this thread's own stores.
+- Value-change detection for the target registers, done by comparing the registers at post, cost what it saved (cycles +0.7% `~`). B4's line-change mask (#104) replaces it.
+
 ### The command thread's own data misses, by level (Track B, 2026-11-12)
 
 How it was measured:
