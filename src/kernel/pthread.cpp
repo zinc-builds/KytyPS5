@@ -374,6 +374,15 @@ struct PthreadAttrPrivate {
 	pthread_attr_t p;
 };
 
+// A guest priority may be read by its thread (placement) while another thread changes it, so
+// every access is atomic.
+static int LoadPriority(const int& priority) {
+	return std::atomic_ref<int>(const_cast<int&>(priority)).load(std::memory_order_relaxed);
+}
+static void StorePriority(int& priority, int value) {
+	std::atomic_ref<int>(priority).store(value, std::memory_order_relaxed);
+}
+
 struct PthreadGuestData {
 	int32_t thread_id;
 	uint8_t reserved[4092];
@@ -1991,7 +2000,7 @@ int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedP
 	int result = pthread_attr_getschedparam(&(*attr)->p, param);
 
 	// Host priority mapping is lossy; return the exact guest value.
-	param->sched_priority = (*attr)->guest_priority;
+	param->sched_priority = LoadPriority((*attr)->guest_priority);
 
 	if (result == 0) {
 		return OK;
@@ -2168,7 +2177,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 	}
 #endif
 
-	attr_value->guest_priority = param->sched_priority;
+	StorePriority(attr_value->guest_priority, param->sched_priority);
 	return OK;
 }
 
@@ -2936,6 +2945,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
 	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Cond, reinterpret_cast<uintptr_t>(cond));
+
+	PthreadPlacementCheck();
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3094,7 +3105,7 @@ namespace {
 
 // A guest thread's priority: written by PthreadSetprio on any thread, read by the thread itself.
 int LoadGuestPriority(Pthread thread) {
-	return std::atomic_ref<int>(thread->attr->guest_priority).load(std::memory_order_relaxed);
+	return LoadPriority(thread->attr->guest_priority);
 }
 
 #if defined(__linux__)
@@ -3609,7 +3620,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 #endif
 
 	// The thread re-places itself at its next wait (PthreadPlacementCheck).
-	std::atomic_ref<int>(thread->attr->guest_priority).store(prio, std::memory_order_relaxed);
+	StorePriority(thread->attr->guest_priority, prio);
 	if (thread == g_pthread_self) {
 		PthreadPlacementCheck();
 	}
@@ -3946,6 +3957,8 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sleep, static_cast<uint64_t>(seconds) * 1000000u);
+
+	PthreadPlacementCheck();
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
 	return OK;
 }

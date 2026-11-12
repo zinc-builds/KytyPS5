@@ -335,5 +335,6 @@ TEST(HybridAffinity, OnlyARaisedGraphicsSubmitterSetsTheBar) {
 	EXPECT_FALSE(RaiseGuestPriorityBar(650, true)); // a higher-priority submitter keeps the bar
 	EXPECT_TRUE(RaiseGuestPriorityBar(690, true));  // a second, lower-priority submitter lowers it
 	EXPECT_EQ(GuestPriorityBar().load(), 690);
+	GuestPriorityBar().store(-1); // leave no bar behind (--gtest_repeat)
 }
 #endif
