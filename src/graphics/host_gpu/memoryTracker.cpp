@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/pageVersions.h"
 #include "graphics/host_gpu/memoryTracker.h"
 
 #include "common/alignment.h"
@@ -96,6 +97,7 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
+	PageVersions::Bump(vaddr, size);
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(offset, bytes);

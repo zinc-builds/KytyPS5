@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/pageVersions.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/memDiag.h"
@@ -897,7 +898,9 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool range
 	                         ? Graphics::GuestSyncEpoch::AdvanceRanged
 	                            : Graphics::GuestSyncEpoch::Advance;
 	advance();
+	Graphics::PageVersions::BeginStore(vaddr, size);
 	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	Graphics::PageVersions::EndStore(vaddr, size);
 	advance();
 	return written;
 }
@@ -911,14 +914,18 @@ bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 		}
 	};
 	advance();
+	Graphics::PageVersions::BeginStore(vaddr, size);
 	const bool written = g_guest_address_space->TryStoreLabelBacking(vaddr, value, size);
+	Graphics::PageVersions::EndStore(vaddr, size);
 	advance();
 	return written;
 }
 
 bool TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value) {
 	Graphics::GuestSyncEpoch::Advance();
+	Graphics::PageVersions::BeginStore(vaddr, size);
 	const bool written = g_guest_address_space->TryFillBacking(vaddr, size, value);
+	Graphics::PageVersions::EndStore(vaddr, size);
 	Graphics::GuestSyncEpoch::Advance();
 	return written;
 }

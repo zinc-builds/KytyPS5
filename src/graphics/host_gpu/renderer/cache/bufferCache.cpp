@@ -2151,6 +2151,12 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source) 
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
 	m_bda_sync.Add(begin, end - begin);
+	static const bool lead = std::getenv("KYTY_BDA_LEAD_STATS") != nullptr;
+	if (lead) {
+		m_bda_lead_pending.emplace_back(
+		    static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+		    end - begin);
+	}
 	if (MemDiag::BdaStatsMode() != 0) {
 		BdaStats::g_queued[static_cast<int>(source)].Add(begin, end - begin);
 	}
@@ -2158,6 +2164,42 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source) 
 
 RangeSet BufferCache::TakeBdaSync() {
 	std::lock_guard lock(m_bda_sync_mutex);
+	static const bool lead = std::getenv("KYTY_BDA_LEAD_STATS") != nullptr;
+	if (lead) {
+		// Bytes by time from queueing (a collection or store) to this take, and per second.
+		static constexpr uint64_t Bounds[] = {10'000, 50'000, 100'000, 250'000, 500'000,
+		                                      1'000'000, 2'000'000, 5'000'000, ~uint64_t {0}};
+		static uint64_t bytes[std::size(Bounds)] = {};
+		static uint64_t takes = 0, ranges = 0, empty_takes = 0, start = 0;
+		const auto now = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+		takes++;
+		empty_takes += m_bda_lead_pending.empty() ? 1 : 0;
+		for (const auto& [t, size]: m_bda_lead_pending) {
+			const auto lead_ns = now - t;
+			size_t     i       = 0;
+			while (lead_ns >= Bounds[i]) {
+				i++;
+			}
+			bytes[i] += size;
+			ranges++;
+		}
+		m_bda_lead_pending.clear();
+		if (start == 0) {
+			start = now;
+		} else if (now - start >= 1'000'000'000ull) {
+			uint64_t total = 0;
+			for (auto b: bytes) total += b;
+			std::printf("BDALEAD takes=%llu empty=%llu ranges=%llu kb=%llu pct<10us/50/100/250/500us/1/2/5ms/more=",
+			            (unsigned long long)takes, (unsigned long long)empty_takes,
+			            (unsigned long long)ranges, (unsigned long long)(total / 1024));
+			for (auto b: bytes) std::printf("%.1f/", total ? 100.0 * double(b) / double(total) : 0.0);
+			std::printf("\n");
+			std::fflush(stdout);
+			std::fill(std::begin(bytes), std::end(bytes), 0);
+			takes = ranges = empty_takes = 0;
+			start = now;
+		}
+	}
 	if (MemDiag::BdaStatsMode() != 0) {
 		for (int k = 0; k < BdaStats::SOURCES; k++) {
 			BdaStats::g_taken[k] = std::exchange(BdaStats::g_queued[k], {});

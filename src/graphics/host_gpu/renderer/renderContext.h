@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/kernelStats.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/pageVersions.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -123,6 +124,7 @@ public:
 	// Where that raises no write fault (asynchronous write protection), invalidate as one would.
 	void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		VerifyNoteGpuWrite(vaddr, size);
+		PageVersions::Bump(vaddr, size);
 		if (LibKernel::Memory::IsAsyncWriteTracked(vaddr, size)) {
 			(void)InvalidateMemory(vaddr, size);
 		}

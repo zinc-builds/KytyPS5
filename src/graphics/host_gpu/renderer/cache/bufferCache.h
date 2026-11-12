@@ -263,6 +263,8 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	// WIP KYTY_BDA_LEAD_STATS: when each queued range arrived (ns), and its size.
+	std::vector<std::pair<uint64_t, uint64_t>>        m_bda_lead_pending;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
