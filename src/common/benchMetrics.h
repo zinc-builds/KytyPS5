@@ -78,6 +78,11 @@ void RegisterPrepareWorker(uint32_t index, const std::atomic<uint64_t>* busy_ns,
 // One METRICS line (cumulative values, no trailing newline), or empty when compiled out.
 // `frames` and `t` are the PERF line's, so the scripts can match the two lines.
 [[nodiscard]] std::string Line(uint64_t frames, double t, uint64_t draws);
+// For per-frame diagnostics (frameDiag.h): a role's thread id (0: none yet), a counter's value
+// and the prepare workers' summed busy time.
+[[nodiscard]] int      ThreadId(Role role);
+[[nodiscard]] uint64_t Value(Counter counter);
+[[nodiscard]] uint64_t PrepareBusyNs();
 // A BUILD line naming the binary's revision.
 [[nodiscard]] std::string BuildLine();
 

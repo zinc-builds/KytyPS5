@@ -3,6 +3,7 @@
 
 #include "common/benchMetrics.h"
 #include "common/debugCounters.h"
+#include "common/frameDiag.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
 #include "graphics/guest_gpu/frameSkip.h"
@@ -755,11 +756,21 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
-	std::scoped_lock lock(g_frame_mutex);
-	g_frames.Record(Clock::now(), ReadCounters());
-	g_flip_count.store(g_frames.total_flips, std::memory_order_relaxed);
-	g_frames.guest_width  = guest_width;
-	g_frames.guest_height = guest_height;
+	const auto now = Clock::now();
+	double     interval_ms = 0.0;
+	uint64_t   frame       = 0;
+	{
+		std::scoped_lock lock(g_frame_mutex);
+		if (g_frames.last_flip != Clock::time_point {}) {
+			interval_ms = std::chrono::duration<double, std::milli>(now - g_frames.last_flip).count();
+		}
+		g_frames.Record(now, ReadCounters());
+		frame = g_frames.total_flips;
+		g_flip_count.store(frame, std::memory_order_relaxed);
+		g_frames.guest_width  = guest_width;
+		g_frames.guest_height = guest_height;
+	}
+	Common::FrameDiag::OnFlip(frame, interval_ms);
 }
 
 uint64_t PerformanceOverlayFlipCount() noexcept {

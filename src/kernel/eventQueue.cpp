@@ -1,4 +1,5 @@
 #include "kernel/eventQueue.h"
+#include "common/frameDiag.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -412,15 +413,23 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
-	if (timo == nullptr) {
-		*out = owner->WaitForEvents(ev, num, 0);
-	}
+	{
+		Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Equeue);
+		if (timo == nullptr) {
+			*out = owner->WaitForEvents(ev, num, 0);
+		}
 
-	if (timo != nullptr) {
-		if (*timo == 0) {
-			*out = owner->GetTriggeredEvents(ev, num);
-		} else {
-			*out = owner->WaitForEvents(ev, num, *timo);
+		if (timo != nullptr) {
+			if (*timo == 0) {
+				*out = owner->GetTriggeredEvents(ev, num);
+			} else {
+				*out = owner->WaitForEvents(ev, num, *timo);
+			}
+		}
+		if (*out > 0) {
+			// The first event: filter (16 bits) and ident (low 32 bits).
+			diag_wait.SetIdent((static_cast<uint64_t>(static_cast<uint16_t>(ev[0].filter)) << 32) |
+			                   static_cast<uint32_t>(ev[0].ident));
 		}
 	}
 
