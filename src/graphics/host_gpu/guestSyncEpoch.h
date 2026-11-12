@@ -21,7 +21,12 @@ inline std::atomic<uint64_t> g_unranged_epoch {1};
 // epoch.
 inline thread_local bool g_stores_ranged = false;
 
+// Stores this thread advanced the epoch for (KYTY_RUN_STATE=verify tells its own from other
+// threads').
+inline thread_local uint64_t t_advances = 0;
+
 inline void Advance() noexcept {
+	t_advances++;
 	g_unranged_epoch.fetch_add(1, std::memory_order_acq_rel);
 	g_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -29,6 +34,7 @@ inline void Advance() noexcept {
 // For a store whose range the caller also records with DrawPrepare::OpenStoredRange and
 // CloseStoredRange.
 inline void AdvanceRanged() noexcept {
+	t_advances++;
 	g_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 

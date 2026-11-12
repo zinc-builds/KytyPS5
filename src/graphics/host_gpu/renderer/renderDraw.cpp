@@ -472,8 +472,12 @@ int RenderExecutor::RunStateMode() {
 
 RenderExecutor::RunResolveCheck RenderExecutor::TakeRunResolveCheck(ImageId id) const {
 	auto&       cache = m_context.GetTextureCache();
-	const auto& image = cache.GetImage(id);
-	return {CurrentRunEpochs(),
+	const auto& image  = cache.GetImage(id);
+	auto        epochs = CurrentRunEpochs();
+	// The guest-sync epoch also moves for other threads' stores (the priority thread's
+	// downloads): only this thread's own count says the resolve stored.
+	epochs.sync = GuestSyncEpoch::t_advances;
+	return {epochs,
 	        cache.ColorClearWork(),
 	        image.settled.load(std::memory_order_acquire),
 	        image.target_settled.load(std::memory_order_acquire),

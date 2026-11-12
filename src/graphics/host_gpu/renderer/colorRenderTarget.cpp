@@ -26,6 +26,29 @@
 
 namespace Libs::Graphics {
 
+// KYTY_RUN_STATE=verify: what a skipped target resolve changed.
+std::string RenderExecutor::DescribeRunResolveChange(const RunResolveCheck& a,
+                                                     const RunResolveCheck& b) {
+	std::string out;
+	const auto  add = [&](const char* name, uint64_t x, uint64_t y) {
+		if (x != y) {
+			out += fmt::format("{} {}->{} ", name, x, y);
+		}
+	};
+	add("sync", a.epochs.sync, b.epochs.sync);
+	add("hazard", a.epochs.hazard, b.epochs.hazard);
+	add("color_checks", a.epochs.color_checks, b.epochs.color_checks);
+	add("binding", a.epochs.binding, b.epochs.binding);
+	add("gc", a.epochs.gc, b.epochs.gc);
+	add("color_clear_work", a.color_clear_work, b.color_clear_work);
+	add("settled", a.settled, b.settled);
+	add("target_settled", a.target_settled, b.target_settled);
+	add("layout", static_cast<uint64_t>(a.layout), static_cast<uint64_t>(b.layout));
+	add("access", static_cast<uint64_t>(a.access), static_cast<uint64_t>(b.access));
+	add("subresources", a.subresources, b.subresources);
+	return out;
+}
+
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
 		case Prospero::ChannelLayout::k10_10_10_2:
@@ -523,10 +546,11 @@ void RenderExecutor::ResolveProposedDepthTarget(CommandBuffer&                 b
 		EXIT("KYTY_RUN_STATE=verify: the depth target of a run is image %u, not %u\n",
 		     static_cast<uint32_t>(r.image_id.index), static_cast<uint32_t>(run_id.index));
 	}
-	if (run && !(TakeRunResolveCheck(run_id) == run_check)) {
+	if (const auto now = run ? TakeRunResolveCheck(run_id) : RunResolveCheck {};
+	    run && !(now == run_check)) {
 		EXIT("KYTY_RUN_STATE=verify: the skipped resolve of the depth target (image %u) had work "
-		     "to do\n",
-		     static_cast<uint32_t>(run_id.index));
+		     "to do: %s\n",
+		     static_cast<uint32_t>(run_id.index), DescribeRunResolveChange(run_check, now).c_str());
 	}
 	if (WorkerTargetsVerify()) {
 		const auto&     hw = buffer.GetRegisters();
@@ -615,10 +639,11 @@ void RenderExecutor::ResolveProposedColorTarget(CommandBuffer&                 b
 	}
 	// The skipped resolve must have had no effect at all: no clear, refresh, store, registration
 	// or state change.
-	if (run && !(TakeRunResolveCheck(run_id) == run_check)) {
+	if (const auto now = run ? TakeRunResolveCheck(run_id) : RunResolveCheck {};
+	    run && !(now == run_check)) {
 		EXIT("KYTY_RUN_STATE=verify: the skipped resolve of color target slot %u (image %u) had "
-		     "work to do\n",
-		     slot, static_cast<uint32_t>(run_id.index));
+		     "work to do: %s\n",
+		     slot, static_cast<uint32_t>(run_id.index), DescribeRunResolveChange(run_check, now).c_str());
 	}
 	if (WorkerTargetsVerify()) {
 		const auto& hw   = buffer.GetRegisters();

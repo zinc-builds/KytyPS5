@@ -632,6 +632,8 @@ private:
 		bool             operator==(const RunResolveCheck&) const = default;
 	};
 	[[nodiscard]] RunResolveCheck TakeRunResolveCheck(ImageId id) const;
+	[[nodiscard]] static std::string DescribeRunResolveChange(const RunResolveCheck& a,
+	                                                     const RunResolveCheck& b);
 	[[nodiscard]] static int RunStateMode();
 	[[nodiscard]] RunEpochs  CurrentRunEpochs() const;
 	[[nodiscard]] bool       RunTargetsValid() const {
