@@ -1512,6 +1512,41 @@ static uint64_t IndirectSourceHash(const uint32_t* packet) {
 	return source == nullptr ? 0 : DecodeHash(source, uint64_t {count} * 8u);
 }
 
+static std::string UserConfigDiff(const HW::UserConfig& a, const HW::UserConfig& b) {
+	std::string diff;
+	const auto  note = [&](bool same, const char* what) {
+		if (!same) {
+			diff += diff.empty() ? what : std::string(" ") + what;
+		}
+	};
+	note(a.GetPrimType() == b.GetPrimType(), "prim_type");
+	note(a.GetIndexOffset() == b.GetIndexOffset(), "index_offset");
+	note(a.GetObjectId() == b.GetObjectId(), "object_id");
+	note(a.GetPrimitiveResetControl() == b.GetPrimitiveResetControl(), "reset_control");
+	note(a.GetGeControl().primitive_group_size == b.GetGeControl().primitive_group_size &&
+	         a.GetGeControl().vertex_group_size == b.GetGeControl().vertex_group_size,
+	     "ge_cntl");
+	note(a.GetGeUserVgprEn().vgpr1 == b.GetGeUserVgprEn().vgpr1 &&
+	         a.GetGeUserVgprEn().vgpr2 == b.GetGeUserVgprEn().vgpr2 &&
+	         a.GetGeUserVgprEn().vgpr3 == b.GetGeUserVgprEn().vgpr3,
+	     "ge_user_vgpr_en");
+	return diff.empty() ? diff : "user config (" + diff + ")";
+}
+
+static std::string BytesDiff(const void* a, const void* b, size_t size, const char* what) {
+	const auto* x = static_cast<const uint8_t*>(a);
+	const auto* y = static_cast<const uint8_t*>(b);
+	for (size_t i = 0; i < size; i++) {
+		if (x[i] != y[i]) {
+			char text[96];
+			std::snprintf(text, sizeof(text), "%s (byte %zu of %zu: 0x%02x vs 0x%02x)", what, i, size,
+			              x[i], y[i]);
+			return text;
+		}
+	}
+	return {};
+}
+
 void CommandProcessor::CopyDecodeState(const CommandProcessor& from) {
 	m_ctx                              = from.m_ctx;
 	m_saved_ctx                        = from.m_saved_ctx;
@@ -1538,8 +1573,13 @@ std::string CommandProcessor::DecodeStateDiff(const CommandProcessor& other) con
 	note(m_saved_ctx.has_value() == other.m_saved_ctx.has_value() &&
 	         (!m_saved_ctx.has_value() || m_saved_ctx->SameRegisters(*other.m_saved_ctx)),
 	     "saved context");
-	note(std::memcmp(&m_ucfg, &other.m_ucfg, sizeof(m_ucfg)) == 0, "user config");
-	note(std::memcmp(&m_sh_ctx, &other.m_sh_ctx, sizeof(m_sh_ctx)) == 0, "shader registers");
+	if (const auto d = UserConfigDiff(m_ucfg, other.m_ucfg); !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
+	if (const auto d = BytesDiff(&m_sh_ctx, &other.m_sh_ctx, sizeof(m_sh_ctx), "shader registers");
+	    !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
 	note(m_index_type_and_size == other.m_index_type_and_size &&
 	         m_index_buffer_size == other.m_index_buffer_size &&
 	         m_index_base_addr == other.m_index_base_addr,
@@ -1570,10 +1610,14 @@ std::string CommandProcessor::ShadowDrawDiff(const CommandProcessor& shadow, uin
 		return diff;
 	}
 	note(queued.registers->SameRegisters(shadow.m_ctx), "context registers");
-	note(std::memcmp(&queued.user_config, &shadow.m_ucfg, sizeof(queued.user_config)) == 0,
-	     "user config");
-	note(std::memcmp(&queued.shaders, &shadow.m_sh_ctx, sizeof(queued.shaders)) == 0,
-	     "shader registers");
+	if (const auto d = UserConfigDiff(queued.user_config, shadow.m_ucfg); !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
+	if (const auto d =
+	        BytesDiff(&queued.shaders, &shadow.m_sh_ctx, sizeof(queued.shaders), "shader registers");
+	    !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
 	note(queued.indexed == draw.indexed, "kind");
 	if (queued.indexed && draw.indexed) {
 		const auto& a = queued.index_args;
