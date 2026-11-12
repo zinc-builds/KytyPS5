@@ -2113,7 +2113,10 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " gpu_written=%" PRIu64 " verified=%" PRIu64 " wait_ns_per_draw=%.0f (waits=%" PRIu64
 			            " drains=%" PRIu64 ") worker_ns_per_draw=%.0f"
 			            " worker_busy=%.1f%% (workers=%zu) texture_resolves=%" PRIu64
-			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%\n",
+			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%"
+			            " hazard_gpu=%" PRIu64 " hazard_epoch=%" PRIu64
+			            " kept_by_ranged=%" PRIu64 " walker_pages=%.2f pages_hist=%" PRIu64 "/%" PRIu64
+			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
@@ -2123,7 +2126,13 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            m_prepare_lanes.size(), stat.texture_updates,
 			            stat.texture_generation_refreshes,
 			            100.0 * static_cast<double>(stat.binding_reuses) /
-			                static_cast<double>(std::max<uint64_t>(stat.binding_sets, 1)));
+			                static_cast<double>(std::max<uint64_t>(stat.binding_sets, 1)),
+			            stat.hazard_gpu, stat.hazard_epoch, stat.kept_by_ranged,
+			            static_cast<double>(stat.walker_pages) /
+			                static_cast<double>(std::max<uint64_t>(stat.adopted, 1)),
+			            stat.page_buckets[0], stat.page_buckets[1], stat.page_buckets[2],
+			            stat.page_buckets[3], stat.page_buckets[4], stat.page_buckets[5],
+			            stat.page_buckets[6], stat.page_buckets[7]);
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;
@@ -2182,7 +2191,12 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		// GPU-written bytes appeared, or the emulator stored into guest memory, while the
 		// worker read: the lookup here would have seen them.
 		m_prepare_stat.hazard++;
-	} else if (DrawPrepare::StoredSince(queued.stored_sequence, queued.log.reads)) {
+		if (DrawPrepare::HazardGeneration() != queued.hazard_generation) {
+			m_prepare_stat.hazard_gpu++;
+		} else {
+			m_prepare_stat.hazard_epoch++;
+		}
+	} else if (DrawPrepare::StoredSince(queued.stored_sequence, queued.log)) {
 		// A readback published bytes the worker read.
 		m_prepare_stat.stored++;
 	} else if (std::ranges::any_of(queued.log.reads, [&](const auto& read) {
@@ -2203,6 +2217,16 @@ void RenderExecutor::AdoptPrograms(QueuedDraw& queued, DrawRenderState& state) {
 		return;
 	}
 	m_prepare_stat.adopted++;
+	if (m_prepare_stats) {
+		if (DrawPrepare::StoredSequence() != queued.stored_sequence) {
+			m_prepare_stat.kept_by_ranged++;
+		}
+		auto pages = queued.log.pages;
+		std::ranges::sort(pages);
+		const auto distinct = static_cast<uint64_t>(std::unique(pages.begin(), pages.end()) - pages.begin());
+		m_prepare_stat.walker_pages += distinct;
+		m_prepare_stat.page_buckets[distinct == 0 ? 0 : std::min<uint64_t>(std::bit_width(distinct), 7)]++;
+	}
 	if (queued.buffers.ready) {
 		// FindBuffers and ObtainBuffer use the worker's buffer side while it holds.
 		m_adopted_buffers = &queued.buffers;

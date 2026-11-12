@@ -119,6 +119,16 @@ void GetSrtWalkerGuestAccess(const void* const** regions, uint64_t* pages_offset
 // read-watched), so a prepare worker's reads of those bytes are logged (DrawPrepare reads).
 // Otherwise the walker loads them in place, unlogged.
 [[nodiscard]] bool SrtWalkerReadsLogged(uint64_t address, uint64_t size);
+// While set on this thread, each walk appends the 4 KiB pages of all its guest loads, watched or
+// not (from the walk's load captures), to `pages`: consecutive repeats are dropped, so the list
+// is short but may hold a page more than once. Null: no page log.
+void SetSrtWalkerPageLog(std::vector<uint64_t>* pages);
+// Appends the 4 KiB pages of loads of `bytes` bytes at `addresses` (a load crossing a page
+// boundary adds both pages), dropping a page equal to the last one appended.
+void AppendSrtLoadPages(std::span<const uint64_t> addresses, uint64_t bytes,
+                        std::vector<uint64_t>& pages);
+// Whether walks on prepare workers log their pages (KYTY_WALKER_PAGE_LOG, default on).
+[[nodiscard]] bool SrtWalkerPageLogEnabled();
 // While set on this thread, walker loads of GPU-written bytes evaluate as unknown instead of
 // waiting for the GPU. Unknown branch conditions keep every successor reachable; a walk that
 // needs such a value fails, and MaterializeResources then repeats it with the wait.

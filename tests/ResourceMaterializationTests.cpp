@@ -394,6 +394,19 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
         "cyclic SRT read-first-lane dependency was accepted");
 }
 
+void TestSrtLoadPages() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  std::vector<uint64_t> pages;
+  // A DWORD crossing 0x2000 logs both pages; repeats of the last page are dropped.
+  const uint64_t loads[] = {0x1ffeu, 0x2004u, 0x2ff0u, 0x5000u};
+  AppendSrtLoadPages(loads, 4u, pages);
+  Check(pages == std::vector<uint64_t>{1u, 2u, 5u}, "load pages: crossing or repeats wrong");
+  pages.clear();
+  const uint64_t aligned[] = {0x1ffcu};
+  AppendSrtLoadPages(aligned, 4u, pages);
+  Check(pages == std::vector<uint64_t>{1u}, "load pages: an aligned DWORD logged two pages");
+}
+
 void TestSrtAliasesShareReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = SrtProgram(0x1000u);
@@ -445,6 +458,16 @@ void TestSrtAliasesShareReads() {
   Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
             reads.count == 3,
         "normalized aliases changed nested reads or repeated a shared read");
+  // With the page log on, the walk logs the page of every load (watched or not).
+  std::vector<uint64_t> logged;
+  SetSrtWalkerPageLog(&logged);
+  Check(WalkSrt(plan, {}, flat, nullptr), "walk with page log failed");
+  SetSrtWalkerPageLog(nullptr);
+  std::ranges::sort(logged);
+  logged.erase(std::unique(logged.begin(), logged.end()), logged.end());
+  Check(logged == std::vector<uint64_t>{1u, 2u, 3u}, "page log missed a walker load");
+  const auto pages_logged = logged.size();
+  Check(WalkSrt(plan, {}, flat, nullptr) && logged.size() == pages_logged, "page log grew while off");
   // An unreadable pointer reads as zero, and so does the null table it yields.
   reads = {.dirty = true};
   Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0u, 0x2222u, 0u} &&
@@ -1564,6 +1587,7 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestSrtLoadPages();
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();

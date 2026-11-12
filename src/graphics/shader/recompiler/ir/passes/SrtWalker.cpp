@@ -180,6 +180,7 @@ struct WalkerGuestAccess {
 WalkerGuestAccess g_walker_access;
 
 thread_local bool t_unknown_gpu_writes = false;
+thread_local std::vector<uint64_t>* t_page_log = nullptr;
 thread_local bool t_unknown_gpu_writes_seen = false;
 
 // Reads a DWORD of a read-watched page without faulting. Bit 32 set: rax[31:0] holds it. Bit 33
@@ -1542,11 +1543,44 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	                                                     scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
+	const auto* first = scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
-		for (auto* read = scratch.data() + plan.srt_captures / 8u; read != end; ++read)
+		for (auto* read = first; read != end; ++read)
 			reads->emplace_back(*read, sizeof(uint32_t));
 	}
+	if (auto* pages = t_page_log; pages != nullptr) {
+		// Walker loads are DWORD-aligned DWORDs (LoadAddressU32 clears the low address bits), so
+		// none crosses a page today; AppendSrtLoadPages covers one that would.
+		AppendSrtLoadPages(std::span<const uint64_t>(first, end), sizeof(uint32_t), *pages);
+	}
 	return true;
+}
+
+void AppendSrtLoadPages(std::span<const uint64_t> addresses, uint64_t bytes,
+                        std::vector<uint64_t>& pages) {
+	uint64_t last = pages.empty() ? UINT64_MAX : pages.back();
+	for (const auto address: addresses) {
+		const uint64_t first_page = address >> 12u;
+		const uint64_t last_page  = (address + std::max<uint64_t>(bytes, 1u) - 1u) >> 12u;
+		for (auto page = first_page; page <= last_page; page++) {
+			if (page != last) {
+				pages.push_back(page);
+				last = page;
+			}
+		}
+	}
+}
+
+void SetSrtWalkerPageLog(std::vector<uint64_t>* pages) {
+	t_page_log = pages;
+}
+
+bool SrtWalkerPageLogEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WALKER_PAGE_LOG");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
 }
 
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {

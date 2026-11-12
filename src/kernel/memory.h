@@ -133,7 +133,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
-// `ranged`: the caller records the range with DrawPrepare::NoteStoredRange around the store.
+// `ranged`: the caller records the range with DrawPrepare::OpenStoredRange and CloseStoredRange
+// around the store.
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged = false);
 // One aligned 4- or 8-byte store through the backing (a label: never written twice).
 bool                   TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size);

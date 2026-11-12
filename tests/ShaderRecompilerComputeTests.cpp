@@ -55512,7 +55512,7 @@ static void CheckRangedStore() {
     watched_ranged = outer.Ranged() && Epoch::g_stores_ranged;
     {
       DP::RangedStore inner(kWatched + 0x1000u, 256); // the next page: not watched
-      unwatched_ranged = inner.Ranged() || Epoch::g_stores_ranged;
+      unwatched_ranged = inner.Ranged() && Epoch::g_stores_ranged;
     }
     outer_kept = Epoch::g_stores_ranged;
   }
@@ -55520,8 +55520,10 @@ static void CheckRangedStore() {
   IR::SetSrtWalkerGuestAccess(saved_regions, saved_offset, saved_read);
   Require("RangedStore", "watched page", watched_ranged,
           "a store to a read-watched page was not ranged");
-  Require("RangedStore", "unwatched page", !unwatched_ranged,
-          "a store to a page the walker reads unlogged was ranged");
+  // With the walker's page log (the default) every worker read is logged, so every store is
+  // ranged; without it the walker reads unwatched pages unlogged.
+  Require("RangedStore", "unwatched page", unwatched_ranged == IR::SrtWalkerPageLogEnabled(),
+          "a store to a page the walker reads unlogged was ranged, or one it logs was not");
   Require("RangedStore", "nesting", outer_kept && reset,
           "an inner scope changed the outer one's flag, or the flag outlived the scope");
   const std::vector<std::pair<uint64_t, uint64_t>> label{{kWatched + 0x14u, 4}};
@@ -55529,6 +55531,22 @@ static void CheckRangedStore() {
   Require("RangedStore", "ranges",
           DP::StoredSince(before, label) && !DP::StoredSince(before, other),
           "a read of the stored bytes was missed, or an unrelated read was hit");
+  // A store already open when a draw is posted (the posted sequence includes its opening record)
+  // is seen at adoption both before and after its closing record; by reads and by walker pages.
+  DP::Log pages_log;
+  pages_log.pages = {kWatched >> 12u};
+  DP::Log other_log;
+  other_log.pages = {(kWatched >> 12u) + 2u};
+  const auto open = DP::OpenStoredRange(kWatched + 0x10u, 8);
+  const auto posted = DP::StoredSequence();
+  const bool open_seen = DP::StoredSince(posted, label) && DP::StoredSince(posted, pages_log) &&
+                         !DP::StoredSince(posted, other) && !DP::StoredSince(posted, other_log);
+  DP::CloseStoredRange(open);
+  const bool closed_seen = DP::StoredSince(posted, label) && DP::StoredSince(posted, pages_log) &&
+                           !DP::StoredSince(posted, other_log);
+  const bool quiet = !DP::StoredSince(DP::StoredSequence(), label);
+  Require("RangedStore", "open store", open_seen && closed_seen && quiet,
+          "a store open at post time escaped adoption, or a later post still saw it");
   std::printf("[host]    RangedStore                      ok\n");
 }
 
