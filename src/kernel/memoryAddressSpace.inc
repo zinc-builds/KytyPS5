@@ -1388,10 +1388,11 @@ private:
 			// KYTY_ASYNC_WATCH_SCAN=0 (default): an asynchronous page is either write-protected or
 			// holds a written mark (a store clears the protection and leaves the mark; promotion
 			// and remaps start pages written), and a watch adds nothing to that: no store after
-			// it can land unmarked. Marks stay until a scan consumes them, and the next full or
-			// submit scan reports them, as it would report them from the kept list (kept-only
-			// collections take neither: they wait for the next scan either way). The chunk is
-			// scanned once the page is watched. Marks older than the watch, from a chunk no
+			// it can land unmarked. Marks stay until a scan consumes them: the next full or submit
+			// scan reports them (the chunk is scanned once the page is watched). A kept-only
+			// collection after a submit scan no longer sees a store made after that scan here,
+			// the same as a store after the submit scan to any other page (a satisfied wait's full
+			// collection settles those). Marks older than the watch, from a chunk no
 			// collection scanned, report a store the watch did not need: one extra invalidation,
 			// never a lost one.
 			// KYTY_ASYNC_WATCH_SCAN=1: scan and keep them here, as before.
