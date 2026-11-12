@@ -24,6 +24,7 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 extern "C" char __executable_start; // NOLINT
@@ -88,6 +89,11 @@ struct State {
 	std::unordered_map<uint64_t, StackTotal>   stacks;
 	std::array<std::pair<uint64_t, uint64_t>, static_cast<size_t>(Driver::Count)> driver {};
 	std::unordered_map<uint64_t, SiteTotal>    direct_sites; // ns = drain wait
+	std::array<UploadSample, static_cast<size_t>(UploadPath::Count)> uploads {};
+	std::array<uint64_t, static_cast<size_t>(UploadPath::Count)>     upload_n {};
+	uint64_t                                   upload_destroy_n  = 0;
+	uint64_t                                   upload_destroy_ns = 0;
+	uint64_t                                   recycler[4]       = {};
 	std::unordered_map<uint64_t, SiteTotal>    sched_sites;  // backlog = ahead, idle = gpu_done
 	std::unordered_map<uint64_t, StackTotal>   sched_stacks;
 	uint64_t                                   sched_waits   = 0;
@@ -426,6 +432,50 @@ void NoteDriver(Driver kind, uint64_t ns) noexcept {
 	d.second += ns;
 }
 
+bool UploadTouch() noexcept {
+	static const bool touch = [] {
+		const char* value = std::getenv("KYTY_DRIVER_STATS");
+		return DriverStats() && value != nullptr && std::strcmp(value, "touch") == 0;
+	}();
+	return touch;
+}
+
+uint64_t ThreadMinorFaults() noexcept {
+	rusage usage {};
+	getrusage(RUSAGE_THREAD, &usage);
+	return static_cast<uint64_t>(usage.ru_minflt);
+}
+
+void NoteUpload(UploadPath path, const UploadSample& sample) noexcept {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	auto&           u = s.uploads[static_cast<size_t>(path)];
+	s.upload_n[static_cast<size_t>(path)]++;
+	u.bytes += sample.bytes;
+	u.alloc_ns += sample.alloc_ns;
+	u.touch_ns += sample.touch_ns;
+	u.copy_ns += sample.copy_ns;
+	u.flush_ns += sample.flush_ns;
+	u.touch_flt += sample.touch_flt;
+	u.copy_flt += sample.copy_flt;
+}
+
+void NoteUploadDestroy(uint64_t ns) noexcept {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	s.upload_destroy_n++;
+	s.upload_destroy_ns += ns;
+}
+
+void NoteRecyclerState(uint64_t entries, uint64_t bytes, uint64_t evicted, uint64_t destroy_queue) noexcept {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	s.recycler[0] = entries;
+	s.recycler[1] = bytes;
+	s.recycler[2] = evicted;
+	s.recycler[3] = destroy_queue;
+}
+
 void NoteDirectRecord(const std::source_location& site, uint64_t drain_ns) noexcept {
 	auto&           s = Get();
 	std::lock_guard lock(s.mutex);
@@ -570,7 +620,8 @@ void Report() noexcept {
 	if (DriverStats()) {
 		static constexpr std::array<const char*, static_cast<size_t>(Driver::Count)> names = {
 		    "submit", "queue_submit", "refresh", "begin_command", "image_create", "image_create_dedicated",
-		    "image_delete", "buffer_create", "buffer_create_dedicated", "buffer_delete"};
+		    "image_delete", "buffer_create", "buffer_create_dedicated", "buffer_delete",
+		    "image_recycled", "image_retire", "view_create", "format_query"};
 		std::string line = "DRIVER";
 		for (size_t i = 0; i < names.size(); i++) {
 			char text[96];
@@ -581,6 +632,34 @@ void Report() noexcept {
 		}
 		std::printf("%s\n", line.c_str());
 		s.driver = {};
+		static constexpr std::array<const char*, static_cast<size_t>(UploadPath::Count)> paths = {
+		    "ring_lap0", "ring", "async", "temporary"};
+		for (size_t i = 0; i < paths.size(); i++) {
+			const auto& u = s.uploads[i];
+			const auto  n = s.upload_n[i];
+			if (n == 0) {
+				continue;
+			}
+			std::printf("UPLOAD %s n_s=%.1f MB_s=%.2f alloc_ms_s=%.3f touch_ms_s=%.3f copy_ms_s=%.3f "
+			            "flush_ms_s=%.3f touch_flt_s=%.0f copy_flt_s=%.0f GBps=%.2f\n",
+			            paths[i], static_cast<double>(n) / secs, static_cast<double>(u.bytes) / 1e6 / secs,
+			            static_cast<double>(u.alloc_ns) / 1e6 / secs,
+			            static_cast<double>(u.touch_ns) / 1e6 / secs,
+			            static_cast<double>(u.copy_ns) / 1e6 / secs,
+			            static_cast<double>(u.flush_ns) / 1e6 / secs,
+			            static_cast<double>(u.touch_flt) / secs, static_cast<double>(u.copy_flt) / secs,
+			            u.copy_ns != 0 ? static_cast<double>(u.bytes) / static_cast<double>(u.copy_ns) : 0.0);
+		}
+		if (s.upload_destroy_n != 0) {
+			std::printf("UPLOAD temporary_destroy n_s=%.1f ms_s=%.3f\n",
+			            static_cast<double>(s.upload_destroy_n) / secs,
+			            static_cast<double>(s.upload_destroy_ns) / 1e6 / secs);
+		}
+		s.uploads          = {};
+		s.upload_n         = {};
+		s.upload_destroy_n = s.upload_destroy_ns = 0;
+		std::printf("RECYCLER entries=%" PRIu64 " MB=%.1f evicted=%" PRIu64 " destroy_queue=%" PRIu64 "\n",
+		            s.recycler[0], static_cast<double>(s.recycler[1]) / 1e6, s.recycler[2], s.recycler[3]);
 		std::vector<const SiteTotal*> direct;
 		for (const auto& [key, t]: s.direct_sites) {
 			direct.push_back(&t);

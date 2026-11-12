@@ -5,6 +5,8 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/gpuWaitDiag.h"
+#include "graphics/host_gpu/renderer/image/imageRecycler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -760,10 +762,12 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
+             ImageRecycler* recycler)
     : info(image_info),
       stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
-      m_graphics(graphics), m_scheduler(scheduler) {
+      m_graphics(graphics), m_scheduler(scheduler),
+      m_recycler(recycler != nullptr && recycler->Enabled() ? recycler : nullptr) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
 	m_cpu_dirty =
@@ -785,10 +789,15 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+	bool                      supported = false;
+	{
+		Common::GpuWaitDiag::DriverScope format_scope(Common::GpuWaitDiag::Driver::ImageFormatQuery);
+		supported = graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                              create.usage, create.flags,
+		                                              &properties) == vk::Result::eSuccess &&
+		            static_cast<bool>(properties.sampleCounts & create.samples);
+	}
+	if (!supported) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),
@@ -796,7 +805,10 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	if (m_recycler != nullptr && m_recycler->Take(create, backing)) {
+		// A recycled image of the same create info: no create, allocation or bind.
+	} else if (!graphics.CreateImage(create, backing) &&
+	           (m_recycler == nullptr || (m_recycler->Flush(), !graphics.CreateImage(create, backing)))) {
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
@@ -830,6 +842,15 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	if (m_recycler != nullptr) {
+		std::vector<vk::ImageView> handles;
+		handles.reserve(views.size());
+		for (const auto& cached: views) {
+			handles.push_back(cached.view);
+		}
+		m_recycler->Retire(std::move(handles), backing);
+		return;
+	}
 	for (const auto& cached: views) {
 		m_graphics.device.destroyImageView(cached.view, nullptr);
 	}
