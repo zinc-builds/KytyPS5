@@ -467,14 +467,21 @@ open PR is a weak signal.
 
 ## Frame pacing (Track R, 2026-11-12)
 
-The target is p99 = 1 refresh (`flip_vbl` p99 1), not only the mean. On Sky Garden 1000–1600
-(before early submit) 7.0% of presented frames took two refreshes. A replay of the measured guest
-frames against the display (`tools/astro-bench/framemodel.py`, within 0.5 points of the measured
-share) says p99 = 1 needs a mean guest frame of ~16.0–16.4 ms: ~1.5 ms less command-thread work
-per frame, or ~1 ms with the guest-late idle gone; the periodic prepare spike and compiles are
-small. FINDINGS, "Frame pacing", has the cause and headroom tables. Judge pacing changes with
-`KYTY_FRAME_DIAG=1` and `framemodel.py` besides `cmd_ns`, and attribute work only per guest frame
-(`GFRAME`), never per presented frame.
+The target is p99 = 1 refresh (`flip_vbl` p99 1), not only the mean. On current `dev`
+(Sky Garden, 1000–1600) 6.2% of presented frames take two refreshes.
+- **The main cause is the game, not our pipeline.** The command thread has no guest work 1.0 ms
+  per frame. The game's render workers (`Draw*`) wait for an efficiency core 2.7 times longer than
+  they run.
+- **Putting them on the performance cores** (`KYTY_GUEST_PCORE_NAMES=Draw`): FPS +2.05%,
+  two-refresh frames 3.9% → 1.5% (A/B, n=3). A default change is proposed, not made.
+- **Next:** the replay estimates that removing the remaining waits plus ~0.5 ms of command-thread
+  CPU, or ~1.5 ms of CPU alone, reaches under 1%.
+- **The periodic 2 s spike is a host daemon** on the command thread's SMT sibling, not ours.
+
+FINDINGS, "Frame pacing", has the tables. Judge pacing changes with `KYTY_FRAME_DIAG=1` and
+`framemodel.py` besides `cmd_ns`, and attribute work only per guest frame (`GFRAME`), never per
+presented frame. A change to the game's core layout (Track B's stager) needs the no-guest-work
+share checked.
 
 ## Status
 
