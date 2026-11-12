@@ -7,11 +7,14 @@
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/regionDefinitions.h"
+#include "kernel/memory.h"
 #include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -48,7 +51,14 @@ constexpr uint32_t kShaderStoreFormat = 1;
 uint64_t ManualStamp() {
 	static const uint64_t stamp = [] {
 		const char* env = std::getenv("KYTY_SHADER_CACHE_STAMP");
-		return env != nullptr && env[0] != '\0' ? std::strtoull(env, nullptr, 10) : uint64_t {0};
+		if (env == nullptr || env[0] < '1' || env[0] > '9') {
+			return uint64_t {0};
+		}
+		// A whole positive decimal number only; anything else is ignored.
+		char*      end   = nullptr;
+		errno            = 0;
+		const auto value = std::strtoull(env, &end, 10);
+		return errno == 0 && end != nullptr && *end == '\0' ? static_cast<uint64_t>(value) : uint64_t {0};
 	}();
 	return stamp;
 }
@@ -60,7 +70,8 @@ uint64_t ManualStamp() {
 //    and register definitions, the pipeline cache and this file), or KYTY_SHADER_CACHE_STAMP;
 //  - sizeof(GraphicsPipelineKey): pipeline records are its raw bytes;
 //  - the device and the switches that change generated code: the SPIR-V profile, the shared
-//    memory limit, the host subgroup sizes, the buffer cache's page table geometry, masked selects
+//    memory limit, the host subgroup sizes, the buffer cache's page table geometry and the DMA
+//    address translation constants, masked selects
 //    and KYTY_BDA_STATS=access (instrumented DMA shaders).
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	Writer      header;
@@ -73,9 +84,13 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	const uint64_t key_size       = sizeof(GraphicsPipelineKey);
 	const uint32_t page_bits      = BufferCache::CACHING_PAGEBITS;
 	const uint64_t page_count     = BufferCache::CACHING_NUMPAGES;
+	// The DMA shaders' address translation (spirvEmitterMemory.cpp).
+	const uint64_t extended_base  = LibKernel::Memory::kExtendedMemoryBase;
+	const uint64_t lower_size     = LOWER_ADDRESS_SIZE;
 	IoAll(header, kShaderStoreFormat, manual, source_hash, key_size, properties.vendorID,
 	      properties.deviceID, SpirvProfile(graphics), properties.limits.maxComputeSharedMemorySize,
-	      graphics.subgroup_size, wave64, page_bits, page_count, masked_selects, bda_access);
+	      graphics.subgroup_size, wave64, page_bits, page_count, extended_base, lower_size,
+	      masked_selects, bda_access);
 	return std::move(header.bytes);
 }
 

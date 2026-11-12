@@ -355,7 +355,8 @@ list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 # and their serialization (src/graphics/shader); the guest register and format definitions they
 # decode with (gpu_defs.h, gpu_format.h/.cpp, hardwareContext.h); what the pipeline cache passes to
 # the recompiler and how it serializes records and graphics pipeline keys (pipelineCache.h/.cpp,
-# pipelineSerialization.cpp); and renderTarget.h, which sizes the key's color arrays. Values the
+# pipelineSerialization.cpp), the guest-to-Vulkan format and blend mappings it records
+# (vulkanCommon.h/.cpp, blendMapping.h); and renderTarget.h, which sizes the key's color arrays. Values the
 # generated code takes from elsewhere (device limits, the buffer cache's page table geometry, the
 # environment switches) go into the store header themselves.
 file(GLOB_RECURSE kyty_shader_store_inputs CONFIGURE_DEPENDS
@@ -369,6 +370,9 @@ list(APPEND kyty_shader_store_inputs
 	"graphics/guest_gpu/gpu_format.h"
 	"graphics/guest_gpu/gpu_format.cpp"
 	"graphics/guest_gpu/hardwareContext.h"
+	"graphics/host_gpu/vulkanCommon.h"
+	"graphics/host_gpu/vulkanCommon.cpp"
+	"graphics/host_gpu/renderer/pipeline/blendMapping.h"
 	"graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 	"graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
 	"graphics/host_gpu/renderer/pipeline/pipelineSerialization.cpp"

@@ -1795,10 +1795,12 @@ target and 8M pipeline-key checks); the level renders the same as a plain build.
     - a manual format number;
     - a hash of the sources that decide what the store records: `src/graphics/shader`, the guest
       format and register definitions, `pipelineCache.h/.cpp`, `pipelineSerialization.cpp` and
-      `renderTarget.h` (listed in `CMakeLists.txt`, hashed at build time);
+      `renderTarget.h`, and the format and blend mappings it records (`vulkanCommon.h/.cpp`,
+      `blendMapping.h`) (listed in `CMakeLists.txt`, hashed at build time);
     - `sizeof(GraphicsPipelineKey)`;
     - the device and the switches that change generated code (SPIR-V profile, limits, subgroup
-      sizes, the buffer cache's page table geometry, `KYTY_MASKED_SELECTS`,
+      sizes, the buffer cache's page table geometry, the DMA shaders' address constants,
+      `KYTY_MASKED_SELECTS`,
       `KYTY_BDA_STATS=access`).
   - **Measured:**
     - a rebuild after editing `libAudio.cpp` reloaded 352 programs, 459 modules and 384
