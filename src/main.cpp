@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -73,6 +74,8 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
+	::printf("  --frame-skip <off|auto>              Skip drawing frames when the emulator falls behind\n"
+	         "                                       the display, so the game keeps its speed. Default: off.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -97,6 +100,18 @@ static void PrintUsage() {
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+}
+
+static bool ParseFrameSkip(const std::string& value, Config::FrameSkipMode& out) {
+	if (value == "off") {
+		out = Config::FrameSkipMode::Off;
+	} else if (value == "auto") {
+		out = Config::FrameSkipMode::Auto;
+	} else {
+		::printf("invalid frame skip mode: %s (off or auto)\n", value.c_str());
+		return false;
+	}
+	return true;
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -242,6 +257,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			return false;
 		}
 
+		if (arg.starts_with("--frame-skip=")) {
+			if (!ParseFrameSkip(arg.substr(std::strlen("--frame-skip=")), options.config.frame_skip)) {
+				return false;
+			}
+			continue;
+		}
+
 		if (!NextArg(argc, argv, i, value)) {
 			::printf("missing value for %s\n", arg.c_str());
 			return false;
@@ -360,6 +382,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, options.config.keyboard_player) ||
 			    options.config.keyboard_player > static_cast<uint32_t>(Config::MAX_PLAYERS)) {
 				::printf("invalid keyboard player: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--frame-skip") {
+			if (!ParseFrameSkip(value, options.config.frame_skip)) {
 				return false;
 			}
 		} else if (arg == "--present-mode") {

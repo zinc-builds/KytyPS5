@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/assert.h"
@@ -225,6 +226,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		if (FrameSkip::DiagEnabled()) {
+			FrameSkip::NoteCpuReadback(fault_vaddr);
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

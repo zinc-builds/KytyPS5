@@ -950,9 +950,18 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// Frame skipping (frameSkip.h): classifies the draw, and drops it in a skipped frame. A dropped
+// draw inside an open occlusion query counts as visible.
+bool CommandProcessor::SkipDraw(bool indirect, bool indirect_count) {
+	if (!FrameSkip::OnDraw(m_ctx, m_sh_ctx, indirect, indirect_count)) {
+		return false;
+	}
+	m_renderer.GetOcclusionQueries().NoteSkippedDraw();
+	return true;
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
-	if (FrameSkip::SkippingDraws()) {
-		FrameSkip::NoteSkippedDraw();
+	if (FrameSkip::Active() && SkipDraw(false, false)) {
 		return;
 	}
 	auto& executor           = m_renderer.GetRenderExecutor();
@@ -1051,8 +1060,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
-	if (FrameSkip::SkippingDraws()) {
-		FrameSkip::NoteSkippedDraw();
+	if (FrameSkip::Active() && SkipDraw(true, count_addr != nullptr)) {
 		return;
 	}
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
@@ -1127,8 +1135,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
-	if (FrameSkip::SkippingDraws()) {
-		FrameSkip::NoteSkippedDraw();
+	if (FrameSkip::Active() && SkipDraw(false, false)) {
 		return;
 	}
 	auto& executor = m_renderer.GetRenderExecutor();
@@ -1329,8 +1336,11 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	GetScheduler().Flush();
-	if (FrameSkip::Enabled()) {
-		FrameSkip::OnFlip(m_renderer.GetVideoOut().PendingFlips(handle));
+	if (FrameSkip::Active()) {
+		std::array<uint64_t, 16> buffers {};
+		const int count = m_renderer.GetVideoOut().DisplayBufferAddresses(
+		    handle, buffers.data(), static_cast<int>(buffers.size()));
+		FrameSkip::OnFlip(buffers.data(), count);
 	}
 }
 

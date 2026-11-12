@@ -49,6 +49,12 @@ public:
 		}
 	}
 
+	// A draw frame skipping dropped: inside an open query it counts as visible.
+	void NoteSkippedDraw() {
+		if (m_open != 0) {
+			m_uncounted++;
+		}
+	}
 	// A PIXEL_PIPE_STAT_DUMP to address, after the draws recorded so far.
 	void Dump(uint64_t address);
 	// Waits for the GPU to run the dumps and writes their counters.

@@ -435,6 +435,9 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
 
+`--frame-skip auto` (off by default) keeps a game's speed when the emulator falls behind the
+display, by skipping the drawing of some frames: see [docs/frame-skip.md](docs/frame-skip.md).
+
 ### AI Use
 
 AI tools may be used for research, reverse engineering, and development assistance. Contributors

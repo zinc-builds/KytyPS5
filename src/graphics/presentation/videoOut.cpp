@@ -1152,6 +1152,9 @@ bool FlipQueue::Flip() {
 		auto& r = *it;
 		if (r.cfg->bus == 0) {
 			LibKernel::TimeDiag::NoteFlipDone(r.cfg->vblank_status.count);
+			if (Graphics::FrameSkip::Active()) {
+				Graphics::FrameSkip::NoteFlipDone(r.cfg->vblank_status.count, r.frame != nullptr);
+			}
 		}
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
@@ -1538,13 +1541,19 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
-int VideoOutDriver::PendingFlips(int handle) {
+int VideoOutDriver::DisplayBufferAddresses(int handle, uint64_t* out, int max) {
 	auto* cfg = m_impl->Get(handle);
 	if (cfg == nullptr) {
 		return 0;
 	}
 	Common::LockGuard lock(cfg->mutex);
-	return cfg->flip_status.flipPendingNum;
+	int count = 0;
+	for (const auto& buffer: cfg->buffers) {
+		if (buffer.Occupied() && count < max) {
+			out[count++] = buffer.data_address;
+		}
+	}
+	return count;
 }
 
 void VideoOutDriver::WaitFlipDone(int handle, int index) {

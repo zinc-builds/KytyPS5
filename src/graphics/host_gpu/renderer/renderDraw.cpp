@@ -11,6 +11,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1310,6 +1311,19 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	if (FrameSkip::Active()) {
+		// Draws whose shaders write memory outlive their frame: frame skipping keeps their target.
+		bool image_writes = false;
+		for (const auto* stage: stages) {
+			for (const auto& image: stage->runtime->module->info.info.images) {
+				image_writes = image_writes || image.written || image.atomic;
+			}
+		}
+		if (shader_write_stages || image_writes) {
+			FrameSkip::NoteSideEffectDraw(buffer.GetRegisters(), static_cast<bool>(shader_write_stages),
+			                              image_writes);
+		}
 	}
 	if (shader_write_stages || HasAtomicWrites()) {
 		// Guest ranges of the draw's buffer accesses: atomics to buffers the stage accesses only
