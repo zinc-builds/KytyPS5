@@ -1949,7 +1949,7 @@ struct PageState {
 
 // Command thread only from here on.
 struct Totals {
-	uint64_t uploads = 0, bytes = 0, pages = 0;
+	uint64_t calls = 0, uploads = 0, bytes = 0, pages = 0; // calls: PrepareBda
 	uint64_t source_bytes[SOURCES + 1] {}; // + not queued by any source this PrepareBda
 	uint64_t repeat_pages = 0;             // uploaded earlier in the same frame
 	uint64_t sampled = 0, sampled_first = 0, changed_bytes = 0, changed_lines = 0, span_bytes = 0;
@@ -2114,6 +2114,9 @@ void Print(double seconds, uint64_t frames) {
 	            static_cast<double>(t.repeat_pages) / seconds, kb(t.source_bytes[0]),
 	            kb(t.source_bytes[1]), kb(t.source_bytes[2]), kb(t.source_bytes[3]),
 	            kb(t.source_bytes[4]));
+	std::printf(" prepare_bda_s=%.0f prepare_bda_per_frame=%.1f",
+	            static_cast<double>(t.calls) / seconds,
+	            frames != 0 ? static_cast<double>(t.calls) / static_cast<double>(frames) : 0.0);
 	const auto compared = t.sampled - t.sampled_first;
 	const auto per      = [compared](uint64_t v) {
         return compared != 0 ? static_cast<double>(v) / static_cast<double>(compared) : 0.0;
@@ -2168,6 +2171,7 @@ RangeSet BufferCache::TakeBdaSync() {
 
 void BufferCache::BdaStatsTick() {
 	using Clock = std::chrono::steady_clock;
+	BdaStats::g_totals.calls++; // once per PrepareBda
 	static Clock::time_point last        = Clock::now();
 	static uint64_t          last_frames = MemDiag::g_flips.load(std::memory_order_relaxed);
 	const auto               now         = Clock::now();
