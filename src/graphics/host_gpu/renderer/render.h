@@ -703,6 +703,9 @@ private:
 	size_t                                         m_register_snapshot_next = 0;
 	RegisterSnapshot*                              m_register_snapshot      = nullptr;
 	const HW::Context*                             m_register_snapshot_source = nullptr;
+	// Lines of the context registers that differ from the previous queued draw's (all with a new
+	// source). Set at each queued post.
+	uint64_t     m_register_lines_changed = ~uint64_t {0};
 	HW::Context* RegisterSnapshotFor(const HW::Context& live, uint64_t sequence);
 	uint64_t                                         m_queued_posted = 0; // sequences posted
 	uint32_t                                         m_queued_count  = 0; // posted, not committed

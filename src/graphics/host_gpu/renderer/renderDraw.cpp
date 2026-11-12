@@ -1894,13 +1894,18 @@ int RegisterSnapshotMode() {
 } // namespace
 
 HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64_t sequence) {
-	using Consumer  = HW::Context::ChangeConsumer;
-	const auto mode = RegisterSnapshotMode();
+	const auto mode    = RegisterSnapshotMode();
 	auto*      current = m_register_snapshot;
-	if (mode != 0 && current != nullptr && m_register_snapshot_source == &live &&
-	    live.ChangedLines(Consumer::Snapshot) == 0) {
+	// Compare only the lines written since the last post with the previous draw's registers.
+	const bool same_source = current != nullptr && m_register_snapshot_source == &live;
+	const auto written     = live.WrittenLines();
+	live.ClearWritten();
+	m_register_lines_changed =
+	    same_source ? (written != 0 ? HW::Context::DifferingLines(live, current->registers, written) : 0)
+	                : ~uint64_t {0};
+	if (mode != 0 && same_source && m_register_lines_changed == 0) {
 		if (mode == 2 && !current->registers.SameRegisters(live)) {
-			EXIT("KYTY_REGISTER_SNAPSHOT=verify: the registers changed without a change mark\n");
+			EXIT("KYTY_REGISTER_SNAPSHOT=verify: the registers changed without a written mark\n");
 		}
 		current->last_sequence = sequence;
 		return &current->registers;
@@ -1927,7 +1932,6 @@ HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64
 		}
 	}
 	snapshot->registers = live;
-	live.ClearChanged(Consumer::Snapshot);
 	m_prepare_stat.register_snapshots++;
 	snapshot->last_sequence    = sequence;
 	m_register_snapshot        = snapshot;

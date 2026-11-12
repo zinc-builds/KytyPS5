@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -590,24 +591,44 @@ public:
 
 	void Reset() {
 		*this = Context();
-		MarkAllChanged();
+		MarkAllWritten();
 	}
 
-	// Lines (64 bytes of this object) whose register values changed, one mask per consumer, set
-	// only by setters that change a value (and Reset, MarkAllChanged): each consumer reads and
-	// clears its own (Snapshot: RenderExecutor's register snapshots; Run: Track B's run check).
-	enum class ChangeConsumer : uint32_t { Snapshot = 0, Run = 1, Count = 2 };
-	[[nodiscard]] uint64_t ChangedLines(ChangeConsumer consumer) const {
-		return m_changed[static_cast<uint32_t>(consumer)];
-	}
-	void ClearChanged(ChangeConsumer consumer) const {
-		m_changed[static_cast<uint32_t>(consumer)] = 0;
-	}
-	// For a wholesale change (a copy assigned over this one, Push/Pop).
-	void MarkAllChanged() {
-		for (auto& mask: m_changed) {
-			mask = ~uint64_t {0};
+	// Lines (64 bytes of this object) a setter wrote since the mask was cleared, whatever the
+	// value (setters only mark; comparing per write cost more than it saved). The reader compares
+	// these lines with an earlier copy (DifferingLines) to learn which ones changed.
+	[[nodiscard]] uint64_t WrittenLines() const {
+		uint64_t mask = 0;
+		for (size_t i = 0; i < m_written.size(); i++) {
+			mask |= static_cast<uint64_t>(m_written[i] != 0) << i;
 		}
+		return mask;
+	}
+	// Const: the mask is mutable. Only the command thread reads, sets or clears it (on the live
+	// context); workers read copies, whose masks nothing uses.
+	void ClearWritten() const { m_written.fill(0); }
+	// For a wholesale change (a copy assigned over this one, Reset, Pop).
+	void MarkAllWritten() { m_written.fill(1); }
+	// The lines among `lines` whose register bytes differ between `a` and `b` (a line past the
+	// registers, the written mask's, compares only its register bytes).
+	[[nodiscard]] static uint64_t DifferingLines(const Context& a, const Context& b, uint64_t lines) {
+		constexpr size_t Registers = offsetof(Context, m_written);
+		constexpr size_t FullLines = Registers / 64;
+		uint64_t         differ    = 0;
+		const auto*      pa        = reinterpret_cast<const uint8_t*>(&a);
+		const auto*      pb        = reinterpret_cast<const uint8_t*>(&b);
+		for (; lines != 0; lines &= lines - 1) {
+			const auto line = static_cast<size_t>(__builtin_ctzll(lines));
+			// Constant sizes, so the compares are inlined.
+			const bool same =
+			    line < FullLines
+			        ? __builtin_memcmp(pa + line * 64, pb + line * 64, 64) == 0
+			        : line > FullLines ||
+			              __builtin_memcmp(pa + FullLines * 64, pb + FullLines * 64,
+			                               Registers % 64) == 0;
+			differ |= same ? 0 : uint64_t {1} << line;
+		}
+		return differ;
 	}
 	// The change-mask bits of the bytes [offset, offset + size) of a Context.
 	[[nodiscard]] static constexpr uint64_t LineMask(size_t offset, size_t size) {
@@ -617,9 +638,9 @@ public:
 	}
 	// Lines of the registers the color and depth target decode reads (Track B's run check).
 	[[nodiscard]] static constexpr uint64_t RunTargetLines();
-	// Whether the registers (not the change masks) equal `other`'s.
+	// Whether the registers (not the written mask) equal `other`'s.
 	[[nodiscard]] bool SameRegisters(const Context& other) const {
-		return std::memcmp(this, &other, offsetof(Context, m_changed)) == 0;
+		return std::memcmp(this, &other, offsetof(Context, m_written)) == 0;
 	}
 
 	void SetColorBase(uint32_t slot, const ColorBase& base) { Assign(m_render_targets[slot].base, base); }
@@ -902,28 +923,25 @@ private:
 
 	ShaderRegisters m_sh_regs;
 
-	// Mutable: consumers clear their mask through a const view of the registers. Only the command
-	// thread reads, sets or clears them (on the live context); workers read snapshots, whose
-	// copies of the masks nothing uses.
-	mutable std::array<uint64_t, static_cast<uint32_t>(ChangeConsumer::Count)> m_changed {};
+	// One flag byte per line, not a bit mask: a setter then only stores, instead of every setter
+	// read-modify-writing one word (a store-forwarding chain through a run of register writes).
+	alignas(64) mutable std::array<uint8_t, 64> m_written {};
+	static void CheckLayout();
 
 	template <typename T>
 	void Assign(T& field, const std::type_identity_t<T>& value) {
-		if (std::memcmp(&field, &value, sizeof(T)) != 0) {
-			field = value;
-			Mark(&field, sizeof(T));
-		}
-	}
-	void Mark(const void* field, size_t size) {
-		const auto offset = static_cast<size_t>(static_cast<const uint8_t*>(field) -
+		field = value;
+		const auto offset = static_cast<size_t>(reinterpret_cast<const uint8_t*>(&field) -
 		                                        reinterpret_cast<const uint8_t*>(this));
-		const auto bits   = LineMask(offset, size);
-		for (auto& mask: m_changed) {
-			mask |= bits;
+		const auto first = offset / 64;
+		const auto last  = (offset + sizeof(T) - 1) / 64;
+		m_written[first] = 1;
+		for (auto line = first + 1; line <= last; line++) {
+			m_written[line] = 1;
 		}
 	}
 };
-static_assert(sizeof(Context) <= 64 * 64, "Context::m_changed has one bit per 64-byte line");
+
 
 #define KYTY_CONTEXT_LINES(member) LineMask(offsetof(Context, member), sizeof(Context::member))
 constexpr uint64_t Context::RunTargetLines() {
@@ -934,6 +952,9 @@ constexpr uint64_t Context::RunTargetLines() {
 	       KYTY_CONTEXT_LINES(m_stencil_clear_value) | KYTY_CONTEXT_LINES(m_aa_config);
 }
 #undef KYTY_CONTEXT_LINES
+inline void Context::CheckLayout() {
+	static_assert(offsetof(Context, m_written) <= 64 * 64, "Context::m_written has a flag per 64-byte line");
+}
 static_assert(Context::RunTargetLines() != 0);
 
 class UserConfig {

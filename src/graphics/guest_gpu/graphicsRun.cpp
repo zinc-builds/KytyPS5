@@ -205,7 +205,7 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 		case ContextStateOperation::Pop:
 			EXIT_IF(!m_saved_ctx.has_value());
 			m_ctx = *m_saved_ctx;
-			m_ctx.MarkAllChanged();
+			m_ctx.MarkAllWritten();
 			m_saved_ctx.reset();
 			break;
 		case ContextStateOperation::PushClear:
