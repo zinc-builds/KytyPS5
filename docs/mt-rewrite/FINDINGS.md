@@ -1636,6 +1636,56 @@ On an E-core, the misses come from lag: pages re-queued 0.3–5 ms before use th
 
 **#116 stays in dev** (`ArmStaged`/`Unstage`, versions bumped where a write mark is consumed, staged chunks in every scan). With nothing staged it is neutral (gate.sh, `cmd_ns` −0.05%). Its arm API has no caller on dev; Track K may reuse the page versions. `pageVersions.h` is on dev; its bump hooks in `MemoryTracker`, `NoteGpuWrite` and the backing-store writes are only on the parked branch.
 
+### PrepareBda's upload copies: parked after four attempts (Track B + Track K, 2026-11-12)
+
+**Conclusion.** PrepareBda's guest→GPU copy (~760 MB/s, ~270 ns/draw plain, ~5% of the command thread on PGO) stays. Four attempts each ran into the same two facts:
+- **binds consume ~44% of these bytes** (#114), so any scheme that skips the eager upload moves those copies to bind time;
+- **tracking a page costs more than copying it**, for the pages the game rewrites on a schedule.
+
+| Attempt | Result |
+|---|---|
+| Pre-staging (copy ahead on a stager, re-arm tracking) | Correct (0 unmarked mismatches), but `cmd_ns` +4.6%, FPS −7%: arming forces scans (+95 ns/draw sys). Entry above |
+| Upstream 0ec2cd5d (re-queue only DMA-accessed pages; Track U port) | Cycles flat, ipd +7.6%, prepare_ns +29%: uploads move to bind time on the workers. Not taken |
+| Hot-dirty (leave rewritten pages unwatched, dirty at every use; Track K + Track B probes) | Not built. The churn (~4,650 invalidated pages/frame) is 94% pages rewritten **every 3rd frame** (triple-buffered). Between writes they get ~13–19 clean binds (#60 worker lookups); "always dirty" turns each into a copy: ~5.6 command-thread copies per write vs 1.0 today, and #60/#78 stop applying. ~58% of those writes are read only by PrepareBda's upload, but an unwatched page can never be queued for PrepareBda again, so it would be synced on every PrepareBda (~180/frame, ~5 GB/frame) |
+| In-place reads (C1 stage 2, and a hybrid limited to pages no bind reads) | **Unsound with decode-time labels**, hybrid included: see below |
+
+**Why in-place reads can't be made exact cheaply.** An in-place read sees guest memory at host GPU execution time, not at the dispatch's PM4 position.
+- EOP and RELEASE_MEM labels are stored when the command thread decodes them, before the host GPU runs the work.
+- A guest that waits for such a label and then rewrites a page is fully ordered on a PS5. Here its store can land while the host GPU still reads the page, so the read returns bytes the real GPU could never have seen. This is not the "unordered store" case pre-staging's gate accepted (a pending write mark): the store is ordered *after* the draw.
+- The pages a hybrid would redirect are exactly the scheduled, every-3rd-frame rewrites. C1 measured the exposure: 2.3% of redirected pages changed between record and completion.
+- Nothing in a page classifier bounds that window, since it depends on how far the host GPU lags the decoder, not on guest ordering.
+- Making it exact means stopping the guest's store until every dispatch that could read the page has finished. Two ways, both too costly:
+  - **Late labels** (C1 stage 1): −15% FPS.
+  - **Per page:** keep redirected pages under the synchronous write-fault path (SIGBUS, several µs plus lock contention per fault, "Write tracking without signals"), and in the handler either (i) block the store until the host GPU passes the reading dispatches, or (ii) swap the page-table entry to a copy of the old bytes first.
+    - (ii) races the GPU. A shader that already loaded the old entry, the pointer into guest memory, can still read after the store lands. Nothing on the GPU side tells the CPU which entries are held.
+    - (i) is exact, but costs a synchronous fault on ~2.5k pages/frame (≥ ~10 ms/frame of game-thread time at several µs each) plus stalls of up to the GPU lag. That is several times the ~1.4 ms/frame the copy costs.
+- A static bound on DMA reads (below) would avoid all of this. It is blocked by pointer-chasing loads.
+
+**DMA read paths (for whoever bounds DMA reads next).** File references are to `dev` at this entry.
+- **What makes a shader DMA-using** (`uses_dma`, ShaderInfoCollection.cpp `Visit` ~:317–334, :520): set on the live IR after specialization (upstream 0b82396f, ours cb32ec2c; no change in Sky Garden). The triggers:
+  - FLAT/GLOBAL/SMEM address loads (not scratch, not `planning_only`). Address *stores* fail, so DMA is read-only.
+  - `IndirectBuffer` buffer ops: V# words the host can't evaluate (ResourceTracking.cpp ~:4232).
+  - BVH intersects.
+  - A scalar load with a host-evaluable base and an immediate offset is `planning_only`: the SRT walker runs it on the host (ResourceTracking.cpp ~:875–934).
+- **How a load is emitted** (spirvEmitterMemory.cpp `get_bda_pointer` ~:1385):
+  - A 16 KiB page lookup in `m_bda_pagetable_buffer` (entries written on buffer (un)registration, whatever the sync state).
+  - **Entry 0:** `RecordBdaFault` and a read of 0 (~0 in BVH shaders). The fault makes `FindBuffer` register the page at the next frame boundary (faultManager.cpp ~:136), with no retry.
+  - **A backed page with unsynced CPU writes reads stale bytes, undetected.** That is what PrepareBda prevents.
+- **When PrepareBda runs:** once per draw or dispatch with any `uses_dma` stage (descriptors.cpp ~:2128, renderCompute.cpp ~:416/:596), ~155–180 per frame. It drains the whole global `m_bda_sync` queue, not per shader.
+- **Where addresses come from:**
+  - SRT-sourced global bases are recorded (`address_bases`, ResourceTracking.cpp ~:4296), but with **no offset bound**: an SGPR base plus a VGPR offset reaches base + 4 GiB.
+  - Full 64-bit VGPR addresses have no recorded origin.
+  - `IndirectBuffer` loads are bounds-checked per load against their runtime V#, but the host can't evaluate it.
+  - BVH reads chase node pointers.
+  - Nothing rules out a scalar or global load feeding a buffer descriptor.
+  - `WalkSrt`, `AffineIndex` and `EvaluateSource` (SrtWalker.h) are the building blocks a static range would need.
+- **Options for a bound:**
+  - (a) A static range per load, from `address_bases` plus value ranges for offsets: 2–3 weeks.
+  - (b) A per-shader reachable-buffer set: ~1 week.
+  - Both become "all memory" for any shader with a full-VGPR, `IndirectBuffer` or BVH load. **Start with a census of the DMA shaders' load kinds** (22 in Sky Garden per #114) before building either.
+  - (c) A runtime guard (in-place redirect, or upstream's first-touch tag) is unsound or inexact, as above.
+- **Measuring DMA reads:** `KYTY_BDA_STATS=access` sets an access bit per 16 KiB page in `get_bda_pointer` (an atomic per call, which halves FPS) and matches it against upload windows (`BdaStats`). Result: ~1 page/s read across 22 shaders.
+
 ### The command thread's own data misses, by level (Track B, 2026-11-12)
 
 How it was measured:
