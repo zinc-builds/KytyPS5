@@ -103,8 +103,12 @@ private:
 	GuestWait m_kind;
 };
 
-// A guest thread submitted a command buffer.
-void OnGuestSubmit() noexcept;
+// A guest thread submitted a command buffer; only graphics submissions mark the submitter.
+void OnGuestSubmit(bool graphics) noexcept;
+
+// A guest thread signalled or broadcast a condition variable: GIDLE names the thread that last
+// signalled the condition the submitter waited on last, and that thread's own last wait.
+void OnGuestCondSignal(const void* cond) noexcept;
 
 // The command thread begins waiting for guest work; then it waited from `start_ns` to `end_ns`
 // (NowNs()). Short waits (under 20 µs) count when they ended in the gap.

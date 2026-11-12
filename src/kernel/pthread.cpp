@@ -2715,6 +2715,7 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 }
 
 int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
+	Common::FrameDiag::OnGuestCondSignal(cond);
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2805,6 +2806,7 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 }
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
+	Common::FrameDiag::OnGuestCondSignal(cond);
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2824,6 +2826,7 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 }
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
+	Common::FrameDiag::OnGuestCondSignal(cond);
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
