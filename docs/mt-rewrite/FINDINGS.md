@@ -1357,6 +1357,28 @@ invalidated at the next collection instead of at processing start.
   n=50 the verifier reports 16 lost writes on watched pages, after which the stale data makes
   the host GPU fail (device lost at a semaphore wait).
 
+**What each collection verifier proves (2026-11-12).** An independent review pointed out that
+the verify modes above prove less than they seem to:
+
+| Mode | What it checks | What it proves | What it does not |
+|---|---|---|---|
+| `KYTY_SUBMIT_SCAN=verify`, `KYTY_RESUME_SCAN=verify` | runs the skipped scan and **handles** what it finds (counts deferred pages) | no write is lost for good | that production invalidates in time: its finds feed back |
+| `KYTY_ASYNC_WP_VERIFY` | a watched page's bytes change only with a report; pending marks and kept writes count as reported | tracking: every store is either reported or still pending | timely visibility to a draw |
+| `KYTY_COLLECT_OBSERVE=1` (#130) | at every publication (`RequestAsyncCollect`: a satisfied WAIT_REG_MEM on a guest-written value, a semaphore wait, a valid rewind, the packet a resumed submission re-runs) it peeks the watched pages with a write pending, without consuming anything; the collection that publication forces must invalidate each one still watched, or the run exits | nothing a publication makes visible is read stale after it: production's own collections, nothing fed back | stores the guest makes without publishing them (races on real hardware too) |
+
+- Clean on Sky Garden (level frames 0–1600, ~390 publications/s, ~200 pending pages each, ~75–100k
+  page checks/s), `spring_punch_sky_aztec` and `final_stage` (frames 0–1200): 0 failures.
+- `KYTY_OBSERVE_DROP=50` (test only: production skips the invalidation of every 50th such page)
+  fails at the first dropped page.
+- Cost: a peek per publication, 17–27 ms/s of command-thread time on the levels above and 40–88
+  ms/s on `final_stage` (a larger asynchronous set), so it shifts timing a little. gate.sh's
+  verify run includes it.
+- `KYTY_COLLECT_OBSERVE_SKIPS=1` also peeks at every scan skip (kept-only collections, waits on
+  the processor's own label) for statistics of what was deferred there. That costs ~475 ms/s in
+  Sky Garden (~7.5k own-label waits/s), half the command thread, so it is off by default. With
+  it, Sky Garden defers ~110 pages per submit-scanned start, ~180 per resume and ~520 per
+  own-label wait. None of those are publications.
+
 ### Where the command thread's library time goes (2026-11-07)
 
 Call stacks of `KytyGpuCmd` on `dev` 4c86dc01 (`perf record -e cpu_core/cycles/u --call-graph lbr
