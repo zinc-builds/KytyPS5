@@ -1851,8 +1851,10 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		m_drain_stats    = EnvFlag("KYTY_DRAIN_STATS", false);
 		// KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo.
 		const bool shared_memo = EnvFlag("KYTY_SHARED_TEXTURE_MEMO", true);
-		// KYTY_PREPARE_OVERFLOW_CPU=<cpu>: with free lanes, one more worker pinned there that takes
-		// only draws at least KYTY_PREPARE_OVERFLOW_K (default 3) past the oldest untaken one.
+		// With free lanes, an overflow worker (HybridAffinity::PrepareOverflowCpu; by default the SMT
+		// sibling of the last worker's core) takes only draws at least KYTY_PREPARE_OVERFLOW_K
+		// (default 3) past the oldest untaken one: burst capacity that never holds a draw the
+		// command thread wants next. KYTY_PREPARE_OVERFLOW=0 turns it off.
 		const bool     overflow   = free_lanes && Common::HybridAffinity::PrepareOverflowCpu() >= 0;
 		const char*    k_text     = std::getenv("KYTY_PREPARE_OVERFLOW_K");
 		const uint32_t overflow_k = overflow ? static_cast<uint32_t>(std::clamp(
