@@ -1384,7 +1384,21 @@ private:
 			// In an asynchronous chunk a page stays write-protected after its last watcher leaves:
 			// a store there costs no signal, and the protection keeps "not written since" provable
 			// (RenderContext::IsCpLabel).
-			if (async && write_protect) {
+			// KYTY_ASYNC_WATCH_SCAN=0 (default): an asynchronous page is write-protected already
+			// (a page there stays protected after its last watcher leaves, and every scan that
+			// consumes a mark protects again), so a new watch changes nothing in the page tables.
+			// The marks of stores since the last scan stay there: the next collection reports
+			// them, as it would report them from the kept list. (Its chunk is scanned: the page
+			// is watched now. Marks older than the watch, from a chunk no collection scanned,
+			// report a store the watch did not need: one extra invalidation, never a lost one.)
+			// KYTY_ASYNC_WATCH_SCAN=1: scan and keep them here, as before.
+			static const bool watch_scan = [] {
+				const char* value = std::getenv("KYTY_ASYNC_WATCH_SCAN");
+				return value != nullptr && value[0] == '1';
+			}();
+			if (async && write_protect && !watch_scan) {
+				// Nothing to do.
+			} else if (async && write_protect) {
 				// Re-protecting would erase written state: the range can include pages already
 				// watched (the page manager batches across them), so their stores are kept for
 				// the next collection, and page tokens advance.
