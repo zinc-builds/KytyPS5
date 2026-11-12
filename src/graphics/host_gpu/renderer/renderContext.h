@@ -159,6 +159,7 @@ private:
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
+	ImageHeapLayout           m_image_heap_layout; // before m_pipeline_cache (its warm-up)
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	PageManager               m_page_manager;

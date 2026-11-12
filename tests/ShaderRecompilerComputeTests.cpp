@@ -6623,6 +6623,7 @@ public:
               "a sampled slot of a storage-bound image did not take a general-layout element");
       Samples("storage and sampled element", storage, color, view);
       RenderExecutorTestAccess::ResetBindings(executor);
+      reused = false; // new bindings from here on
 
       // A draw sampling its depth target read-only: the element in the read-only layout.
       auto depth = MakeLinearDesc(base + depth_offset, width * height * 4u,

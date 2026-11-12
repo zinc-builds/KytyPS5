@@ -73,9 +73,7 @@ size_t ImageHeap::DescriptorHash::operator()(const DescriptorValue& value) const
 	return XXH3_64bits(value.dwords.data(), sizeof(value.dwords));
 }
 
-ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
-    : m_context(context), m_page_manager(page_manager) {
-	auto& graphics = context.GetGraphics();
+ImageHeapLayout::ImageHeapLayout(GraphicContext& graphics): m_graphics(graphics) {
 	vk::PhysicalDeviceVulkan12Properties limits {};
 	vk::PhysicalDeviceProperties2        properties {};
 	properties.pNext = &limits;
@@ -89,10 +87,8 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	                                         vk::DescriptorBindingFlagBits::eUpdateAfterBind |
 	                                         vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
 	const std::array binding_flags {flags, flags};
-	// Resident textures add the samplers their shaders index (binding 1).
-	const uint32_t bindings_count = graphics.resident_textures ? 2u : 1u;
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
-	flags_info.bindingCount  = bindings_count;
+	flags_info.bindingCount  = Bindings(graphics);
 	flags_info.pBindingFlags = binding_flags.data();
 	const std::array bindings {
 	    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity,
@@ -103,26 +99,43 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.pNext        = &flags_info;
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
-	layout_info.bindingCount = bindings_count;
+	layout_info.bindingCount = Bindings(graphics);
 	layout_info.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout) !=
 	        vk::Result::eSuccess);
+	graphics.image_heap_layout = m_layout;
+}
+
+ImageHeapLayout::~ImageHeapLayout() {
+	m_graphics.image_heap_layout = nullptr;
+	m_graphics.device.destroyDescriptorSetLayout(m_layout, nullptr);
+}
+
+uint32_t ImageHeapLayout::Bindings(const GraphicContext& graphics) {
+	// Resident textures add the samplers their shaders index (binding 1).
+	return graphics.resident_textures ? 2u : 1u;
+}
+
+ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
+    : m_context(context), m_page_manager(page_manager) {
+	auto& graphics = context.GetGraphics();
+	// RenderContext's ImageHeapLayout, made before its pipeline cache warms up.
+	EXIT_IF(graphics.image_heap_layout == nullptr);
 	const std::array pool_sizes {
 	    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity},
 	    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, IR::ResidentSamplerCapacity}};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
 	pool_info.maxSets       = 1;
-	pool_info.poolSizeCount = bindings_count;
+	pool_info.poolSizeCount = ImageHeapLayout::Bindings(graphics);
 	pool_info.pPoolSizes    = pool_sizes.data();
 	EXIT_IF(graphics.device.createDescriptorPool(&pool_info, nullptr, &m_pool) !=
 	        vk::Result::eSuccess);
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorPool     = m_pool;
 	allocate.descriptorSetCount = 1;
-	allocate.pSetLayouts        = &m_layout;
+	allocate.pSetLayouts        = &graphics.image_heap_layout;
 	EXIT_IF(graphics.device.allocateDescriptorSets(&allocate, &m_set) != vk::Result::eSuccess);
-	graphics.image_heap_layout = m_layout;
 	// Slot word 0 selects element 0, which stays a null image.
 	m_elements.push_back({.binding = {.layout = vk::ImageLayout::eShaderReadOnlyOptimal}});
 	m_writes.push_back(0u);
@@ -131,10 +144,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 
 ImageHeap::~ImageHeap() {
 	for (const auto& memory: m_memories) Unwatch(*memory);
-	auto& graphics             = m_context.GetGraphics();
-	graphics.image_heap_layout = nullptr;
-	graphics.device.destroyDescriptorPool(m_pool, nullptr);
-	graphics.device.destroyDescriptorSetLayout(m_layout, nullptr);
+	m_context.GetGraphics().device.destroyDescriptorPool(m_pool, nullptr);
 }
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {

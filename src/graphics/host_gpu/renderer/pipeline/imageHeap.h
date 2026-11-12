@@ -16,10 +16,27 @@ namespace Libs::Graphics {
 
 class Buffer;
 class CommandBuffer;
+struct GraphicContext;
 class PageManager;
 class RenderContext;
 class RenderExecutor;
 struct ImageHeapTestAccess;
+
+// The image heap's set layout (IR::ImageHeapSet), as GraphicContext::image_heap_layout while it
+// lives. RenderContext makes it before its pipeline cache, whose warm-up from the shader store
+// creates pipeline layouts that include it.
+class ImageHeapLayout final {
+public:
+	explicit ImageHeapLayout(GraphicContext& graphics);
+	~ImageHeapLayout();
+	KYTY_CLASS_NO_COPY(ImageHeapLayout);
+	// Bindings of the set: the images, and with resident textures the samplers.
+	[[nodiscard]] static uint32_t Bindings(const GraphicContext& graphics);
+
+private:
+	GraphicContext&         m_graphics;
+	vk::DescriptorSetLayout m_layout = nullptr;
+};
 
 // Guest image tables that shaders index by GPU-computed offsets, kept resident in one bindless
 // sampled-image array. A table is keyed by its base and follows its descriptor's size. Each view
@@ -152,7 +169,6 @@ private:
 	std::vector<uint32_t>                     m_scratch;
 	std::vector<uint32_t>                     m_writes; // Elements whose descriptors changed.
 	std::vector<GuestRange>                   m_unmapped; // Since the last Bury.
-	vk::DescriptorSetLayout                   m_layout = nullptr;
 	vk::DescriptorPool                        m_pool   = nullptr;
 	vk::DescriptorSet                         m_set    = nullptr;
 
