@@ -236,10 +236,49 @@ bool StoredSince(uint64_t sequence, const Log& log) {
 	return g_stored.Since(sequence, [&](const StoredRange& range) { return LogHit(log, range); });
 }
 
-Pool::Pool(uint32_t slots): m_slots(slots), m_done(std::make_unique<std::atomic<uint64_t>[]>(slots)) {
+// How long an idle worker spins before it sleeps (KYTY_PREPARE_SPIN_US, default 50): draws
+// arrive every few microseconds, and a sleeping worker's first draw after a pause waits for it to
+// wake.
+static uint64_t SpinUs() {
+	static const uint64_t us = [] {
+		const char* value = std::getenv("KYTY_PREPARE_SPIN_US");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 50ull;
+	}();
+	return us;
+}
+
+Pool::Pool(uint32_t slots, uint32_t overflow_k)
+    : m_slots(slots), m_overflow_k(overflow_k),
+      m_done(std::make_unique<std::atomic<uint64_t>[]>(slots)) {
 	for (uint32_t i = 0; i < slots; i++) {
 		m_done[i].store(0, std::memory_order_relaxed);
 	}
+	if (overflow_k != 0) {
+		m_claim = std::make_unique<std::atomic<uint64_t>[]>(slots);
+		for (uint32_t i = 0; i < slots; i++) {
+			m_claim[i].store(0, std::memory_order_relaxed);
+		}
+	}
+}
+
+bool Pool::ClaimSlot(uint64_t sequence) {
+	auto& slot    = m_claim[(sequence - 1) % m_slots];
+	auto  claimed = slot.load(std::memory_order_relaxed);
+	while (claimed < sequence) {
+		if (slot.compare_exchange_weak(claimed, sequence, std::memory_order_acq_rel,
+		                               std::memory_order_relaxed)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+uint32_t Pool::SleepingWorkers() const {
+	uint32_t sleeping = 0;
+	for (const auto* worker: m_workers) {
+		sleeping += worker->m_sleeping.load(std::memory_order_relaxed) ? 1 : 0;
+	}
+	return sleeping;
 }
 
 uint64_t Pool::Post() {
@@ -255,6 +294,11 @@ uint64_t Pool::Post() {
 				break;
 			}
 		}
+	}
+	// The overflow worker only when a draw it may take is waiting.
+	if (m_overflow != nullptr && m_overflow->m_sleeping.load(std::memory_order_relaxed) &&
+	    sequence > m_claimed.load(std::memory_order_relaxed) + m_overflow_k) {
+		m_overflow->Wake();
 	}
 	return sequence;
 }
@@ -294,9 +338,12 @@ uint64_t Pool::WaitIdle() {
 	return waited;
 }
 
-Worker::Worker(Run run, void* context, uint32_t index, Pool* pool)
-    : m_run(run), m_context(context), m_index(index), m_pool(pool) {
-	if (pool != nullptr) {
+Worker::Worker(Run run, void* context, uint32_t index, Pool* pool, bool overflow)
+    : m_run(run), m_context(context), m_index(index), m_pool(pool), m_overflow(overflow) {
+	if (pool != nullptr && overflow) {
+		EXIT_IF(pool->m_overflow != nullptr || pool->m_claim == nullptr);
+		pool->m_overflow = this;
+	} else if (pool != nullptr) {
 		pool->m_workers.push_back(this);
 	}
 	m_thread = std::thread([this] { Loop(); });
@@ -369,7 +416,11 @@ void Worker::Loop() {
 	}
 	Common::BenchMetrics::RegisterPrepareWorker(m_index, &m_busy_ns, &m_done);
 	if (m_pool != nullptr) {
-		LoopPool();
+		if (m_overflow) {
+			LoopOverflow();
+		} else {
+			LoopPool();
+		}
 		return;
 	}
 	uint64_t done = 0;
@@ -389,7 +440,7 @@ void Worker::Loop() {
 					break;
 				}
 				if ((spins & 255u) == 0 &&
-				    std::chrono::steady_clock::now() - start > std::chrono::microseconds(50)) {
+				    std::chrono::steady_clock::now() - start > std::chrono::microseconds(SpinUs())) {
 					Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSpin, stall);
 					stall = Common::StallDiag::Now();
 					m_sleeping.store(true, std::memory_order_seq_cst);
@@ -437,7 +488,7 @@ void Worker::LoopPool() {
 					break;
 				}
 				if ((spins & 255u) == 0 &&
-				    std::chrono::steady_clock::now() - start > std::chrono::microseconds(50)) {
+				    std::chrono::steady_clock::now() - start > std::chrono::microseconds(SpinUs())) {
 					Common::StallDiag::Add(Common::StallDiag::Cause::WorkerSpin, stall);
 					stall = Common::StallDiag::Now();
 					pool.m_spinning.fetch_sub(1, std::memory_order_relaxed);
@@ -460,6 +511,9 @@ void Worker::LoopPool() {
 		                                          std::memory_order_relaxed)) {
 			continue;
 		}
+		if (pool.m_claim != nullptr && !pool.ClaimSlot(claimed + 1)) {
+			continue; // the overflow worker has it
+		}
 		Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
 		const auto start = NowNs();
 		m_run(m_context, claimed + 1);
@@ -467,6 +521,59 @@ void Worker::LoopPool() {
 		// This worker's job count (BenchMetrics' prep_jobs; nothing waits on it in pool mode).
 		m_done.store(m_done.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+	}
+}
+
+// Takes the first unclaimed draw at least overflow_k past the oldest untaken one; spins briefly
+// (KYTY_PREPARE_OVERFLOW_SPIN_US, default 50), then sleeps until Post finds such a draw.
+void Worker::LoopOverflow() {
+	auto&                 pool    = *m_pool;
+	static const uint64_t spin_us = [] {
+		const char* value = std::getenv("KYTY_PREPARE_OVERFLOW_SPIN_US");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 50ull;
+	}();
+	const auto available = [&] {
+		return pool.m_posted.load(std::memory_order_acquire) >
+		       pool.m_claimed.load(std::memory_order_acquire) + pool.m_overflow_k;
+	};
+	for (;;) {
+		const auto posted   = pool.m_posted.load(std::memory_order_acquire);
+		uint64_t   sequence = 0;
+		for (auto s = pool.m_claimed.load(std::memory_order_acquire) + 1 + pool.m_overflow_k;
+		     s <= posted; s++) {
+			if (pool.ClaimSlot(s)) {
+				sequence = s;
+				break;
+			}
+		}
+		if (sequence != 0) {
+			Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
+			const auto start = NowNs();
+			m_run(m_context, sequence);
+			pool.m_done[(sequence - 1) % pool.m_slots].store(sequence, std::memory_order_release);
+			m_done.store(m_done.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			m_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+			continue;
+		}
+		if (m_stop.load(std::memory_order_acquire)) {
+			return;
+		}
+		const auto start = std::chrono::steady_clock::now();
+		for (uint32_t spins = 1;; spins++) {
+			KYTY_PREPARE_PAUSE();
+			if (available() || m_stop.load(std::memory_order_relaxed)) {
+				break;
+			}
+			if ((spins & 63u) == 0 &&
+			    std::chrono::steady_clock::now() - start > std::chrono::microseconds(spin_us)) {
+				m_sleeping.store(true, std::memory_order_seq_cst);
+				if (!available() && !m_stop.load(std::memory_order_seq_cst)) {
+					m_sleeping.wait(true, std::memory_order_seq_cst);
+				}
+				m_sleeping.store(false, std::memory_order_relaxed);
+				break;
+			}
+		}
 	}
 }
 

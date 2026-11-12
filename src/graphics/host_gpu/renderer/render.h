@@ -313,6 +313,7 @@ public:
 			FinishQueuedDraw(buffer);
 		}
 		m_draining = false;
+		m_post_after_drain = true;
 		// The draws posted next refill the queue: their waits are this drain's refill cost.
 		m_refill_until = m_queued_posted + m_queued_draws.size() - 1;
 		if (m_drain_stats) {
@@ -717,9 +718,13 @@ private:
 	bool                                             m_draining       = false;
 	uint32_t                                         m_drain_reason   = 0;
 	uint64_t                                         m_refill_until   = 0;
+	bool                                             m_post_after_drain = false;
+	bool                                             m_refill_asleep    = false;
 	struct DrainStats {
 		std::array<uint64_t, 768> count {}, drain_wait {}, refill_wait {};
 		uint64_t steady_wait = 0, start_ns = 0;
+		uint64_t refill_posts = 0, refill_asleep_any = 0, refill_asleep_all = 0;
+		uint64_t refill_wait_asleep = 0; // refill waits after a drain whose first post found every worker asleep
 	};
 	std::unique_ptr<DrainStats> m_drain_stat_storage = std::make_unique<DrainStats>();
 	DrainStats&                 m_drain_stat         = *m_drain_stat_storage;

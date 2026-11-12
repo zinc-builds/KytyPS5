@@ -118,9 +118,14 @@ class Worker;
 // Free lanes: workers sharing one queue. The command thread posts sequence numbers in order;
 // each worker takes the oldest one nobody has taken yet, so a slow draw holds up only the worker
 // running it. `slots`: draws in flight at most (the posting ring), one done flag each.
+//
+// Overflow worker (overflow_k != 0): one more worker, typically on an efficiency core, that takes
+// only draws at least `overflow_k` past the oldest untaken one, so it never holds a draw the
+// command thread will want soon. Each slot then also records the sequence last claimed in it, and
+// the other workers skip a sequence the overflow worker claimed.
 class Pool {
 public:
-	explicit Pool(uint32_t slots);
+	explicit Pool(uint32_t slots, uint32_t overflow_k = 0);
 	KYTY_CLASS_NO_COPY(Pool);
 
 	// Hands sequence `posted + 1` to the workers and returns it.
@@ -132,12 +137,20 @@ public:
 		return m_done[(sequence - 1) % m_slots].load(std::memory_order_acquire) >= sequence;
 	}
 
+	// Workers of the pool that sleep (not the overflow worker).
+	[[nodiscard]] uint32_t SleepingWorkers() const;
+	[[nodiscard]] uint32_t Workers() const { return static_cast<uint32_t>(m_workers.size()); }
+
 private:
 	friend class Worker;
 	void WakeAll();
+	bool ClaimSlot(uint64_t sequence);
 
 	uint32_t                                  m_slots;
+	uint32_t                                  m_overflow_k;
 	std::unique_ptr<std::atomic<uint64_t>[]> m_done;
+	std::unique_ptr<std::atomic<uint64_t>[]> m_claim; // with an overflow worker
+	Worker*                                   m_overflow = nullptr;
 	std::vector<Worker*>                      m_workers;
 	uint64_t                                  m_posted_local = 0; // command thread only
 	alignas(64) std::atomic<uint64_t> m_posted {0};
@@ -153,7 +166,7 @@ class Worker {
 public:
 	using Run = void (*)(void* context, uint64_t sequence);
 
-	Worker(Run run, void* context, uint32_t index, Pool* pool = nullptr);
+	Worker(Run run, void* context, uint32_t index, Pool* pool = nullptr, bool overflow = false);
 	~Worker();
 	KYTY_CLASS_NO_COPY(Worker);
 
@@ -173,6 +186,7 @@ private:
 	friend class Pool;
 	void Loop();
 	void LoopPool();
+	void LoopOverflow();
 	// Wakes the worker if it sleeps.
 	void Wake();
 
@@ -180,6 +194,7 @@ private:
 	void*    m_context;
 	uint32_t m_index;
 	Pool*    m_pool;
+	bool     m_overflow;
 	uint64_t m_posted_local = 0; // command thread only
 	alignas(64) std::atomic<uint64_t> m_posted {0};
 	alignas(64) std::atomic<uint64_t> m_done {0};

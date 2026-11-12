@@ -1851,11 +1851,19 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		m_drain_stats    = EnvFlag("KYTY_DRAIN_STATS", false);
 		// KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo.
 		const bool shared_memo = EnvFlag("KYTY_SHARED_TEXTURE_MEMO", true);
+		// KYTY_PREPARE_OVERFLOW_CPU=<cpu>: with free lanes, one more worker pinned there that takes
+		// only draws at least KYTY_PREPARE_OVERFLOW_K (default 3) past the oldest untaken one.
+		const bool     overflow   = free_lanes && Common::HybridAffinity::PrepareOverflowCpu() >= 0;
+		const char*    k_text     = std::getenv("KYTY_PREPARE_OVERFLOW_K");
+		const uint32_t overflow_k = overflow ? static_cast<uint32_t>(std::clamp(
+		                                           k_text != nullptr ? std::atoi(k_text) : 3, 1, 15))
+		                                     : 0u;
+		const uint32_t lanes      = workers + (overflow ? 1u : 0u);
 		if (free_lanes) {
 			m_prepare_pool = std::make_unique<DrawPrepare::Pool>(
-			    static_cast<uint32_t>(m_queued_draws.size()));
+			    static_cast<uint32_t>(m_queued_draws.size()), overflow_k);
 		}
-		for (uint32_t i = 0; i < workers; i++) {
+		for (uint32_t i = 0; i < lanes; i++) {
 			auto lane      = std::make_unique<PrepareLane>();
 			lane->executor = this;
 			lane->index    = i;
@@ -1865,16 +1873,19 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 			lane->textures.memo = m_texture_memos.back().get();
 			// Odd serials, distinct among the workers.
 			lane->textures.serial      = 1 + 2 * i;
-			lane->textures.serial_step = 2 * workers;
+			lane->textures.serial_step = 2 * lanes;
 			lane->stream_ring = m_context.GetBufferCache().CreateWorkerStreamRing();
 			lane->worker   = std::make_unique<DrawPrepare::Worker>(&PrepareQueuedDraw, lane.get(), i,
-			                                                      m_prepare_pool.get());
+			                                                      m_prepare_pool.get(), i >= workers);
 			m_prepare_lanes.push_back(std::move(lane));
 		}
-		Log::WriteToConsoleAndLog(fmt::format("Draw preparation on {} thread(s){}, {} draws ahead{}\n",
-		                                      workers, m_prepare_pool ? " (free lanes)" : "",
-		                                      m_queued_draws.size() - 1,
-		                                      m_prepare_verify ? " (verifying)" : ""));
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Draw preparation on {} thread(s){}, {} draws ahead{}{}\n", workers,
+		    m_prepare_pool ? " (free lanes)" : "", m_queued_draws.size() - 1,
+		    overflow ? fmt::format(", overflow worker on CPU {} (k={})",
+		                           Common::HybridAffinity::PrepareOverflowCpu(), overflow_k)
+		             : std::string(),
+		    m_prepare_verify ? " (verifying)" : ""));
 	}
 	// The ring holds one more slot than the queue, so the next one is free.
 	EXIT_IF(m_queued_count >= m_queued_draws.size());
@@ -1953,6 +1964,17 @@ void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
 	queued.sync_epoch         = GuestSyncEpoch::CurrentUnranged();
 	queued.stored_sequence    = DrawPrepare::StoredSequence();
 	queued.gpu_write_sequence = DrawPrepare::GpuWriteSequence();
+	if (m_post_after_drain) {
+		// KYTY_DRAIN_STATS: are the workers asleep when the first draw after a drain is posted?
+		m_post_after_drain = false;
+		if (m_prepare_pool) {
+			const auto sleeping = m_prepare_pool->SleepingWorkers();
+			m_drain_stat.refill_posts++;
+			m_drain_stat.refill_asleep_any += sleeping != 0 ? 1 : 0;
+			m_drain_stat.refill_asleep_all += sleeping == m_prepare_pool->Workers() ? 1 : 0;
+			m_refill_asleep = sleeping == m_prepare_pool->Workers();
+		}
+	}
 	queued.sequence           = ++m_queued_posted;
 	// The worker finds the slot from the sequence.
 	EXIT_IF(m_queued_draws[(queued.sequence - 1) % m_queued_draws.size()].get() != &queued ||
@@ -2209,6 +2231,7 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 				m_drain_stat.drain_wait[m_drain_reason] += waited;
 			} else if (sequence <= m_refill_until) {
 				m_drain_stat.refill_wait[m_drain_reason] += waited;
+				m_drain_stat.refill_wait_asleep += m_refill_asleep ? waited : 0;
 			} else {
 				m_drain_stat.steady_wait += waited;
 			}
@@ -2322,9 +2345,11 @@ void RenderExecutor::PrintDrainStats() {
 		return stat.drain_wait[a] + stat.refill_wait[a] > stat.drain_wait[b] + stat.refill_wait[b];
 	});
 	std::printf("DRAIN total drains_s=%.0f drain_wait_us_s=%.0f refill_wait_us_s=%.0f "
-	            "steady_wait_us_s=%.0f\n",
+	            "steady_wait_us_s=%.0f refill_posts_s=%.0f asleep_any_s=%.0f asleep_all_s=%.0f "
+	            "refill_wait_asleep_us_s=%.0f\n",
 	            count_total / s, drain_total / s / 1e3, refill_total / s / 1e3,
-	            stat.steady_wait / s / 1e3);
+	            stat.steady_wait / s / 1e3, stat.refill_posts / s, stat.refill_asleep_any / s,
+	            stat.refill_asleep_all / s, stat.refill_wait_asleep / s / 1e3);
 	for (size_t i = 0; i < reasons.size() && i < 12; i++) {
 		const auto r = reasons[i];
 		std::printf("DRAIN reason=%u (%s0x%02x) drains_s=%.0f drain_wait_us_s=%.0f "

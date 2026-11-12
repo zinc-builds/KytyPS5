@@ -200,13 +200,23 @@ inline void ApplyToGpuThread() {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
+// KYTY_PREPARE_OVERFLOW_CPU=<cpu>: the CPU of an overflow prepare worker (see DrawPrepare::Pool),
+// or -1 for none. The emulator's other threads are not kept off it; KYTY_GUEST_THREAD_CPUS can
+// keep the game's threads off it.
+inline int PrepareOverflowCpu() {
+	static const int cpu = EnvCpu("KYTY_PREPARE_OVERFLOW_CPU");
+	return cpu;
+}
+
 // Call from draw prepare worker `worker`: a performance core the emulator leaves to it (see
-// GetPlan).
+// GetPlan). The overflow worker (index PrepareWorkerCount()) goes to PrepareOverflowCpu().
 inline void ApplyToPrepareThread(uint32_t worker) {
 	ApplyPipelinePriority();
 	const auto& plan = GetPlan();
 	int         cpu  = -1;
-	if (worker < plan.prepare_cpus.size()) {
+	if (worker >= PrepareWorkerCount()) {
+		cpu = PrepareOverflowCpu();
+	} else if (worker < plan.prepare_cpus.size()) {
 		cpu = plan.prepare_cpus[worker];
 	} else if (worker == 0) {
 		cpu = EnvCpu("KYTY_PREPARE_CPU");
