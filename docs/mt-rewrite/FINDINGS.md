@@ -1537,6 +1537,24 @@ Results (plain build, same binary, mode on vs off):
   - elements: ~1.08k alive (peak 1.5k), ~470k one-draw conflict elements per run, 127 samplers.
 - **Off mode** against the merge-base: `cmd_ns` −0.94% ±0.98 `~`, `cpd` −0.22% `~`, `ipd` +0.74% `!` (two binaries).
 
+### The command thread's own data misses, by level (Track B, 2026-11-12)
+
+How it was measured:
+- Precise `mem_load_retired.l1_miss` / `l2_miss` samples with data addresses on KytyGpuCmd: plain -O3 -g build of #89, Sky Garden frames 1000+, 10 s.
+- Data addresses were mapped to `Image` objects through the SlotVector's 256-slot chunks, with field offsets from an `offsetof` probe. The method is in `/tmp/trackB/mem-method.md` while the machine keeps it.
+- Totals per draw: 7,700 loads, 329 L1 misses, 53 L2 misses.
+- **Weigh misses by level.** An L1 miss that hits L2 costs ~16 cycles and mostly overlaps. Resident textures removed 31.6 L1 misses per draw for −2.5% cycles.
+
+| Producer | L1/draw | L2/draw | Status |
+|---|---|---|---|
+| Hand-off reads of the QueuedDraw slot and worker records (ExecutePreparedDraw, CanReuseBindings, AdoptPrograms, FinishQueuedDraw, ResolveProposedTexture, PrepareDrawRenderState, PostQueuedDraw) | ~62 | ~18 | B4's hand-off stages |
+| libc copies and compares (ResolveProposedTexture 6.4, FindGraphicsPipeline's key compare 2.9, FindBuffers 2.9, PostQueuedDraw's register copy 2.7, TryReadFast 2.4) | 26.6 | ~7 | B4's stages; cut 3 for the key |
+| NVIDIA driver on the command thread (DispatchDirect, Submit, MasterSemaphore::Refresh, Image::Transit, EndRendering) | 10.6 | ~2 | roadmap step 7 |
+| Bound-image path in `Image` objects (7 of `Image`'s 25 lines per bound image) and `views` arrays | ~43 | ~3 | removed by resident textures (#100); `ImageHot` dropped |
+| **Buffer cache** (HasGpuDirtyBytes' std::map walk 8.9 / 0.0, ObtainBuffer 7.3 / 2.4, RebindBuffers 5.3 / 0.5, FindBuffer, IsRegionGpuModified, TouchBuffer) | 35 | 3.6 | **not worth flattening:** a ceiling of ~500 cycles before overlap |
+| `hw_check` (per-draw register validation, reads the register copy) | 7.5 | 2.8 | to be skipped under B4's register change flags |
+| Recorder ring (Reserve, WaitDone) | 1.9 | 2.0 | |
+
 ### Build modes: PGO + ThinLTO (Track P, 2026-11-11)
 
 The research pass (branch `research/60fps-gap`) found PGO + ThinLTO worth +12.5% with no source
