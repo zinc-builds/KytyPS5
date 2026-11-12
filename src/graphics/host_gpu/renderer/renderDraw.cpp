@@ -974,7 +974,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 }
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
-                                              const DrawIndexBufferSource& source) {
+                                              const DrawIndexBufferSource& source,
+                                              uint32_t speculated = UINT32_MAX) {
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
 		return prepared;
@@ -987,7 +988,8 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		prepared.buffer = stream.Handle();
 	} else {
 		auto [buffer_ptr, offset] =
-		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
+		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false,
+		                                                      false, {}, speculated);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 	}
@@ -1225,7 +1227,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		        : std::span<const uint32_t> {},
 		    vertex_bindings,
 		    m_adopted_buffers != nullptr ? &m_adopted_buffers->vertex_ranges : nullptr);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		index_binding   = PrepareIndexBuffer(
+		    buffer, index_source,
+		    m_adopted_buffers != nullptr ? m_adopted_buffers->index_speculated : UINT32_MAX);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	if (emit.indirect.address != 0) {
@@ -1862,6 +1866,7 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 			// Odd serials, distinct among the workers.
 			lane->textures.serial      = 1 + 2 * i;
 			lane->textures.serial_step = 2 * workers;
+			lane->stream_ring = m_context.GetBufferCache().CreateWorkerStreamRing();
 			lane->worker   = std::make_unique<DrawPrepare::Worker>(&PrepareQueuedDraw, lane.get(), i,
 			                                                      m_prepare_pool.get());
 			m_prepare_lanes.push_back(std::move(lane));
@@ -1958,7 +1963,7 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	self.m_context.GetPipelineCache().GetGraphicsPrograms(
 	    queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
 	DrawPrepare::SetLog(nullptr);
-	self.SpeculateBuffers(queued);
+	self.SpeculateBuffers(queued, lane.stream_ring);
 	self.SpeculateTextures(queued, lane.textures);
 	self.SpeculateTargets(queued, lane.targets);
 	self.ProposePipelineKey(queued);
@@ -2044,9 +2049,10 @@ RenderExecutor::AdoptedTextureProposals(const ShaderStageRuntime& runtime) const
 
 // Prepare worker: the draw's buffer ranges and the clean buffers holding them, as FindBuffers
 // and AcquireVertexBuffers will ask for them (BufferCache::Speculation).
-void RenderExecutor::SpeculateBuffers(QueuedDraw& queued) {
+void RenderExecutor::SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring) {
 	auto& buffers = queued.buffers;
 	buffers.ready = false;
+	buffers.speculation.ring = nullptr;
 	auto& state   = queued.state;
 	if (!BufferCache::WorkerBuffersEnabled() || queued.log.failed ||
 	    state.vertex_info[0].stage.module == nullptr) {
@@ -2054,6 +2060,10 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued) {
 	}
 	auto& cache = m_context.GetBufferCache();
 	cache.BeginSpeculation(buffers.speculation);
+	if (ring != nullptr) {
+		ring->BeginDraw(queued.sequence);
+		buffers.speculation.ring = ring;
+	}
 	uint32_t count = 0;
 	for (uint32_t i = 0; i < state.vertex_stage_count; i++) {
 		buffers.runtimes[count++] = &state.vertex_info[i].stage;
@@ -2089,6 +2099,26 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued) {
 			    buffers.speculation, range.base_address, range.acquired_end - range.base_address);
 		}
 		buffers.vertex_count = merged.count;
+	}
+	// The index range as DrawIndex reads it (8-bit indices are expanded on the command thread).
+	buffers.index_speculated = UINT32_MAX;
+	if (queued.indexed && queued.index_args.index_addr != nullptr) {
+		const auto type = static_cast<Prospero::IndexType>(queued.index_args.index_type_and_size);
+		const uint64_t element = type == Prospero::IndexType::kIndex16   ? 2
+		                         : type == Prospero::IndexType::kIndex32 ? 4
+		                                                                 : 0;
+		if (element != 0 && queued.index_args.index_count != 0) {
+			buffers.index_speculated = cache.SpeculateLookup(
+			    buffers.speculation, reinterpret_cast<uint64_t>(queued.index_args.index_addr),
+			    uint64_t {queued.index_args.index_count} * element);
+		}
+	}
+	// The adoption checks stream copies against GPU writes and emulator stores like the
+	// preparation's other reads.
+	for (const auto& range: buffers.speculation.ranges) {
+		if (range.stream) {
+			queued.log.reads.emplace_back(range.vaddr, range.size);
+		}
 	}
 	buffers.ready = true;
 }
@@ -2148,6 +2178,11 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	m_texture_updates.clear();
 	m_context.GetBufferCache().SetSpeculation(nullptr);
 	buffer.Bind(registers, user_config, shaders);
+	// The worker that prepared this draw (any, with free lanes) may reuse its stream copies once
+	// the GPU passes the current tick. Only that worker's ring holds them.
+	if (auto* ring = queued.buffers.speculation.ring; ring != nullptr) {
+		ring->Retire(sequence, m_context.GetCommandScheduler().CurrentTick());
+	}
 
 	if (m_prepare_stats) {
 		auto&      stat = m_prepare_stat;

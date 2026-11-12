@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/asyncUploader.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/workerStreamRing.h"
 
 #include <array>
 #include <atomic>
@@ -113,19 +114,35 @@ public:
 	// CPU-dirty page. It stays valid while no page anywhere newly became CPU-dirty
 	// (g_cpu_dirty_generation) and no buffer was registered or unregistered since the
 	// generations were read, which happens before the lookups.
+	//
+	// A CPU-written range the command thread would stream-copy (read-only, at most a page, no
+	// GPU-dirty page, a CPU-dirty one) is copied by the worker instead, into its WorkerStreamRing
+	// (`stream`). The worker runs after the draw's PM4 position, so the copy is no older than it.
+	// The command thread uses the copy if the range is still in that state and no page of the
+	// 64-page words holding it newly became CPU-dirty since (`growth`, per range, not global);
+	// the draw's adoption checks it against GPU writes and emulator stores like its other reads.
+	// KYTY_WORKER_STREAM=0 turns this off, =verify copies again at commit and compares, =stats
+	// prints WORKERSTREAM lines.
 	struct SpeculatedRange {
 		uint64_t vaddr  = 0;
 		uint64_t size   = 0;
-		uint64_t offset = 0;
+		uint64_t offset = 0; // in the buffer, or in the stream ring
 		BufferId id {};
+		bool     stream = false;
+		uint64_t growth = 0; // stream: MemoryTracker::CpuGrowthNoCreate when it was copied
+		uint64_t hash   = 0; // stream, KYTY_WORKER_STREAM=verify: of the bytes copied
 	};
 	struct Speculation {
 		uint64_t                     cpu_dirty_generation = 0;
 		uint64_t                     registration_seq     = 1; // odd: none
 		std::vector<SpeculatedRange> ranges;
+		WorkerStreamRing*            ring = nullptr; // null: no stream copies
 	};
 	[[nodiscard]] static bool WorkerBuffersEnabled();
 	[[nodiscard]] static bool WorkerBuffersVerify();
+	[[nodiscard]] static bool WorkerStreamEnabled();
+	// Command thread, at setup: a ring for one prepare worker (owned by the cache).
+	[[nodiscard]] WorkerStreamRing* CreateWorkerStreamRing();
 	// Prepare worker: the generations a speculation is taken against, read before any lookup.
 	void BeginSpeculation(Speculation& speculation) const;
 	// Prepare worker: records the buffer holding [vaddr, vaddr + size) if it is CPU-clean and
@@ -204,6 +221,11 @@ private:
 	                                        std::shared_ptr<PendingRead> read = {});
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool VerifyStreamHit(uint64_t vaddr, uint64_t size, uint64_t offset);
+	[[nodiscard]] uint32_t SpeculateClean(Speculation& speculation, uint64_t vaddr,
+	                                      uint64_t size) const;
+	// The command thread's use of a worker stream copy (SpeculatedRange::stream).
+	[[nodiscard]] bool AdoptWorkerStream(const SpeculatedRange& range);
+	std::vector<std::unique_ptr<WorkerStreamRing>> m_worker_stream_rings;
 
 	// Stream copies of CPU-written ranges, reused for the same (address, size) while the guest
 	// has had no chance to rewrite them (GuestSyncEpoch), in the same command buffer and stream

@@ -1265,8 +1265,275 @@ void BufferCache::BeginSpeculation(Speculation& speculation) const {
 	speculation.cpu_dirty_generation = g_cpu_dirty_generation.load(std::memory_order_acquire);
 }
 
+bool BufferCache::WorkerStreamEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WORKER_STREAM");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+namespace {
+// KYTY_WORKER_STREAM=verify: every adopted worker copy is compared with a fresh one.
+bool WorkerStreamVerify() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WORKER_STREAM");
+		return value != nullptr && std::string_view(value) == "verify";
+	}();
+	return on;
+}
+// KYTY_WORKER_STREAM=stats: WORKERSTREAM lines (command thread).
+bool WorkerStreamStats() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WORKER_STREAM");
+		return value != nullptr && std::string_view(value) == "stats";
+	}();
+	return on;
+}
+enum class StreamOutcome { Adopted, Gpu, Clean, Grown, DirectListed, DirectUnlisted };
+void NoteWorkerStream(StreamOutcome outcome, uint64_t bytes,
+                      const std::vector<std::unique_ptr<WorkerStreamRing>>& rings) {
+	static uint64_t counts[6] {};
+	static uint64_t adopted_bytes = 0;
+	static auto     last          = std::chrono::steady_clock::now();
+	counts[static_cast<int>(outcome)]++;
+	if (outcome == StreamOutcome::Adopted) {
+		adopted_bytes += bytes;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last >= std::chrono::seconds(1)) {
+		const double s = std::chrono::duration<double>(now - last).count();
+		static uint64_t before[3] {};
+		uint64_t        now_total[3] {};
+		for (const auto& ring: rings) {
+			now_total[0] += ring->Full();
+			now_total[1] += ring->Copies();
+			now_total[2] += ring->Reuses();
+		}
+		std::printf("WORKERSTREAM adopted_s=%.0f (%.1f MB/s) gpu_s=%.0f clean_s=%.0f grown_s=%.0f "
+		            "worker_copies_s=%.0f worker_reuses_s=%.0f ring_full_s=%.0f "
+		            "direct_listed_s=%.0f direct_unlisted_s=%.0f\n",
+		            counts[0] / s, adopted_bytes / s / 1e6, counts[1] / s, counts[2] / s,
+		            counts[3] / s, (now_total[1] - before[1]) / s, (now_total[2] - before[2]) / s,
+		            (now_total[0] - before[0]) / s, counts[4] / s, counts[5] / s);
+		std::copy(std::begin(now_total), std::end(now_total), std::begin(before));
+		std::fflush(stdout);
+		std::fill(std::begin(counts), std::end(counts), 0);
+		adopted_bytes = 0;
+		last          = now;
+	}
+}
+} // namespace
+
+WorkerStreamRing::WorkerStreamRing(GraphicContext& graphics, CommandScheduler& scheduler,
+                                   uint64_t size)
+    : m_buffer(graphics, scheduler, MemoryUsage::Stream, size),
+      m_atom(std::max<uint64_t>(graphics.physical_device_properties.limits.nonCoherentAtomSize, 1)),
+      m_scheduler(scheduler) {}
+
+void WorkerStreamRing::Release() {
+	const auto retired = m_retired.load(std::memory_order_acquire);
+	auto&      master  = m_scheduler.GetMasterSemaphore();
+	bool       refreshed = false;
+	while (!m_live.empty()) {
+		const auto& oldest = m_live.front();
+		if (oldest.sequence > retired) {
+			break;
+		}
+		const auto tick = m_ticks[oldest.sequence % TICK_SLOTS].load(std::memory_order_relaxed);
+		if (!master.IsFree(tick)) {
+			if (refreshed) {
+				break;
+			}
+			master.Refresh();
+			refreshed = true;
+			continue;
+		}
+		m_live.pop_front();
+		m_popped++;
+	}
+	if (m_live.empty()) {
+		m_head = 0;
+		m_tail = 0;
+	} else {
+		m_tail = m_live.front().start;
+	}
+}
+
+std::pair<uint8_t*, uint64_t> WorkerStreamRing::Allocate(uint64_t size, uint64_t alignment) {
+	const auto capacity = m_buffer.Size();
+	if (m_buffer.Mapped().empty() || size == 0 || size > capacity / 4) {
+		return {nullptr, 0};
+	}
+	// Whole atoms, so a non-coherent flush of the allocation touches only it.
+	alignment = std::max(alignment, m_atom);
+	size      = (size + m_atom - 1) / m_atom * m_atom;
+	Release();
+	uint64_t start = (m_head + alignment - 1) / alignment * alignment;
+	if (m_live.empty() || m_head > m_tail) {
+		// Free: [head, capacity) and [0, tail).
+		if (start > capacity || capacity - start < size) {
+			if (!m_live.empty() && size >= m_tail) {
+				m_full.fetch_add(1, std::memory_order_relaxed);
+				return {nullptr, 0};
+			}
+			start = 0;
+		}
+	} else if (start >= m_tail || m_tail - start <= size) {
+		// Wrapped: free is [head, tail); kept from reaching tail, so head == tail means empty.
+		m_full.fetch_add(1, std::memory_order_relaxed);
+		return {nullptr, 0};
+	}
+	m_head = start + size;
+	if (m_live.empty() || m_live.back().sequence != m_sequence || start < m_live.back().start) {
+		m_live.push_back({start, m_head, m_sequence});
+	} else {
+		m_live.back().end = m_head;
+	}
+	return {m_buffer.Mapped().data() + start, start};
+}
+
+namespace {
+size_t WorkerCopySlot(uint64_t vaddr, uint64_t size, size_t slots) {
+	return static_cast<size_t>(((vaddr >> 4) ^ (size * 0x9E3779B97F4A7C15ull)) *
+	                           0xBF58476D1CE4E5B9ull >> 40) &
+	       (slots - 1);
+}
+} // namespace
+
+uint64_t WorkerStreamRing::FindCopy(uint64_t vaddr, uint64_t size, uint64_t epoch,
+                                    uint64_t growth, uint64_t& hash) {
+	auto& copy = (*m_copies_by_range)[WorkerCopySlot(vaddr, size, COPY_SLOTS)];
+	if (copy.vaddr != vaddr || copy.size != size || copy.epoch != epoch ||
+	    copy.growth != growth || copy.entry == UINT64_MAX || copy.entry < m_popped) {
+		return UINT64_MAX;
+	}
+	// Released in order: the allocation now lives until this draw retires.
+	auto& allocation    = m_live[copy.entry - m_popped];
+	allocation.sequence = std::max(allocation.sequence, m_sequence);
+	m_reuses.fetch_add(1, std::memory_order_relaxed);
+	hash = copy.hash;
+	return copy.offset;
+}
+
+void WorkerStreamRing::NoteCopy(uint64_t vaddr, uint64_t size, uint64_t offset, uint64_t epoch,
+                                uint64_t growth, uint64_t hash) {
+	(*m_copies_by_range)[WorkerCopySlot(vaddr, size, COPY_SLOTS)] = {
+	    vaddr, size, offset, epoch, growth, m_popped + m_live.size() - 1, hash};
+	m_copies.fetch_add(1, std::memory_order_relaxed);
+}
+
+void WorkerStreamRing::Flush(uint64_t offset, uint64_t size) {
+	size = (size + m_atom - 1) / m_atom * m_atom;
+	m_buffer.Flush(offset, std::min(size, m_buffer.Size() - offset));
+}
+
+WorkerStreamRing* BufferCache::CreateWorkerStreamRing() {
+	if (!WorkerBuffersEnabled() || !WorkerStreamEnabled()) {
+		return nullptr;
+	}
+	m_worker_stream_rings.push_back(
+	    std::make_unique<WorkerStreamRing>(m_graphics, m_scheduler, 64 * MiB));
+	return m_worker_stream_rings.back().get();
+}
+
+bool BufferCache::AdoptWorkerStream(const SpeculatedRange& range) {
+	const auto vaddr = range.vaddr;
+	const auto size  = range.size;
+	// As at the copy: the command thread would stream these bytes now.
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		if (WorkerStreamStats()) NoteWorkerStream(StreamOutcome::Gpu, 0, m_worker_stream_rings);
+		return false;
+	}
+	if (!m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		if (WorkerStreamStats()) NoteWorkerStream(StreamOutcome::Clean, 0, m_worker_stream_rings);
+		return false;
+	}
+	// No page of the range's words newly became CPU-dirty since the copy.
+	if (m_memory_tracker.CpuGrowthNoCreate(vaddr, size) != range.growth) {
+		if (WorkerStreamStats()) NoteWorkerStream(StreamOutcome::Grown, 0, m_worker_stream_rings);
+		return false;
+	}
+	if (WorkerStreamVerify()) {
+		// Every adoption: the guest bytes now hash as the worker's copy did (no stale copy).
+		// One in 32: the ring still holds those bytes (no reuse of live space).
+		static thread_local uint8_t fresh[CACHING_PAGESIZE];
+		static uint64_t             checks = 0;
+		if (!LibKernel::Memory::CopySparseMemory(vaddr, fresh, size)) {
+			EXIT("KYTY_WORKER_STREAM=verify: cannot read 0x%016" PRIx64 "+%" PRIu64 "\n", vaddr,
+			     size);
+		}
+		if (XXH3_64bits(fresh, size) != range.hash) {
+			EXIT("KYTY_WORKER_STREAM=verify: the guest bytes of 0x%016" PRIx64 "+%" PRIu64
+			     " changed since the worker copied them\n",
+			     vaddr, size);
+		}
+		if (checks++ % 32 == 0) {
+			const auto* copy = m_speculation->ring->GetBuffer().Mapped().data() + range.offset;
+			if (std::memcmp(copy, fresh, size) != 0) {
+				uint64_t first = 0;
+				while (first < size && copy[first] == fresh[first]) {
+					first++;
+				}
+				EXIT("KYTY_WORKER_STREAM=verify: the ring copy of 0x%016" PRIx64 "+%" PRIu64
+				     " differs at +%" PRIu64 " (ring offset %" PRIu64 ")\n",
+				     vaddr, size, first, range.offset);
+			}
+		}
+		if (checks % 1000000 == 0) {
+			std::printf("WORKERSTREAM_VERIFY checks=%" PRIu64 "\n", checks);
+			std::fflush(stdout);
+		}
+	}
+	if (WorkerStreamStats()) NoteWorkerStream(StreamOutcome::Adopted, size, m_worker_stream_rings);
+	return true;
+}
+
 uint32_t BufferCache::SpeculateLookup(Speculation& speculation, uint64_t vaddr,
                                       uint64_t size) const {
+	const auto found = SpeculateClean(speculation, vaddr, size);
+	if (found != UINT32_MAX || speculation.ring == nullptr || size == 0 ||
+	    size > CACHING_PAGESIZE || !(GuestRange {vaddr, size}.Valid())) {
+		return found;
+	}
+	// The command thread's stream path: read-only, no GPU-dirty page, a CPU-dirty one. The
+	// growth counters are read before the bits, and the bytes after them.
+	auto&      ring   = *speculation.ring;
+	const auto epoch  = GuestSyncEpoch::Current();
+	uint64_t   growth = 0;
+	if (!m_memory_tracker.IsRegionStreamableNoCreate(vaddr, size, growth)) {
+		return UINT32_MAX;
+	}
+	uint64_t hash   = 0;
+	auto     offset = ring.FindCopy(vaddr, size, epoch, growth, hash);
+	if (offset == UINT64_MAX) {
+		const auto alignment = std::max<uint64_t>(
+		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		const auto [mapped, at] = ring.Allocate(size, alignment);
+		if (mapped == nullptr) {
+			return UINT32_MAX;
+		}
+		if (WorkerStreamVerify()) {
+			// Hash what is copied, through a cached buffer (the ring reads back slowly).
+			static thread_local uint8_t bytes[CACHING_PAGESIZE];
+			if (!LibKernel::Memory::CopySparseMemory(vaddr, bytes, size)) {
+				return UINT32_MAX;
+			}
+			std::memcpy(mapped, bytes, size);
+			hash = XXH3_64bits(bytes, size);
+		} else if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+			return UINT32_MAX;
+		}
+		ring.Flush(at, size);
+		ring.NoteCopy(vaddr, size, at, epoch, growth, hash);
+		offset = at;
+	}
+	speculation.ranges.push_back({vaddr, size, offset, BufferId {}, true, growth, hash});
+	return static_cast<uint32_t>(speculation.ranges.size() - 1);
+}
+
+uint32_t BufferCache::SpeculateClean(Speculation& speculation, uint64_t vaddr,
+                                     uint64_t size) const {
 	const auto seq = speculation.registration_seq;
 	if ((seq & 1u) != 0 || size == 0 || !(GuestRange {vaddr, size}.Valid())) {
 		return UINT32_MAX;
@@ -1329,11 +1596,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (MemDiag::BdaStatsMode() != 0) {
 		BdaStats::NoteBound(vaddr, size);
 	}
-	if (speculated != UINT32_MAX && m_speculation != nullptr && !is_written && !is_texel_buffer) {
+	// The stream path below ignores is_texel_buffer, so a worker stream copy does too.
+	if (speculated != UINT32_MAX && m_speculation != nullptr && !is_written &&
+	    (!is_texel_buffer ||
+	     (speculated < m_speculation->ranges.size() && m_speculation->ranges[speculated].stream))) {
 		const auto& ranges = m_speculation->ranges;
+		// A stream range has no buffer; FindBuffers still finds (or creates) one for its id.
 		if (speculated >= ranges.size() || ranges[speculated].vaddr != vaddr ||
-		    ranges[speculated].size != size || (id && ranges[speculated].id != id)) {
+		    ranges[speculated].size != size ||
+		    (id && !ranges[speculated].stream && ranges[speculated].id != id)) {
 			if (WorkerBuffersStats()) NoteWorkerBuffer(2);
+		} else if (ranges[speculated].stream) {
+			if (AdoptWorkerStream(ranges[speculated])) {
+				return {&m_speculation->ring->GetBuffer(), ranges[speculated].offset};
+			}
 		} else if (!SpeculationValid(*m_speculation)) {
 			if (WorkerBuffersStats()) NoteWorkerBuffer(1);
 		} else {
@@ -1372,6 +1648,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		if (WorkerStreamStats()) {
+			NoteWorkerStream(speculated == UINT32_MAX ? StreamOutcome::DirectUnlisted
+			                                          : StreamOutcome::DirectListed,
+			                 0, m_worker_stream_rings);
+		}
 		static const bool reuse_disabled = std::getenv("KYTY_NO_STREAM_REUSE") != nullptr;
 		const auto        epoch          = GuestSyncEpoch::Current();
 		const auto        tick           = m_scheduler.CurrentTick();

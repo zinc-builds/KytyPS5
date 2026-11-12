@@ -344,6 +344,8 @@ private:
 		// MergeVertexRanges of the draw's vertex stage (vertex_count of them), reused at commit
 		// but for the clamp to mapped memory.
 		MergedVertexRanges                                   vertex_ranges;
+		// Speculation index of the indexed draw's index range (UINT32_MAX: none).
+		uint32_t                                             index_speculated = UINT32_MAX;
 		BufferCache::Speculation                             speculation;
 	};
 
@@ -417,7 +419,8 @@ private:
 	                                RenderColorInfo& r, uint32_t slot);
 	// The worker's buffer side for the queued draw being committed, while it may be used.
 	const WorkerBuffers* m_adopted_buffers = nullptr;
-	void                 SpeculateBuffers(QueuedDraw& queued);
+	// ring: the worker's stream ring (null: no stream copies).
+	void                 SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring);
 	// The worker's texture side for the queued draw being committed, while it may be used.
 	const WorkerTextures* m_adopted_textures = nullptr;
 	// The prepare workers' texture resolve memo, one for all of them (KYTY_SHARED_TEXTURE_MEMO=0:
@@ -655,6 +658,7 @@ private:
 		uint32_t                             index    = 0;
 		WorkerTextureState                   textures;
 		WorkerTargetMemo                     targets;
+		WorkerStreamRing*                    stream_ring = nullptr; // owned by the buffer cache
 		std::unique_ptr<DrawPrepare::Worker> worker;
 	};
 	// Free lanes (KYTY_FREE_LANES, default on with more than one worker): the workers share one
