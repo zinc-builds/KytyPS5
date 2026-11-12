@@ -319,6 +319,149 @@ void TimedUploadWrite(Common::GpuWaitDiag::UploadSample& sample, uint8_t* mapped
 	sample.copy_flt = Diag::ThreadMinorFaults() - flt;
 }
 
+// KYTY_COLLIDE_DIAG=1: when the GPU thread's write collection (or a CP label store) invalidates a
+// page that is GPU-dirty, ReadMemory downloads synchronously to merge the GPU's bytes into it.
+// Does the guest page hold anything the GPU buffer lacks? Each upload records a hash per 64-byte
+// line of the guest bytes it copied, per page; at a collision the page's current guest bytes are
+// hashed again. "same": no line changed since the last upload (the collected write mark adds
+// nothing to the GPU buffer: the download and re-upload are a no-op for it). "out": lines changed,
+// none overlapping the GPU-written bytes. "in": a changed line overlaps them. "none": no upload
+// recorded. COLLIDE line once per second.
+namespace CollideDiag {
+namespace {
+bool Enabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_COLLIDE_DIAG");
+		return v != nullptr && v[0] != '0';
+	}();
+	return on;
+}
+struct PageRec {
+	uint64_t                 up_seq = 0, acq_seq = 0, up_sync = 0, acq_sync = 0;
+	uint64_t                 valid  = 0; // lines with a hash
+	std::array<uint32_t, 64> lines {};
+	bool                     written_upload = false;
+};
+struct State {
+	std::mutex                            mutex;
+	std::unordered_map<uint64_t, PageRec> pages;
+	uint64_t                              seq = 0, sync = 0;
+	uint64_t collisions = 0, examined = 0, clean = 0, same = 0, out = 0, in = 0, none = 0;
+	uint64_t same_sync = 0, later_acq = 0, no_acq = 0, lines_out = 0, lines_in = 0;
+	uint64_t label = 0;
+	uint64_t last_print = 0;
+};
+State& Get() {
+	static State s;
+	return s;
+}
+thread_local bool     t_written = false;
+thread_local uint64_t t_sync    = 0;
+thread_local bool     t_label   = false;
+
+uint32_t LineHash(const uint8_t* bytes, size_t n) {
+	return static_cast<uint32_t>(XXH3_64bits(bytes, n));
+}
+
+void BeginSync(bool is_written) {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	t_sync    = ++s.sync;
+	t_written = is_written;
+}
+
+void NoteUpload(uint64_t address, const uint8_t* staged, uint64_t size) {
+	auto&           s   = Get();
+	std::lock_guard lock(s.mutex);
+	const auto      end = address + size;
+	for (uint64_t page = address & ~4095ull; page < end; page += 4096) {
+		auto&      r  = s.pages[page];
+		const auto lo = std::max(address, page), hi = std::min(end, page + 4096);
+		for (uint64_t line = (lo - page) / 64; line * 64 < hi - page; line++) {
+			const auto a = std::max(lo, page + line * 64), b = std::min(hi, page + line * 64 + 64);
+			if (a != page + line * 64 || b != page + line * 64 + 64) {
+				r.valid &= ~(1ull << line); // partial line: not comparable
+				continue;
+			}
+			r.lines[line] = LineHash(staged + (a - address), 64);
+			r.valid |= 1ull << line;
+		}
+		r.up_seq         = ++s.seq;
+		r.up_sync        = t_sync;
+		r.written_upload = t_written;
+	}
+}
+
+void NoteAcquire(uint64_t vaddr, uint64_t size) {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	for (uint64_t page = vaddr & ~4095ull; page < vaddr + size; page += 4096) {
+		auto& r    = s.pages[page];
+		r.acq_seq  = ++s.seq;
+		r.acq_sync = t_sync;
+	}
+}
+
+void NoteCollision(uint64_t vaddr, uint64_t size, const RangeSet& gpu, const auto& page_gpu_dirty) {
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	s.collisions++;
+	s.label += t_label ? 1 : 0;
+	std::array<uint8_t, 4096> bytes {};
+	for (uint64_t page = vaddr & ~4095ull; page < vaddr + size; page += 4096) {
+		if (!page_gpu_dirty(page)) {
+			s.clean++;
+			continue;
+		}
+		s.examined++;
+		const auto it = s.pages.find(page);
+		if (it == s.pages.end() || it->second.valid == 0 || it->second.up_seq == 0 ||
+		    !LibKernel::Memory::CopySparseMemory(page, bytes.data(), 4096)) {
+			s.none++;
+			continue;
+		}
+		const auto& r = it->second;
+		uint32_t    changed_out = 0, changed_in = 0;
+		for (uint32_t line = 0; line < 64; line++) {
+			if ((r.valid & (1ull << line)) == 0 || LineHash(bytes.data() + line * 64, 64) == r.lines[line]) {
+				continue;
+			}
+			bool overlap = false;
+			gpu.ForEachInRange(page + line * 64, 64, [&](uint64_t, uint64_t) { overlap = true; });
+			(overlap ? changed_in : changed_out)++;
+		}
+		s.lines_out += changed_out;
+		s.lines_in += changed_in;
+		if (changed_in != 0) {
+			s.in++;
+		} else if (changed_out != 0) {
+			s.out++;
+		} else {
+			s.same++;
+		}
+		if (r.acq_seq == 0) {
+			s.no_acq++;
+		} else if (r.acq_sync == r.up_sync) {
+			s.same_sync++; // uploaded by the sync that took GPU ownership
+		} else if (r.acq_seq > r.up_seq) {
+			s.later_acq++; // GPU ownership taken later, without uploading the page
+		}
+	}
+	const auto now = Common::GpuWaitDiag::NowNs();
+	if (now - s.last_print >= 1'000'000'000ull) {
+		s.last_print = now;
+		std::printf("COLLIDE collisions=%" PRIu64 " label=%" PRIu64 " pages_gpu=%" PRIu64
+		            " pages_clean=%" PRIu64 " same=%" PRIu64 " out=%" PRIu64 " in=%" PRIu64
+		            " none=%" PRIu64 " acq_same_sync=%" PRIu64 " acq_later=%" PRIu64 " acq_none=%" PRIu64
+		            " lines_out=%" PRIu64 " lines_in=%" PRIu64 " tracked_pages=%zu\n",
+		            s.collisions, s.label, s.examined, s.clean, s.same, s.out, s.in, s.none,
+		            s.same_sync, s.later_acq, s.no_acq, s.lines_out, s.lines_in, s.pages.size());
+		std::fflush(stdout);
+	}
+}
+} // namespace
+} // namespace CollideDiag
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -663,6 +806,10 @@ BufferCache::~BufferCache() {
 	}
 }
 
+void BufferCache::SetCollideLabelScope(bool on) noexcept {
+	CollideDiag::t_label = on;
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
@@ -721,6 +868,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 			if (IsRegionGpuModified(vaddr, size)) {
+				if (is_write && CollideDiag::Enabled()) {
+					CollideDiag::NoteCollision(vaddr, size, m_gpu_modified_ranges, [this](uint64_t page) {
+						return IsRegionGpuModified(page, 4096);
+					});
+				}
 				downloaded              = true;
 				const auto [start, len] = DownloadWindow(buffer, vaddr, size);
 				// Reads in flight publish first: their bytes are no longer GPU-dirty.
@@ -1063,6 +1215,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	if (CollideDiag::Enabled()) {
+		CollideDiag::BeginSync(is_written);
+	}
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -1070,6 +1225,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (is_written && CollideDiag::Enabled()) {
+		CollideDiag::NoteAcquire(vaddr, size);
+	}
 	if (MemDiag::BdaStatsMode() != 0 && source && g_sync_kind == MemDiag::Sync::Bda) {
 		BdaStats::NoteUpload(buffer, copies);
 	}
@@ -1194,6 +1352,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+			if (CollideDiag::Enabled()) {
+				CollideDiag::NoteUpload(address, mapped + copy.srcOffset, copy.size);
 			}
 			if (MemDiag::BdaStatsMode() != 0 && g_sync_kind == MemDiag::Sync::Bda) {
 				BdaStats::NoteStaged(address, mapped + copy.srcOffset, copy.size);
