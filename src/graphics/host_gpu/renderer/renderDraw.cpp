@@ -1793,10 +1793,14 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		return nullptr;
 	}
 	if (m_prepare_lanes.empty()) {
-		const char* depth_text = std::getenv("KYTY_PREPARE_DEPTH");
-		const auto  depth = std::clamp(depth_text != nullptr ? std::atoi(depth_text) : 4, 1, 16);
-		const auto  workers = std::max(Common::HybridAffinity::PrepareWorkerCount(), 1u);
+		const auto workers = std::max(Common::HybridAffinity::PrepareWorkerCount(), 1u);
 		EXIT_IF(workers > ShaderRecompiler::IR::ResourcePlan::MaxPrepareWorkers);
+		const bool free_lanes = workers > 1 && EnvFlag("KYTY_FREE_LANES", true);
+		// Deeper with free lanes: a worker past a slow draw can then run further ahead (with strict
+		// alternation the extra draws only queue behind it; either alone measured flat).
+		const char* depth_text = std::getenv("KYTY_PREPARE_DEPTH");
+		const auto  depth = std::clamp(depth_text != nullptr ? std::atoi(depth_text) : free_lanes ? 8 : 4,
+		                               1, 16);
 		// One more slot than the queue, rounded up to a multiple of the workers.
 		m_queued_draws.resize((depth + workers) / workers * workers);
 		for (auto& slot: m_queued_draws) {
@@ -1807,7 +1811,7 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		m_drain_stats    = EnvFlag("KYTY_DRAIN_STATS", false);
 		// KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo.
 		const bool shared_memo = EnvFlag("KYTY_SHARED_TEXTURE_MEMO", true);
-		if (workers > 1 && EnvFlag("KYTY_FREE_LANES", true)) {
+		if (free_lanes) {
 			m_prepare_pool = std::make_unique<DrawPrepare::Pool>(
 			    static_cast<uint32_t>(m_queued_draws.size()));
 		}

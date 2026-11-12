@@ -658,7 +658,8 @@ private:
 		std::unique_ptr<DrawPrepare::Worker> worker;
 	};
 	// Free lanes (KYTY_FREE_LANES, default on with more than one worker): the workers share one
-	// queue instead of taking every n-th draw. Outlives the lanes.
+	// queue instead of taking every n-th draw, and the queue defaults to 8 draws ahead instead of 4
+	// (KYTY_PREPARE_DEPTH). Outlives the lanes.
 	std::unique_ptr<DrawPrepare::Pool>               m_prepare_pool;
 	std::vector<std::unique_ptr<PrepareLane>>        m_prepare_lanes;
 	std::vector<std::unique_ptr<QueuedDraw>>         m_queued_draws;
