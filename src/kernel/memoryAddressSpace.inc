@@ -1069,9 +1069,127 @@ public:
 		}
 		for (const auto& [begin, end]: found) {
 			m_write_protection.Scan(begin, end - begin, [&](uint64_t written_begin, uint64_t written_end) {
+				StagedConsumedLocked(written_begin, written_end);
 				m_kept_writes.emplace_back(written_begin, written_end);
 			});
 		}
+	}
+
+	// BDA pre-staging (docs/mt-rewrite/bda-prestage-design.md): a page another thread copies ahead
+	// of its upload is "staged". Arming clears its written mark (keeping any store found: on a
+	// newly staged page it predates the copy, on an already staged one it moves the version) and
+	// registers it, in one hold of m_kept_mutex; from then on every consumption of its mark (any
+	// re-protecting scan: GPU-thread collections, submit scans, label stores, re-protections)
+	// moves its PageVersions version, so the copy is not used. Refused, with nullopt: pages
+	// outside asynchronous write protection, and aliased pages (a store through another view of
+	// the bytes marks no page table of this one). Returns the remap generation the arm is valid
+	// for: remaps, aliases, unmaps and zeroing move it (g_remap_generation).
+	std::optional<uint64_t> ArmStaged(uint64_t vaddr, uint64_t size) {
+		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		const auto begin = vaddr & ~uint64_t {0xfff};
+		const auto end   = (vaddr + size + 0xfff) & ~uint64_t {0xfff};
+		if (size == 0 || end <= begin || dry_run || !m_write_protection.AsyncEnabled()) {
+			m_prestage_refused_async.fetch_add(1, std::memory_order_relaxed);
+			return std::nullopt;
+		}
+		// Read first: a remap after this read voids the arm.
+		const auto generation = g_remap_generation.load(std::memory_order_acquire);
+		std::shared_lock lock(m_mutex);
+		auto             it = m_maps.upper_bound(begin);
+		if (it == m_maps.begin()) {
+			m_prestage_refused_async.fetch_add(1, std::memory_order_relaxed);
+			return std::nullopt;
+		}
+		--it;
+		const auto& entry = it->second;
+		bool        async = entry.write_protected && begin >= entry.vaddr &&
+		             end <= entry.vaddr + entry.size;
+		for (auto chunk = begin >> ASYNC_CHUNK_BITS; async && chunk <= (end - 1) >> ASYNC_CHUNK_BITS;
+		     chunk++) {
+			async = chunk < ASYNC_CHUNK_COUNT &&
+			        m_async_chunks[chunk].load(std::memory_order_relaxed) != 0;
+		}
+		if (!async) {
+			m_prestage_refused_async.fetch_add(1, std::memory_order_relaxed);
+			return std::nullopt;
+		}
+		const auto offset = entry.backing_offset + (begin - entry.vaddr);
+		for (const auto& [_, other]: m_maps) {
+			if (&other != &entry && other.backing_offset < offset + (end - begin) &&
+			    offset < other.backing_offset + other.size) {
+				m_prestage_refused_alias.fetch_add(1, std::memory_order_relaxed);
+				return std::nullopt;
+			}
+		}
+		std::lock_guard kept_lock(m_kept_mutex);
+		// Clear the marks first. A store found on a page staged before this arm may postdate that
+		// page's live copy, so it moves the version like any consumption; on pages this arm adds,
+		// the store predates the copy to come (kept only).
+		uint64_t kept = 0;
+		m_write_protection.Scan(begin, end - begin, [&](uint64_t written_begin, uint64_t written_end) {
+			StagedConsumedLocked(written_begin, written_end);
+			m_kept_writes.emplace_back(written_begin, written_end);
+			kept += (written_end - written_begin) >> 12u;
+		});
+		uint64_t staged = 0;
+		for (auto page = begin; page < end; page += 0x1000) {
+			const auto chunk = page >> ASYNC_CHUNK_BITS;
+			auto&      bits  = m_staged_bits[chunk];
+			const auto index = (page >> 12u) & 511u;
+			if ((bits[index / 64] & (uint64_t {1} << (index % 64))) == 0) {
+				bits[index / 64] |= uint64_t {1} << (index % 64);
+				m_staged_count[chunk].fetch_add(1, std::memory_order_relaxed);
+				staged++;
+			}
+			// Per page, never a floor bump: staged ranges are long, and a floor bump would void
+			// every label token.
+			m_page_seq[(page >> 12u) % m_page_seq.size()] = {page, ++m_seq};
+		}
+		m_staged_total.fetch_add(staged, std::memory_order_relaxed);
+		m_prestage_arms.fetch_add(1, std::memory_order_relaxed);
+		m_prestage_prearm_pages.fetch_add(kept, std::memory_order_relaxed);
+		return generation;
+	}
+
+	void Unstage(uint64_t vaddr, uint64_t size) {
+		const auto begin = vaddr & ~uint64_t {0xfff};
+		const auto end   = (vaddr + size + 0xfff) & ~uint64_t {0xfff};
+		if (m_staged_total.load(std::memory_order_relaxed) == 0 || end <= begin) {
+			return;
+		}
+		std::lock_guard kept_lock(m_kept_mutex);
+		for (auto page = begin; page < end; page += 0x1000) {
+			const auto chunk = page >> ASYNC_CHUNK_BITS;
+			auto       found = m_staged_bits.find(chunk);
+			if (found == m_staged_bits.end()) {
+				page = ((chunk + 1) << ASYNC_CHUNK_BITS) - 0x1000;
+				continue;
+			}
+			const auto index = (page >> 12u) & 511u;
+			auto&      word  = found->second[index / 64];
+			if ((word & (uint64_t {1} << (index % 64))) != 0) {
+				word &= ~(uint64_t {1} << (index % 64));
+				m_staged_total.fetch_sub(1, std::memory_order_relaxed);
+				if (m_staged_count[chunk].fetch_sub(1, std::memory_order_relaxed) == 1) {
+					m_staged_bits.erase(found);
+				}
+			}
+		}
+	}
+
+	struct PrestageStats {
+		uint64_t arms = 0, refused_async = 0, refused_alias = 0, prearm_pages = 0, bumped_pages = 0,
+		         staged_pages = 0;
+	};
+	PrestageStats TakePrestageStats() {
+		PrestageStats stats;
+		stats.arms          = m_prestage_arms.exchange(0, std::memory_order_relaxed);
+		stats.refused_async = m_prestage_refused_async.exchange(0, std::memory_order_relaxed);
+		stats.refused_alias = m_prestage_refused_alias.exchange(0, std::memory_order_relaxed);
+		stats.prearm_pages  = m_prestage_prearm_pages.exchange(0, std::memory_order_relaxed);
+		stats.bumped_pages  = m_prestage_bumped_pages.exchange(0, std::memory_order_relaxed);
+		stats.staged_pages  = m_staged_total.load(std::memory_order_relaxed);
+		return stats;
 	}
 
 	// KYTY_SUBMIT_SCAN_SERIAL=1: the earlier scheme (for A/B).
@@ -1091,9 +1209,11 @@ public:
 	void ScanAsyncChunks(std::vector<std::pair<uint64_t, uint64_t>>& written,
 	                     bool (*wanted)(uint64_t begin, uint64_t end), bool protect = true) {
 		std::shared_lock lock(m_mutex);
+		// Chunks holding staged pages are scanned too: their stores must move the pages' versions.
 		const auto want = [&](uint64_t chunk) {
 			return wanted == nullptr ||
-			       wanted(chunk << ASYNC_CHUNK_BITS, (chunk + 1) << ASYNC_CHUNK_BITS);
+			       wanted(chunk << ASYNC_CHUNK_BITS, (chunk + 1) << ASYNC_CHUNK_BITS) ||
+			       m_staged_count[chunk].load(std::memory_order_relaxed) != 0;
 		};
 		for (size_t i = 0; i < m_async_list.size();) {
 			auto first = m_async_list[i];
@@ -1108,6 +1228,9 @@ public:
 			m_write_protection.Scan(first << ASYNC_CHUNK_BITS,
 			                        (last - first + 1) << ASYNC_CHUNK_BITS,
 			                        [&](uint64_t begin, uint64_t end) {
+				                        if (protect) {
+					                        StagedConsumed(begin, end);
+				                        }
 				                        if (!written.empty() && written.back().second == begin) {
 					                        written.back().second = end;
 				                        } else {
@@ -1164,8 +1287,38 @@ private:
 
 	// Under m_kept_mutex: [begin, end) was written and is write-protected again; report keeps it
 	// for the next ScanAsyncWrites.
+	// Under m_kept_mutex: the written marks of [begin, end) were consumed by a re-protecting scan;
+	// staged pages there get a new version (their copies are no longer current).
+	void StagedConsumedLocked(uint64_t begin, uint64_t end) const {
+		if (m_staged_total.load(std::memory_order_relaxed) == 0) {
+			return;
+		}
+		for (auto page = begin & ~uint64_t {0xfff}; page < end; page += 0x1000) {
+			const auto chunk = page >> ASYNC_CHUNK_BITS;
+			if (chunk >= ASYNC_CHUNK_COUNT || m_staged_count[chunk].load(std::memory_order_relaxed) == 0) {
+				page = ((chunk + 1) << ASYNC_CHUNK_BITS) - 0x1000;
+				continue;
+			}
+			const auto found = m_staged_bits.find(chunk);
+			const auto index = (page >> 12u) & 511u;
+			if (found != m_staged_bits.end() &&
+			    (found->second[index / 64] & (uint64_t {1} << (index % 64))) != 0) {
+				Graphics::PageVersions::Bump(page, 0x1000);
+				m_prestage_bumped_pages.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+	void StagedConsumed(uint64_t begin, uint64_t end) const {
+		if (m_staged_total.load(std::memory_order_relaxed) == 0) {
+			return;
+		}
+		std::lock_guard kept_lock(m_kept_mutex);
+		StagedConsumedLocked(begin, end);
+	}
+
 	void HideWritesLocked(uint64_t begin, uint64_t end, bool report) const {
 		if (report) {
+			StagedConsumedLocked(begin, end);
 			m_kept_writes.emplace_back(begin, end);
 		}
 		if (end - begin > 64 * 0x1000) {
@@ -1425,6 +1578,17 @@ private:
 	};
 	std::array<AliasMemo, 1024> m_alias_memo {}; // under m_kept_mutex
 	std::mutex                  m_submit_scan_mutex; // KYTY_SUBMIT_SCAN_SERIAL only
+	// BDA pre-staging: staged pages per chunk (bitmaps under m_kept_mutex, counts lock-free for
+	// the scans' chunk filter).
+	mutable std::unordered_map<uint64_t, std::array<uint64_t, 8>> m_staged_bits;
+	std::unique_ptr<std::atomic<uint16_t>[]>                      m_staged_count =
+	    std::make_unique<std::atomic<uint16_t>[]>(ASYNC_CHUNK_COUNT);
+	std::atomic<uint64_t>         m_staged_total {0};
+	std::atomic<uint64_t>         m_prestage_arms {0};
+	std::atomic<uint64_t>         m_prestage_refused_async {0};
+	std::atomic<uint64_t>         m_prestage_refused_alias {0};
+	std::atomic<uint64_t>         m_prestage_prearm_pages {0};
+	mutable std::atomic<uint64_t> m_prestage_bumped_pages {0};
 #endif
 #endif
 
@@ -1527,6 +1691,23 @@ public:
 		std::shared_lock lock(m_mutex);
 		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->StoreLabel(vaddr, value, size);
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	std::optional<uint64_t> ArmStaged(uint64_t vaddr, uint64_t size) {
+		if (!Owns(vaddr, size)) {
+			return std::nullopt;
+		}
+		std::shared_lock lock(m_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			m_prestage_refused_private.fetch_add(1, std::memory_order_relaxed);
+			return std::nullopt;
+		}
+		return m_backing->ArmStaged(vaddr, size);
+	}
+	[[nodiscard]] uint64_t TakePrestageRefusedPrivate() {
+		return m_prestage_refused_private.exchange(0, std::memory_order_relaxed);
+	}
+#endif
 
 	bool TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value) {
 		if (!Owns(vaddr, size)) {
@@ -2163,4 +2344,5 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
+	std::atomic<uint64_t>                      m_prestage_refused_private {0};
 };

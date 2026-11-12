@@ -6,6 +6,7 @@
 #include "common/virtualMemory.h"
 
 #include <utility>
+#include <optional>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -141,6 +142,19 @@ bool                   TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint
 // Fills dword-aligned [vaddr, vaddr + size) with value through the backing alias: no write
 // faults, so the caller invalidates the range. False (nothing written) if it is not all backed.
 bool                   TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value);
+// BDA pre-staging (docs/mt-rewrite/bda-prestage-design.md), any thread. ArmStaged registers
+// [vaddr, vaddr + size) as staged and clears its written marks (stores found are kept for the
+// next collection); from then on every consumption of a staged page's written mark moves its
+// PageVersions version. nullopt: refused (not asynchronously write-protected, aliased, or
+// private); otherwise the remap generation the arm holds for (GuestRemapGeneration).
+std::optional<uint64_t> ArmStaged(uint64_t vaddr, uint64_t size);
+void                    Unstage(uint64_t vaddr, uint64_t size);
+struct PrestageCounters {
+	uint64_t arms = 0, refused_async = 0, refused_alias = 0, refused_private = 0, prearm_pages = 0,
+	         bumped_pages = 0, staged_pages = 0, remap_generation = 0;
+};
+// Counts since the last call (staged_pages and remap_generation: current values).
+PrestageCounters TakePrestageCounters();
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);

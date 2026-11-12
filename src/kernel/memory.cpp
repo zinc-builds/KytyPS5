@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/memDiag.h"
+#include "graphics/host_gpu/pageVersions.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -26,9 +27,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -921,6 +924,46 @@ bool TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value) {
 	const bool written = g_guest_address_space->TryFillBacking(vaddr, size, value);
 	Graphics::GuestSyncEpoch::Advance();
 	return written;
+}
+
+std::optional<uint64_t> ArmStaged(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return g_guest_address_space != nullptr ? g_guest_address_space->ArmStaged(vaddr, size)
+	                                        : std::nullopt;
+#else
+	(void)vaddr;
+	(void)size;
+	return std::nullopt;
+#endif
+}
+
+void Unstage(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space != nullptr) {
+		g_guest_address_space->Backing().Unstage(vaddr, size);
+	}
+#else
+	(void)vaddr;
+	(void)size;
+#endif
+}
+
+PrestageCounters TakePrestageCounters() {
+	PrestageCounters counters;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space != nullptr) {
+		const auto stats         = g_guest_address_space->Backing().TakePrestageStats();
+		counters.arms            = stats.arms;
+		counters.refused_async   = stats.refused_async;
+		counters.refused_alias   = stats.refused_alias;
+		counters.refused_private = g_guest_address_space->TakePrestageRefusedPrivate();
+		counters.prearm_pages    = stats.prearm_pages;
+		counters.bumped_pages    = stats.bumped_pages;
+		counters.staged_pages    = stats.staged_pages;
+	}
+#endif
+	counters.remap_generation = g_remap_generation.load(std::memory_order_relaxed);
+	return counters;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
