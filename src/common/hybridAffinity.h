@@ -17,6 +17,9 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <vector>
 
 namespace Common::HybridAffinity {
@@ -58,6 +61,8 @@ struct Plan {
 	int       gpu_cpu = -1;
 	// Each draw prepare worker's CPU, or -1 for none chosen.
 	std::vector<int> prepare_cpus;
+	// The overflow prepare worker's CPU (see PrepareOverflowCpu), or -1.
+	int overflow_cpu = -1;
 };
 
 inline int EnvCpu(const char* name) {
@@ -126,12 +131,47 @@ inline Plan& GetPlan() {
 		}
 		prepare.resize(std::min<size_t>(prepare.size(), PrepareWorkerCount()));
 		result.prepare_cpus = prepare;
+		// The overflow prepare worker: by default on the SMT sibling of the last prepare worker's
+		// core. KYTY_PREPARE_OVERFLOW_CPU=<n> picks another CPU, KYTY_PREPARE_OVERFLOW=0 turns it off.
+		const char* overflow_env = std::getenv("KYTY_PREPARE_OVERFLOW");
+		if (const int cpu = EnvCpu("KYTY_PREPARE_OVERFLOW_CPU"); cpu >= 0) {
+			result.overflow_cpu = cpu;
+		} else if ((overflow_env == nullptr || overflow_env[0] != '0') && prepare.size() >= 2) {
+			for (const int sibling: ReadCpuList("/sys/devices/system/cpu/cpu" +
+			                                    std::to_string(prepare.back()) +
+			                                    "/topology/thread_siblings_list")) {
+				if (sibling != prepare.back() && performance.count(sibling) != 0) {
+					result.overflow_cpu = sibling;
+					break;
+				}
+			}
+		}
+		if (overflow_env != nullptr && overflow_env[0] == '0') {
+			result.overflow_cpu = -1;
+		}
 		// KYTY_RESERVE_CPUS=<list>: also keep the emulator off these (for a thread pinned there).
 		const char* reserve_env = std::getenv("KYTY_RESERVE_CPUS");
 		const auto  reserved    = reserve_env != nullptr ? ParseCpuList(reserve_env) : std::set<int> {};
 		CPU_ZERO(&result.process);
+		// The emulator's other threads (its main thread, driver threads) stay off the SMT siblings
+		// of the prepare workers' cores while there is an overflow worker (one of them is its CPU),
+		// and off the overflow worker's CPU. KYTY_FREE_PREPARE_SIBLINGS=0|1 overrides the first.
+		std::set<int> prepare_siblings;
+		if (result.overflow_cpu >= 0) {
+			prepare_siblings.insert(result.overflow_cpu);
+		}
+		const char* free_siblings = std::getenv("KYTY_FREE_PREPARE_SIBLINGS");
+		if (free_siblings != nullptr ? free_siblings[0] == '1' : result.overflow_cpu >= 0) {
+			for (const int cpu: prepare) {
+				for (const int sibling: ReadCpuList("/sys/devices/system/cpu/cpu" +
+				                                    std::to_string(cpu) +
+				                                    "/topology/thread_siblings_list")) {
+					prepare_siblings.insert(sibling);
+				}
+			}
+		}
 		for (const int cpu: performance) {
-			if (siblings.count(cpu) == 0 && cpu != gpu &&
+			if (siblings.count(cpu) == 0 && cpu != gpu && prepare_siblings.count(cpu) == 0 &&
 			    std::ranges::find(prepare, cpu) == prepare.end() &&
 			    reserved.count(cpu) == 0 && CPU_ISSET(cpu, &allowed)) {
 				CPU_SET(cpu, &result.process);
@@ -143,6 +183,20 @@ inline Plan& GetPlan() {
 	return plan;
 }
 
+// The GPU pipeline threads (command, prepare workers, recorder) run at this nice value
+// (KYTY_PIPELINE_NICE, default 0 = unchanged), so other programs' threads on their cores yield to
+// them. Lowering nice needs RLIMIT_NICE (ulimit -e) or CAP_SYS_NICE; without it this is a no-op.
+// Not SCHED_FIFO/RR: these threads spin, and a spinning real-time thread starves kernel work.
+inline void ApplyPipelinePriority() {
+	static const int nice = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_NICE");
+		return value != nullptr ? std::clamp(std::atoi(value), -20, 19) : 0;
+	}();
+	if (nice != 0) {
+		(void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), nice);
+	}
+}
+
 // Call early in main(), before threads start: later threads inherit the mask.
 inline void ApplyToProcess() {
 	auto& plan = GetPlan();
@@ -152,13 +206,15 @@ inline void ApplyToProcess() {
 			prepare += (prepare.empty() ? "" : ",") + std::to_string(cpu);
 		}
 		std::printf("Hybrid CPU: emulator on %d performance threads, GPU command thread on CPU %d, "
-		            "draw prepare workers on CPUs %s\n",
-		            CPU_COUNT(&plan.process), plan.gpu_cpu, prepare.empty() ? "-" : prepare.c_str());
+		            "draw prepare workers on CPUs %s, overflow worker on CPU %d\n",
+		            CPU_COUNT(&plan.process), plan.gpu_cpu, prepare.empty() ? "-" : prepare.c_str(),
+		            plan.overflow_cpu);
 	}
 }
 
 // Call from the GPU command thread itself.
 inline void ApplyToGpuThread() {
+	ApplyPipelinePriority();
 	const auto& plan = GetPlan();
 	if (!plan.active) {
 		return;
@@ -169,12 +225,29 @@ inline void ApplyToGpuThread() {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
+// The CPU of the overflow prepare worker (see DrawPrepare::Pool), or -1 for none: by default the
+// SMT sibling of the last prepare worker's core on a hybrid CPU with the plan active (GetPlan).
+inline int PrepareOverflowCpu() {
+	static const int cpu = [] {
+		const char* off = std::getenv("KYTY_PREPARE_OVERFLOW");
+		if (off != nullptr && off[0] == '0') {
+			return -1;
+		}
+		const int env = EnvCpu("KYTY_PREPARE_OVERFLOW_CPU");
+		return env >= 0 ? env : GetPlan().overflow_cpu;
+	}();
+	return cpu;
+}
+
 // Call from draw prepare worker `worker`: a performance core the emulator leaves to it (see
-// GetPlan).
+// GetPlan). The overflow worker (index PrepareWorkerCount()) goes to PrepareOverflowCpu().
 inline void ApplyToPrepareThread(uint32_t worker) {
+	ApplyPipelinePriority();
 	const auto& plan = GetPlan();
 	int         cpu  = -1;
-	if (worker < plan.prepare_cpus.size()) {
+	if (worker >= PrepareWorkerCount()) {
+		cpu = PrepareOverflowCpu();
+	} else if (worker < plan.prepare_cpus.size()) {
 		cpu = plan.prepare_cpus[worker];
 	} else if (worker == 0) {
 		cpu = EnvCpu("KYTY_PREPARE_CPU");
@@ -242,6 +315,7 @@ inline void ApplyToGuestThread(const std::string& name) {
 // Call from the GPU recording thread: an efficiency core of its own, which the emulator leaves
 // free. KYTY_RECORDER_CPU=<n> picks another CPU.
 inline void ApplyToRecorderThread() {
+	ApplyPipelinePriority();
 	int cpu = -1;
 	if (const char* value = std::getenv("KYTY_RECORDER_CPU"); value != nullptr) {
 		cpu = std::atoi(value);

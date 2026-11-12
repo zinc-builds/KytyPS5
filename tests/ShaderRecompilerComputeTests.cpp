@@ -55944,6 +55944,96 @@ static void CheckRangedStore() {
   std::printf("[host]    RangedStore                      ok\n");
 }
 
+// DrawPrepare::Pool with an overflow worker: the overflow worker never takes a draw closer than
+// `k` to the oldest untaken one, the others skip what it took, and every posted sequence runs
+// exactly once.
+static void CheckOverflowPool() {
+  using Libs::Graphics::Require;
+  namespace DP = Libs::Graphics::DrawPrepare;
+  constexpr uint32_t kSlots = 9, kK = 3, kTotal = 3000;
+  struct State {
+    std::array<std::atomic<uint32_t>, kTotal + 1> runs{};
+    std::array<std::atomic<uint32_t>, kTotal + 1> by_overflow{};
+    std::atomic<bool> gate{false};
+    std::atomic<uint32_t> held{0};
+  } state;
+  struct Lane {
+    State *state;
+    bool overflow;
+  };
+  const auto run = [](void *context, uint64_t sequence) {
+    auto &lane = *static_cast<Lane *>(context);
+    // The first two draws hold both regular workers until the gate opens.
+    if (sequence <= 2) {
+      lane.state->held.fetch_add(1, std::memory_order_acq_rel);
+    }
+    while (sequence <= 2 && !lane.state->gate.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    lane.state->runs[sequence].fetch_add(1, std::memory_order_relaxed);
+    if (lane.overflow) {
+      lane.state->by_overflow[sequence].store(1, std::memory_order_relaxed);
+    }
+  };
+  Lane regular{&state, false}, extra{&state, true};
+  bool early_ok = true, overflow_ran = false;
+  uint32_t overflow_total = 0;
+  bool exactly_once = true;
+  {
+    DP::Pool pool(kSlots, kK);
+    DP::Worker w0(run, &regular, 0, &pool);
+    DP::Worker w1(run, &regular, 1, &pool);
+    DP::Worker w2(run, &extra, 2, &pool, true);
+    (void)pool.Post();
+    (void)pool.Post();
+    const auto held_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (state.held.load(std::memory_order_acquire) < 2 &&
+           std::chrono::steady_clock::now() < held_deadline) {
+      std::this_thread::yield();
+    }
+    early_ok = state.held.load() == 2;
+    for (uint64_t s = 3; s <= 8; s++) {
+      (void)pool.Post();
+    }
+    // Draws 1 and 2 hold the regular workers, so 3 is the oldest untaken: the overflow worker may
+    // take only 6..8.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline &&
+           !(pool.Done(6) && pool.Done(7) && pool.Done(8))) {
+      std::this_thread::yield();
+    }
+    for (uint64_t s = 3; s <= 5; s++) {
+      early_ok = early_ok && state.runs[s].load() == 0;
+    }
+    for (uint64_t s = 6; s <= 8; s++) {
+      overflow_ran = overflow_ran || state.by_overflow[s].load() != 0;
+    }
+    state.gate.store(true, std::memory_order_release);
+    for (uint64_t s = 1; s <= 8; s++) {
+      (void)pool.Wait(s);
+    }
+    // A steady stream: the command thread's pattern of posting while the ring has room.
+    uint64_t waited = 8;
+    for (uint64_t s = 9; s <= kTotal; s++) {
+      while (s > kSlots + waited) {
+        (void)pool.Wait(++waited);
+      }
+      (void)pool.Post();
+    }
+    (void)pool.WaitIdle();
+    for (uint64_t s = 1; s <= kTotal; s++) {
+      exactly_once = exactly_once && state.runs[s].load() == 1;
+      overflow_total += state.by_overflow[s].load();
+    }
+  }
+  Require("OverflowPool", "far ahead only", early_ok && overflow_ran,
+          "the overflow worker took a draw within k of the oldest untaken one, or none ahead");
+  Require("OverflowPool", "exactly once", exactly_once,
+          "a sequence ran twice or not at all with an overflow worker");
+  std::printf("[host]    OverflowPool                     ok (overflow ran %u of %u)\n",
+              overflow_total, kTotal);
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -57375,6 +57465,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
   CheckRangedStore();
+  CheckOverflowPool();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "
