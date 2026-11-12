@@ -417,6 +417,8 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 }
 
 void GuestGpu::Enqueue(Submission submission) {
+	// Before the submission is visible: its processing must find this scan's writes kept.
+	submission.submit_scanned = m_renderer.ScanAsyncWritesAtSubmit();
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -555,8 +557,13 @@ bool GuestGpu::Process(Submission& submission) {
 	bool complete = true;
 	GuestSyncEpoch::Advance();
 	MemDiag::NoteSubmit();
-	// Writes the guest made before submitting, in asynchronously write-protected ranges.
-	m_renderer.CollectAsyncWrites();
+	// Writes the guest made before submitting, in asynchronously write-protected ranges: the
+	// submitting thread scanned for them (kept), or this scans. Stores after the submit scan
+	// are collected where the command buffer can first depend on them: a satisfied wait on a
+	// guest-written value, a semaphore wait or a rewind (RequestAsyncCollect), or a resumed
+	// submission (its later processing scans here). See FINDINGS "Submit-time collection".
+	m_renderer.CollectAsyncWrites(submission.submit_scanned);
+	submission.submit_scanned = false;
 
 	switch (submission.type) {
 		case SubmissionType::Commands:

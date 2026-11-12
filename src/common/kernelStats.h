@@ -32,6 +32,7 @@ enum class Site : uint8_t {
 	LabelPeek,         // RenderContext::IsCpLabel (AsyncPageUntouched)
 	CollectScan,       // CollectAsyncWrites: the PAGEMAP_SCAN pass
 	CollectInvalidate, // CollectAsyncWrites: invalidating the written pages
+	CollectKept,       // CollectAsyncWrites after a submit scan: kept writes only
 	Fill,              // BufferCache::FillBuffer through the guest mapping
 	Promote,           // promoting chunks to asynchronous write protection
 	Watch,             // page-tracker protection changes (watchers added or removed)
@@ -245,7 +246,7 @@ struct ThreadStat {
 
 inline const char* SiteName(int site) noexcept {
 	static constexpr const char* names[] = {
-	    "none",         "label_store",   "label_peek", "collect_scan", "collect_inval",
+	    "none",         "label_store",   "label_peek", "collect_scan", "collect_inval", "collect_kept",
 	    "fill",         "promote",       "watch",      "srt_walk",     "command",
 	    "prepare_wait", "recorder_wait", "gpu_wait",   "sched_wait",   "idle"};
 	static_assert(sizeof(names) / sizeof(names[0]) == SITES);

@@ -272,6 +272,9 @@ private:
 static bool                                       g_log_alias_writes = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
 static std::mutex                                 g_alias_write_mutex;
 static std::vector<std::pair<uint64_t, uint64_t>> g_alias_writes;
+// KYTY_ASYNC_WP_VERIFY: kept writes the GPU thread's last collection took; each must be among
+// the writes that collection handled (RenderContext::VerifyAsyncWrites).
+static std::vector<std::pair<uint64_t, uint64_t>> g_verify_kept_taken;
 
 // Advances whenever guest bytes change without a store through a guest view or the backing
 // (remaps, zeroing): RenderContext::IsCpLabel's proof does not cover those.
@@ -908,6 +911,9 @@ public:
 
 	// Whether no guest view has stored to the page since ProtectAsyncPage gave the token.
 	[[nodiscard]] bool AsyncPageUntouched(uint64_t page, uint64_t token) {
+		// Not during a submit scan: it clears written marks before it advances their pages'
+		// tokens (taken before m_mutex, as the submit scan does).
+		std::lock_guard  submit_lock(m_submit_scan_mutex);
 		std::shared_lock lock(m_mutex);
 		if (!AsyncPageTrackedUnlocked(page)) {
 			return false;
@@ -931,6 +937,14 @@ public:
 			    chunk << ASYNC_CHUNK_BITS, ASYNC_CHUNK_SIZE,
 			    [&](uint64_t begin, uint64_t end) { written.emplace_back(begin, end); }, false);
 		}
+		// Kept writes are pending report too: the next collection takes them. After any submit
+		// scan in flight, which may hold writes it took from the page tables.
+		lock.unlock();
+		{
+			std::lock_guard submit_lock(m_submit_scan_mutex);
+		}
+		std::lock_guard kept_lock(m_kept_mutex);
+		written.insert(written.end(), m_kept_writes.begin(), m_kept_writes.end());
 	}
 
 	void AsyncRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
@@ -949,14 +963,62 @@ public:
 	// re-protects them. The caller handles them after the lock is released. Chunks the filter
 	// rejects (nothing there needs its writes) are left as they are: a page that gains a write
 	// watcher is write-protected then, so stores before that need no report.
+	// Kept writes are taken after the scan and after any submit scan in flight (see
+	// ScanAsyncWritesAtSubmit), so a store a submit scan took from the page tables is reported
+	// by the first collection that ends after it.
 	void ScanAsyncWrites(std::vector<std::pair<uint64_t, uint64_t>>& written,
 	                     bool (*wanted)(uint64_t begin, uint64_t end) = nullptr) {
-		std::shared_lock lock(m_mutex);
+		ScanAsyncChunks(written, wanted);
+		TakeKeptWrites(written);
+	}
+
+	// Appends the kept writes (re-protections and submit scans), after waiting for a submit
+	// scan in flight.
+	void TakeKeptWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
 		{
-			std::lock_guard kept_lock(m_kept_mutex);
-			written.insert(written.end(), m_kept_writes.begin(), m_kept_writes.end());
-			m_kept_writes.clear();
+			std::lock_guard submit_lock(m_submit_scan_mutex);
 		}
+		std::lock_guard kept_lock(m_kept_mutex);
+		// KYTY_ASYNC_WP_VERIFY_DROP_KEPT=<n> (test only): silently drops every n-th kept write, to
+		// show the verifier reports such a loss.
+		static const uint64_t drop_every = [] {
+			const char* value = std::getenv("KYTY_ASYNC_WP_VERIFY_DROP_KEPT");
+			return value != nullptr && g_log_alias_writes ? std::strtoull(value, nullptr, 10) : 0;
+		}();
+		static uint64_t taken = 0;
+		for (const auto& entry: m_kept_writes) {
+			if (drop_every != 0 && ++taken % drop_every == 0) {
+				continue;
+			}
+			written.push_back(entry);
+			if (g_log_alias_writes) {
+				g_verify_kept_taken.push_back(entry);
+			}
+		}
+		m_kept_writes.clear();
+	}
+
+	// KYTY_SUBMIT_SCAN: the collection for a submission's start, done by the submitting guest
+	// thread before it enqueues. Found pages are re-protected by the same PAGEMAP_SCAN call,
+	// then kept (their label tokens advance), so the next collection on the GPU thread reports
+	// them, whichever submission it is for. Submit scans run one at a time.
+	void ScanAsyncWritesAtSubmit(bool (*wanted)(uint64_t begin, uint64_t end)) {
+		static thread_local std::vector<std::pair<uint64_t, uint64_t>> found;
+		std::lock_guard submit_lock(m_submit_scan_mutex);
+		found.clear();
+		ScanAsyncChunks(found, wanted);
+		if (found.empty()) {
+			return;
+		}
+		std::lock_guard kept_lock(m_kept_mutex);
+		for (const auto& [begin, end]: found) {
+			HideWritesLocked(begin, end, true);
+		}
+	}
+
+	void ScanAsyncChunks(std::vector<std::pair<uint64_t, uint64_t>>& written,
+	                     bool (*wanted)(uint64_t begin, uint64_t end)) {
+		std::shared_lock lock(m_mutex);
 		const auto want = [&](uint64_t chunk) {
 			return wanted == nullptr ||
 			       wanted(chunk << ASYNC_CHUNK_BITS, (chunk + 1) << ASYNC_CHUNK_BITS);
@@ -1289,6 +1351,7 @@ private:
 		bool     aliased    = true;
 	};
 	std::array<AliasMemo, 1024> m_alias_memo {}; // under m_kept_mutex
+	std::mutex                  m_submit_scan_mutex; // held for a whole submit scan
 #endif
 #endif
 
