@@ -409,7 +409,7 @@ void RenderExecutor::SpeculateTargets(QueuedDraw& queued, WorkerTargetMemo& memo
 	    state.vertex_info[0].stage.module == nullptr) {
 		return;
 	}
-	const auto& hw    = queued.registers;
+	const auto& hw    = *queued.registers;
 	uint32_t    count = 0;
 	if (state.mrt_mask == 0) {
 		state.color_info.Construct(0);
