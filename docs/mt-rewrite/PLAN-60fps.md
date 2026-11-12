@@ -369,12 +369,14 @@ dev f1777d2f, frames 1000–1600:
 | backend: memory | **5.9k (41%)** | **6.4k (39%)** | 3.1k |
 | backend: core | 2.5k | 2.0k | 4.5k |
 | loads missing L1 / L2 / L3 | 364 / 56 / 9.2 | 367 / 55 / 9.0 | 166 / 22 / 2.7 |
-| loads served from another core (fwd + no-fwd) | **30 + 13** | 28 + 14 | 14 + 4 |
+| retired loads with a cross-core snoop hit (fwd + no-fwd) | **30 + 13** | 28 + 14 | 14 + 4 |
 | branch mispredicts, DTLB walks, machine clears | 31, 8.2, 1.5 | 30, 8.1, 2.3 | 14, 2.5, 0.7 |
 
-- Rough cost by latency share of the memory-bound cycles: the 43 cross-core loads ≈ 2.4k
-  cycles/draw (~16% of the thread, ~0.45 µs on pgo); DRAM ≈ 1.4k; L2 hits ≈ 1.9k.
-- 75% of all L2 misses are loads of lines another core holds.
+- A heuristic split of the memory-bound cycles by typical latency × count: the 43 cross-core
+  snoop-hit loads ≈ 2.4k cycles/draw (~16% of the thread, ~0.45 µs on pgo); DRAM ≈ 1.4k; L2 hits
+  ≈ 1.9k. These are retired-load counts, not unique line transfers. `no_fwd` loads take their
+  data from L3 after a snoop hit in another core, so they still pay the snoop.
+- 75% of all L2-missing loads hit a line another core holds.
 - Precise samples (`mem_load_l3_hit_retired.xsnp_fwd/no_fwd`, pgo):
   - **about half of the command thread's cross-core loads (~22 lines/draw) hit the 24 KB
     `QueuedDraw` slots**, spread over the worker-written `DrawRenderState`. That struct is 17 KB:
@@ -382,8 +384,8 @@ dev f1777d2f, frames 1000–1600:
   - the other half hit other emulator heap memory, none of it guest memory;
   - on the workers, 60% are reads of the 2.7 KB register snapshot the command thread copies into
     the slot.
-- So **every byte a worker writes and the command thread then reads costs a cross-core
-  transfer**, ~55 cycles net per line. Moving work onto workers pays only if the result handed
+- So **every line a worker writes and the command thread then reads is a cross-core transfer**,
+  roughly 55 cycles net per such load by the heuristic above. Moving work onto workers pays only if the result handed
   back is small. Pass record ids or pointers to immutable cached records instead of copying
   1–2 KB structs into the slot, and don't rewrite fields that didn't change.
 

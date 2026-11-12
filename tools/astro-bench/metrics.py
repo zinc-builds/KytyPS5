@@ -135,7 +135,6 @@ def compute(a, b, pa, pb):
             if "be_bound" in td and "mem_bound" in td:
                 td["core_bound"] = td["be_bound"] - td["mem_bound"]
             th["td"] = td
-            th["slots_per_cycle"] = slots / draws / th["cyc"] if th["cyc"] else 0.0
         r["threads"][t] = th
     waits = {k: d(f"{k}_wait_ns") / draws for k in ("drain", "refill", "steady", "idle")}
     r["wait"] = {
