@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
+#include "graphics/host_gpu/churnDiag.h"
 #include "graphics/host_gpu/memDiag.h"
 
 #include "common/assert.h"
@@ -1356,7 +1357,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
-	if (MemDiag::BdaStatsMode() != 0) {
+	if (MemDiag::BdaStatsMode() != 0 || ChurnDiag::Enabled()) {
 		MemDiag::g_flips.fetch_add(1, std::memory_order_relaxed);
 	}
 

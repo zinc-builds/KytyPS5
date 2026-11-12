@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
+#include "graphics/host_gpu/churnDiag.h"
 #include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -1015,6 +1016,19 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (MemDiag::BdaStatsMode() != 0 && source && g_sync_kind == MemDiag::Sync::Bda) {
 		BdaStats::NoteUpload(buffer, copies);
 	}
+	if (ChurnDiag::Enabled()) {
+		const bool bda = g_sync_kind == MemDiag::Sync::Bda;
+		ChurnDiag::NoteUse(vaddr, size,
+		                   bda ? ChurnDiag::BdaSync
+		                   : g_sync_kind == MemDiag::Sync::Image ? ChurnDiag::ImageSync
+		                                                         : ChurnDiag::ObtainSync);
+		if (source) {
+			for (const auto& copy: copies) {
+				ChurnDiag::NoteUse(buffer.CpuAddress() + copy.dstOffset, copy.size,
+				                   bda ? ChurnDiag::BdaUpload : ChurnDiag::ObtainUpload);
+			}
+		}
+	}
 	if (MemDiag::Enabled()) {
 		MemDiag::Add(MemDiag::SyncCalls0, g_sync_kind, 1);
 		if (source) {
@@ -1614,6 +1628,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			if (WorkerBuffersStats()) NoteWorkerBuffer(2);
 		} else if (ranges[speculated].stream) {
 			if (AdoptWorkerStream(ranges[speculated])) {
+				ChurnDiag::NoteUse(vaddr, size, ChurnDiag::WorkerStream);
 				return {&m_speculation->ring->GetBuffer(), ranges[speculated].offset};
 			}
 		} else if (!SpeculationValid(*m_speculation)) {
@@ -1632,6 +1647,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				return full;
 			}
 			if (WorkerBuffersStats()) NoteWorkerBuffer(0);
+			ChurnDiag::NoteUse(vaddr, size,
+			                   size <= CACHING_PAGESIZE ? ChurnDiag::WorkerClean
+			                                            : ChurnDiag::WorkerCleanLarge);
 			TouchBuffer(buffer);
 			return {&buffer, found.offset};
 		}
@@ -1667,6 +1685,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			if (copy.epoch == epoch && copy.tick == tick && copy.lap == m_stream_buffer.Laps()) {
 				if (!StreamVerifyEnabled() || VerifyStreamHit(vaddr, size, copy.offset)) {
 					MemDiag::Add(MemDiag::StreamReuse);
+					ChurnDiag::NoteUse(vaddr, size, ChurnDiag::StreamReuse);
 					return {&m_stream_buffer, copy.offset};
 				}
 			} else {
@@ -1690,6 +1709,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				MemDiag::NoteStreamCopy(vaddr, size, snapshot);
 			}
 			m_stream_buffer.Commit();
+			ChurnDiag::NoteUse(vaddr, size, ChurnDiag::DirectStream);
 			return {&m_stream_buffer, offset};
 		}
 	}

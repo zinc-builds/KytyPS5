@@ -6,6 +6,7 @@
 #include "common/kernelStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/churnDiag.h"
 #include "graphics/host_gpu/memDiag.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -689,6 +690,7 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 	for (const auto& [begin, end]: watched) {
 		// The same work as a write fault on each page (HandleFault).
 		MemDiag::Add(MemDiag::AsyncInvalidatedPages, (end - begin) / TRACKER_PAGE_SIZE);
+		ChurnDiag::NoteInvalidated(begin, end);
 		if (IsMapped(begin, end - begin)) {
 			(void)InvalidateMemory(begin, end - begin);
 			continue;
