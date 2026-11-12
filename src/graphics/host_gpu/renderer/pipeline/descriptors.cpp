@@ -1551,7 +1551,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
 	// The prepare worker's sources, when it decoded these same stages.
-	if (const auto* adopted = m_adopted_buffers;
+	if (auto* adopted = m_adopted_buffers;
 	    adopted != nullptr && adopted->stage_count == stages.size() &&
 	    std::ranges::equal(stages, std::span {adopted->runtimes.data(), adopted->stage_count},
 	                       [](const PreparedBindings* stage, const ShaderStageRuntime* runtime) {
@@ -1575,7 +1575,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		}
 		for (size_t i = 0; i < stages.size(); i++) {
 			auto& sources = stages[i]->buffer_sources;
-			sources       = adopted->sources[i];
+			// Take the worker's vector instead of copying it (KYTY_BUFFER_SOURCES_SWAP=0 copies):
+			// the slot gets this stage's previous vector, which the worker refills (resize and
+			// assign, as before) on its next job there. Entries no resource uses are never read.
+			static const bool swap = [] {
+				const char* value = std::getenv("KYTY_BUFFER_SOURCES_SWAP");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (swap) {
+				sources.swap(adopted->sources[i]);
+			} else {
+				sources = adopted->sources[i];
+			}
 			if (verify) {
 				bool same = fresh[i].size() == sources.size();
 				for (size_t j = 0; same && j < sources.size(); j++) {

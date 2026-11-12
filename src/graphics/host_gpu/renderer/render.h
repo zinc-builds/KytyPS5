@@ -441,7 +441,8 @@ private:
 	void ResolveProposedColorTarget(CommandBuffer& buffer, const WorkerColorTargetRecord* record,
 	                                RenderColorInfo& r, uint32_t slot);
 	// The worker's buffer side for the queued draw being committed, while it may be used.
-	const WorkerBuffers* m_adopted_buffers = nullptr;
+	// Non-const: FindBuffers takes the worker's buffer sources by swapping vectors with the slot.
+	WorkerBuffers* m_adopted_buffers = nullptr;
 	// ring: the worker's stream ring (null: no stream copies).
 	void                 SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring);
 	// The worker's texture side for the queued draw being committed, while it may be used.
