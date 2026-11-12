@@ -71,6 +71,9 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   `_Build/linux/kyty_emulator_clang_lld.map` (perf report prints file offsets; vaddr = offset +
   0x1000; for `perf script` runtime addresses pass the load base = r-xp mapping start − (its file
   offset + 0x1000), e.g. from `/proc/<pid>/maps` or `perf script --show-mmap-events`).
+- `hitches.py <label> [--frames A-B] [--list]` — long frames in a run with `KYTY_FRAME_DIAG=1`:
+  frames over 50 and 100 ms and the worst one over the level frames, level-load frames (>= 1 GiB
+  uploaded) apart; `--list` says what each spent. `gate.sh` runs it on one long run a side.
 - `kstats.py <label>` — the GPU command thread's kernel time by call site over the frame window,
   from a run with `KYTY_KERNEL_STATS=1`.
 - `framediag.py <bench log> [A-B …]` — summarise `KYTY_FRAME_DIAG=1` lines: refresh and wall

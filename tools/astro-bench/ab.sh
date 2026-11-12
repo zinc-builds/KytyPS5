@@ -11,6 +11,8 @@
 #   --max-age H     stored reference runs count if younger than H hours (default 24)
 #   --shot F        run 1 of each side saves a screenshot at level frame F (GARDEN_SHOT)
 #   --extra LINE    one more batch.sh line, run in the same lock hold (repeatable; gate.sh)
+#   --hitch A-B     one more run a side over level frames A-B with KYTY_FRAME_DIAG=1, in the same
+#                   lock hold: /tmp/bench-<label>-hitch-{ref,new}.log for hitches.py (gate.sh)
 # Window: 200-500 ends each run ~23 s sooner (~35 s instead of ~59 s) and gives the same verdicts
 # as 1000-1600 (PR #87); its FPS and CPU-ns noise is 2-3x larger, its cycles/draw noise the same.
 # Reuse: with >= 3 stored clean runs of the reference (same binary, window, env, flags) younger
@@ -26,7 +28,7 @@ repo=$(git -C "$dir" rev-parse --show-toplevel)
 label=$1
 [[ -n "$label" && "$label" != -* ]] || { sed -n '2,17p' "$0" >&2; exit 2; }
 shift
-n=2 pair=0 max_age=24 ref_sha= ref_install= new_install= env= ref_env= new_env= shot=
+n=2 pair=0 max_age=24 ref_sha= ref_install= new_install= env= ref_env= new_env= shot= hitch=
 extra=()
 window=${GARDEN_FRAMES:-$AB_WINDOW_DEFAULT}
 while [ $# -gt 0 ]; do
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
 	--max-age) max_age=$2; shift ;;
 	--shot) shot=$2; shift ;;
 	--extra) extra+=("$2"); shift ;;
+	--hitch) hitch=$2; shift ;;
 	*) echo "ab.sh: unknown option $1" >&2; exit 2 ;;
 	esac
 	shift
@@ -92,6 +95,10 @@ for i in $(seq "$n"); do
 	lines+=("$label-new$i KYTY_INSTALL=$new_install GARDEN_FRAMES=$window $s $env $new_env -- --amd-cpu")
 done
 lines+=("${extra[@]}")
+if [ -n "$hitch" ]; then
+	lines+=("$label-hitch-ref KYTY_INSTALL=$ref_install KYTY_FRAME_DIAG=1 GARDEN_FRAMES=$hitch $env $ref_env -- --amd-cpu")
+	lines+=("$label-hitch-new KYTY_INSTALL=$new_install KYTY_FRAME_DIAG=1 GARDEN_FRAMES=$hitch $env $new_env -- --amd-cpu")
+fi
 # batch.sh warms up its first line's install only; a cold shader store (a new binary) compiles
 # during the first frames, so the other install gets its own short warm-up (not stored).
 if [ "$reuse" = 0 ]; then
