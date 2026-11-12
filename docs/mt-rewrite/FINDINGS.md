@@ -1581,7 +1581,59 @@ PrepareBda's uploads, measured on a plain build in Sky Garden:
 - Queue to upload took a median of 7.7 s, a p10 of 1.3 ms and a p90 of 31 s: mostly pages PrepareBda doesn't take, which a bind uploads much later.
 - Today this is harmless, because uploads read guest memory at upload time.
 - **Anyone who copies guest data earlier than its use** (pre-staging, worker-side copies, snapshots at a collection) must re-arm write tracking on what they copy, or they will upload stale bytes. That holds even where the guest orders its write before the draw with a label and a wait, because that wait's collection doesn't see unwatched pages.
-- Probe and page versions: branch `trackB/bda-prestage`, `KYTY_BDA_LEAD_STATS`. The pre-staging design that would re-arm tracking is under review with Track K.
+- Probe and page versions: branch `trackB/bda-prestage`, `KYTY_BDA_LEAD_STATS`. Pre-staging, which re-arms tracking, was then built and parked: see the next entry.
+
+### BDA pre-staging: correct, but tracking the pages costs more than copying them (Track B + Track K, 2026-11-12)
+
+PrepareBda's guest→staging copy was moved to a stager thread. The thread arms each queued range (`LibKernel::Memory::ArmStaged`, #116) and copies its pages into a host-visible arena ahead of the draw. PrepareBda then records GPU copies from the arena for the pages whose version is still the one copied. Design: `docs/mt-rewrite/bda-prestage-design.md`. **Parked, unmerged:** branch `trackB/bda-prestage-pr`, kill switch `KYTY_BDA_PRESTAGE=0|1|verify|strict`.
+
+**Correctness: the strongest evidence we have for the asynchronous write tracker.** In `verify` mode, every staged page used is compared with guest memory at use. A difference is classified by whether the page still holds an unconsumed write mark (`PeekAsyncGuestWrites`):
+- **marked:** a store after the last collection. It has no ordering against this draw: every legitimate ordering goes through a collection (submit scan; a wait, semaphore or rewind satisfied by a guest value; a collecting resume), and that collection consumes the mark and moves the version first.
+- **unmarked:** a real loss.
+
+For every marked difference, the page's next use must see a newer version (the "loop" check). Plain build, Sky Garden 1000–1600:
+
+| Run | Unmarked | Marked | Loop closed / open |
+|---|---|---|---|
+| verify | **0** | 41 | 41 / 0 |
+| `--frame-skip auto` | **0** | 12 | 12 / 0 |
+| `KYTY_RESIDENT_TEXTURES=1` | **0** | 14 | 14 / 0 |
+| fault injected (`KYTY_BDA_PRESTAGE_DROP_ARM=1000`: the arm is skipped) | **8 caught** (copies 0.8–14 ms old) | 11 | 11 / 0 |
+
+- With `DROP_ARM=64`, the stale copies crashed the game during loading (a host SIGSEGV at a guest address).
+- The unit test (`virtual_memory_allocation_tests --bda-prestage-only`) catches a stale copy used 1.5 s after staging.
+- **Marked differences:** 1–4 pages/s out of ~150k compared. Size: median 1.4 KB, range 1 byte to 2.1 KB.
+  - **55% hit one buffer at 0x55aaf0000:** ~37 contiguous pages of floats, all rewritten together ~10 ms after staging (per-frame animation or particle data).
+  - A one-byte flag at offset 0x740 of page 0x50ecf3000 recurs (01 → 00), most likely a guest-side status word.
+  - The rest is spread over ~10 buffers.
+- The PGO build was not run.
+
+**Performance: a regression.** Same binary, `KYTY_BDA_PRESTAGE=0` vs on, 3 runs a side, plain build: `cmd_ns` **+4.6% ±0.5 `!`**, cycles/draw +0.0% `~`, `cmd_sns` +60% `!`, ipd +2.4% `!`, FPS **−7.0% `!`**.
+
+| | Effect | Why |
+|---|---|---|
+| Saved | memcpy 7.9% → 3.0% of the command thread's user samples. With the stager on a P-core, cycles/draw −3.3 to −3.5% | 63–72% of PrepareBda's ~1 GB/s served from staging (E-core), 95–99% (P-core) |
+| Kernel | `cmd_sns` 238 → 387 (E-core) / ~500 ns/draw (P-core) | Collection scans go from 5.0k to 14.4k calls/s (+25 ms/s, ≈ +95 ns/draw): #116 must scan every chunk that holds staged pages, and 8–12k pages stay staged at any time. Voluntary context switches go from 369 to 8,640/s (the command thread blocks on the stager's mutex) |
+| GPU | `KYTY_GPU_TIME` busy 627 → 660 ms/s (+5%) | Staged runs were copied from the host-visible arena on the universal queue, not through the transfer queue into a device ring |
+| User | Take 1.7% of the command thread | A per-page hash map and its allocations |
+| FPS | −5.5 to −7% at every placement | Not core competition (see below). GPU time and the command thread's kernel time |
+
+**Placement** (stager busy share and the share of bytes it serves, at ~1 GB/s):
+
+| Stager CPU | Busy | Served | FPS (54.5 off) |
+|---|---|---|---|
+| E-core 18, shared with the game | 34–36% | 63–72% | 51.5 |
+| CPU 4 | 18.7% | 95% | 51.5 |
+| CPU 9 | 20.3% | 99% | 51.3 |
+
+On an E-core, the misses come from lag: pages re-queued 0.3–5 ms before use that the stager hasn't reached yet. Coalescing the inbox and skipping copies that are still current raised the served share from ~40% to ~70%.
+
+**Conclusion: for the pages the game rewrites every frame, tracking them costs more than copying them.** A staged copy is only safe if the page is re-armed, and every armed page has to be scanned at every collection.
+- Fixing the GPU path and the lock would at best leave ~−1% `cmd_ns`, possibly flat, against carrying a second writer of guest-data copies with its own validation rule.
+- Upstream's alternative (0ec2cd5d, Track U) was flat too.
+- The next question is the reverse: leave those pages unwatched and treat them as dirty at every use ("hot-dirty", Track K + Track B).
+
+**#116 stays in dev** (`ArmStaged`/`Unstage`, versions bumped where a write mark is consumed, staged chunks in every scan). With nothing staged it is neutral (gate.sh, `cmd_ns` −0.05%). Its arm API has no caller on dev; Track K may reuse the page versions. `pageVersions.h` is on dev; its bump hooks in `MemoryTracker`, `NoteGpuWrite` and the backing-store writes are only on the parked branch.
 
 ### The command thread's own data misses, by level (Track B, 2026-11-12)
 
