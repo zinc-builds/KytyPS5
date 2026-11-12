@@ -282,6 +282,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// (A suspended wait resumes through Process, which collects too.)
 	if (m_renderer.IsCpLabel(reinterpret_cast<uint64_t>(addr), value)) {
 		MemDiag::Add(MemDiag::WaitOnCpLabel);
+		m_renderer.ObserveSkip(RenderContext::ObserveSkipKind::CpLabel);
 		return;
 	}
 	MemDiag::Add(MemDiag::WaitCollections);
@@ -604,7 +605,8 @@ bool GuestGpu::Process(Submission& submission) {
 	    submission.submit_scanned && GetSubmitScanMode() == SubmitScanMode::Verify
 	        ? RenderContext::KeptVerify::Submit
 	    : resume_skip && resume_mode == ResumeScanMode::Verify ? RenderContext::KeptVerify::Resume
-	                                                            : RenderContext::KeptVerify::None);
+	                                                            : RenderContext::KeptVerify::None,
+	    !submission.submit_scanned && resume_skip);
 	submission.submit_scanned = false;
 
 	switch (submission.type) {

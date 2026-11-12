@@ -610,18 +610,165 @@ static void ReportPrestage() {
 	std::fflush(stdout);
 }
 
-void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
+// KYTY_COLLECT_OBSERVE (see renderContext.h). GPU thread only.
+namespace {
+int ObserveMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_COLLECT_OBSERVE");
+		if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+			return 0;
+		}
+		return std::string_view(value) == "count" ? 2 : 1;
+	}();
+	return mode;
+}
+struct Observe {
+	std::vector<uint64_t> pending; // watched pages with pending writes at a publication
+	uint64_t publications = 0, pending_pages = 0, checked = 0, failures = 0, dropped = 0;
+	uint64_t skips[3] {}, skip_pages[3] {};
+	uint64_t peek_ns = 0;
+	uint64_t last_ns = 0;
+};
+Observe g_observe;
+uint64_t ObserveNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+} // namespace
+
+bool RenderContext::ObserveCollectEnabled() noexcept {
+	return ObserveMode() != 0;
+}
+
+// The watched pages whose guest writes no collection has taken yet: page-table marks and
+// kept writes, read without consuming them.
+static void ObservePeek(const PageManager& pages, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+	std::vector<std::pair<uint64_t, uint64_t>> written;
+	LibKernel::Memory::PeekAsyncGuestWrites(written);
+	for (const auto& [begin, end]: written) {
+		pages.AppendWriteWatched(begin, end, out);
+	}
+}
+
+void RenderContext::ObservePublication() {
+	EXIT_IF(g_on_decode_thread);
+	const auto start = ObserveNowNs();
+	std::vector<std::pair<uint64_t, uint64_t>> watched;
+	ObservePeek(m_page_manager, watched);
+	for (const auto& [begin, end]: watched) {
+		for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			g_observe.pending.push_back(page);
+		}
+	}
+	g_observe.publications++;
+	g_observe.peek_ns += ObserveNowNs() - start;
+}
+
+void RenderContext::ObserveSkip(ObserveSkipKind kind) {
+	// A peek at every skip costs ~60 us each (~7.5k own-label waits a second in Sky Garden: half
+	// the command thread), so these statistics are opt-in: KYTY_COLLECT_OBSERVE_SKIPS=1.
+	static const bool skips = [] {
+		const char* value = std::getenv("KYTY_COLLECT_OBSERVE_SKIPS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!ObserveCollectEnabled() || !skips) {
+		return;
+	}
+	const auto start = ObserveNowNs();
+	std::vector<std::pair<uint64_t, uint64_t>> watched;
+	ObservePeek(m_page_manager, watched);
+	const auto k = static_cast<int>(kind);
+	g_observe.skips[k]++;
+	for (const auto& [begin, end]: watched) {
+		g_observe.skip_pages[k] += (end - begin) / TRACKER_PAGE_SIZE;
+	}
+	g_observe.peek_ns += ObserveNowNs() - start;
+}
+
+// After a collection a publication forced: every pending page still watched must have been
+// invalidated by it.
+static void ObserveCheck(const PageManager& pages, const std::vector<uint64_t>& invalidated) {
+	auto& o = g_observe;
+	std::vector<uint64_t> done = invalidated;
+	std::sort(done.begin(), done.end());
+	std::sort(o.pending.begin(), o.pending.end());
+	o.pending.erase(std::unique(o.pending.begin(), o.pending.end()), o.pending.end());
+	for (const auto page: o.pending) {
+		o.checked++;
+		if (std::binary_search(done.begin(), done.end(), page)) {
+			continue;
+		}
+		// No longer watched: the caches hold nothing from it to invalidate.
+		if (!pages.HasWriteWatchedPage(page)) {
+			continue;
+		}
+		o.failures++;
+		std::printf("COLLECTOBSERVE FAIL: page 0x%llx had a guest write pending at a publication, "
+		            "and the collection it forced did not invalidate it\n",
+		            static_cast<unsigned long long>(page));
+		std::fflush(stdout);
+		if (ObserveMode() == 1) {
+			EXIT("KYTY_COLLECT_OBSERVE: a published guest write was not invalidated by the "
+			     "collection its publication forced (page 0x%llx)\n",
+			     static_cast<unsigned long long>(page));
+		}
+	}
+	o.pending_pages += o.pending.size();
+	o.pending.clear();
+}
+
+static void ObserveReport() {
+	auto&      o   = g_observe;
+	const auto now = ObserveNowNs();
+	if (o.last_ns == 0) {
+		o.last_ns = now;
+		return;
+	}
+	if (now - o.last_ns < 1'000'000'000ull) {
+		return;
+	}
+	const double s = static_cast<double>(now - o.last_ns) / 1e9;
+	std::printf("COLLECTOBSERVE publications_s=%.0f pending_pages_per=%.1f checked_s=%.0f failures=%llu "
+	            "dropped=%llu skips_s(submit,resume,cplabel)=%.0f,%.0f,%.0f "
+	            "deferred_pages_per_skip=%.1f,%.1f,%.1f peek_ms_s=%.2f\n",
+	            o.publications / s,
+	            o.publications != 0 ? static_cast<double>(o.pending_pages) / o.publications : 0.0,
+	            o.checked / s, static_cast<unsigned long long>(o.failures),
+	            static_cast<unsigned long long>(o.dropped), o.skips[0] / s, o.skips[1] / s,
+	            o.skips[2] / s,
+	            o.skips[0] != 0 ? static_cast<double>(o.skip_pages[0]) / o.skips[0] : 0.0,
+	            o.skips[1] != 0 ? static_cast<double>(o.skip_pages[1]) / o.skips[1] : 0.0,
+	            o.skips[2] != 0 ? static_cast<double>(o.skip_pages[2]) / o.skips[2] : 0.0,
+	            static_cast<double>(o.peek_ns) / 1e6 / s);
+	std::fflush(stdout);
+	o.publications = o.pending_pages = o.checked = o.peek_ns = 0;
+	for (int k = 0; k < 3; k++) {
+		o.skips[k] = o.skip_pages[k] = 0;
+	}
+	o.last_ns = now;
+}
+
+void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool resume) {
 	EXIT_IF(g_on_decode_thread); // GPU thread only (Process start, sync prologues)
 	ReportPrestage();
 	const Common::FrameDiag::Scope frame_diag(Common::FrameDiag::Counter::Collects,
 	                                          Common::FrameDiag::Counter::CollectNs);
 	// A pending request (a satisfied wait published guest data, maybe in another submission
 	// that is now blocked) needs a full scan: only a full scan settles it.
-	if (AsyncCollectRequested()) {
+	const bool requested = AsyncCollectRequested();
+	if (requested) {
 		kept_only = false;
 		verify    = KeptVerify::None;
 	}
 	m_async_collect_requested.store(false, std::memory_order_relaxed);
+	const bool observe = ObserveCollectEnabled();
+	if (observe) {
+		ObserveReport();
+	}
+	// Pages the observer requires this collection to invalidate (a publication forced it).
+	static std::vector<uint64_t> observed;
+	observed.clear();
 	static std::vector<std::pair<uint64_t, uint64_t>> written;
 	static std::vector<std::pair<uint64_t, uint64_t>> watched;
 	written.clear();
@@ -655,6 +802,10 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 			}
 			written.insert(written.end(), late.begin(), late.end());
 		}
+		if (observe) {
+			// What this kept-only collection leaves for later (after the kept writes it takes).
+			ObserveSkip(resume ? ObserveSkipKind::Resume : ObserveSkipKind::Submit);
+		}
 	} else {
 		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::CollectScan);
 		LibKernel::Memory::CollectAsyncGuestWrites(written, WantsAsyncScan);
@@ -686,6 +837,9 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 	if (written.empty()) {
 		VerifyAsyncWrites(written, true);
 		VerifyAsyncWrites(written, false);
+		if (observe && requested) {
+			ObserveCheck(m_page_manager, observed);
+		}
 		return;
 	}
 	KYTY_PROFILER_BLOCK("CollectAsyncWrites");
@@ -702,9 +856,42 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 		return pages;
 	}());
 	VerifyAsyncWrites(written, true);
+	// KYTY_OBSERVE_DROP=<n> (test only, with KYTY_COLLECT_OBSERVE): this collection leaves every
+	// n-th page a publication made visible stale, as a production bug would; observe must fail.
+	static const uint64_t drop_every = [] {
+		const char* value = std::getenv("KYTY_OBSERVE_DROP");
+		return value != nullptr && ObserveCollectEnabled() ? std::strtoull(value, nullptr, 10) : 0;
+	}();
+	std::vector<uint64_t> drop;
+	if (observe && requested && drop_every != 0) {
+		static uint64_t counter = 0;
+		for (const auto page: g_observe.pending) {
+			if (++counter % drop_every == 0) {
+				drop.push_back(page);
+			}
+		}
+		std::sort(drop.begin(), drop.end());
+		g_observe.dropped += drop.size();
+	}
 	for (const auto& [begin, end]: watched) {
 		// The same work as a write fault on each page (HandleFault).
 		MemDiag::Add(MemDiag::AsyncInvalidatedPages, (end - begin) / TRACKER_PAGE_SIZE);
+		if (observe && requested) {
+			for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+				if (std::binary_search(drop.begin(), drop.end(), page)) {
+					continue;
+				}
+				observed.push_back(page);
+			}
+			if (!drop.empty()) {
+				for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+					if (!std::binary_search(drop.begin(), drop.end(), page)) {
+						(void)InvalidateMemory(page, TRACKER_PAGE_SIZE);
+					}
+				}
+				continue;
+			}
+		}
 		if (IsMapped(begin, end - begin)) {
 			(void)InvalidateMemory(begin, end - begin);
 			continue;
@@ -714,6 +901,9 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 		}
 	}
 	VerifyAsyncWrites(written, false);
+	if (observe && requested) {
+		ObserveCheck(m_page_manager, observed);
+	}
 }
 
 bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size,

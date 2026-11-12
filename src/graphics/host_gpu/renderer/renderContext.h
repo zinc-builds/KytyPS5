@@ -107,7 +107,27 @@ public:
 	// verify (KYTY_SUBMIT_SCAN=verify, KYTY_RESUME_SCAN=verify): with kept_only, also scan and
 	// count the write-watched pages the skipped scan would have found.
 	enum class KeptVerify { None, Submit, Resume };
-	void CollectAsyncWrites(bool kept_only = false, KeptVerify verify = KeptVerify::None);
+	// resume: a kept-only collection because a resumed submission skips its scan (#103), not
+	// because its submitting thread scanned (observe statistics only).
+	void CollectAsyncWrites(bool kept_only = false, KeptVerify verify = KeptVerify::None,
+	                        bool resume = false);
+	// KYTY_COLLECT_OBSERVE=1 (or =count): checks that every guest write a publication (a
+	// satisfied wait that requests a collection) can make visible is invalidated by the
+	// collection that publication forces, without changing what production collects. At each
+	// RequestAsyncCollect it records the watched pages with pending writes (page-table marks and
+	// kept writes, read without consuming them); the forced collection must invalidate each one
+	// still watched, or the run fails (=1 exits, =count counts). With
+	// KYTY_COLLECT_OBSERVE_SKIPS=1 the scan skips (kept-only collections after a submit scan or
+	// on a resume, and waits on the processor's own label) peek too, for statistics: what was
+	// deferred there (slow: a peek at each of thousands of skips a second). KYTY_OBSERVE_DROP=<n> (test only)
+	// makes production skip the invalidation of every n-th such page, which observe must catch.
+	// Unlike KYTY_SUBMIT_SCAN=verify and KYTY_RESUME_SCAN=verify, which handle what the
+	// skipped scan would have found (nothing is lost for good), this proves timely visibility:
+	// nothing a publication makes visible is read stale after it.
+	[[nodiscard]] static bool ObserveCollectEnabled() noexcept;
+	enum class ObserveSkipKind { Submit, Resume, CpLabel };
+	void ObservePublication();
+	void ObserveSkip(ObserveSkipKind kind);
 	// KYTY_SUBMIT_SCAN (default on): a guest thread's scan before it enqueues a submission.
 	// False when it did not scan (switched off, or no asynchronous protection).
 	bool ScanAsyncWritesAtSubmit();
@@ -118,6 +138,9 @@ public:
 	// outside a sync (a guest command, say) would need a sync first.
 	void RequestAsyncCollect() noexcept {
 		EXIT_IF(g_on_decode_thread);
+		if (ObserveCollectEnabled()) {
+			ObservePublication();
+		}
 		m_async_collect_requested.store(true, std::memory_order_relaxed);
 	}
 	[[nodiscard]] bool AsyncCollectRequested() const noexcept {
