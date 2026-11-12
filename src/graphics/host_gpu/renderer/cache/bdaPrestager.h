@@ -35,7 +35,8 @@ struct GraphicContext;
 // KYTY_BDA_PRESTAGE: 1 (default) on, 0 off, verify: also compare every staged page used with
 // guest memory at use and count differences, strict: exit on the first one, repair (diagnostic):
 // count them and copy those pages fresh.
-// KYTY_BDA_PRESTAGE_ARENA=<MiB> (64), KYTY_BDA_PRESTAGE_CPU=<cpu>, KYTY_BDA_PRESTAGE_STATS=1:
+// KYTY_BDA_PRESTAGE_ARENA=<MiB> (64), KYTY_BDA_PRESTAGE_CPU=<list> and
+// KYTY_BDA_PRESTAGE_OWN_CORE=1 (placement, see HybridAffinity::StagerCpus), KYTY_BDA_PRESTAGE_STATS=1:
 // BDAPRESTAGE lines. KYTY_BDA_PRESTAGE_DROP_ARM=<n>: fault injection, skips the arm of every nth
 // range (verify must then find differences).
 class BdaPrestager {
@@ -87,7 +88,7 @@ public:
 		// Batches taken from the inbox: queued and coalesced bytes, and their lag (oldest queueing
 		// to the batch's end).
 		std::atomic<uint64_t> batches {0}, queued_bytes {0}, coalesced_bytes {0}, lag_ns {0},
-		    lag_max_ns {0}, current {0};
+		    lag_max_ns {0}, current {0}, mismatched_marked {0}, mismatched_unmarked {0};
 	};
 	[[nodiscard]] const Stats& Counters() const noexcept { return m_stat; }
 

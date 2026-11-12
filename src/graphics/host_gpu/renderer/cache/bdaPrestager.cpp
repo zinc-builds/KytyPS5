@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -156,6 +157,15 @@ void BdaPrestager::Run() {
 #if defined(__linux__)
 	pthread_setname_np(pthread_self(), "KytyBdaStage");
 	Common::HybridAffinity::ApplyToStagerThread();
+	{
+		std::string cpus;
+		for (const int cpu: Common::HybridAffinity::StagerCpus()) {
+			cpus += (cpus.empty() ? "" : ",") + std::to_string(cpu);
+		}
+		std::printf("BdaPrestager: stager thread on CPUs %s%s\n", cpus.empty() ? "(any)" : cpus.c_str(),
+		            Common::HybridAffinity::StagerOwnsCores() ? " (taken from the game's set)"
+		                                                      : " (shared with the game)");
+	}
 #endif
 	std::vector<std::pair<uint64_t, uint64_t>> work;
 	uint64_t                                   oldest_ns = 0;
@@ -520,6 +530,49 @@ void BdaPrestager::Take(uint64_t address, uint64_t size, uint64_t dst_offset,
 					if (std::memcmp(now, m_shadow.data() + uint64_t {entry.slot} * PageSize,
 					                PageSize) != 0) {
 						m_stat.mismatched.fetch_add(1, std::memory_order_relaxed);
+						{
+							// Sample: where the bytes differ, how old the copy is and what the
+							// stager last did with the page.
+							const auto* staged_bytes =
+							    m_shadow.data() + uint64_t {entry.slot} * PageSize;
+							uint32_t first = PageSize, last = 0, bytes = 0;
+							for (uint32_t i = 0; i < PageSize; i++) {
+								if (now[i] != staged_bytes[i]) {
+									first = std::min(first, i);
+									last  = i;
+									bytes++;
+								}
+							}
+							const auto trace = m_trace.find(page);
+							// A write mark not yet taken: the store is after the last scan, so a
+							// later collection reports it (a store for later work); none: unexplained.
+							std::vector<std::pair<uint64_t, uint64_t>> pending;
+							LibKernel::Memory::PeekAsyncGuestWrites(pending);
+							const bool marked = std::any_of(
+							    pending.begin(), pending.end(), [&](const auto& range) {
+								    return range.first < page + PageSize && page < range.second;
+							    });
+							(marked ? m_stat.mismatched_marked : m_stat.mismatched_unmarked)
+							    .fetch_add(1, std::memory_order_relaxed);
+							std::printf("BDAPRESTAGE_MISMATCH page=0x%016" PRIx64
+							            " version=%u generation=%" PRIu64 " age_ms=%.2f "
+							            "differing_bytes=%u first=0x%x last=0x%x staged=%02x%02x%02x%02x "
+							            "now=%02x%02x%02x%02x queued_ago_ms=%.2f pending_mark=%d\n",
+							            page, version, generation,
+							            entry.staged_ns != 0
+							                ? static_cast<double>(NowNs() - entry.staged_ns) / 1e6
+							                : -1.0,
+							            bytes, first, last, staged_bytes[first & ~3u],
+							            staged_bytes[(first & ~3u) + 1], staged_bytes[(first & ~3u) + 2],
+							            staged_bytes[(first & ~3u) + 3], now[first & ~3u],
+							            now[(first & ~3u) + 1], now[(first & ~3u) + 2],
+							            now[(first & ~3u) + 3],
+							            trace != m_trace.end() && trace->second.queued_ns != 0
+							                ? static_cast<double>(NowNs() - trace->second.queued_ns) /
+							                      1e6
+							                : -1.0,
+							            marked ? 1 : 0);
+						}
 						if (m_mode == 4) { // repair (diagnostic): never serve a differing copy
 							m_free_slots.push_back(entry.slot);
 							add_fresh(piece, piece_bytes);
@@ -575,7 +628,7 @@ void BdaPrestager::ReportIfDue() {
 	    "evicted=%.1f%% version=%.1f%% generation=%.1f%% | stager: staged_mb_s=%.0f "
 	    "wasted_mb_s=%.0f (superseded %.0f, evicted %.0f, moved_in_copy %.0f) refused_pages_s=%.0f "
 	    "odd_s=%.0f arena_full_s=%.0f arms_s=%.0f busy=%.1f%% | verify: compared_s=%.0f "
-	    "mismatched=%" PRIu64 "\n",
+	    "mismatched=%" PRIu64 " (pending_mark %" PRIu64 ", unmarked %" PRIu64 ")\n",
 	    pct(served), static_cast<double>(uses * PageSize) / 1e6 / seconds, pct(missing),
 	    pct(refused), pct(evicted), pct(version), pct(generation),
 	    static_cast<double>(staged * PageSize) / 1e6 / seconds,
@@ -588,7 +641,8 @@ void BdaPrestager::ReportIfDue() {
 	    static_cast<double>(take(m_stat.arena_full)) / seconds,
 	    static_cast<double>(take(m_stat.arms)) / seconds,
 	    100.0 * static_cast<double>(take(m_stat.busy_ns)) / (seconds * 1e9),
-	    static_cast<double>(compared) / seconds, mismatched);
+	    static_cast<double>(compared) / seconds, mismatched, take(m_stat.mismatched_marked),
+	    take(m_stat.mismatched_unmarked));
 	uint64_t age[4], by[4];
 	for (int i = 0; i < 4; i++) {
 		age[i] = take(m_stat.moved_age[i]);

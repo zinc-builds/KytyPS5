@@ -273,34 +273,53 @@ inline int RecorderCpu() {
 	return efficiency.empty() ? -1 : *efficiency.rbegin();
 }
 
-// The BDA pre-stager's CPU: KYTY_BDA_PRESTAGE_CPU, else the efficiency core before the
-// recorder's (-1: none).
-inline int StagerCpu() {
+// The BDA pre-stager's CPUs. KYTY_BDA_PRESTAGE_CPU=<list> picks them; by default the efficiency
+// core before the recorder's, shared with the game's threads (the stager sleeps when it has
+// nothing to copy). Never the GPU command thread's core (either SMT thread). Empty: no pinning.
+inline std::set<int> StagerCpus() {
+	if (!GetPlan().active && std::getenv("KYTY_BDA_PRESTAGE_CPU") == nullptr) {
+		return {};
+	}
+	std::set<int> cpus;
 	if (const char* value = std::getenv("KYTY_BDA_PRESTAGE_CPU"); value != nullptr) {
-		return std::atoi(value);
-	}
-	if (!GetPlan().active) {
-		return -1;
-	}
-	const auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
-	const int  recorder   = RecorderCpu();
-	for (auto it = efficiency.rbegin(); it != efficiency.rend(); ++it) {
-		if (*it != recorder) {
-			return *it;
+		cpus = ParseCpuList(value);
+	} else {
+		const auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
+		const int  recorder   = RecorderCpu();
+		for (auto it = efficiency.rbegin(); it != efficiency.rend(); ++it) {
+			if (*it != recorder) {
+				cpus.insert(*it);
+				break;
+			}
 		}
 	}
-	return -1;
+	if (const int gpu = GetPlan().gpu_cpu; gpu >= 0) {
+		for (const int cpu: ReadCpuList("/sys/devices/system/cpu/cpu" + std::to_string(gpu) +
+		                                "/topology/thread_siblings_list")) {
+			cpus.erase(cpu);
+		}
+		cpus.erase(gpu);
+	}
+	return cpus;
 }
 
-// Call from the BDA pre-stager thread (BdaPrestager): an efficiency core of its own.
+// KYTY_BDA_PRESTAGE_OWN_CORE=1: the stager's CPUs also leave the game's thread set.
+inline bool StagerOwnsCores() {
+	const char* value = std::getenv("KYTY_BDA_PRESTAGE_OWN_CORE");
+	return value != nullptr && value[0] == '1';
+}
+
+// Call from the BDA pre-stager thread (BdaPrestager).
 inline void ApplyToStagerThread() {
-	const int cpu = StagerCpu();
-	if (cpu < 0) {
+	const auto cpus = StagerCpus();
+	if (cpus.empty()) {
 		return;
 	}
 	cpu_set_t set;
 	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
+	for (const int cpu: cpus) {
+		CPU_SET(cpu, &set);
+	}
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
@@ -319,13 +338,15 @@ inline void ApplyToGuestThread(const std::string& name) {
 			return std::string(value) == "none" ? std::set<int> {} : ParseCpuList(value);
 		}
 		auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
-		// Not the recording thread's CPU (see ApplyToRecorderThread) nor the BDA pre-stager's
-		// (ApplyToStagerThread), whether or not pre-staging is on, so that its kill switch
-		// changes nothing else.
-		const int recorder = RecorderCpu();
-		const int stager   = StagerCpu();
-		efficiency.erase(recorder);
-		efficiency.erase(stager);
+		// Not the recording thread's CPU (see ApplyToRecorderThread), nor the BDA pre-stager's
+		// with KYTY_BDA_PRESTAGE_OWN_CORE=1 (whether or not pre-staging is on, so that its kill
+		// switch changes nothing else).
+		efficiency.erase(RecorderCpu());
+		if (StagerOwnsCores()) {
+			for (const int cpu: StagerCpus()) {
+				efficiency.erase(cpu);
+			}
+		}
 		return efficiency;
 	}();
 	if (cpus.empty()) {
