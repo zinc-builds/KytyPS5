@@ -39,6 +39,15 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
     boots to the title and the run fails: A/B against such a reference with `GARDEN_ROUTE=menu`.
   - `menu`: title → save 1 → Gorilla Nebula → Sky Garden (Dive In is a *hold* of Cross), driven
     by `vpad.py`. Needs the save. Its numbers are not comparable with `lvl` runs (FINDINGS.md).
+  `GARDEN_LEVEL=<name>` boots another level on the `lvl` route: a `<File>` name from the dump's
+  `data/prein/product_levels.xml` (e.g. `timestop_casino`; `tools/re/zx.cpp` extracts it). The game
+  logs `StartLevel` with a short name (`snowy_canyon`), so the first `StartLevel` counts. Runs of
+  another level stay out of the result store (its references are Sky Garden's).
+- `levels.sh [-m verify|perf] [-f A-B] [-s F] [-e ENV] [-t TAG] [-l FILE] <level>...` — one
+  `garden.sh` run per level in one hold of the lock, then a table (loaded level, result or the
+  failure with the log's last error line, FPS, draws/frame, `cmd_ns`, worst frame, screenshot).
+  `-m verify` (default): every verifier that exits on a difference, frames 0–400, a screenshot at
+  frame 300. `-m perf`: frames 200–800. `levels-spread.txt` is a spread of eight levels.
 - `benchlock.sh` — host-wide lock so agents sharing the machine never overlap. `garden.sh`,
   `run.sh` and `batch.sh` take it exclusively (the emulator inherits it, so `KEEP_RUNNING=1` holds
   it until the emulator exits); wrap other emulator launches in `benchlock.sh run …` and builds or
