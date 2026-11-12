@@ -39,8 +39,9 @@ It drops draws, PSSR passes, and the presentation of its image, **except** draws
 
 | Kept | Why | How it is found |
 |---|---|---|
-| Render targets not redrawn every frame (shadow caches, probes, impostors) | Later frames reuse them without redrawing; a skipped refresh would stay stale until the next one | Each target's write rate over drawn frames; below 90% it is kept |
-| Targets of draws that write buffers or storage images | Their writes outlive the frame (the CPU or a later pass may read them) | The draw commit reports shaders with buffer/image writes |
+| Render targets refreshed every few frames (shadow caches, probes, impostors) | Later frames reuse them without redrawing; a skipped refresh would stay stale until the next one | Each target's write runs over drawn frames: three runs of one or two frames in a row make it periodic, until a run of 8 |
+| New render targets (first 8 drawn frames) | A one-off render (a baked cube map) must not land in a skipped frame | First sight |
+| Draws whose shaders write buffers or storage images | Their writes outlive the frame: the CPU or a later pass may read them | The draw commit reports the shader combination (ES/GS/PS addresses); later draws of it are kept |
 | Targets the CPU reads back (`--readback-tiled-images`, `--readback-linear-images`) | The texture cache writes them back to guest memory after each submit | The same size/tiling rule as the texture cache |
 | Draws with no render target | They exist only for their side effects | No color or depth target bound |
 | `KYTY_FRAME_SKIP_KEEP=<addr>,…` | Manual: a target base address or pixel-shader address | Found with the diagnostic below |
@@ -50,9 +51,30 @@ Occlusion queries: a dropped draw inside an open query counts one visible sample
 not culled because their draw was skipped (without `--occlusion-queries` every query already reads
 as visible). New targets are kept until ~45 drawn frames have shown them to be every-frame ones.
 
+A target is not "periodic" just because it goes unused for a while: dynamic resolution moves the
+scene between differently sized targets, and each is redrawn every frame while in use.
+
 What can still differ after a skipped frame: temporal effects (TAA or PSSR history) see one frame
 less of history, and anything computed in a skipped frame from a render target (a depth pyramid
-for GPU culling, a luminance average) uses the last drawn frame's content.
+for GPU culling, a luminance average) uses the last drawn frame's content. A game's own GPU timing
+sees skipped frames as cheap: Astro Bot's dynamic resolution then raises the resolution a little.
+
+## Astro Bot, Sky Garden (KYTY_FRAME_SKIP_DIAG=1, 600-frame windows)
+
+- **Render targets:** every target is redrawn in every frame except the two video-out buffers
+  (alternating). No periodic targets, so nothing is kept for that reason.
+- **Draws that write memory:** ~590 draws a frame (main pass, three pixel shaders) do atomic-only
+  writes into three 128-byte buffers at `0x50740de00` (one per frame in flight), and the CPU reads
+  them back (~1.3 read faults a frame on those pages): feedback the game consumes. ~15 draws a
+  frame write two storage images (12 and 8 MiB), also read back. All are kept: a skipped frame
+  still draws these ~620, and costs the command thread ~8 ms instead of ~22.
+- **GPU-driven culling:** no multi-draw has a GPU-written count (3 plain indirect draws a frame),
+  so no draw count depends on a skipped frame's depth.
+- **CPU readback of render targets:** off by default (`--readback-*-images`), so the CPU never
+  reads render-target memory; with it on, small tiled and linear targets are kept.
+- **Occlusion queries:** without `--occlusion-queries` every query reads as visible; with it, a
+  dropped draw inside a query counts as visible.
+- **Untargeted draws:** ~30-50 a frame, kept.
 
 ## Diagnostic: `KYTY_FRAME_SKIP_DIAG=1`
 
