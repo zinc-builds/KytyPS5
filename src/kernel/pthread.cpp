@@ -587,16 +587,6 @@ public:
 
 	void FreeDetachedThreads();
 
-	// Calls fn for every running thread (started, not finished), under the pool's lock.
-	template <class F> void ForEachRunning(F&& fn) {
-		Common::LockGuard lock(m_mutex);
-		for (auto* p: m_threads) {
-			if (!p->free && !p->almost_done && p->host_thread_id != 0 && p->attr != nullptr) {
-				fn(p);
-			}
-		}
-	}
-
 private:
 	std::vector<Pthread> m_threads;
 	Common::Mutex        m_mutex;
@@ -2859,6 +2849,8 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Cond, reinterpret_cast<uintptr_t>(cond));
+
+	PthreadPlacementCheck();
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3026,6 +3018,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Cond, reinterpret_cast<uintptr_t>(cond));
+
+	PthreadPlacementCheck();
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3096,21 +3090,64 @@ Pthread PthreadSelfOrNull() {
 	return g_pthread_self;
 }
 
-void PthreadNoteGraphicsSubmitter() {
+namespace {
+
+// A guest thread's priority: written by PthreadSetprio on any thread, read by the thread itself.
+int LoadGuestPriority(Pthread thread) {
+	return std::atomic_ref<int>(thread->attr->guest_priority).load(std::memory_order_relaxed);
+}
+
 #if defined(__linux__)
-	// Each submission checks only that its thread's priority is the one it last saw.
-	thread_local int seen = -1;
-	auto*            self = g_pthread_self;
-	if (self == nullptr || self->attr == nullptr || self->attr->guest_priority == seen) {
+struct GuestPlacement {
+	bool        placed   = false;
+	uint32_t    epoch    = 0;
+	int         priority = 0;
+	std::string name; // as the thread started (a rename does not move it)
+};
+thread_local GuestPlacement t_guest_placement;
+#endif
+
+} // namespace
+
+void PthreadPlacementCheck() {
+#if defined(__linux__)
+	auto* self = g_pthread_self;
+	// The main thread stays with the emulator (core layout, #46).
+	if (self == nullptr || self == g_pthread_main || self->attr == nullptr ||
+	    !Common::HybridAffinity::GuestPlacementActive()) {
 		return;
 	}
-	seen = self->attr->guest_priority;
-	if (Common::HybridAffinity::NoteGraphicsSubmitter(seen)) {
-		g_pthread_context->GetPthreadPool()->ForEachRunning([](Pthread thread) {
-			Common::HybridAffinity::ApplyToGuestThread(thread->name, thread->attr->guest_priority,
-			                                           static_cast<int>(thread->host_thread_id));
-		});
+	auto&      state    = t_guest_placement;
+	const auto epoch    = Common::HybridAffinity::GuestPlacementEpoch().load(std::memory_order_acquire);
+	const int  priority = LoadGuestPriority(self);
+	if (state.placed && state.epoch == epoch && state.priority == priority) {
+		return;
 	}
+	if (!state.placed) {
+		state.name = self->name;
+	}
+	state.placed   = true;
+	state.epoch    = epoch;
+	state.priority = priority;
+	Common::HybridAffinity::ApplyToGuestThread(state.name, priority);
+#endif
+}
+
+void PthreadNoteGraphicsSubmitter() {
+#if defined(__linux__)
+	// Each submission only compares its thread's priority with the one it last saw.
+	thread_local int seen = -1;
+	auto*            self = g_pthread_self;
+	if (self == nullptr || self->attr == nullptr) {
+		return;
+	}
+	const int priority = LoadGuestPriority(self);
+	if (priority == seen) {
+		return;
+	}
+	seen = priority;
+	Common::HybridAffinity::NoteGraphicsSubmitter(priority);
+	PthreadPlacementCheck();
 #endif
 }
 
@@ -3258,11 +3295,11 @@ static void* RunThread(void* arg) {
 #endif
 	}
 #if defined(__linux__)
-	Common::HybridAffinity::ApplyToGuestThread(thread->name, thread->attr->guest_priority,
-	                                           static_cast<int>(os_thread_id));
 	Common::GpuWaitDiag::SetGuestThread(thread->name,
 	                                    reinterpret_cast<uintptr_t>(thread->attr->stack_addr),
 	                                    static_cast<size_t>(thread->attr->stack_size));
+
+	PthreadPlacementCheck();
 #endif
 #endif
 
@@ -3531,7 +3568,7 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	*prio = thread->attr->guest_priority;
+	*prio = LoadGuestPriority(thread);
 	LOGF("\t PthreadGetprio: %d, %d\n", thread->unique_id, *prio);
 	return OK;
 }
@@ -3571,13 +3608,11 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 #endif
 
-	thread->attr->guest_priority = prio;
-#if defined(__linux__)
-	if (thread->host_thread_id != 0) {
-		Common::HybridAffinity::ApplyToGuestThread(thread->name, prio,
-		                                           static_cast<int>(thread->host_thread_id));
+	// The thread re-places itself at its next wait (PthreadPlacementCheck).
+	std::atomic_ref<int>(thread->attr->guest_priority).store(prio, std::memory_order_relaxed);
+	if (thread == g_pthread_self) {
+		PthreadPlacementCheck();
 	}
-#endif
 	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
 	return OK;
 }
@@ -3903,6 +3938,8 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sleep, microseconds);
+
+	PthreadPlacementCheck();
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3915,6 +3952,8 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
 	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sleep, rqtp != nullptr ? static_cast<uint64_t>(rqtp->tv_nsec / 1000) : 0);
+
+	PthreadPlacementCheck();
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}

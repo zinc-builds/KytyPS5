@@ -324,12 +324,16 @@ TEST(HybridAffinity, OnlyARaisedGraphicsSubmitterSetsTheBar) {
 	if (std::getenv("KYTY_GUEST_PCORE_PRIORITY") != nullptr) {
 		GTEST_SKIP() << "KYTY_GUEST_PCORE_PRIORITY is set";
 	}
-	EXPECT_FALSE(NoteGraphicsSubmitter(kGuestDefaultPriority)); // default priority: no bar
+	const auto epoch = GuestPlacementEpoch().load();
+	EXPECT_FALSE(RaiseGuestPriorityBar(680, false)); // placement inactive: no bar
+	EXPECT_FALSE(RaiseGuestPriorityBar(kGuestDefaultPriority, true)); // default priority: no bar
 	EXPECT_EQ(GuestPriorityBar().load(), -1);
-	EXPECT_TRUE(NoteGraphicsSubmitter(680));
+	EXPECT_EQ(GuestPlacementEpoch().load(), epoch);
+	EXPECT_TRUE(RaiseGuestPriorityBar(680, true));
 	EXPECT_EQ(GuestPriorityBar().load(), 680);
-	EXPECT_FALSE(NoteGraphicsSubmitter(650)); // a higher-priority submitter keeps the bar
-	EXPECT_TRUE(NoteGraphicsSubmitter(690));  // a second, lower-priority submitter lowers it
+	EXPECT_EQ(GuestPlacementEpoch().load(), epoch + 1); // the threads re-place themselves
+	EXPECT_FALSE(RaiseGuestPriorityBar(650, true)); // a higher-priority submitter keeps the bar
+	EXPECT_TRUE(RaiseGuestPriorityBar(690, true));  // a second, lower-priority submitter lowers it
 	EXPECT_EQ(GuestPriorityBar().load(), 690);
 }
 #endif

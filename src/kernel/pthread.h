@@ -114,6 +114,9 @@ uint64_t              PthreadGetHostThreadId(Pthread thread);
 // The calling game thread submitted graphics work: on hybrid CPUs, game threads at or above its
 // priority move to the performance cores (HybridAffinity::NoteGraphicsSubmitter).
 void                  PthreadNoteGraphicsSubmitter();
+// The calling game thread places itself if its priority or the placement rule changed since it
+// last did (hybrid CPUs; called from its waits). Cheap when nothing changed.
+void                  PthreadPlacementCheck();
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);

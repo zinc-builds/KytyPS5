@@ -2071,15 +2071,23 @@ frame on Sky Garden (`KYTY_FRAME_DIAG`, PR #113). The chain:
   workers.
 - No emulator event (flip, vblank, EOP, label) is in that chain.
 
-**The rule.** The guest's own priorities say which threads matter (lower numbers run first, 700 is
-the default):
+**The rule.** The guest's own priorities mark these threads on Sky Garden (lower numbers run
+first, 700 is the default):
 - `DrawThread` and the `Draw*` workers are at 678–680, `Havok` workers at 478, audio at 256.
 - The `tbb` pool, main thread and streamers are at 699–716.
 
-When a game thread first submits graphics command buffers at a raised priority (below 700), every
-game thread at that priority or above moves to the emulator's performance cores. Threads that
-start later or change priority follow. A submitter at the default priority sets no bar. On Linux
-the emulator otherwise ignores guest priorities (`PthreadSetprio` maps them only on Windows).
+The threads that submit graphics command buffers set a bar: the largest raised priority number
+(below 700) any submitter has had. Every game thread at that priority or above runs on the
+emulator's performance cores, the rest on the efficiency cores.
+- Each thread places itself when it starts, and again at its next wait (condition, semaphore,
+  event flag, equeue, sleep) after the bar or its own priority changed. No thread changes another
+  thread's affinity.
+- The game's main thread stays with the emulator, as before.
+- A submitter at the default priority sets no bar.
+
+This is a heuristic: a guest priority does not say what the frame waits for. It fits Sky Garden,
+where the render workers the submitter waits on share its priority. On Linux the emulator
+otherwise ignores guest priorities (`PthreadSetprio` maps them only on Windows).
 
 **Measured** (PGO, `dev` 6f46c2ca, frames 1000–1600, same binary, 3 runs per arm interleaved;
 two-refresh share from `KYTY_FRAME_DIAG` `FRAME` lines). Load from other programs on the
@@ -2098,8 +2106,8 @@ efficiency cores changes the game's pace from batch to batch, so only arms of on
 | 3 | automatic bar (this change) | 59.1 | 0.30 | 1.5% (1.4%) |
 
 - In batch 1, `ab.sh` gave FPS +5.39% (≥ 3 sd) with `cmd_ns` flat.
-- The priority rule also moves the `Havok` workers (~0.4–0.5 CPU) and audio. That makes it robust
-  when the efficiency cores are busy, where the name list alone was not.
+- The priority rule also moves the `Havok` workers (~0.4–0.5 CPU) and audio. On Sky Garden that
+  held up when the efficiency cores were busy, where the name list alone did not.
 - Raising the other threads' nice (no privilege needed) helped less: the render workers still
   share cores with the `tbb` pool.
 - **The 2 s spike frames** (the host's fan-control daemon on the command thread's SMT sibling) are

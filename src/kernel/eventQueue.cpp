@@ -1,6 +1,8 @@
 #include "kernel/eventQueue.h"
 #include "common/frameDiag.h"
 
+#include "kernel/pthread.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -389,6 +391,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
+	LibKernel::PthreadPlacementCheck();
 	PRINT_NAME();
 
 	auto owner = KernelPinEqueue(eq);

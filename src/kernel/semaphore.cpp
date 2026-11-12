@@ -1,6 +1,8 @@
 #include "kernel/semaphore.h"
 #include "common/frameDiag.h"
 
+#include "kernel/pthread.h"
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -279,6 +281,8 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
 	Common::FrameDiag::GuestWaitScope diag_wait(Common::FrameDiag::GuestWait::Sema, reinterpret_cast<uintptr_t>(sem));
+
+	LibKernel::PthreadPlacementCheck();
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
