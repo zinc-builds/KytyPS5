@@ -257,8 +257,8 @@ void OnGuestFlip(uint64_t frame) noexcept {
 	const auto now_ns = NowNs();
 	if (g_guest.have) {
 		char head[160];
-		std::snprintf(head, sizeof(head), "GFRAME g=%" PRIu64 " f=%" PRIu64 " ms=%.3f", g_guest.count,
-		              frame, static_cast<double>(now_ns - g_guest.last_ns) / 1e6);
+		std::snprintf(head, sizeof(head), "GFRAME g=%" PRIu64 " f=%" PRIu64 " t=%" PRIu64 " ms=%.3f",
+		              g_guest.count, frame, now_ns, static_cast<double>(now_ns - g_guest.last_ns) / 1e6);
 		Print(head, now, g_guest.last);
 	}
 	g_guest.have    = true;

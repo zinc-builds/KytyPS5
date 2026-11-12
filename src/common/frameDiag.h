@@ -70,7 +70,8 @@ private:
 
 // The command thread, after it decoded and flushed a guest flip: one GFRAME line with the same
 // fields for the work between that flip and the previous one (`frame`: the presented flip count
-// then, to place the line in a bench window).
+// then, to place the line in a bench window; t=: steady-clock ns, CLOCK_MONOTONIC on Linux, to
+// line it up with `perf record -k CLOCK_MONOTONIC`).
 void OnGuestFlip(uint64_t frame) noexcept;
 
 // The presentation thread, at each presented flip of the main bus: `frame` is the flip count
