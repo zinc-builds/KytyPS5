@@ -17,6 +17,9 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <vector>
 
 namespace Common::HybridAffinity {
@@ -130,8 +133,21 @@ inline Plan& GetPlan() {
 		const char* reserve_env = std::getenv("KYTY_RESERVE_CPUS");
 		const auto  reserved    = reserve_env != nullptr ? ParseCpuList(reserve_env) : std::set<int> {};
 		CPU_ZERO(&result.process);
+		// KYTY_FREE_PREPARE_SIBLINGS=1: also keep the emulator (its main thread, driver threads)
+		// off the SMT siblings of the prepare workers' cores.
+		std::set<int> prepare_siblings;
+		if (const char* value = std::getenv("KYTY_FREE_PREPARE_SIBLINGS");
+		    value != nullptr && value[0] == '1') {
+			for (const int cpu: prepare) {
+				for (const int sibling: ReadCpuList("/sys/devices/system/cpu/cpu" +
+				                                    std::to_string(cpu) +
+				                                    "/topology/thread_siblings_list")) {
+					prepare_siblings.insert(sibling);
+				}
+			}
+		}
 		for (const int cpu: performance) {
-			if (siblings.count(cpu) == 0 && cpu != gpu &&
+			if (siblings.count(cpu) == 0 && cpu != gpu && prepare_siblings.count(cpu) == 0 &&
 			    std::ranges::find(prepare, cpu) == prepare.end() &&
 			    reserved.count(cpu) == 0 && CPU_ISSET(cpu, &allowed)) {
 				CPU_SET(cpu, &result.process);
@@ -141,6 +157,20 @@ inline Plan& GetPlan() {
 		return result;
 	}();
 	return plan;
+}
+
+// The GPU pipeline threads (command, prepare workers, recorder) run at this nice value
+// (KYTY_PIPELINE_NICE, default 0 = unchanged), so other programs' threads on their cores yield to
+// them. Lowering nice needs RLIMIT_NICE (ulimit -e) or CAP_SYS_NICE; without it this is a no-op.
+// Not SCHED_FIFO/RR: these threads spin, and a spinning real-time thread starves kernel work.
+inline void ApplyPipelinePriority() {
+	static const int nice = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_NICE");
+		return value != nullptr ? std::clamp(std::atoi(value), -20, 19) : 0;
+	}();
+	if (nice != 0) {
+		(void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), nice);
+	}
 }
 
 // Call early in main(), before threads start: later threads inherit the mask.
@@ -159,6 +189,7 @@ inline void ApplyToProcess() {
 
 // Call from the GPU command thread itself.
 inline void ApplyToGpuThread() {
+	ApplyPipelinePriority();
 	const auto& plan = GetPlan();
 	if (!plan.active) {
 		return;
@@ -172,6 +203,7 @@ inline void ApplyToGpuThread() {
 // Call from draw prepare worker `worker`: a performance core the emulator leaves to it (see
 // GetPlan).
 inline void ApplyToPrepareThread(uint32_t worker) {
+	ApplyPipelinePriority();
 	const auto& plan = GetPlan();
 	int         cpu  = -1;
 	if (worker < plan.prepare_cpus.size()) {
@@ -242,6 +274,7 @@ inline void ApplyToGuestThread(const std::string& name) {
 // Call from the GPU recording thread: an efficiency core of its own, which the emulator leaves
 // free. KYTY_RECORDER_CPU=<n> picks another CPU.
 inline void ApplyToRecorderThread() {
+	ApplyPipelinePriority();
 	int cpu = -1;
 	if (const char* value = std::getenv("KYTY_RECORDER_CPU"); value != nullptr) {
 		cpu = std::atoi(value);
