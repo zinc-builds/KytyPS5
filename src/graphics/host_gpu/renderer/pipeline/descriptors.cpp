@@ -1673,15 +1673,18 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		shadow_start = ResidentTextures::Now();
 	}
-	const bool                resident = program.bindings.ResidentWords() != 0u;
-	ResidentStore::Counters   resident_now;
+	const bool              resident      = program.bindings.ResidentWords() != 0u;
+	bool                    resident_fast = false;
+	ResidentStore::Counters resident_now;
 	if (resident) {
-		BeginResidentImages(prepared, resident_now);
+		resident_fast = BeginResidentImages(prepared, resident_now);
 	}
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (program.info.images[i].resident) {
-			RebindResidentImage(prepared, i, resident_now, resolved);
+			if (!resident_fast) {
+				RebindResidentImage(prepared, i, resident_now, resolved);
+			}
 			continue;
 		}
 		if (!images[i].image_id) continue;
@@ -1742,15 +1745,38 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 // and samples a shared element of its view, or, if the image is also a target or storage image
 // of this draw, a one-draw element in whatever layout the commit gives it. The index words go
 // into the shader data before RebindBuffers uploads it.
-void RenderExecutor::BeginResidentImages(PreparedBindings& prepared, ResidentStore::Counters& now) {
+bool RenderExecutor::BeginResidentImages(PreparedBindings& prepared, ResidentStore::Counters& now) {
+	auto& store = ResidentStoreOf();
+	auto& slots = prepared.resident_slots;
+	now         = store.Snapshot();
+	slots.rebind = now;
+	store.GetStats().sets++;
+	// The same records as the last draw (binding-set reuse), nothing a skip depends on moved since
+	// the set settled, and none of its images is a target or storage image of this draw.
+	bool fast = prepared.reused && slots.settled && slots.settled_at == now;
+	if (fast && !m_resident_conflicts.empty()) {
+		const auto& images = prepared.runtime->module->info.info.images;
+		for (uint32_t i = 0; fast && i < images.size(); i++) {
+			fast = !images[i].resident ||
+			       std::ranges::find(m_resident_conflicts, prepared.images[i].image_id) ==
+			           m_resident_conflicts.end();
+		}
+	}
+	slots.verify_fast = false;
+	if (fast && !ResidentTexturesVerify()) {
+		slots.fast = true;
+		store.GetStats().fast_sets++;
+		return true;
+	}
+	slots.fast        = false;
+	slots.verify_fast = fast;
 	const auto& program = prepared.runtime->module->info;
-	auto&       slots   = prepared.resident_slots;
 	const auto  count   = program.info.images.size();
 	slots.kinds.assign(count, PreparedBindings::ResidentSlots::None);
 	slots.verify.assign(count, 0);
 	slots.elements.assign(count, 0);
 	slots.words.resize(program.bindings.ResidentWords());
-	now = ResidentStoreOf().Snapshot();
+	return false;
 }
 
 void RenderExecutor::RebindResidentImage(PreparedBindings& prepared, uint32_t index,
@@ -1833,8 +1859,16 @@ void RenderExecutor::RebindResidentImage(PreparedBindings& prepared, uint32_t in
 		stats.conflicts++;
 	} else {
 		slots.kinds[index]    = Slots::Acquired;
-		slots.elements[index] = store.Element(*image, binding.image_id, binding.image_view);
+		slots.elements[index] = store.Element(record, *image, binding.image_id, binding.image_view);
 		stats.acquired++;
+	}
+	if (verify && predicted && (slots.verify[index] & Slots::SlowAcquire) != 0 &&
+	    image->residency_version.load(std::memory_order_seq_cst) != skip.version) {
+		// This image was unsettled (counted) after the prediction's snapshot, which still had
+		// the remembered counters: a CPU write the classic acquire took and a skip would not, as
+		// a write just after a classic acquire would not be.
+		stats.verify_races++;
+		slots.verify[index] &= static_cast<uint8_t>(~Slots::SlowAcquire);
 	}
 	if (verify && predicted) {
 		const char* what = again                                 ? "the slot was resolved again"
@@ -1855,8 +1889,21 @@ void RenderExecutor::RebindResidentImage(PreparedBindings& prepared, uint32_t in
 }
 
 void RenderExecutor::EndResidentImages(PreparedBindings& prepared) {
-	const auto& bindings = prepared.runtime->module->info.bindings;
+	using Slots          = PreparedBindings::ResidentSlots;
+	const auto& program  = prepared.runtime->module->info;
+	const auto& bindings = program.bindings;
 	auto&       slots    = prepared.resident_slots;
+	if (slots.verify_fast) {
+		// KYTY_RESIDENT_TEXTURES=verify: a set skipped whole must skip slot by slot.
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (program.info.images[i].resident && slots.kinds[i] != Slots::Null &&
+			    (slots.verify[i] & Slots::Predicted) == 0) {
+				EXIT("KYTY_RESIDENT_TEXTURES=verify: stage %u slot %u: the set settled, but the "
+				     "slot was not a skip\n",
+				     static_cast<uint32_t>(program.stage), i);
+			}
+		}
+	}
 	if (bindings.resident_samplers != 0u && !slots.samplers_valid) {
 		auto& store = ResidentStoreOf();
 		EXIT_IF(prepared.samplers.size() != bindings.resident_samplers);
@@ -1875,9 +1922,12 @@ void RenderExecutor::EndResidentImages(PreparedBindings& prepared) {
 
 void RenderExecutor::CommitResidentImage(PreparedBindings& prepared, uint32_t index) {
 	using Slots      = PreparedBindings::ResidentSlots;
-	auto&      slots = prepared.resident_slots;
-	const auto kind  = slots.kinds[index];
+	auto& slots = prepared.resident_slots;
+	auto  kind  = slots.kinds[index];
 	EXIT_IF(kind == Slots::None);
+	if (slots.fast && kind != Slots::Null) {
+		kind = Slots::Skip;
+	}
 	if (kind == Slots::Null) {
 		return;
 	}
@@ -1958,16 +2008,77 @@ void RenderExecutor::EndResidentCommit(std::span<PreparedBindings* const> stages
 	    })) {
 		return;
 	}
-	auto&    store  = ResidentStoreOf();
-	auto&    stats  = store.GetStats();
-	auto&    cache  = m_context.GetTextureCache();
+	auto& store = ResidentStoreOf();
+	auto& cache = m_context.GetTextureCache();
+	// Before any settled flag Remember reads (Image::StoreSettled).
+	const auto end = store.Snapshot();
+	if (ResidentStatsEnabled()) {
+		NoteResidentStats(stages);
+	}
+	for (auto* prepared: stages) {
+		const auto& program = prepared->runtime->module->info;
+		if (program.bindings.ResidentWords() == 0u) {
+			continue;
+		}
+		auto& slots = prepared->resident_slots;
+		// A slot skipped in this draw was checked at `rebind`; it holds at `end` only if nothing
+		// moved during the draw.
+		const bool same = end == slots.rebind;
+		if (slots.fast) {
+			slots.settled = slots.settled && same;
+			continue;
+		}
+		bool settled = true;
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			switch (slots.kinds[i]) {
+				case Slots::None:
+				case Slots::Null: break;
+				case Slots::Skip: settled = settled && same; break;
+				case Slots::Conflict: settled = false; break;
+				case Slots::Acquired: {
+					const WorkerTextureRecord* record = nullptr;
+					if (slots.proposals != nullptr && i < slots.proposals->size()) {
+						record = (*slots.proposals)[i].record;
+					}
+					const auto& binding = prepared->images[i];
+					if (record == nullptr || binding.source != record->serial) {
+						settled = false;
+						break;
+					}
+					auto& image = cache.GetImage(binding.image_id);
+					settled     = store.Remember(*record, image, binding.image_id, slots.elements[i],
+					                             binding.layout == image.ReadLayout(), end) &&
+					          settled;
+					break;
+				}
+				default: EXIT("invalid resident slot kind\n");
+			}
+		}
+		slots.settled    = settled;
+		slots.settled_at = end;
+	}
+	store.EndDraw();
+}
+
+// KYTY_RESIDENT_STATS=1: the stage counts of the RESIDENT lines (push data, spills, index words).
+bool RenderExecutor::ResidentStatsEnabled() {
+	static const bool enabled = std::getenv("KYTY_RESIDENT_STATS") != nullptr;
+	return enabled;
+}
+
+void RenderExecutor::NoteResidentStats(std::span<PreparedBindings* const> stages) {
+	auto&    stats  = ResidentStoreOf().GetStats();
 	uint32_t cursor = UINT32_MAX;
 	for (auto* prepared: stages) {
-		const auto& program  = prepared->runtime->module->info;
-		const auto& bindings = program.bindings;
+		const auto& bindings = prepared->runtime->module->info.bindings;
 		const auto  words    = bindings.ResidentWords();
 		stats.stages++;
-		stats.words[words == 0u ? 0 : words <= 2u ? 1 : words <= 4u ? 2 : words <= 8u ? 3 : words <= 16u ? 4 : 5]++;
+		stats.words[words == 0u    ? 0
+		            : words <= 2u  ? 1
+		            : words <= 4u  ? 2
+		            : words <= 8u  ? 3
+		            : words <= 16u ? 4
+		                           : 5]++;
 		if (cursor == UINT32_MAX) {
 			cursor = bindings.UsesPushData() ? bindings.push_data_start_dword : 1u;
 		}
@@ -1981,26 +2092,7 @@ void RenderExecutor::EndResidentCommit(std::span<PreparedBindings* const> stages
 			}
 		}
 		bindings.AdvancePushData(cursor);
-		if (words == 0u) {
-			continue;
-		}
-		const auto& slots = prepared->resident_slots;
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			if (slots.kinds[i] != Slots::Acquired || slots.proposals == nullptr ||
-			    i >= slots.proposals->size()) {
-				continue;
-			}
-			const auto* record  = (*slots.proposals)[i].record;
-			const auto& binding = prepared->images[i];
-			if (record == nullptr || binding.source != record->serial) {
-				continue;
-			}
-			auto& image = cache.GetImage(binding.image_id);
-			store.Remember(*record, image, binding.image_id, slots.elements[i],
-			               binding.layout == image.ReadLayout());
-		}
 	}
-	store.EndDraw();
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -2061,7 +2153,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		EXIT_IF(!(pipeline.push_stages & NativeShaderStage(program.stage)));
 	}
 	if (pipeline.uses_image_heap) {
-		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
+		const bool bind =
+		    pipeline_bind_point != vk::PipelineBindPoint::eGraphics ||
+		    m_context.GetCommandScheduler().GetDynamicState().bindings.NeedsHeapSet(
+		        pipeline.pipeline_layout);
+		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout,
+		                                bind);
 	}
 	const bool resident_shadow =
 	    pipeline_bind_point == vk::PipelineBindPoint::eGraphics && ResidentTexturesShadow();
@@ -2091,9 +2188,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		// Two copies: the KYTY_RESIDENT_TEXTURES=shadow one times and checks each transition.
 		const auto transit_images = [&](auto shadow_on) {
 			constexpr bool kShadow = decltype(shadow_on)::value;
+			// A set skipped whole needs no call unless an image left its read state since.
+			const bool resident_quiet =
+			    descriptors.resident_slots.fast &&
+			    Image::read_layout_epoch.load(std::memory_order_relaxed) ==
+			        descriptors.resident_slots.layout_epoch;
 			for (uint32_t i = 0; i < program.info.images.size(); i++) {
 				if (program.info.images[i].resident) {
-					CommitResidentImage(descriptors, i);
+					if (!resident_quiet) {
+						CommitResidentImage(descriptors, i);
+					}
 					continue;
 				}
 				auto& binding = descriptors.images[i];

@@ -41,6 +41,15 @@ struct TextureDescription {
 	bool                    null              = false;
 };
 
+// Resident textures: what a slot's skip depends on (ResidentStore::Snapshot).
+struct ResidentCounters {
+	uint64_t binding_epoch = 0;
+	uint64_t tick          = 0;
+	uint64_t unsettle      = 0;
+	uint64_t layout        = 0;
+	bool operator==(const ResidentCounters&) const = default;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -115,6 +124,14 @@ struct PreparedBindings {
 		std::vector<uint16_t>               words;    // resident images, then samplers
 		uint64_t                            layout_epoch   = 0; // read_layout_epoch at RebindImages
 		bool                                samplers_valid = false;
+		// The set: every slot could be sampled with no per-image work when the counters were
+		// `settled_at` (taken at the end of a commit). A reused set (the same records) whose
+		// counters still are those skips every slot: `fast` (no per-slot state is touched).
+		ResidentCounters rebind;     // at this draw's RebindImages
+		ResidentCounters settled_at;
+		bool             settled     = false;
+		bool             fast        = false;
+		bool             verify_fast = false; // KYTY_RESIDENT_TEXTURES=verify: fast, done per slot
 	} resident_slots;
 };
 

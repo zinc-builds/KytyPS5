@@ -420,12 +420,15 @@ private:
 		}
 		return *m_resident_store;
 	}
-	void BeginResidentImages(PreparedBindings& prepared, ResidentStore::Counters& now);
+	// Returns whether the whole set is skipped (no per-slot work).
+	[[nodiscard]] bool BeginResidentImages(PreparedBindings& prepared, ResidentStore::Counters& now);
 	void RebindResidentImage(PreparedBindings& prepared, uint32_t index,
 	                         const ResidentStore::Counters& now, bool& resolved);
 	void EndResidentImages(PreparedBindings& prepared);
 	void CommitResidentImage(PreparedBindings& prepared, uint32_t index);
 	void EndResidentCommit(std::span<PreparedBindings* const> stages);
+	[[nodiscard]] static bool ResidentStatsEnabled();
+	void                      NoteResidentStats(std::span<PreparedBindings* const> stages);
 	std::unique_ptr<ResidentStore> m_resident_store;
 	// This draw's targets and storage images that resident elements sample.
 	std::vector<ImageId>           m_resident_conflicts;

@@ -68,9 +68,12 @@ bool ResidentStore::TrySkip(const WorkerTextureRecord& record, ImageId id, const
 			return false;
 		}
 	}
-	element.used_tick = now.tick;
-	entry.used_tick   = now.tick;
-	out.element       = entry.element;
+	if (element.used_tick != now.tick) {
+		element.used_tick = now.tick;
+		entry.used_tick   = now.tick;
+	}
+	out.element = entry.element;
+	out.version = entry.version;
 	out.view          = element.key.view;
 	return true;
 }
@@ -93,15 +96,28 @@ uint32_t ResidentStore::Allocate(vk::ImageView view, vk::ImageLayout layout) {
 	element.retired  = false;
 	element.conflict = false;
 	element.layout   = layout;
+	m_dirty          = true;
 	m_stats.allocations++;
 	m_stats.live++;
 	m_stats.live_peak = std::max(m_stats.live_peak, m_stats.live);
 	return index;
 }
 
-uint32_t ResidentStore::Element(Image& image, ImageId id, vk::ImageView view) {
+uint32_t ResidentStore::Element(const WorkerTextureRecord* record, Image& image, ImageId id,
+                                vk::ImageView view) {
+	const auto tick = m_context.GetTextureCache().GcTick();
+	// The record's last element, if it still samples this view of this image.
+	if (record != nullptr && record->resident != 0 && record->resident < m_entries.size()) {
+		const auto& entry = m_entries[record->resident];
+		if (entry.record_serial == record->serial && entry.image_serial == image.serial) {
+			auto& element = m_elements[entry.element];
+			if (element.live && element.generation == entry.generation && element.key.view == view) {
+				element.used_tick = tick;
+				return entry.element;
+			}
+		}
+	}
 	const ViewKey key {image.serial, view};
-	const auto    tick = m_context.GetTextureCache().GcTick();
 	if (const auto found = m_views.find(key); found != m_views.end()) {
 		m_elements[found->second].used_tick = tick;
 		return found->second;
@@ -129,6 +145,7 @@ void ResidentStore::SetConflict(uint32_t element, vk::ImageView view, vk::ImageL
 	m_elements[element].key.view = view;
 	m_elements[element].layout   = layout;
 	m_context.GetImageHeap().SetResident(element, view, layout);
+	m_dirty = true;
 }
 
 uint16_t ResidentStore::Sampler(vk::Sampler sampler) {
@@ -144,8 +161,8 @@ uint16_t ResidentStore::Sampler(vk::Sampler sampler) {
 	return found->second;
 }
 
-void ResidentStore::Remember(const WorkerTextureRecord& record, Image& image, ImageId id,
-                             uint32_t element, bool read_state) {
+bool ResidentStore::Remember(const WorkerTextureRecord& record, Image& image, ImageId id,
+                             uint32_t element, bool read_state, const Counters& counters) {
 	auto index = record.resident;
 	if (index == 0 || index >= m_entries.size() || m_entries[index].record_serial != record.serial) {
 		if (m_free_entries.empty()) {
@@ -163,13 +180,14 @@ void ResidentStore::Remember(const WorkerTextureRecord& record, Image& image, Im
 	entry.generation    = m_elements[element].generation;
 	entry.image_id      = id;
 	entry.image_serial  = image.serial;
-	// The counters before the settled flag (Image::StoreSettled).
-	entry.counters = Snapshot();
+	// The counters were read before the settled flag (Image::StoreSettled).
+	entry.counters = counters;
 	entry.version  = image.residency_version.load(std::memory_order_seq_cst);
 	entry.ok = read_state &&
 	           (image.settled.load(std::memory_order_seq_cst) & Image::SettledRefresh) != 0 &&
 	           image.registered && !image.depth_id && !image.binding.needs_rebind;
 	entry.used_tick = entry.counters.tick;
+	return entry.ok;
 }
 
 void ResidentStore::Retire(uint32_t index) {
@@ -220,15 +238,17 @@ void ResidentStore::Age(uint64_t tick) {
 	}
 }
 
-void ResidentStore::EndDraw() {
+uint64_t ResidentStore::m_context_tick() const {
+	return m_context.GetTextureCache().GcTick();
+}
+
+void ResidentStore::FlushDraw() {
 	m_context.GetImageHeap().WriteResidentElements();
+	m_dirty = false;
 	for (const auto index: m_draw_conflicts) {
 		Retire(index);
 	}
 	m_draw_conflicts.clear();
-	m_stats.draws++;
-	Age(m_context.GetTextureCache().GcTick());
-	Print();
 }
 
 const char* ResidentStore::CheckElement(uint32_t element, const Image& image, ImageId id,
@@ -280,15 +300,15 @@ void ResidentStore::Print() {
 	}
 	m_print_ns    = now;
 	const auto& s = m_stats;
-	std::printf("RESIDENT draws=%" PRIu64 " stages=%" PRIu64 " stages_push=%" PRIu64
+	std::printf("RESIDENT draws=%" PRIu64 " sets=%" PRIu64 " fast_sets=%" PRIu64 " stages=%" PRIu64 " stages_push=%" PRIu64
 	            " stages_buffer=%" PRIu64 " stages_spilled=%" PRIu64 " slots=%" PRIu64 " null=%" PRIu64
 	            " skip_global=%" PRIu64 " skip_image=%" PRIu64 " acquired=%" PRIu64
-	            " conflicts=%" PRIu64 " late_transits=%" PRIu64 " allocs=%" PRIu64
+	            " conflicts=%" PRIu64 " late_transits=%" PRIu64 " verify_races=%" PRIu64 " allocs=%" PRIu64
 	            " retires=%" PRIu64 " conflict_elements=%" PRIu64 " gc_ticks=%" PRIu64
 	            " live=%zu live_peak=%zu samplers=%zu words=%" PRIu64 ",%" PRIu64 ",%" PRIu64
 	            ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-	            s.draws, s.stages, s.stages_push, s.stages_buffer, s.stages_spilled, s.slots, s.null_slots,
-	            s.skip_global, s.skip_image, s.acquired, s.conflicts, s.late_transits,
+	            s.draws, s.sets, s.fast_sets, s.stages, s.stages_push, s.stages_buffer, s.stages_spilled, s.slots, s.null_slots,
+	            s.skip_global, s.skip_image, s.acquired, s.conflicts, s.late_transits, s.verify_races,
 	            s.allocations, s.retirements, s.conflict_elements, s.gc_ticks, s.live, s.live_peak,
 	            m_samplers.size(), s.words[0], s.words[1], s.words[2], s.words[3], s.words[4],
 	            s.words[5]);

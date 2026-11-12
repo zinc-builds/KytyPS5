@@ -32,6 +32,7 @@ static bool SameDescriptor(const vk::DescriptorImageInfo& a, const vk::Descripto
 void GraphicsBindings::UseLayout(vk::PipelineLayout layout) {
 	if (layout != m_layout) {
 		m_layout          = layout;
+		m_heap_layout     = nullptr;
 		m_constants_known = 0;
 		m_writes_valid    = false;
 	}

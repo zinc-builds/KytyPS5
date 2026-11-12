@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -37,23 +38,20 @@ struct WorkerTextureRecord;
 // Command thread only.
 class ResidentStore final {
 public:
-	struct Counters {
-		uint64_t binding_epoch = 0;
-		uint64_t tick          = 0;
-		uint64_t unsettle      = 0;
-		uint64_t layout        = 0;
-	};
+	using Counters = ResidentCounters;
 	struct Skip {
 		uint32_t      element = 0;
 		vk::ImageView view    = nullptr;
 		bool          global  = false; // by the global counters, not the per-image version
+		uint32_t      version = 0;     // the image's residency_version when it was remembered
 	};
 	struct Stats {
 		// stages_spilled: shader data in a buffer only because of the index words (the push
 		// data cursor estimated from the draw's earlier stages).
 		uint64_t draws = 0, stages = 0, stages_push = 0, stages_buffer = 0, stages_spilled = 0;
+		uint64_t sets = 0, fast_sets = 0;
 		uint64_t slots = 0, null_slots = 0, skip_global = 0, skip_image = 0, acquired = 0,
-		         conflicts = 0, late_transits = 0;
+		         conflicts = 0, late_transits = 0, verify_races = 0;
 		uint64_t allocations = 0, retirements = 0, conflict_elements = 0, gc_ticks = 0;
 		std::array<uint64_t, 6> words {}; // stages by resident words: 0, 1-2, 3-4, 5-8, 9-16, 17+
 		size_t   live = 0, live_peak = 0;
@@ -67,17 +65,30 @@ public:
 	// Whether a record's slot can sample its remembered element with no per-image work.
 	[[nodiscard]] bool TrySkip(const WorkerTextureRecord& record, ImageId id, const Counters& now,
 	                           TextureCache& cache, Skip& out);
-	// The element sampling `view` of `image` in its read layout.
-	[[nodiscard]] uint32_t Element(Image& image, ImageId id, vk::ImageView view);
+	// The element sampling `view` of `image` in its read layout; `record`'s, if it is that one.
+	[[nodiscard]] uint32_t Element(const WorkerTextureRecord* record, Image& image, ImageId id,
+	                               vk::ImageView view);
 	// A one-draw element for a conflict slot; SetConflict names its view and layout at commit.
 	[[nodiscard]] uint32_t ConflictElement();
 	void                   SetConflict(uint32_t element, vk::ImageView view, vk::ImageLayout layout);
 	[[nodiscard]] uint16_t Sampler(vk::Sampler sampler);
-	// After the commit's transitions: what a later draw of this record can skip.
-	void Remember(const WorkerTextureRecord& record, Image& image, ImageId id, uint32_t element,
-	              bool read_state);
+	// After the commit's transitions, with the counters taken before (Snapshot): what a later draw
+	// of this record can skip. Returns whether it can.
+	bool Remember(const WorkerTextureRecord& record, Image& image, ImageId id, uint32_t element,
+	              bool read_state, const Counters& counters);
 	// After a draw's commit: writes new descriptors, retires its conflict elements, ages.
-	void EndDraw();
+	void EndDraw() {
+		if (m_dirty || !m_draw_conflicts.empty()) {
+			FlushDraw();
+		}
+		m_stats.draws++;
+		if (const auto tick = m_context_tick(); tick != m_last_tick) {
+			Age(tick);
+		}
+		if ((m_stats.draws & 1023u) == 0u) {
+			Print();
+		}
+	}
 	// Verify mode: whether `element` samples `view` of `image` (registered) in `layout`.
 	[[nodiscard]] const char* CheckElement(uint32_t element, const Image& image, ImageId id,
 	                                       vk::ImageView view, vk::ImageLayout layout) const;
@@ -126,6 +137,8 @@ private:
 	};
 
 	uint32_t Allocate(vk::ImageView view, vk::ImageLayout layout);
+	void     FlushDraw();
+	uint64_t m_context_tick() const;
 	void     Retire(uint32_t index);
 	void     Age(uint64_t tick);
 	void     Print();
@@ -140,6 +153,7 @@ private:
 	VulkanImageState                                  m_saved_state;
 	std::vector<VulkanImageState>                     m_saved_subresources;
 	uint64_t                                          m_last_tick = UINT64_MAX;
+	bool                                              m_dirty     = false; // descriptors to write
 	uint64_t                                          m_print_ns  = 0;
 	Stats                                             m_stats;
 };

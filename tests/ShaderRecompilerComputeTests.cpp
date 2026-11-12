@@ -6529,11 +6529,13 @@ public:
       // One draw of the stage: `before` runs after the draw's targets are bound, `after` after
       // its bindings are prepared (as AcquireRenderTargets would set target layouts).
       PreparedBindings prepared;
+      bool reused = false; // the next draw reuses the set (binding-set reuse)
       const auto Draw = [&](const TextureBinding &binding, bool with_record, auto &&before,
                             auto &&after) {
         RenderExecutorTestAccess::ResetBindings(executor);
         before();
         prepared.runtime = &runtime;
+        prepared.reused = reused;
         prepared.images = {binding};
         prepared.images[0].source = with_record ? record.serial : 0;
         prepared.shader_data.assign(program.bindings.ShaderDataDwords(), 0u);
@@ -6585,6 +6587,13 @@ public:
       Require(name, "skip", Kind() == Slots::Skip && skipped == first,
               "an unchanged record did not skip to its element");
       Samples("skipped element", skipped, color, view);
+
+      // The reused set, settled: skipped whole, with no per-slot work.
+      reused = true;
+      const auto whole = Draw(texture, true, Nothing, Nothing);
+      Require(name, "fast set", prepared.resident_slots.fast && whole == first,
+              "a settled reused set was not skipped whole");
+      Samples("fast set element", whole, color, view);
 
       // The image becomes a target between two draws of the set: a one-draw element in the
       // attachment layout (general, since the draw also samples it).

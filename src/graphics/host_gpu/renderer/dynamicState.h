@@ -43,6 +43,7 @@ public:
 	void Reset() {
 		m_pipeline        = nullptr;
 		m_layout          = nullptr;
+		m_heap_layout     = nullptr;
 		m_constants_known = 0;
 		m_writes_valid    = false;
 	}
@@ -50,8 +51,20 @@ public:
 	// Something else bound graphics descriptor sets: forget what was pushed.
 	void ForgetLayout() {
 		m_layout          = nullptr;
+		m_heap_layout     = nullptr;
 		m_constants_known = 0;
 		m_writes_valid    = false;
+	}
+
+	// Whether the image heap's set (IR::ImageHeapSet) must be bound for `layout`: it stays bound
+	// while draws keep the layout (another layout's set 0 disturbs it).
+	[[nodiscard]] bool NeedsHeapSet(vk::PipelineLayout layout) {
+		UseLayout(layout);
+		if (m_heap_layout == layout) {
+			return false;
+		}
+		m_heap_layout = layout;
+		return true;
 	}
 
 	[[nodiscard]] vk::Pipeline BoundPipeline() const { return m_pipeline; }
@@ -77,6 +90,7 @@ private:
 
 	vk::Pipeline                          m_pipeline        = nullptr;
 	vk::PipelineLayout                    m_layout          = nullptr;
+	vk::PipelineLayout                    m_heap_layout     = nullptr;
 	std::array<uint32_t, 32>              m_constants {};
 	uint32_t                              m_constants_known = 0; // bit per dword
 	bool                                  m_writes_valid    = false;

@@ -590,7 +590,7 @@ void ImageHeap::WriteDescriptors() {
 }
 
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
-                       vk::PipelineLayout layout) {
+                       vk::PipelineLayout layout, bool bind) {
 	KYTY_PROFILER_FUNCTION();
 	const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
 	for (auto* view: m_active) {
@@ -627,6 +627,9 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		});
 	}
 	m_active.clear();
+	if (!bind) {
+		return;
+	}
 	buffer.Record([bind_point, layout, set = m_set](vk::CommandBuffer cb) {
 		cb.bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &set, 0, nullptr);
 	});
