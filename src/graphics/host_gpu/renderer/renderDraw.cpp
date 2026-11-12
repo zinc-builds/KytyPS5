@@ -2142,9 +2142,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	m_texture_updates.clear();
 	m_context.GetBufferCache().SetSpeculation(nullptr);
 	buffer.Bind(registers, user_config, shaders);
-	// The worker may reuse this draw's stream copies once the GPU passes the current tick.
-	if (auto* ring = m_prepare_lanes[(sequence - 1) % m_prepare_lanes.size()]->stream_ring;
-	    ring != nullptr) {
+	// The worker that prepared this draw (any, with free lanes) may reuse its stream copies once
+	// the GPU passes the current tick. Only that worker's ring holds them.
+	if (auto* ring = queued.buffers.speculation.ring; ring != nullptr) {
 		ring->Retire(sequence, m_context.GetCommandScheduler().CurrentTick());
 	}
 
