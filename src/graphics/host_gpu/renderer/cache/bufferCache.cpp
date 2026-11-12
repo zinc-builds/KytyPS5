@@ -270,6 +270,11 @@ void NoteStreamCopy(uint64_t vaddr, uint64_t size, const void* bytes) {
 
 namespace Libs::Graphics {
 
+static std::unordered_map<uint64_t, uint64_t> g_probe_hashes; // under m_bda_sync_mutex
+static std::unordered_map<uint64_t, uint64_t> g_probe_times;
+static std::unordered_map<uint64_t, std::vector<uint8_t>> g_probe_copies;
+
+
 namespace {
 
 thread_local MemDiag::Sync g_sync_kind = MemDiag::Sync::Obtain;
@@ -1108,6 +1113,78 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+const Buffer* BufferCache::FindBufferPtr(uint64_t vaddr) {
+	auto it = m_buffers.upper_bound(vaddr);
+	if (it == m_buffers.begin()) {
+		return nullptr;
+	}
+	--it;
+	const auto& buffer = m_slot_buffers[it->second];
+	return vaddr < buffer.CpuAddress() + buffer.Size() ? &buffer : nullptr;
+}
+
+// Probe (KYTY_BDA_LEAD_STATS): sampled pages whose bytes changed between being queued for
+// upload (a collection or store) and the upload, with no queueing in between.
+void BufferCache::ProbeUnobserved(uint64_t address, uint64_t size) {
+	static const bool lead = std::getenv("KYTY_BDA_LEAD_STATS") != nullptr;
+	if (!lead) {
+		return;
+	}
+	static uint64_t compared = 0, changed = 0, start = 0;
+	std::lock_guard lock(m_bda_sync_mutex);
+	for (uint64_t page = Common::AlignUp(address, TRACKER_PAGE_SIZE); page + TRACKER_PAGE_SIZE <= address + size;
+	     page += TRACKER_PAGE_SIZE) {
+		auto it = g_probe_hashes.find(page);
+		if (it == g_probe_hashes.end()) {
+			continue;
+		}
+		alignas(64) static uint8_t bytes[TRACKER_PAGE_SIZE];
+		if (LibKernel::Memory::CopySparseMemory(page, bytes, TRACKER_PAGE_SIZE)) {
+			compared++;
+			if (XXH3_64bits(bytes, TRACKER_PAGE_SIZE) != it->second) {
+				changed++;
+				static uint32_t printed = 0;
+				const auto      t   = g_probe_times[page];
+				const auto      now_ns = static_cast<uint64_t>(
+                    std::chrono::steady_clock::now().time_since_epoch().count());
+				std::string detail;
+				if (auto c = g_probe_copies.find(page); c != g_probe_copies.end()) {
+					uint32_t diff = 0, first = 0xffffffffu, last = 0;
+					for (uint32_t i = 0; i < TRACKER_PAGE_SIZE; i++) {
+						if (c->second[i] != bytes[i]) {
+							diff++;
+							first = std::min(first, i);
+							last  = i;
+						}
+					}
+					detail = fmt::format(" diff_bytes={} first=0x{:x} last=0x{:x}", diff, first, last);
+				}
+				if (printed++ < 400 || !detail.empty()) {
+					const auto* buf = FindBufferPtr(page);
+					std::printf("BDAUNOBS page=0x%llx lead_us=%.0f buffer=0x%llx+0x%llx%s\n",
+					            (unsigned long long)page, double(now_ns - t) / 1000.0,
+					            buf ? (unsigned long long)buf->CpuAddress() : 0ull,
+					            buf ? (unsigned long long)buf->Size() : 0ull, detail.c_str());
+				}
+			}
+		}
+		g_probe_hashes.erase(it);
+		g_probe_times.erase(page);
+		g_probe_copies.erase(page);
+	}
+	const auto now = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+	if (start == 0) {
+		start = now;
+	} else if (now - start >= 1'000'000'000ull) {
+		std::printf("BDAUNOBSERVED compared=%llu changed=%llu share=%.2f%% pending=%zu\n",
+		            (unsigned long long)compared, (unsigned long long)changed,
+		            compared ? 100.0 * double(changed) / double(compared) : 0.0, g_probe_hashes.size());
+		std::fflush(stdout);
+		compared = changed = 0;
+		start    = now;
+	}
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -1122,6 +1199,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
+			ProbeUnobserved(address, copy.size);
 			if (MemDiag::BdaStatsMode() != 0 && g_sync_kind == MemDiag::Sync::Bda) {
 				BdaStats::NoteStaged(address, mapped + copy.srcOffset, copy.size);
 			}
@@ -2152,6 +2230,23 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source) 
 	std::lock_guard lock(m_bda_sync_mutex);
 	m_bda_sync.Add(begin, end - begin);
 	static const bool lead = std::getenv("KYTY_BDA_LEAD_STATS") != nullptr;
+	if (lead && (source == BdaSource::Invalidate || source == BdaSource::CpuWrite)) {
+		// Probe: a 1/16 sample of pages hashed as queued, compared when uploaded.
+		for (uint64_t page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			if (((page >> 12u) & 15u) != 0) {
+				continue;
+			}
+			alignas(64) static thread_local uint8_t bytes[TRACKER_PAGE_SIZE];
+			if (LibKernel::Memory::CopySparseMemory(page, bytes, TRACKER_PAGE_SIZE)) {
+				g_probe_hashes[page] = XXH3_64bits(bytes, TRACKER_PAGE_SIZE);
+				g_probe_times[page]  = static_cast<uint64_t>(
+                    std::chrono::steady_clock::now().time_since_epoch().count());
+				if (((page >> 12u) & 1023u) == 0) {
+					g_probe_copies[page].assign(bytes, bytes + TRACKER_PAGE_SIZE);
+				}
+			}
+		}
+	}
 	if (lead) {
 		m_bda_lead_pending.emplace_back(
 		    static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
