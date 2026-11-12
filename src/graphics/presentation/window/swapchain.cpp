@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/playtest.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -297,6 +298,8 @@ private:
 // image (no overlay, no scaling), and <path> is removed. 8-bit RGBA/BGRA and 10-bit A2RGB/A2BGR
 // SDR frames (reduced to 8 bits). The file
 // is checked every 16 presents; a capture waits for its frame's GPU work once.
+// The playtest recorder (KYTY_PLAYTEST) asks for shots too: the next frame is copied and the
+// pixels go to its helper thread, which writes the file.
 class BenchShot final {
 public:
 	explicit BenchShot(GraphicContext& graphics): m_graphics(graphics) {
@@ -317,7 +320,7 @@ public:
 
 	// Before the present commands: records a copy of `frame` when a requested shot is due.
 	bool Record(vk::CommandBuffer command, Presenter::Frame* frame) {
-		if (m_request.empty() || frame == nullptr || frame->blank || frame->hdr || !Due()) {
+		if (frame == nullptr || frame->blank || frame->hdr || !Due()) {
 			return false;
 		}
 		switch (frame->image.format) {
@@ -332,6 +335,12 @@ public:
 		const auto format = frame->image.format;
 		if (m_layout == Layout::Unsupported) {
 			std::printf("SHOT unsupported frame format %s\n", vk::to_string(format).c_str());
+			if (m_playtest) {
+				Common::Playtest::FailShot(("unsupported frame format " + vk::to_string(format)).c_str());
+				m_playtest = false;
+				m_out.clear();
+				return false;
+			}
 			Finish();
 			return false;
 		}
@@ -357,6 +366,12 @@ public:
 			                    &allocation, &handle, &m_allocation, &info) != VK_SUCCESS) {
 				std::printf("SHOT could not allocate a %llu-byte readback buffer\n",
 				            static_cast<unsigned long long>(size));
+				if (m_playtest) {
+					Common::Playtest::FailShot("no readback buffer");
+					m_playtest = false;
+					m_out.clear();
+					return false;
+				}
 				Finish();
 				return false;
 			}
@@ -385,6 +400,16 @@ public:
 	// After the copy's submission has completed.
 	void Save() {
 		vmaInvalidateAllocation(m_graphics.allocator, m_allocation, 0, VK_WHOLE_SIZE);
+		if (m_playtest) {
+			// One copy here; the conversion and the file are the playtest helper thread's.
+			const auto*          src = static_cast<const uint8_t*>(m_mapped);
+			std::vector<uint8_t> pixels(src, src + static_cast<size_t>(m_extent.width) * m_extent.height * 4);
+			Common::Playtest::SubmitShot(m_extent.width, m_extent.height, static_cast<int>(m_layout) - 1,
+			                             std::move(pixels));
+			m_playtest = false;
+			m_out.clear();
+			return;
+		}
 		FILE* f = std::fopen(m_out.c_str(), "wb");
 		if (f != nullptr) {
 			std::fprintf(f, "P6\n%u %u\n255\n", m_extent.width, m_extent.height);
@@ -423,7 +448,12 @@ public:
 private:
 	bool Due() {
 		if (m_out.empty()) {
-			if ((++m_polls & 15u) != 0) {
+			if (const char* playtest = Common::Playtest::PendingShot(); playtest != nullptr) {
+				m_out      = playtest;
+				m_playtest = true;
+				return true;
+			}
+			if (m_request.empty() || (++m_polls & 15u) != 0) {
 				return false;
 			}
 			FILE* f = std::fopen(m_request.c_str(), "r");
@@ -464,12 +494,14 @@ private:
 	uint32_t        m_polls = 0;
 	uint32_t        m_extra = 0;
 	uint32_t        m_taken = 0;
+	bool            m_playtest = false; // the shot in progress is the playtest recorder's
 	std::string     m_base;
 	VkBuffer        m_buffer     = VK_NULL_HANDLE;
 	VmaAllocation   m_allocation = nullptr;
 	void*           m_mapped     = nullptr;
 	vk::DeviceSize  m_size       = 0;
 	vk::Extent2D    m_extent {};
+	// Order matters: the playtest recorder's layout code is the value minus one.
 	enum class Layout { Unsupported, Rgba8, Bgra8, A2Rgb10, A2Bgr10 } m_layout = Layout::Unsupported;
 };
 

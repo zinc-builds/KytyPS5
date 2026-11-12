@@ -2,6 +2,7 @@
 
 #include "common/benchMetrics.h"
 #include "common/debugCounters.h"
+#include "common/playtest.h"
 
 #include <algorithm>
 #include <array>
@@ -132,7 +133,7 @@ constexpr std::array OwnNames {"mutex_wait_ns", "mutex_waits", "gc", "gc_ns", "c
                                "cmd_blocked_ns", "wd", "wd_ns", "wd_dw", "label_stale",
                                "label_written", "wd_memo", "ind", "ind_queued", "ind_gpu_count",
                                "ind_patched", "ind_unqueued", "ind_predicated",
-                               "ind_verified"};
+                               "ind_verified", "tex_free"};
 static_assert(OwnNames.size() == static_cast<size_t>(Counter::Count));
 
 struct Totals {
@@ -243,6 +244,10 @@ void Print(const char* head, const Totals& now, const Totals& a) {
 bool ReadEnabled() noexcept {
 	const char* value = std::getenv("KYTY_FRAME_DIAG");
 	return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+bool ReadCounting() noexcept {
+	return Enabled() || Common::Playtest::Enabled();
 }
 
 void OnFlip(uint64_t frame, double interval_ms) noexcept {
@@ -422,10 +427,13 @@ bool CmdIdle() noexcept {
 }
 
 void OnCmdIdleBegin() noexcept {
-	if (!Enabled()) {
+	if (!Counting()) {
 		return;
 	}
 	g_cmd_idle.store(true, std::memory_order_relaxed);
+	if (!Enabled()) {
+		return;
+	}
 	g_idle_sub = g_submitter.load(std::memory_order_acquire);
 	if (g_idle_sub != nullptr) {
 		for (int k = 0; k < kKinds; k++) {
@@ -437,12 +445,12 @@ void OnCmdIdleBegin() noexcept {
 
 void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept {
 	g_cmd_idle.store(false, std::memory_order_relaxed);
-	if (!Enabled()) {
+	if (!Counting()) {
 		return;
 	}
 	Add(Counter::CmdIdles);
 	Add(Counter::CmdIdleNs, end_ns - start_ns);
-	if (end_ns - start_ns < kIdleMinNs) {
+	if (!Enabled() || end_ns - start_ns < kIdleMinNs) {
 		return;
 	}
 	auto* sub = g_submitter.load(std::memory_order_acquire);

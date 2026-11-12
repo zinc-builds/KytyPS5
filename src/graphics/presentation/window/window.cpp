@@ -1,6 +1,7 @@
 ﻿#include "graphics/presentation/window.h"
 
 #include "common/assert.h"
+#include "common/playtest.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -494,6 +495,15 @@ void WindowContext::ProcessEvent(double time_s) {
 					Controller::CycleKeyboardPlayer();
 				}
 				return;
+			case SDLK_F9:
+				// The playtest marker: "something looked or felt wrong just now".
+				if (Common::Playtest::Enabled()) {
+					if (pressed) {
+						Common::Playtest::Marker();
+					}
+					return;
+				}
+				break;
 #if defined(__APPLE__)
 			case SDLK_P:
 				if ((event->key.mod & SDL_KMOD_GUI) == 0) {

@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/playtest.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -94,6 +95,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
+	Common::Playtest::Init(); // KYTY_PLAYTEST only
 	subsystems.Initialize<Log::Lifecycle>();
 
 	if (Common::File::IsFileExisting(param_json)) {

@@ -387,6 +387,8 @@ private:
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
+	// The compile in progress is a playtest-injected miss (not stored).
+	bool m_injected_miss = false;
 	// Graphics stages indexed like GraphicsPipelineKey::stage_ids, and the dispatch's stage. A
 	// stage's resources stay valid until the next lookup of that stage kind.
 	GraphicsResources                      m_graphics_resources;

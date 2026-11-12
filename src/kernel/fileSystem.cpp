@@ -1,6 +1,7 @@
 #include "kernel/fileSystem.h"
 
 #include "common/archive.h"
+#include "common/playtest.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -756,6 +757,8 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	}
 
 	if (d == 1 || d == 2) {
+		// The playtest recorder reads level names from the game's output.
+		Common::Playtest::OnGuestOutput(buf, nbytes);
 		auto*      out      = (d == 1 ? stdout : stderr);
 		const auto written  = std::fwrite(buf, 1, nbytes, out);
 		const auto flush_ok = std::fflush(out) == 0;

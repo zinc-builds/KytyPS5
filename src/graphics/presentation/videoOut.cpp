@@ -1,6 +1,7 @@
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
+#include "common/playtest.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -893,6 +894,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 
 	cfg.flip_status.flipPendingNum++;
+	Common::Playtest::NoteFlipQueue(static_cast<uint32_t>(cfg.flip_status.flipPendingNum));
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
 	if (source == FlipRequestSource::GpuEop) {
 		cfg.flip_status.gcQueueNum++;

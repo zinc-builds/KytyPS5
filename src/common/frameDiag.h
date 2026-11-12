@@ -47,6 +47,7 @@ enum class Counter {
 	                    // bound, no index buffer, records needed on the CPU (tess, quad list, mesh)
 	IndirectPredicated, // multi-draw indirect packets skipped by predication
 	IndirectVerified,   // queued draws whose GPU count was checked (KYTY_INDIRECT_QUEUE=verify)
+	TextureFrees,
 	Count
 };
 
@@ -60,9 +61,17 @@ inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 	static const bool enabled = ReadEnabled();
 	return enabled;
 }
+// The counters above (and the command thread's idle timing) also run for the playtest recorder
+// (KYTY_PLAYTEST, common/playtest.h), which prints nothing per frame; the lines, guest-wait
+// timing and GIDLE stay KYTY_FRAME_DIAG's.
+[[nodiscard]] bool ReadCounting() noexcept;
+[[nodiscard]] inline bool Counting() noexcept {
+	static const bool counting = ReadCounting();
+	return counting;
+}
 
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
-	if (Enabled()) {
+	if (Counting()) {
 		Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
 	}
 }
@@ -75,7 +84,7 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 class Scope {
 public:
 	Scope(Counter count, Counter ns) noexcept
-	    : m_count(count), m_ns(ns), m_start(Enabled() ? NowNs() : 0) {}
+	    : m_count(count), m_ns(ns), m_start(Counting() ? NowNs() : 0) {}
 	~Scope() {
 		if (m_start != 0) {
 			Add(m_count);

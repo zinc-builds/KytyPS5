@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
+#include "common/playtest.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
@@ -654,6 +655,13 @@ int PollGamepadTouchPad(uint64_t now_ms) {
 void HostInputPadButton(int id, int button, bool down) {
 	const auto  source = InputMap::SourceFromButton(button);
 	const auto& map    = GetInputMap();
+	// The playtest marker (KYTY_PLAYTEST): the PS button or the DualSense microphone button, which
+	// games can't read and the default mapping leaves unbound. A mapping that binds one keeps it.
+	if (down && Common::Playtest::Enabled() && map.PadControl(source) == INVALID_CONTROL &&
+	    (button == SDL_GAMEPAD_BUTTON_GUIDE || button == SDL_GAMEPAD_BUTTON_MISC1)) {
+		Common::Playtest::Marker();
+		return;
+	}
 	ApplyPadControl(id, map.PadControl(source), source, down);
 }
 

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "common/frameDiag.h"
+#include "common/playtest.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -343,6 +345,7 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	Common::FrameDiag::Add(Common::FrameDiag::Counter::TextureFrees);
 	m_slot_images[id].ClearGpuModified();
 	DeleteImage(id);
 }
@@ -1073,6 +1076,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		const uint64_t playtest = Common::Playtest::BeginTextureUpload(); // 0 when off
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1080,6 +1084,14 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		if (playtest != 0) {
+			const auto& info  = image.info;
+			const auto  bytes = info.LinearSize();
+			Common::Playtest::EndTextureUpload(
+			    playtest, bytes, info.extent.width, info.extent.height, static_cast<uint32_t>(info.pixel_format),
+			    info.resources.levels,
+			    bytes >= Common::Playtest::TextureUploadEventBytes ? vk::to_string(info.pixel_format).c_str() : "");
+		}
 	}
 	image.RefreshComplete();
 }
@@ -2327,6 +2339,38 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 			MarkAsMaybeDirty(id, owner);
 		}
 	}
+}
+
+void TextureCache::InjectReupload(uint64_t bytes) {
+	std::vector<std::pair<uint64_t, uint64_t>> ranges; // size, address
+	{
+		std::scoped_lock lock {m_lock};
+		uint64_t         latest = 0;
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			latest = std::max(latest, image.tick_accessed_last);
+		});
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			// Only textures the CPU owns: render targets and GPU-written images hold data that
+			// guest memory doesn't have.
+			if (!image.registered || !image.IsTracked() || image.binding.is_target || image.IsGpuModified() ||
+			    image.IsCpuDirty() || image.info.metadata.compression != VideoOutCompression::Uncompressed ||
+			    image.tick_accessed_last + 2 < latest || image.info.data.size == 0) {
+				return;
+			}
+			ranges.emplace_back(image.info.data.size, image.info.data.address);
+		});
+	}
+	std::sort(ranges.begin(), ranges.end(), std::greater<>());
+	uint64_t done = 0;
+	for (const auto& [size, address]: ranges) {
+		if (done >= bytes) {
+			break;
+		}
+		InvalidateMemory(address, size);
+		done += size;
+	}
+	std::printf("PLAYTEST inject: %llu MiB of %zu sampled textures marked CPU-written\n",
+	            static_cast<unsigned long long>(done >> 20u), ranges.size());
 }
 
 bool TextureCache::IsMeta(uint64_t address) {

@@ -1,6 +1,7 @@
 #include "graphics/presentation/systemOverlay.h"
 
 #include "common/assert.h"
+#include "common/playtest.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/localization.h"
@@ -23,6 +24,7 @@
 
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -709,11 +711,12 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
+	const auto marker        = Common::Playtest::ToastMarker();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            cursor.enabled,
+	            cursor.enabled || marker != 0,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
-	            PerformanceOverlayRevision()};
+	            PerformanceOverlayRevision() + (marker != 0 ? 4u + 8u * marker : 0u)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1666,6 +1669,35 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	// The playtest marker's confirmation (KYTY_PLAYTEST, F9 / PS / mic button): a small pill in
+	// the top-left corner for 2.5 s. It is drawn over the presented image only; the marker's
+	// screenshot is the guest image without it.
+	void DrawPlaytestMarker(vk::Extent2D frame_extent, float min_top) {
+		const auto marker = Common::Playtest::ToastMarker();
+		if (marker == 0) {
+			return;
+		}
+		const float scale = std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                                        static_cast<float>(frame_extent.height) / 1080.0f),
+		                               0.65f, 1.25f);
+		char text[48];
+		std::snprintf(text, sizeof(text), "Marker %u saved", marker);
+		const float  size   = 24.0f * scale;
+		const ImVec2 extent = ImGui::GetFont()->CalcTextSizeA(size, std::numeric_limits<float>::max(), 0.0f, text);
+		const float  pad    = 12.0f * scale;
+		const float  dot    = 8.0f * scale;
+		const ImVec2 top_left {24.0f * scale, std::max(24.0f * scale, min_top + 12.0f)};
+		const ImVec2 bottom_right {top_left.x + pad * 3.0f + dot * 2.0f + extent.x,
+		                           top_left.y + pad * 2.0f + extent.y};
+		auto* draw = ImGui::GetForegroundDrawList();
+		draw->AddRectFilled(top_left, bottom_right, IM_COL32(16, 20, 24, 225), (bottom_right.y - top_left.y) * 0.5f);
+		draw->AddRect(top_left, bottom_right, IM_COL32(80, 220, 120, 200), (bottom_right.y - top_left.y) * 0.5f,
+		              ImDrawFlags_RoundCornersAll, 2.0f * scale);
+		const ImVec2 centre {top_left.x + pad + dot, (top_left.y + bottom_right.y) * 0.5f};
+		draw->AddCircleFilled(centre, dot, IM_COL32(80, 220, 120, 255));
+		draw->AddText(nullptr, size, {centre.x + dot + pad, top_left.y + pad}, IM_COL32(255, 255, 255, 255), text);
+	}
+
 	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
 		std::erase_if(retired_trophy_images, [](const auto& texture) {
 			if (texture->Status != ImTextureStatus_Destroyed) {
@@ -1802,7 +1834,8 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
+		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled() &&
+		    Common::Playtest::ToastMarker() == 0) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1843,6 +1876,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now, performance_bottom);
+		DrawPlaytestMarker(frame_extent, performance_bottom);
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;

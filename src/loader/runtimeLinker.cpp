@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
+#include "common/playtest.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -195,6 +196,9 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
+	if (Common::Playtest::Enabled() && record_id < g_stubbed_imports.size()) {
+		Common::Playtest::OnStubCall(record_id, g_stubbed_imports[record_id].name.c_str());
+	}
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
