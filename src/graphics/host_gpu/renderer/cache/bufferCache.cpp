@@ -1755,6 +1755,21 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
+		// Through the backing alias, then the invalidation the guest mapping's write faults would
+		// have done (KYTY_FILL_BACKING=0: through the guest mapping).
+		static const bool backing = [] {
+			const char* value = std::getenv("KYTY_FILL_BACKING");
+			return value == nullptr || value[0] != '0';
+		}();
+		auto& context = m_scheduler.Context();
+		if (backing && context.IsMapped(vaddr, size)) {
+			Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Fill);
+			if (Libs::LibKernel::Memory::TryFillBacking(vaddr, size, value)) {
+				RenderContext::VerifyNoteGpuWrite(vaddr, size);
+				(void)context.InvalidateMemory(vaddr, size);
+				return;
+			}
+		}
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto*                          destination = reinterpret_cast<uint32_t*>(vaddr);
 		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::Fill);

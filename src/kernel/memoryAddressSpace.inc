@@ -467,6 +467,33 @@ public:
 		return true;
 	}
 
+	// Fills [vaddr, vaddr + size) with a 32-bit value through the backing alias (as the guest
+	// mapping's std::fill did).
+	// False (nothing written) unless backing mappings hold all of it.
+	bool FillDwords(uint64_t vaddr, uint64_t size, uint32_t value) {
+		if ((vaddr & 3u) != 0 || (size & 3u) != 0) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		bool             complete = true;
+		ForEachSparseRange(
+		    m_maps, vaddr, size, [](const MapEntry&, uint64_t, uint64_t) {},
+		    [&](uint64_t, uint64_t) { complete = false; });
+		if (!complete) {
+			return false;
+		}
+		LogAliasWrite(vaddr, size);
+		ForEachSparseRange(
+		    m_maps, vaddr, size,
+		    [&](const MapEntry& entry, uint64_t start, uint64_t bytes) {
+			    auto* target = reinterpret_cast<uint32_t*>(
+			        m_backing_base + (entry.backing_offset + start - entry.vaddr));
+			    std::fill(target, target + bytes / sizeof(uint32_t), value);
+		    },
+		    [](uint64_t, uint64_t) {});
+		return true;
+	}
+
 	// Copies [vaddr, vaddr + size) without locks when one backing mapping holds all of it, through
 	// a translation this thread looked up earlier. False: take the locked path.
 	bool TryReadFast(uint64_t vaddr, void* data, uint64_t size) {
@@ -1453,6 +1480,14 @@ public:
 		}
 		std::shared_lock lock(m_mutex);
 		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->StoreLabel(vaddr, value, size);
+	}
+
+	bool TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->FillDwords(vaddr, size, value);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
