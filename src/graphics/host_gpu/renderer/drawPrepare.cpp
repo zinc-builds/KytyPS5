@@ -236,9 +236,10 @@ bool StoredSince(uint64_t sequence, const Log& log) {
 	return g_stored.Since(sequence, [&](const StoredRange& range) { return LogHit(log, range); });
 }
 
-Pool::Pool(uint32_t slots): m_slots(slots), m_done(std::make_unique<std::atomic<uint64_t>[]>(slots)) {
-	for (uint32_t i = 0; i < slots; i++) {
-		m_done[i].store(0, std::memory_order_relaxed);
+Pool::Pool(std::vector<std::atomic<uint64_t>*> done)
+    : m_slots(static_cast<uint32_t>(done.size())), m_done(std::move(done)) {
+	for (auto* flag: m_done) {
+		flag->store(0, std::memory_order_relaxed);
 	}
 }
 
@@ -248,12 +249,15 @@ uint64_t Pool::Post() {
 	const auto sequence = ++m_posted_local;
 	EXIT_IF(sequence > m_slots && !Done(sequence - m_slots));
 	m_posted.store(sequence, std::memory_order_release);
-	if (m_spinning.load(std::memory_order_relaxed) == 0) {
-		for (auto* worker: m_workers) {
-			if (worker->m_sleeping.load(std::memory_order_relaxed)) {
+	// The sleep flags change only when a worker sleeps or wakes, so reading them stays in this
+	// core's cache; m_spinning changes on every idle spell of a worker, so it is read only when a
+	// worker sleeps.
+	for (auto* worker: m_workers) {
+		if (worker->m_sleeping.load(std::memory_order_relaxed)) {
+			if (m_spinning.load(std::memory_order_relaxed) == 0) {
 				worker->Wake();
-				break;
 			}
+			break;
 		}
 	}
 	return sequence;
@@ -463,7 +467,7 @@ void Worker::LoopPool() {
 		Common::StallDiag::Scope busy(Common::StallDiag::Cause::WorkerBusy);
 		const auto start = NowNs();
 		m_run(m_context, claimed + 1);
-		pool.m_done[claimed % pool.m_slots].store(claimed + 1, std::memory_order_release);
+		pool.m_done[claimed % pool.m_slots]->store(claimed + 1, std::memory_order_release);
 		// This worker's job count (BenchMetrics' prep_jobs; nothing waits on it in pool mode).
 		m_done.store(m_done.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);

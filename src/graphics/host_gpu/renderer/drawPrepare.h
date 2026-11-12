@@ -120,7 +120,9 @@ class Worker;
 // running it. `slots`: draws in flight at most (the posting ring), one done flag each.
 class Pool {
 public:
-	explicit Pool(uint32_t slots);
+	// `done`: one completion flag per slot (sequence s uses done[(s - 1) % slots]), placed by the
+	// caller next to what the command thread reads when the job is finished; outlives the pool.
+	explicit Pool(std::vector<std::atomic<uint64_t>*> done);
 	KYTY_CLASS_NO_COPY(Pool);
 
 	// Hands sequence `posted + 1` to the workers and returns it.
@@ -129,15 +131,15 @@ public:
 	uint64_t Wait(uint64_t sequence);
 	uint64_t WaitIdle();
 	[[nodiscard]] bool Done(uint64_t sequence) const {
-		return m_done[(sequence - 1) % m_slots].load(std::memory_order_acquire) >= sequence;
+		return m_done[(sequence - 1) % m_slots]->load(std::memory_order_acquire) >= sequence;
 	}
 
 private:
 	friend class Worker;
 	void WakeAll();
 
-	uint32_t                                  m_slots;
-	std::unique_ptr<std::atomic<uint64_t>[]> m_done;
+	uint32_t                            m_slots;
+	std::vector<std::atomic<uint64_t>*> m_done;
 	std::vector<Worker*>                      m_workers;
 	uint64_t                                  m_posted_local = 0; // command thread only
 	alignas(64) std::atomic<uint64_t> m_posted {0};

@@ -1852,8 +1852,11 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 		// KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo.
 		const bool shared_memo = EnvFlag("KYTY_SHARED_TEXTURE_MEMO", true);
 		if (free_lanes) {
-			m_prepare_pool = std::make_unique<DrawPrepare::Pool>(
-			    static_cast<uint32_t>(m_queued_draws.size()));
+			std::vector<std::atomic<uint64_t>*> done;
+			for (auto& slot: m_queued_draws) {
+				done.push_back(&slot->done);
+			}
+			m_prepare_pool = std::make_unique<DrawPrepare::Pool>(std::move(done));
 		}
 		for (uint32_t i = 0; i < workers; i++) {
 			auto lane      = std::make_unique<PrepareLane>();

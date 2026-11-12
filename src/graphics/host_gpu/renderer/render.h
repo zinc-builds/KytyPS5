@@ -351,39 +351,52 @@ private:
 	};
 
 	// A queued draw: what it was given, its registers when queued, and the worker's lookup.
+	// A queued draw's slot, laid out by who writes it and when the other side reads it: fields
+	// the command thread writes at post and fields a worker writes never share a line, and what
+	// the command thread needs to start the draw sits in the first lines of each group.
 	struct QueuedDraw {
+		// --- Command thread, at post (the worker reads these; the command thread at commit).
+		alignas(64) uint64_t sequence = 0;
 		// The draw's context registers: a command-thread-owned snapshot shared by consecutive
 		// draws while the registers do not change (RegisterSnapshot).
-		HW::Context*                     registers = nullptr;
-		std::unique_ptr<HW::Context>     registers_verify; // KYTY_REGISTER_SNAPSHOT=verify
-		HW::UserConfig                   user_config;
-		HW::Shader                       shaders;
-		bool                             indexed = true;
-		DrawIndexArgs                    index_args;
-		DrawAutoArgs                     auto_args;
-		DrawRenderState                  state;
-		PipelineCache::GraphicsResources resources;
-		DrawPrepare::Log                 log;
-		uint64_t                         sequence = 0;
+		HW::Context* registers = nullptr;
 		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged,
 		// DrawPrepare::StoredSequence and DrawPrepare::GpuWriteSequence when it was queued.
-		uint64_t                         hazard_generation  = 0;
-		uint64_t                         sync_epoch         = 0;
-		uint64_t                         stored_sequence    = 0;
-		uint64_t                         gpu_write_sequence = 0;
+		uint64_t       hazard_generation  = 0;
+		uint64_t       sync_epoch         = 0;
+		uint64_t       stored_sequence    = 0;
+		uint64_t       gpu_write_sequence = 0;
+		bool           indexed            = true;
+		HW::UserConfig user_config;
+		DrawIndexArgs  index_args;
+		DrawAutoArgs   auto_args;
+		HW::Shader     shaders;
+
+		// --- Worker, ready side: what the command thread reads first at adoption.
+		// Free lanes' completion flag for this slot (DrawPrepare::Pool), then the log, the
+		// proposed targets' record pointers and the texture proposals.
+		alignas(64) std::atomic<uint64_t> done {0};
+		DrawPrepare::Log                  log;
+		WorkerTargets                     targets;
+		WorkerTextures                    textures;
+
+		// --- Worker, bulk.
+		alignas(64) DrawRenderState      state;
+		PipelineCache::GraphicsResources resources;
 		WorkerBuffers                    buffers;
-		WorkerTextures                   textures;
+		// The pipeline key the worker built from its programs and proposed targets.
+		WorkerPipelineKey pipeline_key;
+
+		// --- Command thread, at commit, handed to the worker's next job on this slot.
 		// Resolves the command thread made for this draw, for the worker's memo (see
 		// TextureMemoRecord): appended while the command thread owns the slot, applied and
 		// cleared by the worker before its next job on it.
-		std::vector<TextureMemoRecord> texture_updates;
-		WorkerTargets                  targets;
+		alignas(64) std::vector<TextureMemoRecord> texture_updates;
 		// Color targets the command thread resolved for this draw, for the worker's records:
 		// handed over like texture_updates.
 		std::vector<std::unique_ptr<WorkerColorTargetRecord>> target_updates;
 		std::vector<std::unique_ptr<WorkerDepthTargetRecord>> depth_updates;
-		// The pipeline key the worker built from its programs and proposed targets.
-		WorkerPipelineKey pipeline_key;
+		std::unique_ptr<HW::Context>                          registers_verify; // KYTY_REGISTER_SNAPSHOT=verify
 	};
 	// The worker's pipeline key for the queued draw being committed, if its programs were adopted.
 	const WorkerPipelineKey* m_adopted_pipeline_key = nullptr;
@@ -522,6 +535,12 @@ private:
 	}
 	[[nodiscard]] uint64_t PrepareJob(uint64_t sequence) const {
 		return (sequence - 1) / m_prepare_lanes.size() + 1;
+	}
+	// Whether queued draw `sequence` is prepared, without waiting (acquire: its slot is then
+	// complete and stays unchanged until it commits).
+	[[nodiscard]] bool PreparedDone(uint64_t sequence) const {
+		return m_prepare_pool ? m_prepare_pool->Done(sequence)
+		                      : PrepareWorker(sequence).Done(PrepareJob(sequence));
 	}
 	// Waits until every worker has finished its posted jobs.
 	void WaitPrepareIdle();
@@ -684,12 +703,14 @@ private:
 		WorkerStreamRing*                    stream_ring = nullptr; // owned by the buffer cache
 		std::unique_ptr<DrawPrepare::Worker> worker;
 	};
+	// Declared before the pool and the lanes, which point into the slots (done flags): it is
+	// destroyed after them.
+	std::vector<std::unique_ptr<QueuedDraw>>         m_queued_draws;
 	// Free lanes (KYTY_FREE_LANES, default on with more than one worker): the workers share one
 	// queue instead of taking every n-th draw, and the queue defaults to 8 draws ahead instead of 4
 	// (KYTY_PREPARE_DEPTH). Outlives the lanes.
 	std::unique_ptr<DrawPrepare::Pool>               m_prepare_pool;
 	std::vector<std::unique_ptr<PrepareLane>>        m_prepare_lanes;
-	std::vector<std::unique_ptr<QueuedDraw>>         m_queued_draws;
 	// Register snapshots for queued draws (KYTY_REGISTER_SNAPSHOT=0: a new one per draw; =verify:
 	// a reused snapshot is compared with the registers, and a draw's snapshot at commit with a
 	// copy taken at post). Only the command thread allocates, reuses and retires them: one is
