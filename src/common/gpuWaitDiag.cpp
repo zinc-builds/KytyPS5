@@ -76,6 +76,7 @@ struct State {
 	uint64_t                                   waits       = 0;
 	uint64_t                                   wait_ns     = 0;
 	uint64_t                                   flips       = 0;
+	uint64_t                                   early       = 0;
 	std::unordered_map<uint64_t, SiteTotal>    sites;
 	std::unordered_map<uint64_t, StackTotal>   stacks;
 	uint32_t                                   next_site_id = 1;
@@ -354,6 +355,18 @@ void NoteFlip(uint64_t tick) noexcept {
 	}
 }
 
+void NoteEarlySubmit() noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	s.early++;
+	if (Mode() == 2 && s.origin != 0) {
+		Append(s, "E %" PRIu64 "\n", Rel(s, NowNs()));
+	}
+}
+
 void NoteFlipDone(uint64_t tick) noexcept {
 	if (Mode() != 2) {
 		return;
@@ -392,11 +405,11 @@ void Report() noexcept {
 	}
 	const double secs = static_cast<double>(now - s.period_start) / 1e9;
 	std::printf("GPUWAIT waits_s=%.0f wait_ms_s=%.2f gpu_idle_ms_s=%.2f idle_gaps_s=%.0f "
-	            "submits_s=%.0f submits_to_idle_s=%.0f submit_call_ms_s=%.2f flips_s=%.1f\n",
+	            "submits_s=%.0f submits_to_idle_s=%.0f early_submits_s=%.0f submit_call_ms_s=%.2f flips_s=%.1f\n",
 	            static_cast<double>(s.waits) / secs, static_cast<double>(s.wait_ns) / 1e6 / secs,
 	            static_cast<double>(s.idle_ns) / 1e6 / secs, static_cast<double>(s.idle_gaps) / secs,
 	            static_cast<double>(s.submits) / secs, static_cast<double>(s.idle_submit) / secs,
-	            static_cast<double>(s.submit_ns) / 1e6 / secs, static_cast<double>(s.flips) / secs);
+	            static_cast<double>(s.early) / secs, static_cast<double>(s.submit_ns) / 1e6 / secs, static_cast<double>(s.flips) / secs);
 	std::vector<const SiteTotal*> sites;
 	for (const auto& [key, total]: s.sites) {
 		if (total.n != 0) {
@@ -462,7 +475,7 @@ void Report() noexcept {
 #endif
 	std::fflush(stdout);
 	s.submits = s.submit_ns = s.idle_ns = s.idle_gaps = s.idle_submit = 0;
-	s.waits = s.wait_ns = s.flips = 0;
+	s.waits = s.wait_ns = s.flips = s.early = 0;
 	s.sites.clear();
 	s.stacks.clear();
 	s.period_start = now;

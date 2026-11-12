@@ -52,6 +52,8 @@ void NoteWait(uint64_t tick, uint64_t current, uint64_t known, uint64_t start_ns
 void NoteFlip(uint64_t tick) noexcept;
 void NoteGuestSubmission(uint32_t queue) noexcept;
 void NoteFlipDone(uint64_t tick) noexcept; // any thread
+// The command thread submitted early because the GPU ran out of work (KYTY_EARLY_SUBMIT).
+void NoteEarlySubmit() noexcept;
 
 // The command thread registers itself (for the off-CPU sampler).
 void SetCommandThread() noexcept;

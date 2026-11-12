@@ -95,7 +95,46 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 	m_command.m_recorder = m_recorder.get();
 	if (record_thread) {
 		m_master.EnableWaitDiag();
+		const char* early = std::getenv("KYTY_EARLY_SUBMIT");
+		if (early == nullptr || early[0] != '0') {
+			const char* age_us = std::getenv("KYTY_EARLY_SUBMIT_US");
+			m_early_submit_age = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+			                         std::chrono::microseconds(
+			                             age_us != nullptr ? std::strtoll(age_us, nullptr, 10) : 150))
+			                         .count();
+		}
 	}
+}
+
+bool CommandScheduler::SubmitIfGpuIdle() {
+	// Flush (BeginNext) needs bound registers: unit tests may record without them.
+	if (m_early_submit_age < 0 || m_command.IsInvalid() || !Active()) {
+		return false;
+	}
+	// The GPU still has submitted work: it is fed, and this buffer goes with a later submission.
+	// The known tick is at most 20 us old (PopPendingOperations, every draw, or here).
+	const auto last_submitted = CurrentTick() - 1;
+	if (m_master.KnownGpuTick() < last_submitted) {
+		const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+		if (now - m_last_refresh.load(std::memory_order_relaxed) <
+		    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		        std::chrono::microseconds(20))
+		        .count()) {
+			return false;
+		}
+		m_last_refresh.store(now, std::memory_order_relaxed);
+		m_master.Refresh();
+		if (m_master.KnownGpuTick() < last_submitted) {
+			return false;
+		}
+	}
+	if (std::chrono::steady_clock::now().time_since_epoch().count() - m_command_begin <
+	    m_early_submit_age) {
+		return false;
+	}
+	Common::GpuWaitDiag::NoteEarlySubmit();
+	Flush();
+	return true;
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -339,6 +378,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_command_begin = std::chrono::steady_clock::now().time_since_epoch().count();
 	VulkanDiagnostics::BeginCommandBuffer(
 	    m_graphics.device, m_graphics.physical_device_properties.limits.timestampPeriod,
 	    m_command.m_buffer);

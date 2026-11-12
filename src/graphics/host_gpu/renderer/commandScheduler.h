@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,21 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           Finish(const std::source_location& site = std::source_location::current());
+	// Early submission (KYTY_EARLY_SUBMIT, on by default; =0 off). The command processor calls
+	// this at packets where nothing is held open across command buffers (no queued draw,
+	// dispatch chain or atomic batch). When every earlier submission has finished on the GPU
+	// (it would sit idle) and the open command buffer has been recording for at least
+	// KYTY_EARLY_SUBMIT_US µs (default 150), it is submitted now rather than when the guest's
+	// command buffer ends. Returns whether it submitted.
+	bool           SubmitIfGpuIdle();
+	// Sets the early-submission age in µs (< 0: off), for tests.
+	void           SetEarlySubmitUs(int64_t age_us) noexcept {
+		m_early_submit_age =
+		    age_us < 0 ? -1
+		               : std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		                     std::chrono::microseconds(age_us))
+		                     .count();
+	}
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// The next submission waits (at the transfer stage) until semaphore reaches value: work the
@@ -116,6 +132,8 @@ private:
 	OperationState               m_operation_state      = OperationState::Open;
 	vk::Semaphore                m_next_wait_semaphore  = nullptr;
 	uint64_t                     m_next_wait_value      = 0;
+	int64_t                      m_command_begin        = 0;  // steady_clock ticks at BeginCommand
+	int64_t                      m_early_submit_age     = -1; // steady_clock ticks; < 0: off
 };
 
 } // namespace Libs::Graphics
