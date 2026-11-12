@@ -128,7 +128,8 @@ constexpr std::array DebugFields {
 };
 constexpr std::array OwnNames {"mutex_wait_ns", "mutex_waits", "gc", "gc_ns", "collects", "collect_ns",
                                "submit_scans", "submit_scan_ns", "tex_new", "buf_new", "cmd_gpu_waits",
-                               "cmd_gpu_wait_ns"};
+                               "cmd_gpu_wait_ns", "cmd_idles", "cmd_idle_ns", "cmd_blocks",
+                               "cmd_blocked_ns"};
 static_assert(OwnNames.size() == static_cast<size_t>(Counter::Count));
 
 struct Totals {
@@ -236,12 +237,9 @@ void Print(const char* head, const Totals& now, const Totals& a) {
 
 } // namespace
 
-bool Enabled() noexcept {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_FRAME_DIAG");
-		return value != nullptr && std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
+bool ReadEnabled() noexcept {
+	const char* value = std::getenv("KYTY_FRAME_DIAG");
+	return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
 void OnFlip(uint64_t frame, double interval_ms) noexcept {
@@ -438,7 +436,12 @@ void OnCmdIdleBegin() noexcept {
 
 void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept {
 	g_cmd_idle.store(false, std::memory_order_relaxed);
-	if (!Enabled() || end_ns - start_ns < kIdleMinNs) {
+	if (!Enabled()) {
+		return;
+	}
+	Add(Counter::CmdIdles);
+	Add(Counter::CmdIdleNs, end_ns - start_ns);
+	if (end_ns - start_ns < kIdleMinNs) {
 		return;
 	}
 	auto* sub = g_submitter.load(std::memory_order_relaxed);
