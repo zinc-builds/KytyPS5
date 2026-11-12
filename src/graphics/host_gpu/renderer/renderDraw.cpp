@@ -1419,7 +1419,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		if (atomic_draw) {
 			if (!HasAtomicWrites()) {
 				buffer.EndRendering();
-				ShaderWriteHazardBarrier(buffer.Handle(), shader_write_stages);
+				buffer.RecordQueued([shader_write_stages](vk::CommandBuffer cb) {
+					ShaderWriteHazardBarrier(cb, shader_write_stages);
+				});
 			}
 			batch.stages |= shader_write_stages;
 			for (const auto& [address, size]: atomic) {
@@ -1436,7 +1438,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (shader_write_stages) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory.
 		buffer.EndRendering();
-		ShaderWriteHazardBarrier(buffer.Handle(), shader_write_stages);
+		buffer.RecordQueued([shader_write_stages](vk::CommandBuffer cb) {
+			ShaderWriteHazardBarrier(cb, shader_write_stages);
+		});
 	}
 	buffer.BeginRendering(rendering);
 	const bool pipeline_changed = bound.BoundPipeline() != pipeline.pipeline;
@@ -1493,7 +1497,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 
 	if (shader_write_stages) {
 		buffer.EndRendering();
-		ShaderWriteBarrier(buffer.Handle(), shader_write_stages);
+		buffer.RecordQueued([shader_write_stages](vk::CommandBuffer cb) {
+			ShaderWriteBarrier(cb, shader_write_stages);
+		});
 	}
 }
 
@@ -1536,7 +1542,9 @@ void RenderExecutor::FlushAtomicWrites(CommandBuffer& buffer) {
 		return;
 	}
 	buffer.EndRendering();
-	ShaderWriteBarrier(buffer.Handle(), m_atomic_batch.stages);
+	buffer.RecordQueued([stages = m_atomic_batch.stages](vk::CommandBuffer cb) {
+		ShaderWriteBarrier(cb, stages);
+	});
 	m_atomic_batch.stages = {};
 	m_atomic_batch.atomic.Clear(); // keeping their capacity
 	m_atomic_batch.plain.Clear();

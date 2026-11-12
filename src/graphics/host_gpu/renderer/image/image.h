@@ -63,6 +63,13 @@ public:
 	// Returns whether a barrier was recorded.
 	bool Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range);
+	// Transit's state change and barriers, for a caller that records them itself (queued for the
+	// recording thread); ends the scheduler's rendering if any are needed.
+	[[nodiscard]] Barriers TransitBarriers(vk::ImageLayout destination_layout,
+	                                       vk::AccessFlags2 destination_access,
+	                                       std::optional<ImageSubresourceRange> range);
+	static void RecordBarriers(vk::CommandBuffer cb, const vk::ImageMemoryBarrier2* barriers,
+	                           uint32_t count);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

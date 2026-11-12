@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "common/gpuWaitDiag.h"
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -149,6 +150,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
+	Common::GpuWaitDiag::DriverScope driver_scope(Common::GpuWaitDiag::Driver::ImageCreate);
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
@@ -159,6 +161,13 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
 	image.image = native_image;
+	if (Common::GpuWaitDiag::DriverStats() && result == vk::Result::eSuccess) {
+		VmaAllocationInfo2 info {};
+		vmaGetAllocationInfo2(allocator, image.allocation, &info);
+		if (info.dedicatedMemory != VK_FALSE) {
+			driver_scope.SetKind(Common::GpuWaitDiag::Driver::ImageCreateDedicated);
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		return false;
@@ -181,6 +190,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
+	Common::GpuWaitDiag::DriverScope driver_scope(Common::GpuWaitDiag::Driver::ImageDelete);
 
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
