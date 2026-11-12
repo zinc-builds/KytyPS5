@@ -9,6 +9,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuWaitDiag.h"
 #include "common/benchMetrics.h"
 #include "common/kernelStats.h"
 #include "common/stallDiag.h"
@@ -448,11 +449,13 @@ void GuestGpu::ThreadRun(void* data) {
 	FrameSkip::Init();
 	Common::StallDiag::SetCommandThread();
 	Common::KernelStats::SetCommandThread();
+	Common::GpuWaitDiag::SetCommandThread();
 	Common::BenchMetrics::RegisterThread(Common::BenchMetrics::Role::Cmd);
 
 	for (;;) {
 		Common::StallDiag::Report();
 		Common::KernelStats::Report();
+		Common::GpuWaitDiag::Report();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         should_stop = false;
@@ -558,6 +561,9 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	if (Common::GpuWaitDiag::Enabled()) {
+		Common::GpuWaitDiag::NoteGuestSubmission(submission.queue_id);
+	}
 	GuestSyncEpoch::Advance();
 	MemDiag::NoteSubmit();
 	// Writes the guest made before submitting, in asynchronously write-protected ranges: the
@@ -1336,8 +1342,17 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	if (Common::GpuWaitDiag::Enabled()) {
+		const auto tick = GetScheduler().CurrentTick();
+		Common::GpuWaitDiag::NoteFlip(tick);
+		GetScheduler().DeferPriorityOperation([&renderer = m_renderer, request, tick] {
+			Common::GpuWaitDiag::NoteFlipDone(tick);
+			renderer.GetVideoOut().CompleteFlip(request);
+		});
+	} else {
+		GetScheduler().DeferPriorityOperation(
+		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	}
 	GetScheduler().Flush();
 	if (FrameSkip::Active()) {
 		std::array<uint64_t, 16> buffers {};
