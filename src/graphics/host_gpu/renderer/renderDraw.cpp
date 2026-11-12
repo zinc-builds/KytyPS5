@@ -2161,6 +2161,60 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	if (m_drain_stats) {
 		PrintDrainStats();
 	}
+	// KYTY_HANDOFF_DIFF=1: per field of the slot, the 64-byte lines that differ from the previous
+	// adopted draw's (what a hand-off writing only changed lines would still move).
+	static const bool handoff_diff = EnvFlag("KYTY_HANDOFF_DIFF", false);
+	if (handoff_diff) {
+		struct Range {
+			const char* name;
+			size_t      begin, end;
+		};
+		const auto& st = queued.state;
+		const auto  base = reinterpret_cast<const uint8_t*>(&queued);
+		const auto  at   = [&](const void* p) {
+            return static_cast<size_t>(reinterpret_cast<const uint8_t*>(p) - base);
+		};
+		const Range ranges[] = {
+		    {"registers", at(&queued.registers), at(&queued.registers) + sizeof(queued.registers)},
+		    {"shaders", at(&queued.shaders), at(&queued.shaders) + sizeof(queued.shaders)},
+		    {"user_config", at(&queued.user_config), at(&queued.user_config) + sizeof(queued.user_config)},
+		    {"state.depth", at(&st.depth_info), at(&st.depth_info) + sizeof(st.depth_info)},
+		    {"state.color", at(&st.color_info), at(&st.color_info) + sizeof(st.color_info)},
+		    {"state.vertex", at(&st.vertex_info), at(&st.vertex_info) + sizeof(st.vertex_info)},
+		    {"state.pixel", at(&st.ps_input_info), at(&st.ps_input_info) + sizeof(st.ps_input_info)},
+		    {"state", at(&st), at(&st) + sizeof(st)},
+		    {"resources", at(&queued.resources), at(&queued.resources) + sizeof(queued.resources)},
+		    {"log", at(&queued.log), at(&queued.log) + sizeof(queued.log)},
+		    {"buffers", at(&queued.buffers), at(&queued.buffers) + sizeof(queued.buffers)},
+		    {"textures", at(&queued.textures), at(&queued.textures) + sizeof(queued.textures)},
+		    {"targets", at(&queued.targets), at(&queued.targets) + sizeof(queued.targets)},
+		    {"pipeline_key", at(&queued.pipeline_key), at(&queued.pipeline_key) + sizeof(queued.pipeline_key)},
+		    {"slot", 0, sizeof(QueuedDraw)},
+		};
+		constexpr size_t Count = std::size(ranges);
+		static std::vector<uint8_t>       previous(sizeof(QueuedDraw));
+		static std::array<uint64_t, Count> changed {};
+		static uint64_t                    draws = 0;
+		for (size_t r = 0; r < Count; r++) {
+			for (size_t line = ranges[r].begin & ~size_t {63}; line < ranges[r].end; line += 64) {
+				const auto n = std::min<size_t>(64, sizeof(QueuedDraw) - line);
+				changed[r] += std::memcmp(base + line, previous.data() + line, n) != 0 ? 1 : 0;
+			}
+		}
+		std::memcpy(previous.data(), base, sizeof(QueuedDraw));
+		if ((++draws & ((uint64_t {1} << 18) - 1)) == 0) {
+			std::string line = "HANDOFFDIFF draws=" + std::to_string(draws);
+			for (size_t r = 0; r < Count; r++) {
+				char text[96];
+				std::snprintf(text, sizeof(text), " %s=%.1f/%zu", ranges[r].name,
+				              static_cast<double>(changed[r]) / static_cast<double>(draws),
+				              (ranges[r].end - (ranges[r].begin & ~size_t {63}) + 63) / 64);
+				line += text;
+			}
+			std::printf("%s\n", line.c_str());
+			std::fflush(stdout);
+		}
+	}
 	// The draw reads the registers it was queued with.
 	auto& registers   = *buffer.m_registers;
 	auto& user_config = *buffer.m_user_config;
