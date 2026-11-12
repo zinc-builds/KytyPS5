@@ -5,6 +5,7 @@
 #endif
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/frameSkip.h"
+#include "graphics/guest_gpu/streamDiag.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
 #include "graphics/host_gpu/memDiag.h"
 
@@ -625,6 +626,9 @@ bool GuestGpu::Process(Submission& submission) {
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
+			if (StreamDiag::Enabled()) {
+				StreamDiag::OnProcessorReset(!cp.IsAsyncComputeQueue());
+			}
 			break;
 	}
 
@@ -638,6 +642,10 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
+		if (StreamDiag::Enabled()) {
+			StreamDiag::OnSubmissionBegin(!IsAsyncComputeQueue(), commands.data(),
+			                              static_cast<uint32_t>(commands.size()));
+		}
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
@@ -923,6 +931,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	EXIT_IF(packet_dw > remaining_dw);
 	if (execution.m_suspended) {
 		return false;
+	}
+	if (StreamDiag::Enabled()) {
+		StreamDiag::OnPacket(!IsAsyncComputeQueue(), packet, packet_dw);
 	}
 	// The handler may have pushed a buffer (a call): advance the packet's own cursor.
 	auto& own = execution.m_buffer_stack.back();
@@ -1464,6 +1475,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	}
 	if (Common::FrameDiag::Enabled()) {
 		Common::FrameDiag::OnGuestFlip(PerformanceOverlayFlipCount());
+	}
+	if (StreamDiag::Enabled()) {
+		StreamDiag::OnGuestFlip(PerformanceOverlayFlipCount());
 	}
 }
 

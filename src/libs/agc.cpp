@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/streamDiag.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -34,6 +35,20 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+
+// KYTY_STREAM_DIAG counts every AGC entry by guest thread (streamDiag.h).
+#undef PRINT_NAME
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define PRINT_NAME()                                                                               \
+	do {                                                                                           \
+		if (Libs::Graphics::StreamDiag::Enabled()) {                                               \
+			static const uint32_t stream_diag_id = Libs::Graphics::StreamDiag::RegisterHle(__func__); \
+			Libs::Graphics::StreamDiag::OnHle(stream_diag_id);                                     \
+		}                                                                                          \
+		if (PRINT_NAME_ENABLED) {                                                                  \
+			Libs::PrintName(g_library, g_module, __func__);                                        \
+		}                                                                                          \
+	} while (false)
 
 namespace Libs::Graphics {
 
@@ -304,6 +319,9 @@ struct CommandBuffer {
 		}
 		auto* ret_ptr = cursor_up;
 		cursor_up += size_dw;
+		if (StreamDiag::Enabled()) {
+			StreamDiag::OnAllocate(ret_ptr);
+		}
 		return ret_ptr;
 	}
 };
@@ -4134,6 +4152,9 @@ static TessellationDriverState g_tessellation_driver_state {};
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	Common::FrameDiag::OnGuestSubmit(true);
 
+	if (StreamDiag::Enabled()) {
+		StreamDiag::OnSubmit(dcb, size_in_dwords, true);
+	}
 	LibKernel::PthreadNoteGraphicsSubmitter();
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
@@ -4195,6 +4216,9 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	}
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
+	if (StreamDiag::Enabled()) {
+		StreamDiag::OnSubmit(acb, size_in_dwords, false);
+	}
 
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
