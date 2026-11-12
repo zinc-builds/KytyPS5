@@ -1846,6 +1846,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 				if (inserted && image.info.htile_initial_clear) {
 					metadata->second.clear_mask.set();
 				}
+				metadata->second.owner = id;
 			}
 			return image.FindView(desc.view_info);
 		}
@@ -1864,6 +1865,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 			if (inserted && image.info.htile_initial_clear) {
 				metadata->second.clear_mask.set();
 			}
+			metadata->second.owner = id;
 		}
 		return image.FindView(desc.view_info);
 	}

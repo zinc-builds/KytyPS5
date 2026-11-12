@@ -10103,6 +10103,18 @@ public:
       Require(name, "superseded HTile image release",
               live_consumed && !texture_cache.IsMetaCleared(base + shared_htile, 0),
               "freeing a superseded depth image re-armed its successor's HTile clear");
+      // Reacquiring through a fast path must take the range back too: freeing the image it
+      // superseded must not re-arm the reacquirer's consumed clear.
+      auto other_depth = MakeMetadataDepth(0x12600, shared_htile);
+      const auto other_id = texture_cache.FindImage(other_depth);
+      (void)texture_cache.FindDepthTarget(other_id, other_depth);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      (void)texture_cache.TouchMeta(base + shared_htile, 0, false);
+      TextureCacheTestAccess::DeleteImage(texture_cache, other_id);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      Require(name, "reacquired HTile owner",
+              !texture_cache.IsMetaCleared(base + shared_htile, 0),
+              "freeing an image re-armed the HTile clear of the image that reacquired the range");
       TextureCacheTestAccess::DeleteImage(texture_cache, live_id);
       Require(name, "HTile owner release", !texture_cache.IsMeta(base + shared_htile),
               "freeing the HTile owner kept its clear state");
