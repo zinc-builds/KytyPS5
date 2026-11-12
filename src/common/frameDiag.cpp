@@ -137,7 +137,7 @@ struct Totals {
 	ThreadStat                                               cmd;
 	uint64_t prep_wait_ns = 0, rec_wait_ns = 0, rejected = 0, drains = 0;
 	uint64_t prep_busy_ns = 0, prep_cpu_ns = 0, rec_cpu_ns = 0;
-	uint64_t proc_minflt = 0, proc_majflt = 0;
+	uint64_t proc_minflt = 0, proc_majflt = 0, proc_cpu_ns = 0;
 };
 
 // On the command thread itself, its own clock and rusage are cheaper than /proc.
@@ -190,6 +190,10 @@ Totals Read(bool self) {
 	if (getrusage(RUSAGE_SELF, &usage) == 0) {
 		t.proc_minflt = static_cast<uint64_t>(usage.ru_minflt);
 		t.proc_majflt = static_cast<uint64_t>(usage.ru_majflt);
+		// Every thread's user and system time (guest threads included), µs resolution.
+		t.proc_cpu_ns = (static_cast<uint64_t>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000000u +
+		                 static_cast<uint64_t>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec)) *
+		                1000u;
 	}
 #endif
 	return t;
@@ -211,13 +215,14 @@ void Print(const char* head, const Totals& now, const Totals& a) {
         line, sizeof(line),
         "%s cmd_cpu_ns=%llu cmd_runq_ns=%llu cmd_minflt=%llu cmd_majflt=%llu cmd_vcs=%llu "
                "cmd_ics=%llu prep_wait_ns=%llu rec_wait_ns=%llu rejected=%llu drains=%llu prep_busy_ns=%llu "
-               "prep_cpu_ns=%llu rec_cpu_ns=%llu proc_minflt=%llu proc_majflt=%llu",
+               "prep_cpu_ns=%llu rec_cpu_ns=%llu proc_minflt=%llu proc_majflt=%llu proc_cpu_ns=%llu",
         head, d(now.cmd.cpu_ns, a.cmd.cpu_ns), d(now.cmd.runq_ns, a.cmd.runq_ns),
         d(now.cmd.minflt, a.cmd.minflt), d(now.cmd.majflt, a.cmd.majflt), d(now.cmd.vcs, a.cmd.vcs),
         d(now.cmd.ics, a.cmd.ics), d(now.prep_wait_ns, a.prep_wait_ns), d(now.rec_wait_ns, a.rec_wait_ns),
         d(now.rejected, a.rejected), d(now.drains, a.drains), d(now.prep_busy_ns, a.prep_busy_ns),
         d(now.prep_cpu_ns, a.prep_cpu_ns), d(now.rec_cpu_ns, a.rec_cpu_ns),
-        d(now.proc_minflt, a.proc_minflt), d(now.proc_majflt, a.proc_majflt));
+        d(now.proc_minflt, a.proc_minflt), d(now.proc_majflt, a.proc_majflt),
+        d(now.proc_cpu_ns, a.proc_cpu_ns));
 	for (size_t i = 0; i < DebugFields.size() && n < static_cast<int>(sizeof(line)) - 48; i++) {
 		n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu", DebugFields[i].second,
 		                   d(now.debug[i], a.debug[i]));
@@ -359,12 +364,54 @@ GuestWaitScope::~GuestWaitScope() {
 	self->head.store(head + 1, std::memory_order_release);
 }
 
-void OnGuestSubmit() noexcept {
-	if (!Enabled()) {
+void OnGuestSubmit(bool graphics) noexcept {
+	if (!Enabled() || !graphics) {
 		return;
 	}
 	g_submitter.store(Self(), std::memory_order_relaxed);
 	g_last_submit_ns.store(NowNs(), std::memory_order_relaxed);
+}
+
+namespace {
+
+// The last signal of each condition variable, by address (a direct-mapped table; a collision
+// only loses an attribution).
+struct CondSignal {
+	std::atomic<uint64_t>     cond {0};
+	std::atomic<uint64_t>     ns {0};
+	std::atomic<GuestThread*> thread {nullptr};
+	std::atomic<uint64_t>     last_ident {0}; // the signaller's last wait before the signal
+	std::atomic<uint64_t>     last_start {0};
+	std::atomic<uint64_t>     last_end {0};
+};
+constexpr uint32_t kConds = 4096;
+CondSignal         g_conds[kConds];
+
+CondSignal& CondSlot(uint64_t cond) {
+	return g_conds[(cond >> 4) * 0x9E3779B97F4A7C15ull >> 52 & (kConds - 1)];
+}
+
+} // namespace
+
+void OnGuestCondSignal(const void* cond) noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	auto*      self = Self();
+	const auto key  = reinterpret_cast<uint64_t>(cond);
+	auto&      slot = CondSlot(key);
+	const auto head = self->head.load(std::memory_order_relaxed);
+	if (head != 0) {
+		const auto& entry = self->ring[(head - 1) % kRing];
+		slot.last_ident.store(entry.ident.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		slot.last_start.store(entry.start.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		slot.last_end.store(entry.end.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	} else {
+		slot.last_ident.store(~uint64_t {0}, std::memory_order_relaxed);
+	}
+	slot.thread.store(self, std::memory_order_relaxed);
+	slot.ns.store(NowNs(), std::memory_order_relaxed);
+	slot.cond.store(key, std::memory_order_release);
 }
 
 void OnCmdIdleBegin() noexcept {
@@ -442,6 +489,28 @@ void OnCmdIdle(uint64_t start_ns, uint64_t end_ns) noexcept {
 		                   kind < kKinds ? kKindNames[kind] : "?", last_ident & ((uint64_t {1} << 56) - 1),
 		                   static_cast<double>(last_end - last_start) / 1e6,
 		                   static_cast<double>(end_ns - last_end) / 1e6);
+	}
+	const auto mask = (uint64_t {1} << 56) - 1;
+	if (last_end != 0 && (last_ident >> 56) == static_cast<uint64_t>(GuestWait::Cond) && n > 0 &&
+	    n < static_cast<int>(sizeof(line))) {
+		auto& slot = CondSlot(last_ident & mask);
+		if (slot.cond.load(std::memory_order_acquire) == (last_ident & mask)) {
+			const auto* sig      = slot.thread.load(std::memory_order_relaxed);
+			const auto  sig_ns   = slot.ns.load(std::memory_order_relaxed);
+			const auto  sig_last = slot.last_ident.load(std::memory_order_relaxed);
+			const auto  s_start  = slot.last_start.load(std::memory_order_relaxed);
+			const auto  s_end    = slot.last_end.load(std::memory_order_relaxed);
+			const auto  kind     = static_cast<int>(sig_last >> 56);
+			n += std::snprintf(line + n, sizeof(line) - n, " sig=%d:%s sig_before_ms=%.3f", sig->tid,
+			                   sig->name, (static_cast<double>(end_ns) - static_cast<double>(sig_ns)) / 1e6);
+			if (sig_last != ~uint64_t {0} && n > 0 && n < static_cast<int>(sizeof(line))) {
+				n += std::snprintf(line + n, sizeof(line) - n,
+				                   " sig_last=%s sig_last_id=0x%" PRIx64 " sig_last_ms=%.3f sig_last_before_ms=%.3f",
+				                   kind < kKinds ? kKindNames[kind] : "?", sig_last & mask,
+				                   static_cast<double>(s_end - s_start) / 1e6,
+				                   (static_cast<double>(sig_ns) - static_cast<double>(s_end)) / 1e6);
+			}
+		}
 	}
 	if (n > 0 && n < static_cast<int>(sizeof(line))) {
 		std::printf("%s\n", line);
