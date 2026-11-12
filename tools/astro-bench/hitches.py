@@ -79,6 +79,9 @@ def main():
             counted.append((lf, ms, d))
     if not counted:
         sys.exit(f'hitches.py: {log}: no frames in level frames {frames[0]}-{frames[1]}')
+    last = max(c[0] for c in counted + [(lf, 0, None) for lf, _ in loads])
+    if frames[1] < (1 << 62) and last < frames[1] - 2:
+        sys.exit(f'hitches.py: {log}: the run ends at level frame {last}, before {frames[1]}')
     over50 = [c for c in counted if c[1] > 50.0]
     over100 = [c for c in counted if c[1] > 100.0]
     worst = max(counted, key=lambda c: c[1])

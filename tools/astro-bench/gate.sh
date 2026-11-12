@@ -111,7 +111,14 @@ if [ "$hitch" = 1 ]; then
 	hnew=$(python3 -I "$dir/hitches.py" "$label-hitch-new" --frames "$hframes" 2>&1)
 	o100() { sed -n 's/.* over100=\([0-9]*\) .*/\1/p' <<<"$1"; }
 	r=$(o100 "$href") w=$(o100 "$hnew")
-	if [ -z "$r" ] && [ -n "$w" ] && [[ "$href" == *"no GFRAME"* ]]; then
+	# Only runs that reached the window's end count (batch.sh does not stop on a failed run).
+	done_ref=0 done_new=0
+	[[ "$(head -1 "/tmp/garden-$label-hitch-ref.out" 2>/dev/null)" == "$label-hitch-ref: fps="* ]] && done_ref=1
+	[[ "$(head -1 "/tmp/garden-$label-hitch-new.out" 2>/dev/null)" == "$label-hitch-new: fps="* ]] && done_new=1
+	if [ "$done_ref" = 0 ] || [ "$done_new" = 0 ]; then
+		status=FAIL
+		hverdict="FAIL: a hitch run did not complete (ref $done_ref, new $done_new; see /tmp/garden-$label-hitch-*.out)"
+	elif [ -z "$r" ] && [ -n "$w" ] && [[ "$href" == *"no GFRAME"* ]]; then
 		hverdict="new side only: the reference predates KYTY_FRAME_DIAG"
 	elif [ -z "$r" ] || [ -z "$w" ]; then
 		status=FAIL
@@ -152,6 +159,7 @@ elif [ -f "$new_png" ]; then
 	else
 		echo "**Screenshots:** new only, $new_png (the reference binary predates KYTY_SHOT_FILE:"
 		echo "compare with a dev screenshot by hand)"
+		echo "- [ ] I compared the new frame at level frame $shot with a dev screenshot by eye: no missing or wrong geometry, textures or colors."
 	fi
 else
 	status=FAIL
