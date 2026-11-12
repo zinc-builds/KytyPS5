@@ -75,7 +75,7 @@ struct Target {
 
 struct SideDraw {
 	uint64_t     key = 0, ps = 0, gs = 0;
-	bool         buffer = false, image = false, atomic_only = false, known = false;
+	bool         side = false, buffer = false, image = false, atomic_only = false, known = false;
 	int          range_count = 0;
 	WrittenRange ranges[4] {};
 };
@@ -103,9 +103,8 @@ struct State {
 	int                                  last_count   = -1;
 	uint64_t                             last_shader  = 0;
 	bool                                 last_shader_keep = true;
-	// Shader combinations drawn in a drawn frame: their side effects are known one flip later.
+	// Shader combinations the draw commit has inspected (with or without side effects).
 	std::unordered_set<uint64_t>         known_shaders;
-	std::vector<uint64_t>                seen_shaders, seen_shaders_prev;
 	int                                  max_consecutive = 1;
 	int                                  consecutive     = 0;
 	uint64_t                             frames       = 0; // flips
@@ -202,10 +201,17 @@ void DrawAttachments(const HW::Context& ctx, Attachments& out) {
 		info.format = static_cast<uint32_t>(rt.info.format);
 		info.tiled  = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
 	}
-	const auto& depth = ctx.GetDepthRenderTarget();
-	if (ctx.GetDepthControl().z_write_enable && depth.z_write_base_addr != 0) {
+	// Depth or stencil may be written: depth writes, a stencil test (its ops may write), or a
+	// depth or stencil clear. Over-counting a write only keeps more draws.
+	const auto& depth   = ctx.GetDepthRenderTarget();
+	const auto& control = ctx.GetDepthControl();
+	const auto& render  = ctx.GetRenderControl();
+	const uint64_t base = depth.z_write_base_addr != 0 ? depth.z_write_base_addr
+	                                                   : depth.stencil_write_base_addr;
+	if (base != 0 && (control.z_write_enable || control.stencil_enable ||
+	                  render.depth_clear_enable || render.stencil_clear_enable)) {
 		auto& info  = out.list[out.count++];
-		info.key    = depth.z_write_base_addr;
+		info.key    = base;
 		info.width  = depth.size.x_max + 1;
 		info.height = depth.size.y_max + 1;
 		info.format = static_cast<uint32_t>(depth.z_info.format);
@@ -441,19 +447,12 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 		keep = keep || s.last_targets[i]->keep;
 	}
 
-	// Shader combinations: a skipped frame drops only those already drawn in a drawn frame (whose
-	// buffer and image writes the commit has reported) and found to have none.
-	const uint64_t shader = ShaderKey(sh);
+	// Shader combinations: a skipped frame drops only those the draw commit has inspected and
+	// found to write no buffers or storage images.
 	if (!Detail::g_skipping) {
-		if (shader != s.last_shader) {
-			s.last_shader      = shader;
-			s.last_shader_keep = true; // re-evaluated in the next skipped frame
-			if (!s.known_shaders.contains(shader)) {
-				s.seen_shaders.push_back(shader);
-			}
-		}
 		return false;
 	}
+	const uint64_t shader = ShaderKey(sh);
 	if (shader != s.last_shader) {
 		s.last_shader      = shader;
 		s.last_shader_keep = !s.known_shaders.contains(shader) || s.side_shaders.contains(shader) ||
@@ -470,10 +469,20 @@ bool OnDraw(const HW::Context& ctx, const HW::Shader& sh, bool indirect, bool in
 	return true;
 }
 
-void NoteSideEffectDraw(const HW::Shader& sh, bool buffer_writes, bool image_writes, bool atomic_only,
-                        bool known, const WrittenRange* ranges, int range_count) {
+void NoteCommittedDraw(const HW::Shader& sh, bool buffer_writes, bool image_writes, bool atomic_only,
+                       bool known, const WrittenRange* ranges, int range_count) {
+	// Draws come in runs of one shader combination: report a write-free one once per run.
+	thread_local uint64_t last_clean = 0;
+	const uint64_t        key        = ShaderKey(sh);
+	if (!buffer_writes && !image_writes) {
+		if (key == last_clean) {
+			return;
+		}
+		last_clean = key;
+	}
 	SideDraw draw;
-	draw.key         = ShaderKey(sh);
+	draw.key         = key;
+	draw.side        = buffer_writes || image_writes;
 	draw.ps          = sh.GetPs().ps_regs.data_addr;
 	draw.gs          = sh.GetVs().gs_regs.data_addr;
 	draw.buffer      = buffer_writes;
@@ -538,6 +547,10 @@ void OnFlip(const uint64_t* display_buffers, int display_buffer_count) {
 	{
 		std::scoped_lock lock(s.side_mutex);
 		for (const auto& draw: s.side_pending) {
+			s.known_shaders.insert(draw.key);
+			if (!draw.side) {
+				continue;
+			}
 			auto& side = s.side_shaders[draw.key];
 			side.ps    = draw.ps;
 			side.gs    = draw.gs;
@@ -616,12 +629,6 @@ void OnFlip(const uint64_t* display_buffers, int display_buffer_count) {
 	}
 	s.last_count  = -1;
 	s.last_shader = 0;
-	// Shader combinations drawn in the frame before this one have been committed by now.
-	for (const auto shader: s.seen_shaders_prev) {
-		s.known_shaders.insert(shader);
-	}
-	s.seen_shaders_prev.swap(s.seen_shaders);
-	s.seen_shaders.clear();
 
 	if (Detail::g_diag) {
 		s.diag_frames++;

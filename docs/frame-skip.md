@@ -38,14 +38,15 @@ label writes, interrupts and end-of-pipe events, waits, the flip (on its vblank,
 image), occlusion-query dumps. The game sees exactly the same command stream completing.
 
 It drops draws, PSSR passes, and the presentation of its image, **except** these draws (a draw
-is kept if any of its color or depth attachments, or its shaders, call for it):
+is kept if any of its color or depth/stencil attachments, or its shaders, call for it; a depth or
+stencil attachment counts as written with depth writes, a stencil test, or a depth or stencil clear):
 
 | Kept | Why | How it is found |
 |---|---|---|
 | Render targets refreshed every few frames (shadow caches, probes, impostors) | Later frames reuse them without redrawing; a skipped refresh would stay stale until the next one | Each target's write runs over drawn frames: three runs of one or two frames in a row make it periodic, until a run of 8 |
 | New render targets (first 8 drawn frames) | A one-off render (a baked cube map) must not land in a skipped frame | First sight |
 | Draws whose shaders write buffers or storage images | Their writes outlive the frame: the CPU or a later pass may read them | The draw commit reports the shader combination (ES/GS/PS addresses); later draws of it are kept |
-| Shader combinations not yet drawn in a drawn frame | Their side effects are not known yet | Dropped only once the commit has seen them |
+| Shader combinations the draw commit has not inspected yet | Their side effects are not known | Dropped only once the commit has inspected one of their draws |
 | Indirect draws | They patch shader registers that later draws inherit | Never dropped (3 a frame in Sky Garden) |
 | Targets the CPU reads back (`--readback-tiled-images`, `--readback-linear-images`) | The texture cache writes them back to guest memory after each submit | The same size/tiling rule as the texture cache |
 | Draws with no render target | They exist only for their side effects | No color or depth target bound |

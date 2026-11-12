@@ -1313,7 +1313,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (FrameSkip::Active()) {
-		// Draws whose shaders write memory outlive their frame: frame skipping keeps them.
+		// Frame skipping keeps draws whose shaders write memory, and drops a shader combination
+		// only once it was inspected here.
 		bool image_writes = false;
 		bool known        = true;
 		bool atomic_only  = true;
@@ -1340,10 +1341,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 				}
 			}
 		}
-		if (shader_write_stages || image_writes) {
-			FrameSkip::NoteSideEffectDraw(buffer.GetShaders(), static_cast<bool>(shader_write_stages),
-			                              image_writes, atomic_only, known, ranges.data(), range_count);
-		}
+		FrameSkip::NoteCommittedDraw(buffer.GetShaders(), static_cast<bool>(shader_write_stages),
+		                             image_writes, atomic_only, known, ranges.data(), range_count);
 	}
 	if (shader_write_stages || HasAtomicWrites()) {
 		// Guest ranges of the draw's buffer accesses: atomics to buffers the stage accesses only
