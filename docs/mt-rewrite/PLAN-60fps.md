@@ -223,6 +223,71 @@ step 1 comes first.
   its cache lookup around preparation.
 - **Record progress.** Add a row to the FINDINGS.md progress table for every merged gain (on a
   conflict, rebase and keep both rows). Update your track's status line below.
+- **Build modes.** Both sides of an A/B use the same `KYTY_BUILD_MODE` and, in `pgo` mode, the
+  same profile file: pin it once with `export KYTY_PGO_PROFILE=$(readlink -e
+  ~/.cache/kyty-pgo/current.profdata)` before `refbuild.sh` and `build.sh` (protocol below).
+
+### Build modes: PGO + ThinLTO (Track P, 2026-11-11)
+
+PGO + ThinLTO is worth +11% FPS on `dev` with no source change: command-thread instructions/draw
+−26.9%, cycles/draw −13.4%, FPS 48.34 / 48.94 → 53.89 / 54.21 (same batch, frames 1000–1600). The tools build any commit or checkout in one of four modes
+(`KYTY_BUILD_MODE`, `tools/astro-bench/buildmode.sh`): `plain` (default), `lto`, `pgo` (ThinLTO +
+`-fprofile-use=$KYTY_PGO_PROFILE`) and `pgogen` (instrumented). CMake: `-DKYTY_LTO=thin`,
+`-DKYTY_PGO=generate|use`, `-DKYTY_PGO_PROFILE=<file>`; all off by default. Relinks share a ThinLTO
+cache in `~/.cache/kyty-thinlto`.
+
+**A/B in pgo mode** (`ab.sh` and `gate.sh`, "Bench metrics and A/B" below, build the reference
+with `refbuild.sh`, which follows the exported mode and profile):
+
+```bash
+export KYTY_BUILD_MODE=pgo KYTY_PGO_PROFILE=$(readlink -e ~/.cache/kyty-pgo/current.profdata)
+new=$(tools/astro-bench/build.sh)                          # this checkout: _Build/linux-pgo/install
+tools/astro-bench/ab.sh mylabel --new-install "$new"       # screening; the ref is <merge-base>-pgo-<hash>
+tools/astro-bench/gate.sh mylabel --new-install "$new"     # once, before merge
+```
+
+- Same mode and same profile file on both sides, always. `refbuild.sh` keys its cache on the mode
+  and the profile's hash, both scripts print `mode=pgo … sha256=<hash>`, each install has a
+  `BUILD_MODE` file next to it, and `ab.sh` refuses two installs whose mode or profile differ.
+- A shared profile (trained on the merge-base) is fine for cycles/draw and FPS, but it biases
+  instructions/draw. A branch's new code is compiled without counts, which changes PGO's inlining
+  and layout choices there. Measured on #83 (PGO + ThinLTO, 3 runs a side, FINDINGS "Build modes"):
+  the same #83 source with a profile retrained on itself vs the `dev` profile is instructions/draw
+  −2.5% ±0.2 (signal), cycles/draw +2.1% ±1.1 and FPS within noise (an earlier 4-run FPS batch:
+  −0.2%). So the stale profile's penalty is invisible next to the ~1% layout noise on cycles and
+  FPS, and plainly visible on instructions. Hence:
+  - Screen on instructions/draw in **plain** mode, or with a same-binary kill-switch A/B in any
+    mode; instruction counts do not depend on a profile there.
+  - In pgo mode, read cycles/draw and FPS with the shared profile; do not decide on its
+    instructions/draw.
+  - A pgo number of record for a hot-path change can give each side its own profile (merge-base
+    with its profile, branch with `pgo-train.sh HEAD`), which is what the user gets after the merge
+    and a retrain. `ab.sh` refuses different profiles, so run that pair with `batch.sh` and
+    `results.py verdict --ref … --new …` on the `/tmp/garden-<label>.json` files.
+- Retrain after hot-path merges to `dev` (anything on the command thread, the prepare workers or
+  the guest-memory paths): whoever merges runs `tools/astro-bench/pgo-train.sh origin/dev` after
+  `git fetch`; `current.profdata` then moves to the new `dev` commit. A retrain takes ~5 minutes
+  of machine time: the instrumented build, 2.5–3.5 min (153 s cold in a build dir, 209 s as a
+  `refbuild.sh` of a new commit while other builds ran), then a warm-up run and the training run,
+  ~1¾ min under the exclusive lock (the instrumented build runs at ~31 FPS), and seconds to merge.
+  Lock waits come on top.
+- Gains sized on plain builds shrink on PGO builds, the build the user plays (14–26% in the
+  research measurements). #83 (+1.8% FPS on plain) reads cycles/draw −2.3% ±1.1 with the shared
+  profile and −0.3% ±0.7 with each side on its own profile, so report a pgo-mode cycles/draw
+  number for hot-path changes next to the plain screening.
+- Build times (one changed `.cpp` is `renderDraw.cpp`; wall time without lock waits):
+
+  | Build | Cold (no ccache) | Incremental | Fresh dir, ccache warm |
+  |---|---|---|---|
+  | plain | 146 s | 7 s | 111 s (`refbuild.sh`, worktree setup included) |
+  | pgogen (instrumented) | 153 s | 6 s | 209 s (`refbuild.sh` of a new commit) |
+  | pgo (ThinLTO + PGO) | 141 s (link 17 s) | 7 s (relink ~2 s from the cache) | 202 s with a new profile, 22 s for `build.sh` after `refbuild.sh` with the same profile |
+
+  A new profile changes every compile command, so the first build with it recompiles everything;
+  `refbuild.sh` and `build.sh` with the same profile then share ccache entries.
+- The profile is trained on Sky Garden frames 0–1600 only. Other levels run code paths it saw
+  rarely or never, so a play build may gain less there (see "Building the fast binary" in
+  `docs/mt-rewrite/README.md`).
 
 ## Bench metrics and A/B (Track T, 2026-11-11)
 

@@ -9,9 +9,14 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <magic_enum.hpp>
 
@@ -472,7 +477,47 @@ int wmain(int argc, wchar_t* argv[]) {
 
 #else
 
+// PGO training (KYTY_PGO=generate builds, tools/astro-bench/pgo-train.sh): the benchmark stops the
+// emulator with a signal, so the profile runtime's exit hook never writes the counters. With
+// KYTY_PGO_DUMP=<prefix> a thread writes them every KYTY_PGO_DUMP_INTERVAL seconds (default 10),
+// alternately to <prefix>.a.profraw and <prefix>.b.profraw, so a kill during one write leaves the
+// other file whole. Counters are cumulative: the newer whole file is the profile. The runtime
+// truncates a profile only once per process and appends after that, so each slot is removed
+// before it is written (otherwise a slot holds several snapshots that a merge would add up).
+// The symbols exist only in instrumented builds; elsewhere the weak references are null and
+// this is a no-op.
+#include <unistd.h>
+
+extern "C" __attribute__((weak)) int  __llvm_profile_write_file(void);
+extern "C" __attribute__((weak)) void __llvm_profile_set_filename(const char*);
+
+static void StartPgoDumper() {
+    const char* prefix = std::getenv("KYTY_PGO_DUMP");
+    if (prefix == nullptr || *prefix == '\0' || __llvm_profile_write_file == nullptr ||
+        __llvm_profile_set_filename == nullptr) {
+        return;
+    }
+    const char* interval_env = std::getenv("KYTY_PGO_DUMP_INTERVAL");
+    const int   interval     = std::max(1, interval_env != nullptr ? std::atoi(interval_env) : 10);
+    std::thread([p = std::string(prefix), interval] {
+        // The runtime keeps the pointer it is given, so the names must outlive every write.
+        static std::string names[2];
+        names[0] = p + ".a.profraw";
+        names[1] = p + ".b.profraw";
+        for (unsigned i = 0;; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(interval));
+            const std::string& name = names[i & 1u];
+            if (unlink(name.c_str()) != 0 && errno != ENOENT) {
+                continue; // writing would append to the old snapshot
+            }
+            __llvm_profile_set_filename(name.c_str());
+            __llvm_profile_write_file();
+        }
+    }).detach();
+}
+
 int main(int argc, char* argv[]) {
+    StartPgoDumper();
     return Main(argc, argv);
 }
 
