@@ -153,7 +153,7 @@ if [ -n "$GARDEN_SHOT" ]; then
 	# binary without KYTY_SHOT_FILE never does: stop ~2 s of frames after the shot's frame.
 	for _ in $(seq 60); do
 		[ "$(grep -c '^SHOT ' "$log")" -ge "${KYTY_SHOT_COUNT:-1}" ] && break
-		[ "$(last_frames)" -ge "$((base + GARDEN_SHOT + 120))" ] 2>/dev/null && break
+		[ "$(last_frames)" -ge "$((base + GARDEN_SHOT + 120 + ${KYTY_SHOT_COUNT:-1}))" ] 2>/dev/null && break
 		wait_s 1
 	done
 	if [ -s "/tmp/garden-$label-shot.ppm" ] && magick "/tmp/garden-$label-shot.ppm" "$shot_png" 2>/dev/null; then
