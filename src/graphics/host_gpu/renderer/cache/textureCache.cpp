@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/drainProbe.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
@@ -469,6 +470,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
+	DrainProbe::NoteWrite(image.info.data.address, image.info.data.size);
 	// Small tiled targets are written back too: games read GPU results such as reductions and
 	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
 	// in a 1x1 R32G32 target, and its water physics read it to sample the wave heights).
@@ -1926,6 +1928,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.ClearBufferModified();
 	image.RefreshComplete();
 	image.MarkGpuModified();
+	DrainProbe::NoteWrite(image.info.data.address, image.info.data.size);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,

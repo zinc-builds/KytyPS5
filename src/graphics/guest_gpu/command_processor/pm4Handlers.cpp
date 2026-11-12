@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/drainProbe.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -969,6 +970,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+	DrainProbe::NoteRead(indirect_buffer, uint64_t {indirect_num_dw} * 4u, true);
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
@@ -991,6 +993,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	DrainProbe::NoteRead(indirect_buffer, uint64_t {indirect_num_dw} * 8u, false);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -1062,6 +1065,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
+	DrainProbe::NoteRead(indirect_buffer, uint64_t {indirect_num_dw} * 8u, false);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -1113,6 +1117,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	DrainProbe::NoteRead(indirect_buffer, uint64_t {indirect_num_dw} * 8u, false);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);

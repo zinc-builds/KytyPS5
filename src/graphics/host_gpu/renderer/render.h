@@ -320,6 +320,7 @@ public:
 		}
 	}
 	[[nodiscard]] bool HasQueuedDraw() const { return m_queued_count != 0; }
+	[[nodiscard]] uint64_t QueuedDrawCount() const { return m_queued_count; }
 
 private:
 	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,

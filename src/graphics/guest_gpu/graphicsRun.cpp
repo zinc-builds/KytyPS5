@@ -1,4 +1,5 @@
 #if defined(__linux__)
+#include "graphics/host_gpu/drainProbe.h"
 #include "common/hybridAffinity.h"
 #include <pthread.h>
 #endif
@@ -822,7 +823,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (!KeepsQueuedDraw(packet_header)) {
 				reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
 			}
+			const bool cache_op = reason == Pm4::IT_EVENT_WRITE || reason == Pm4::IT_ACQUIRE_MEM ||
+			                      reason == Pm4::IT_PFP_SYNC_ME || reason == Pm4::IT_RELEASE_MEM;
+			if (cache_op) {
+				DrainProbe::BeginCacheDrain(executor.QueuedDrawCount());
+			}
 			executor.FinishQueuedDraws(CurrentBuffer(), reason);
+			if (cache_op) {
+				DrainProbe::EndCacheDrain();
+			}
 		}
 		if (!DefersAsyncCollect(packet_header)) {
 			m_renderer.CollectAsyncWritesIfRequested();

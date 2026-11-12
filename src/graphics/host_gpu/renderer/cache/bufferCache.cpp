@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/drainProbe.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
@@ -1712,6 +1713,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			DrawPrepare::NoteGpuWrite(vaddr, size);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		DrainProbe::NoteWrite(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
