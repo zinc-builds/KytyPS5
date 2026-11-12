@@ -45,7 +45,7 @@ is never pushed to and never receives PRs from here.
 
 ## Building the fast binary (PGO + ThinLTO)
 
-The play build gains ~12% FPS in Sky Garden from profile-guided optimization plus ThinLTO (see
+The play build gains ~11% FPS in Sky Garden from profile-guided optimization plus ThinLTO (see
 "Build modes" in `PLAN-60fps.md`). In a checkout of `dev`, in its own build dir:
 
 ```bash

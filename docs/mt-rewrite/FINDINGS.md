@@ -84,7 +84,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-11 | SRT walker page log: on the prepare workers the walker records the 4 KiB pages of every guest load (a load crossing a page logs both; ~3.2 distinct pages per draw, at most 7), so every worker read of guest memory is logged and every emulator store between queued draws is ranged (`RangedStore`, buffer readbacks); a queued draw is dropped only if a store since its post, or one still open, overlaps its reads or pages (`OpenStoredRange`/`CloseStoredRange`; a store open at post time used to escape). Prepare rejections from emulator stores ~715/s → 0, ~700 draws/s kept by the range check; the ~240/s left are GPU-written bytes (gate < 300/s met); prepare wait and worker time unchanged (~100–140 and ~3.55 µs/draw), so FPS is flat: the wait is slow-draw latency, not rejections. `KYTY_WALKER_PAGE_LOG=0` restores the read-watched-only rule (Track B4; same batch: ref `dev` 85eb0cb6 48.93 / 49.62; earlier ABBA against the kill switch +0.25%; `KYTY_PREPARE_VERIFY` + `KYTY_WORKER_BUFFERS=verify` + `KYTY_WORKER_TEXTURES_VERIFY` 93.7k adopted draws clean) | 49.60 / 49.01 | 257.8k / 257.2k | 41.3 (max 133.1) / 41.1 (max 66.7) | 27.2 / 26.5 |
 | 2026-11-11 | Ranged GPU-write hazard: guest bytes newly marked GPU-written (`ObtainBuffer` for a written buffer) are recorded by range, like emulator stores, and drop only the queued draws whose logged reads or walker pages they overlap, instead of every queued draw. Sound because the mark comes after the pages turn read-watched, so later worker reads are logged and checked by `HasGpuDirtyBytes`; buffer, texture, target and pipeline-key proposals never read GPU-written state (they keep their own checks). Prepare rejections 265/s → ~1/s (all hazards gone; ~95 draws/s kept by the range check), prepare wait unchanged within noise (`KYTY_RANGED_GPU_HAZARD=0` restores the generation) (Track B4; same batch: ref `dev` 85eb0cb6 49.82 / 48.61, kill switch 50.06 / 49.73, +0.5% over it; `KYTY_PREPARE_VERIFY` + `KYTY_WORKER_BUFFERS=verify` + `KYTY_WORKER_TEXTURES_VERIFY` 93.5k adopted draws clean) | 50.01 / 50.24 | 262.6k / 263.2k | 33.5 (max 33.7) / 33.5 (max 33.9) | 29.9 / 29.9 |
 | 2026-11-11 | Two texture-cache cuts on the command thread: a depth+stencil target whose image and stencil plane are unchanged since the last acquisition skips the cache lock, `AssociateStencil` and both refreshes (`KYTY_STENCIL_TARGET_FAST=0|verify`; `FindDepthTarget` 1.46% → 0.73% of the thread); `MaterializeColorClear` remembers a call that had nothing to do and skips the metadata reads while the guest-sync epoch, the prepare hazard generation and the buffer cache's color-metadata check generation hold (`KYTY_COLOR_CLEAR_MEMO=0|verify`; 2.41% → 1.66%) (Track B; same batch, 4 pairs: ref `dev` 85eb0cb6 47.83 / 46.26 / 49.05 / 49.01, mean 48.04; +1.8%, 3 of 4 pairs up; both verify modes clean in game and in the tests) | 47.28 / 48.41 / 49.82 / 50.03 | 248.9k / 254.6k / 259.9k / 264.2k | 33.6 (max 33.9) / 33.7 (max 34.0) / 33.5 (max 33.8) / 33.5 (max 33.5) | 29.1 / 28.3 / 29.8 / 29.9 |
-| 2026-11-11 | **Build mode:** PGO + ThinLTO, no source change (`KYTY_BUILD_MODE=pgo`, profile trained on this bench by `pgo-train.sh`; Track P). Same batch, plain build of the same commit: 49.29 / 48.56, worst_ms 33.6 / 41.8. Rows from here on say which mode they were measured in; the protocol is "Build modes" in PLAN-60fps.md | 55.04 / 54.76 | 288.1k / 288.3k | 36.2 (max 66.7) / 33.4 (max 33.6) | 27.4 / 29.9 |
+| 2026-11-12 | **Build mode:** PGO + ThinLTO, no source change (`KYTY_BUILD_MODE=pgo`, profile trained on this bench by `pgo-train.sh`; Track P). Same batch, plain build of the same commit (`dev` ffcface5 + the tooling): 48.34 / 48.94, worst_ms 42.6 / 33.5. Command thread: instructions/draw 27.5k → 20.1k (−26.9% ±0.2), cycles/draw 16.9k → 14.7k (−13.4% ±0.8), FPS +11.1% ±0.9. Rows from here on say which mode they were measured in; the protocol is "Build modes" in PLAN-60fps.md | 53.89 / 54.21 | 282.1k / 284.6k | 50.2 (max 199.7) / 34.8 (max 50.0) | 27.4 / 28.6 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1510,14 +1510,21 @@ functions added nothing. Track P made it a build mode (CMake `KYTY_LTO`, `KYTY_P
 `KYTY_PGO_PROFILE`; `tools/astro-bench/{buildmode,build,pgo-train,refbuild}.sh`). The profile
 comes from an instrumented build (`-fprofile-generate`) running the bench: the bench kills the
 emulator, so `KYTY_PGO_DUMP=<prefix>` makes it write its counters every 10 s, alternating between
-two files so a kill mid-write leaves the other whole.
+two files so a kill mid-write leaves the other whole. (The profile runtime truncates a file only
+once per process and appends after that, so the dumper deletes a slot before rewriting it; a
+first version summed ~4 snapshots per file, which over-weighted the first seconds of the run.)
 
-On `dev` 084ca762 + the tooling (178862af), same batch: plain 49.29 / 48.56, PGO + ThinLTO
-55.04 / 54.76 (+12.2%). Draws/s 257k → 288k.
+On `dev` ffcface5 + the tooling (44954b73), same batch, frames 1000–1600: plain 48.34 / 48.94,
+PGO + ThinLTO 53.89 / 54.21; command thread instructions/draw −26.9% ±0.2, cycles/draw
+−13.4% ±0.8, FPS +11.1% ±0.9; prepare worker 3.40 → 2.97 µs/draw. (Before the dumper fix, on
+084ca762: 49.29 / 48.56 → 55.04 / 54.76, +12.2%; with the fixed profile, 49.35 / 49.56 →
+54.14 / 54.69, +10.3%. Between-binary FPS pairs carry ~1% layout noise, so these agree.)
 
 Does a profile trained on the merge-base under-serve a branch's new code? #83 (texture-cache depth
-fast path and color-clear memo, +1.8% on plain builds) merged onto 178862af, all PGO + ThinLTO,
-two batches ordered dev, #83/dev profile, #83/own profile, then reversed:
+fast path and color-clear memo, +1.8% FPS on plain builds), all PGO + ThinLTO.
+
+FPS only, #83 merged onto 178862af (profiles from the first dumper), two batches ordered dev,
+#83/dev profile, #83/own profile, then reversed:
 
 | Build | Runs | Mean |
 |---|---|---|
@@ -1525,10 +1532,21 @@ two batches ordered dev, #83/dev profile, #83/own profile, then reversed:
 | #83 with the `dev` profile | 54.25 / 54.79 / 55.14 / 55.12 | 54.83 |
 | #83 with a profile retrained on #83 | 54.74 / 55.32 / 53.87 / 54.86 | 54.70 |
 
-The retrained profile is no better than the shared one (−0.13 FPS, within the ~0.3 standard
-error), so A/Bs can use a shared profile. #83's own gain reads ~0 on PGO builds with either
-profile: PGO's branch layout and inlining seem to already capture what it saves. Gains sized on
-plain builds should be re-checked in pgo mode.
+Per-draw metrics, #83 merged onto 44954b73 (fixed dumper), one batch, 3 runs a side, frames
+200–500 (`results.py verdict`, ± is one standard deviation of the difference):
+
+| Comparison | instructions/draw | cycles/draw | FPS |
+|---|---|---|---|
+| #83: own profile vs `dev` profile (same source) | −2.46% ±0.24 ! | +2.06% ±1.09 ~ | −4.3% ±2.0 ? |
+| #83 vs `dev`, both on the `dev` profile | −1.02% ±0.24 ! | −2.33% ±1.09 ? | +4.2% ±1.9 ? |
+| #83 on its own profile vs `dev` on its own | −3.46% ±0.17 ! | −0.32% ±0.74 ~ | −0.3% ±1.4 ~ |
+
+A stale profile changes the branch's instruction count measurably (PGO inlines and lays out
+uncounted code differently), but its cycles/draw and FPS cost is invisible next to the ~1% layout
+noise between two binaries (and the 4-run FPS batch above shows none). So A/Bs can share a profile
+for cycles and FPS; instructions/draw is screened in plain mode or same-binary instead. #83's own
+gain mostly disappears on PGO builds (cycles/draw −0.3%..−2.3% depending on the profile): PGO's
+layout and inlining already capture much of what it saves.
 
 Correctness of the PGO + ThinLTO build: the unit suites pass (`build_flags_tests`, which checks
 that `-ffp-contract=off` survives, `shader_recompiler_compute_tests` and the other suites listed

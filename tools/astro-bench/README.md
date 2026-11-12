@@ -51,7 +51,7 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   `ref=$(tools/astro-bench/refbuild.sh "$(git merge-base HEAD origin/dev)")`, then a batch line
   `ref1 KYTY_INSTALL=$ref -- --amd-cpu`.
 - **Build modes** (`KYTY_BUILD_MODE`, `buildmode.sh`): `plain` (default), `lto` (ThinLTO),
-  `pgo` (ThinLTO + PGO with `KYTY_PGO_PROFILE`, the fast build: ~+12% FPS) and `pgogen`
+  `pgo` (ThinLTO + PGO with `KYTY_PGO_PROFILE`, the fast build: ~+11% FPS) and `pgogen`
   (instrumented). `refbuild.sh` keys its cache on the mode and the profile's hash
   (`<sha>-pgo-<hash12>/`), so plain and PGO installs never mix. A/B protocol, retrain rule and
   measured times: "Build modes" in `docs/mt-rewrite/PLAN-60fps.md`.
