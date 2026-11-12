@@ -397,6 +397,18 @@ uint32_t ImageHeap::Allocate() {
 	return index;
 }
 
+uint32_t ImageHeap::AllocateResident(vk::ImageView view, vk::ImageLayout layout) {
+	const auto index                = Allocate();
+	m_elements[index].binding.image_view = view;
+	m_elements[index].binding.layout     = layout;
+	m_writes.push_back(index);
+	return index;
+}
+
+void ImageHeap::RetireResident(uint32_t index) {
+	m_retired.emplace_back(m_context.GetCommandScheduler().CurrentTick(), index);
+}
+
 void ImageHeap::Retire(View& view) {
 	if (view.released.empty()) return;
 	// A retired index is reused once its tick ends, so no held entry may keep it.

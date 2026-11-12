@@ -1448,6 +1448,29 @@ The version that measured free deferred those writes and uploaded stale bytes.
 change that moves a label store between queued draws must check the draws' read ranges against
 it.
 
+### Resident textures, stage 1a shadow mode (Track R, 2026-11-12)
+
+`KYTY_RESIDENT_TEXTURES=shadow` (design: `RESEARCH-thin-commit.md`). Every texture a worker record resolves gets an element of the image heap's set-1 array, and every sampler a stable index. Nothing reads them; the classic path still binds. Per draw, the commit predicts which images a resident binding could skip, then checks that the classic path did nothing for them: no refresh, no barrier, no state change, the element's view and read layout. The first difference exits. The prediction uses the binding epoch, the GC tick and `Image::unsettle_generation` / `read_layout_epoch`, or per image `Image::residency_version`.
+
+Results, Sky Garden frames 1000–1600 (plain build):
+- Two full runs, 0 mismatches. A predictor with the counters disabled exits within seconds, so the check is live.
+
+| | global counters | per-image versions |
+|---|---|---|
+| sampled images skippable | 94.2% | 96.4% |
+| stage sets with images, skippable | 84.3% | 87.0% |
+| draws with every set skippable | 82.7% | 85.3% |
+| command-thread time in code a resident binding deletes | 191 ns/draw | 217 ns/draw |
+
+- Ceiling for that code (all sets with worker records): 296 ns/draw.
+- Images that stay per draw:
+  - colour-clear step (DCC/CMASK): 3.2%;
+  - resolved without a worker record: 0.9%;
+  - storage: 0.06%.
+  - There were no target/feedback conflicts and no dynamic-mip slots.
+- Elements: ~1.1k distinct views alive (run peak 1.5k of 65,536). About 1 allocation and 1 retirement per frame with an 8-GC-tick ageing (a GC tick is ~1 per frame). 127 distinct samplers.
+- Off mode: neutral. `ab.sh` against the merge-base: ipd +0.33% ±0.20, cpd −0.34% ±0.80, FPS +0.43% ±1.39, all noise. The first version cost ~1.6% FPS with its hooks inside the hot loops. They are now compiled into a second copy of each loop.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or

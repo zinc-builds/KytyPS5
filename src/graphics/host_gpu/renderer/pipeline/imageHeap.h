@@ -50,6 +50,13 @@ public:
 	// At a suspend point.
 	void RunGarbageCollector();
 
+	// Elements outside any table (resident textures, KYTY_RESIDENT_TEXTURES): an element that
+	// samples `view` in `layout`, written at the next WriteResidentElements. Retiring one makes
+	// it reusable once the current scheduler tick is free.
+	[[nodiscard]] uint32_t AllocateResident(vk::ImageView view, vk::ImageLayout layout);
+	void                   RetireResident(uint32_t index);
+	void                   WriteResidentElements() { WriteDescriptors(); }
+
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
 
