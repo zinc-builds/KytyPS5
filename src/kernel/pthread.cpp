@@ -1,5 +1,6 @@
 #include "kernel/pthread.h"
 #include "common/frameDiag.h"
+#include "common/gpuWaitDiag.h"
 #include "common/hybridAffinity.h"
 
 #include "common/assert.h"
@@ -3229,6 +3230,7 @@ static void* RunThread(void* arg) {
 	}
 #if defined(__linux__)
 	Common::HybridAffinity::ApplyToGuestThread(thread->name);
+	Common::GpuWaitDiag::SetGuestThread(thread->name);
 #endif
 #endif
 
