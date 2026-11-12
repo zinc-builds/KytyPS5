@@ -9,37 +9,31 @@
 
 namespace Libs::Graphics {
 
-// KYTY_COMMIT_PREFETCH (prototype; off by default): software prefetches for what the command
-// thread reads when it commits a queued draw.
-// - cmd: while committing draw N, the command thread prefetches for the draws behind it, one
-//   pointer level per draw of distance, so no level needs a load that misses: the slot's header
-//   lines at N+4, its proposal arrays and target records at N+3, texture records and target
-//   images at N+2, texture images at N+1. A draw whose preparation is not finished is skipped
-//   at that distance (nothing writes a finished slot until it commits).
-// - worker: the prepare worker prefetches a memo record's command-thread lines when it proposes
-//   the record.
-// A prefetch never faults and reads nothing guest-visible. Every pointer followed is alive: a
-// queued draw's records are freed only after the draw commits (SharedTextureMemo::Collect,
-// WorkerTargetMemo's retired lists), and images are addressed through the texture cache's slot
-// vector, whose chunks are never freed.
-enum class CommitPrefetch : uint8_t { Off = 0, Worker = 1, Cmd = 2, Both = 3 };
-
-[[nodiscard]] inline CommitPrefetch CommitPrefetchMode() {
-	static const CommitPrefetch mode = [] {
-		const char* value = std::getenv("KYTY_COMMIT_PREFETCH");
-		if (value == nullptr) return CommitPrefetch::Off;
-		if (std::strcmp(value, "worker") == 0) return CommitPrefetch::Worker;
-		if (std::strcmp(value, "cmd") == 0) return CommitPrefetch::Cmd;
-		if (std::strcmp(value, "both") == 0) return CommitPrefetch::Both;
-		return CommitPrefetch::Off;
+// KYTY_COMMIT_PREFETCH (RenderExecutor::PrefetchQueued): while the command thread commits queued
+// draw N, it prefetches what it will read for the draws behind it, one pointer level per draw of
+// distance, so no level needs a load that misses. Most of what it pulls was written by a prepare
+// worker on another core (the slot, its vectors, the worker's records).
+// Levels (KYTY_COMMIT_PREFETCH_LEVELS, a bit mask; default all):
+//   1 H: slot N+3's lines the commit reads;
+//   2 S: what slot N+2 points at: proposal arrays, log and buffer vectors, target records;
+//   4 R: texture records of N+1 (not those the previous draw proposed at the same place);
+//   8 I: images of N's texture records and targets (likewise only new ones).
+// A level is skipped for a draw not yet prepared at its distance (nothing writes a prepared slot
+// until it commits). A prefetch never faults and reads nothing guest-visible, and every pointer
+// followed is alive: a queued draw's records are freed only after the draw commits
+// (SharedTextureMemo::Collect, WorkerTargetMemo's retired lists), and images are addressed
+// through the texture cache's slot vector, whose chunks are never freed.
+// KYTY_COMMIT_PREFETCH=0 turns it off.
+[[nodiscard]] inline uint32_t CommitPrefetchLevels() {
+	static const uint32_t levels = [] {
+		const char* mode = std::getenv("KYTY_COMMIT_PREFETCH");
+		if (mode == nullptr || std::strcmp(mode, "0") == 0) {
+			return 0u;
+		}
+		const char* mask = std::getenv("KYTY_COMMIT_PREFETCH_LEVELS");
+		return mask == nullptr ? 15u : static_cast<uint32_t>(std::strtoul(mask, nullptr, 0)) & 15u;
 	}();
-	return mode;
-}
-[[nodiscard]] inline bool CommitPrefetchCmd() {
-	return (static_cast<uint8_t>(CommitPrefetchMode()) & 2u) != 0;
-}
-[[nodiscard]] inline bool CommitPrefetchWorker() {
-	return (static_cast<uint8_t>(CommitPrefetchMode()) & 1u) != 0;
+	return levels;
 }
 
 inline void PrefetchLine(const void* address) {

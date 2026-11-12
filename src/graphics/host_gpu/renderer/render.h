@@ -518,8 +518,13 @@ private:
 	// for the queued draws behind it.
 	void PrefetchQueued(uint64_t sequence);
 	struct CommitPrefetchStat {
-		uint64_t                draws = 0;
-		std::array<uint64_t, 5> done {}; // by distance: the draw there was prepared
+		uint64_t                draws = 0, records = 0, images = 0;
+		std::array<uint64_t, 4> done {}; // by distance: the draw there was prepared
+		// The previous draw's texture records (flattened by stage) at levels R and I, and its color
+		// target records at level I: only places that changed are prefetched.
+		std::array<const WorkerTextureRecord*, 64>     last_records {};
+		std::array<const WorkerTextureRecord*, 64>     last_image_records {};
+		std::array<const WorkerColorTargetRecord*, 8>  last_targets {};
 	} m_commit_prefetch_stat;
 	// The queued draw's programs: the worker's if nothing they depend on changed since it was
 	// queued, else looked up here.

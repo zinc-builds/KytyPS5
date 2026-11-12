@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
-#include "graphics/host_gpu/renderer/commitPrefetch.h"
 #include "graphics/host_gpu/renderer/pipeline/drawStateCache.h"
 
 #include "common/alignment.h"
@@ -1069,15 +1068,6 @@ void RenderExecutor::SpeculateTextures(QueuedDraw& queued, WorkerTextureState& w
 			const auto  key    = TextureDescriptionKey(inputs, value);
 			if (const auto* found = memo.Find(key, inputs, value); found != nullptr) {
 				out[i] = ProposeRecord(found);
-				if (CommitPrefetchWorker()) {
-					// The lines ResolveProposedTexture will read on the command thread.
-					PrefetchLine(&found->resolved);
-					PrefetchLine(&found->binding.image_id);
-					PrefetchLine(&found->binding.layout);
-					PrefetchLine(&found->found_id);
-					PrefetchLine(&found->generation);
-					PrefetchLine(&found->metadata_base_layer);
-				}
 				continue;
 			}
 			auto record         = std::make_unique<WorkerTextureRecord>();
