@@ -149,7 +149,33 @@ public:
 		SettledTarget  = 4u, // and it is already a render target
 	};
 	std::atomic<uint8_t> settled {0};
+
+	// TextureCache::MaterializeColorClear's last call that had nothing to do (GPU thread): another
+	// call with the same description finds nothing either while the guest-sync epoch, the prepare
+	// hazard generation and the buffer cache's color-metadata check generation all hold.
+	struct ColorClearMemo {
+		ImageMetadataInfo      metadata;
+		ImageViewInfo          view;
+		vk::Extent3D           extent;
+		Prospero::BufferFormat guest_format    = Prospero::BufferFormat::kInvalid;
+		Prospero::TileMode     tile_mode       = Prospero::TileMode::kLinear;
+		Prospero::ImageType    type            = Prospero::ImageType::kColor2D;
+		uint32_t               levels          = 0;
+		uint32_t               layers          = 0;
+		uint32_t               bytes_per_block = 0;
+		uint32_t               base_layer      = 0;
+		uint8_t                binding         = 0;
+		uint64_t               epoch = 0, hazard = 0, checks = 0;
+		bool                   valid = false;
+	} color_clear_memo;
+	// FindDepthTarget's depth+stencil fast path: this image (the depth plane, or a stencil plane)
+	// needs no refresh, association or GPU-write commit for the target it was last acquired as.
+	// Cleared with `settled`.
+	std::atomic<uint8_t> target_settled {0};
+	ImageId              target_stencil_id {}; // depth plane: its stencil plane then
 	void                 Unsettle() noexcept {
+		// Depth+stencil images keep settled at 0, so target_settled is cleared regardless.
+		target_settled.store(0, std::memory_order_release);
 		// Under the texture cache lock, like every write of settled.
 		if (settled.load(std::memory_order_relaxed) != 0) {
 			StoreSettled(0, true);
