@@ -27,6 +27,8 @@ enum class Counter {
 	SubmitScanNs,
 	TextureCreates,
 	BufferCreates,
+	CmdGpuWaits,  // the command thread blocked on the GPU timeline (MasterSemaphore::Wait)
+	CmdGpuWaitNs,
 	Count
 };
 
@@ -65,6 +67,11 @@ private:
 	Counter  m_ns;
 	uint64_t m_start;
 };
+
+// The command thread, after it decoded and flushed a guest flip: one GFRAME line with the same
+// fields for the work between that flip and the previous one (`frame`: the presented flip count
+// then, to place the line in a bench window).
+void OnGuestFlip(uint64_t frame) noexcept;
 
 // The presentation thread, at each presented flip of the main bus: `frame` is the flip count
 // (PERF lines' frames=) and `interval_ms` the time since the previous one.

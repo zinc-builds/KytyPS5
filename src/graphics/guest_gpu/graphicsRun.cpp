@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/gpuWaitDiag.h"
+#include "common/frameDiag.h"
 #include "common/benchMetrics.h"
 #include "common/kernelStats.h"
 #include "common/stallDiag.h"
@@ -26,6 +27,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -1445,6 +1447,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		const int count = m_renderer.GetVideoOut().DisplayBufferAddresses(
 		    handle, buffers.data(), static_cast<int>(buffers.size()));
 		FrameSkip::OnFlip(buffers.data(), count);
+	}
+	if (Common::FrameDiag::Enabled()) {
+		Common::FrameDiag::OnGuestFlip(PerformanceOverlayFlipCount());
 	}
 }
 
