@@ -29,7 +29,7 @@ public:
 	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
-	void           Finish();
+	void           Finish(const std::source_location& site = std::source_location::current());
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// The next submission waits (at the transfer stage) until semaphore reaches value: work the
@@ -38,7 +38,7 @@ public:
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
-	void                      Wait(uint64_t tick);
+	void Wait(uint64_t tick, const std::source_location& site = std::source_location::current());
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);

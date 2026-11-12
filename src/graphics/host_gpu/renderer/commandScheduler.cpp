@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuWaitDiag.h"
 #include "common/kernelStats.h"
 #include "common/stallDiag.h"
 #include "graphics/host_gpu/vulkanDiagnostics.h"
@@ -92,6 +93,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	m_command.m_recorder = m_recorder.get();
+	if (record_thread) {
+		m_master.EnableWaitDiag();
+	}
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -161,17 +165,17 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
-void CommandScheduler::Finish() {
+void CommandScheduler::Finish(const std::source_location& site) {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(CurrentTick() - 1, site);
 	BeginNext();
 	PopPendingOperations();
 }
 
-void CommandScheduler::Wait(uint64_t tick) {
+void CommandScheduler::Wait(uint64_t tick, const std::source_location& site) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -180,10 +184,10 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		m_master.Wait(tick, site);
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		m_master.Wait(tick, site);
 	}
 }
 
@@ -360,6 +364,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	const auto diag_start = m_master.WaitDiag() ? Common::GpuWaitDiag::NowNs() : 0;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -384,6 +389,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	if (diag_start != 0) {
+		Common::GpuWaitDiag::NoteSubmit(tick, diag_start, Common::GpuWaitDiag::NowNs(),
+		                                Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws));
+	}
 
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);

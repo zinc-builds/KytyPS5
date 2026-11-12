@@ -1697,6 +1697,36 @@ Two effects:
 - A target unused while the scene sits at another resolution is not a "periodic" target. Frame skipping's keep rule uses write runs for this reason.
 - Raised resolution adds host GPU work to the drawn frames.
 
+### GPU waits and the frame timeline (Track W, 2026-11-12)
+
+Three PGO builds of `dev` with a cheaper command thread each (`cmd_ns` 3385 → 3332 → 3270) all
+ran ~54.8 FPS: the command thread just became less busy (95.5% → 93.6%). `KYTY_GPU_WAIT_DIAG`
+(below) on `dev` e1ad8deb, frames 1000–1600, ~18.2 ms per frame:
+
+- **One site waits on the GPU:** `BufferCache::DownloadBufferMemory<false>` (`bufferCache.cpp`, the
+  synchronous branch), from `GuestGpu::Process` → `RenderContext::CollectAsyncWrites` →
+  `BufferCache::InvalidateMemory` → `ReadMemory`. At the start of a guest submission, the write
+  scan finds a CPU write on a page the GPU wrote, and the GPU's bytes are downloaded before the page
+  is invalidated. Almost always one 12 MiB buffer (`0x55b408000`), a 32 KiB window. 0.23–0.29
+  waits per frame, 2.8–2.9 ms each (max 4 ms), each for its own fresh submit with 10–11 earlier
+  submits still on the GPU: 0.62 ms per frame, 3.4% of the command thread.
+- **The GPU is busy 12.3 ms per frame and idle 5.9**, in ~5.5 gaps per frame; 23 submits per frame,
+  21% of them reaching an idle GPU. The main pass is 1920×1080 (5 targets) and GPU time matches
+  the ~12.2 ms of Track G4, so dynamic resolution has not raised it.
+- **A frame (flip decoded at t = 0):** the previous frame's last ~620 draws are recorded from
+  −4.2 ms but submitted only at −0.05 ms, after the GPU sat idle for 3.5 ms; they take the GPU
+  5.5 ms. From 0.2 to 4.4 ms the command thread decodes one guest command buffer (1,218 draws)
+  without submitting; its pieces queue behind that chunk. At 5.1 ms the next submission's write
+  scan downloads and waits 3.0 ms. The flip's own submit completes 4.25 ms after the flip decodes.
+- **So the frame was bounded by the command thread plus GPU pipeline latency, not GPU
+  throughput:** every ms the command thread saved before the download became wait there, because
+  the heavy end-of-frame chunk reached the GPU late and in one piece.
+- **Other sleeps of the command thread, ~3%** (`KYTY_OFFCPU_SAMPLE=1`): label peeks
+  (`AsyncPageUntouched` in `WaitRegMem`) blocked on the submit-scan mutex ~0.8%,
+  `WaitPriorityOperations` ~0.8%, `TakeKeptWrites` waiting for in-flight submit scans ~0.3%.
+- Ruled out: vsync (the command thread never runs out of work; flips 1 vblank apart at p50), the
+  game's threads, the present path (its own scheduler; the command thread never waits there).
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
@@ -1863,6 +1893,19 @@ Two effects:
   with pages walked; `UFFDIO_WRITEPROTECT`, uffd register, `mprotect`, futex wakes, `sched_yield`,
   signal handlers) plus each site's inclusive wall time; `tools/astro-bench/kstats.py <label>`
   averages them over the `garden.sh` frame window. Costs nothing measurable when off.
+- GPU waits (Track W): `KYTY_GPU_WAIT_DIAG=1` prints once per second a `GPUWAIT` line (the
+  command thread's GPU waits, GPU idle time and gaps, submits, `vkQueueSubmit` time, flips), one
+  `GPUWAITSITE` line per waiting call site (file:line through a defaulted `std::source_location`
+  on `CommandScheduler::Wait`/`Finish` and `MasterSemaphore::Wait`; backlog, own-submit share,
+  whether the waited submit reached an idle GPU) and `GPUWAITSTACK` return-address stacks (offsets
+  from the executable start; symbolize with the `.map`). `=trace` also writes every submit,
+  completion, wait, guest submission and flip to `$KYTY_GPU_WAIT_TRACE` (default
+  `/tmp/gpuwait-trace.txt`) and prints `GPUWAITDL` per synchronous download;
+  `tools/astro-bench/gpuwait.py <trace>` turns it into per-frame numbers and a timeline (`--show`).
+  `KYTY_OFFCPU_SAMPLE=1` adds `OFFCPU` lines: a sampler reads the command thread's
+  `/proc/self/task/<tid>/syscall` every ~200 µs and keys its sleeps by syscall and the return
+  addresses on its stack (heuristic: stale words appear). Perf can't record context switches
+  here (`perf_event_paranoid` 2).
 - Critical path: `KYTY_STALL_DIAG=1` prints a `STALL` line once per second with the GPU command
   thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
   GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)

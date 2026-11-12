@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuWaitDiag.h"
 #include "common/kernelStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -527,6 +528,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
+		if (Common::GpuWaitDiag::Mode() == 2) {
+			std::printf("GPUWAITDL buffer=0x%" PRIx64 "+0x%" PRIx64 " window=0x%" PRIx64 "+0x%" PRIx64
+			            " bytes=%" PRIu64 "\n",
+			            buffer_address, buffer.Size(), vaddr, size, total_size);
+		}
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();

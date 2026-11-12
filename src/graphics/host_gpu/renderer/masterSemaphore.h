@@ -5,6 +5,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <memory>
+#include <source_location>
+#include <thread>
 
 namespace Libs::Graphics {
 
@@ -29,13 +32,19 @@ public:
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
 	void Refresh();
-	void Wait(uint64_t tick);
+	void Wait(uint64_t tick, const std::source_location& site = std::source_location::current());
+
+	// KYTY_GPU_WAIT_DIAG: this timeline is the one tracked (the main render scheduler's).
+	void EnableWaitDiag();
+	[[nodiscard]] bool WaitDiag() const noexcept { return m_wait_diag; }
 
 private:
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	bool                  m_wait_diag = false;
+	std::jthread          m_wait_diag_poller;
 };
 
 } // namespace Libs::Graphics
