@@ -839,7 +839,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	}
 }
 
-void CommandProcessor::RunPrologue(const PacketView& view, bool& first_packet) {
+// Inlined into the packet loops: these run for every packet.
+[[gnu::always_inline]] void CommandProcessor::RunPrologue(const PacketView& view, bool& first_packet) {
 	auto&      executor      = m_renderer.GetRenderExecutor();
 	const auto packet_header = view.header;
 	const auto opcode        = view.opcode;
@@ -875,7 +876,7 @@ void CommandProcessor::RunPrologue(const PacketView& view, bool& first_packet) {
 	}
 }
 
-bool CommandProcessor::RunHandler(Pm4Execution& execution, const PacketView& view) {
+[[gnu::always_inline]] bool CommandProcessor::RunHandler(Pm4Execution& execution, const PacketView& view) {
 	auto&       cursor        = execution.m_buffer_stack.back();
 	const auto* packet        = view.packet;
 	const auto  packet_header = view.header;
