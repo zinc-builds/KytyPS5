@@ -8,8 +8,10 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -41,6 +43,7 @@ public:
 
 private:
 	friend class CommandProcessor;
+	friend class DecodeThread;
 
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
@@ -55,11 +58,14 @@ private:
 	bool                      m_resume_collects = false;
 };
 
+class DecodeThread;
+class GuestGpu;
+
 class CommandProcessor {
 public:
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
 	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
-	~CommandProcessor() = default;
+	~CommandProcessor();
 
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
@@ -128,7 +134,29 @@ public:
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	friend class DecodeThread;
+	// ProcessPm4, or with KYTY_DECODE_THREAD=1 the decode thread's loop.
+	void RunPacketLoop(Pm4Execution& execution);
 	void ProcessPm4(Pm4Execution& execution);
+	// One packet as the loop sees it (ProcessPm4, and the decode thread's loop and its syncs).
+	struct PacketView {
+		const uint32_t* packet;
+		uint32_t        header;
+		uint32_t        opcode;
+		uint32_t        remaining_dw;
+		uint32_t        total_dw;
+	};
+	// The per-packet work before the handler: drains, collection, dispatch chain, epoch, atomic
+	// batch, early submit.
+	void RunPrologue(const PacketView& view, bool& first_packet);
+	// The handler, then the cursor (chains, calls). False if the packet suspended the execution.
+	bool RunHandler(Pm4Execution& execution, const PacketView& view);
+	// KYTY_DECODE_THREAD: the packet loop on the decode thread, the GPU thread committing.
+	void ProcessPm4Decode(Pm4Execution& execution);
+	// Decode thread: has the GPU thread run `view` (or the guest commands, without a view) after
+	// committing everything posted. True if the loop must stop (the packet suspended).
+	bool DecodeSync(const PacketView* view);
+	[[nodiscard]] static bool OnDecodeThread() noexcept;
 	// resume_collects: the suspending packet runs again on resume and, when satisfied, requests
 	// the collection its release needs (RequestAsyncCollect), so the resume needs no scan.
 	void SuspendPm4(bool resume_collects = false);
@@ -139,6 +167,27 @@ private:
 
 	RenderContext& m_renderer;
 	bool           m_in_dispatch_packet = false; // ProcessPm4 runs a dispatch packet's handler
+	struct DecodeThreadDeleter {
+		void operator()(DecodeThread* decode) const;
+	};
+	std::unique_ptr<DecodeThread, DecodeThreadDeleter> m_decode;
+	// Decode thread: the handler found the packet must run on the GPU thread, and did nothing.
+	bool m_decode_bail = false;
+	// KYTY_DECODE_THREAD=verify: a shadow processor replays the decode thread's packets on the GPU
+	// thread; its draws are captured instead of queued.
+	struct ShadowDraw {
+		bool          valid   = false;
+		bool          indexed = false;
+		DrawIndexArgs index {};
+		DrawAutoArgs  automatic {};
+	};
+	bool       m_shadow = false;
+	ShadowDraw m_shadow_draw;
+	void       CopyDecodeState(const CommandProcessor& from);
+	// Empty if this processor's decode state equals `other`'s, else what differs.
+	[[nodiscard]] std::string DecodeStateDiff(const CommandProcessor& other) const;
+	// The shadow's last draw against posted draw `sequence`; empty if equal.
+	[[nodiscard]] std::string ShadowDrawDiff(const CommandProcessor& shadow, uint64_t sequence) const;
 	HW::Context    m_ctx;
 	std::optional<HW::Context> m_saved_ctx;
 	HW::UserConfig m_ucfg;

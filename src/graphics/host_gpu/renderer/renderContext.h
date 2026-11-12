@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/decodeHandoff.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -112,10 +113,18 @@ public:
 	bool ScanAsyncWritesAtSubmit();
 	// Where the guest may have published data mid-stream (a satisfied wait), the collection
 	// can wait until the next packet that reads guest data: see CollectAsyncWritesIfRequested.
-	void RequestAsyncCollect() noexcept { m_async_collect_requested = true; }
-	[[nodiscard]] bool AsyncCollectRequested() const noexcept { return m_async_collect_requested; }
+	// Set and cleared on the GPU thread, only inside a sync while the decode thread
+	// (KYTY_DECODE_THREAD) is parked: its read is ordered by the sync's release/acquire. A setter
+	// outside a sync (a guest command, say) would need a sync first.
+	void RequestAsyncCollect() noexcept {
+		EXIT_IF(g_on_decode_thread);
+		m_async_collect_requested.store(true, std::memory_order_relaxed);
+	}
+	[[nodiscard]] bool AsyncCollectRequested() const noexcept {
+		return m_async_collect_requested.load(std::memory_order_relaxed);
+	}
 	void CollectAsyncWritesIfRequested() {
-		if (m_async_collect_requested) {
+		if (AsyncCollectRequested()) {
 			CollectAsyncWrites();
 		}
 	}
@@ -139,6 +148,7 @@ public:
 	// wait it satisfies publishes no guest data, so needs no collection.
 	template <typename T>
 	[[nodiscard]] bool IsCpLabel(uint64_t vaddr, T value) const {
+		EXIT_IF(g_on_decode_thread);
 		const auto& label = m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()];
 		if (!(label.vaddr == vaddr && sizeof(T) <= label.size &&
 		      static_cast<T>(label.value) == value &&
@@ -180,7 +190,7 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
-	bool                      m_async_collect_requested = false;
+	std::atomic<bool>         m_async_collect_requested {false};
 	struct CpLabel {
 		uint64_t vaddr      = 0;
 		uint64_t value      = 0;

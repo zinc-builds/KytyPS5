@@ -598,14 +598,15 @@ static void ReportPrestage() {
 }
 
 void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
+	EXIT_IF(g_on_decode_thread); // GPU thread only (Process start, sync prologues)
 	ReportPrestage();
 	// A pending request (a satisfied wait published guest data, maybe in another submission
 	// that is now blocked) needs a full scan: only a full scan settles it.
-	if (m_async_collect_requested) {
+	if (AsyncCollectRequested()) {
 		kept_only = false;
 		verify    = KeptVerify::None;
 	}
-	m_async_collect_requested = false;
+	m_async_collect_requested.store(false, std::memory_order_relaxed);
 	static std::vector<std::pair<uint64_t, uint64_t>> written;
 	static std::vector<std::pair<uint64_t, uint64_t>> watched;
 	written.clear();
@@ -702,6 +703,7 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify) {
 
 bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size,
                                  bool invalidate) {
+	EXIT_IF(g_on_decode_thread); // GPU thread only (sync packets)
 	const auto page = vaddr & ~uint64_t {0xfff};
 	if (size == 0 || size > sizeof(uint64_t) || ((vaddr + size - 1) & ~uint64_t {0xfff}) != page) {
 		return false;

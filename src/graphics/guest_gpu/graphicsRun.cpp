@@ -1,6 +1,7 @@
 #if defined(__linux__)
 #include "common/hybridAffinity.h"
 #include <pthread.h>
+#include <sys/resource.h>
 #endif
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/frameSkip.h"
@@ -37,6 +38,7 @@
 #include <atomic>
 #include <cstdio>
 #include <deque>
+#include <string_view>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -91,6 +93,9 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
+	if (auto* wake = m_command_wake.load(std::memory_order_acquire); wake != nullptr) {
+		wake->Notify();
+	}
 }
 
 void GuestGpu::ProcessCommands() {
@@ -626,7 +631,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		~ExecutionScope() { g_current_execution = nullptr; }
 	} execution_scope(execution);
 
-	ProcessPm4(execution);
+	RunPacketLoop(execution);
 	// Nothing stays queued past the packet loop.
 	m_renderer.GetRenderExecutor().FinishQueuedDraws(CurrentBuffer(),
 	                                                 RenderExecutor::DrainEndOfLoop);
@@ -826,75 +831,98 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		auto handler = g_cp_op_func[opcode];
-
-		if (executor.HasQueuedDraw() &&
-		    (!KeepsQueuedDraw(packet_header) ||
-		     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
-			uint32_t reason = RenderExecutor::DrainAsyncCollect;
-			if (!KeepsQueuedDraw(packet_header)) {
-				reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
-			}
-			executor.FinishQueuedDraws(CurrentBuffer(), reason);
-		}
-		if (!DefersAsyncCollect(packet_header)) {
-			m_renderer.CollectAsyncWritesIfRequested();
-		}
-		if (first_packet || !KeepsDispatchChain(packet_header)) {
-			executor.EndDispatchChain(CurrentBuffer());
-			first_packet = false;
-		}
-		if (!KeepsAtomicWrites(packet_header)) {
-			// The same packets may signal the guest or store into its memory.
-			GuestSyncEpoch::Advance();
-			if (executor.HasAtomicWrites()) {
-				executor.FlushAtomicWrites(CurrentBuffer());
-			}
-			// Nothing is held open across command buffers here: the draw queue was drained and
-			// the dispatch chain ended above (both packets' Keeps* are false) and the atomic
-			// batch was just closed. If the GPU has run out of work, it gets what was recorded
-			// so far now, not when the guest's command buffer ends (KYTY_EARLY_SUBMIT).
-			if (!KeepsQueuedDraw(packet_header) && !KeepsDispatchChain(packet_header)) {
-				GetScheduler().SubmitIfGpuIdle();
-			}
-		}
-
-		if (handler == nullptr) {
-			const auto offset = cursor.offset_dw;
-			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
-			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
-			     reinterpret_cast<uint64_t>(packet));
-			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
-			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
-			auto* const base       = packet - offset;
-			for (uint32_t i = dump_begin; i < dump_end; i++) {
-				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
-			}
-			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
-		}
-
-		// Only dispatches from the packet loop chain: it ends chains at synchronizing packets.
-		m_in_dispatch_packet = opcode == Pm4::IT_DISPATCH_DIRECT;
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-		m_in_dispatch_packet = false;
-		EXIT_IF(packet_dw > remaining_dw);
-		if (execution.m_suspended) {
+		const PacketView view {packet, packet_header, opcode, remaining_dw, total_dw};
+		RunPrologue(view, first_packet);
+		if (!RunHandler(execution, view)) {
 			return;
 		}
-		cursor.offset_dw += packet_dw;
-		execution.m_made_progress = true;
-		if (!execution.m_next_buffer.empty()) {
-			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
-			if (execution.m_chain) {
-				cursor = {execution.m_next_buffer};
-			} else {
-				execution.m_buffer_stack.push_back({execution.m_next_buffer});
-			}
-			execution.m_next_buffer = {};
+	}
+}
+
+// Inlined into the packet loops: these run for every packet.
+[[gnu::always_inline]] void CommandProcessor::RunPrologue(const PacketView& view, bool& first_packet) {
+	auto&      executor      = m_renderer.GetRenderExecutor();
+	const auto packet_header = view.header;
+	const auto opcode        = view.opcode;
+	if (executor.HasQueuedDraw() &&
+	    (!KeepsQueuedDraw(packet_header) ||
+	     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
+		uint32_t reason = RenderExecutor::DrainAsyncCollect;
+		if (!KeepsQueuedDraw(packet_header)) {
+			reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
+		}
+		executor.FinishQueuedDraws(CurrentBuffer(), reason);
+	}
+	if (!DefersAsyncCollect(packet_header)) {
+		m_renderer.CollectAsyncWritesIfRequested();
+	}
+	if (first_packet || !KeepsDispatchChain(packet_header)) {
+		executor.EndDispatchChain(CurrentBuffer());
+		first_packet = false;
+	}
+	if (!KeepsAtomicWrites(packet_header)) {
+		// The same packets may signal the guest or store into its memory.
+		GuestSyncEpoch::Advance();
+		if (executor.HasAtomicWrites()) {
+			executor.FlushAtomicWrites(CurrentBuffer());
+		}
+		// Nothing is held open across command buffers here: the draw queue was drained and
+		// the dispatch chain ended above (both packets' Keeps* are false) and the atomic
+		// batch was just closed. If the GPU has run out of work, it gets what was recorded
+		// so far now, not when the guest's command buffer ends (KYTY_EARLY_SUBMIT).
+		if (!KeepsQueuedDraw(packet_header) && !KeepsDispatchChain(packet_header)) {
+			GetScheduler().SubmitIfGpuIdle();
 		}
 	}
+}
+
+[[gnu::always_inline]] bool CommandProcessor::RunHandler(Pm4Execution& execution, const PacketView& view) {
+	auto&       cursor        = execution.m_buffer_stack.back();
+	const auto* packet        = view.packet;
+	const auto  packet_header = view.header;
+	const auto  opcode        = view.opcode;
+	const auto  total_dw      = view.total_dw;
+	const auto  remaining_dw  = view.remaining_dw;
+	auto        handler       = g_cp_op_func[opcode];
+	if (handler == nullptr) {
+		const auto offset = cursor.offset_dw;
+		LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
+		     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
+		     reinterpret_cast<uint64_t>(packet));
+		const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
+		const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
+		auto* const base       = packet - offset;
+		for (uint32_t i = dump_begin; i < dump_end; i++) {
+			LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
+		}
+		EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
+	}
+
+	// Only dispatches from the packet loop chain: it ends chains at synchronizing packets.
+	m_in_dispatch_packet = opcode == Pm4::IT_DISPATCH_DIRECT;
+	const auto packet_dw =
+	    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+	m_in_dispatch_packet = false;
+	EXIT_IF(packet_dw > remaining_dw);
+	if (execution.m_suspended) {
+		return false;
+	}
+	// The handler may have pushed a buffer (a call): advance the packet's own cursor.
+	auto& own = execution.m_buffer_stack.back();
+	EXIT_IF(&own != &cursor);
+	cursor.offset_dw += packet_dw;
+	execution.m_made_progress = true;
+	if (!execution.m_next_buffer.empty()) {
+		// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
+		if (execution.m_chain) {
+			cursor = {execution.m_next_buffer};
+		} else {
+			execution.m_buffer_stack.push_back({execution.m_next_buffer});
+		}
+		execution.m_next_buffer = {};
+	}
+	return true;
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {
@@ -990,6 +1018,26 @@ bool CommandProcessor::SkipDraw(bool indirect, bool indirect_count) {
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	auto& executor           = m_renderer.GetRenderExecutor();
 	args.index_type_and_size = m_index_type_and_size;
+	if (m_shadow) {
+		if (args.instance_count == 0) {
+			args.instance_count = m_num_instances;
+		}
+		m_shadow_draw = {.valid = true, .indexed = true, .index = args};
+		return;
+	}
+	if (OnDecodeThread()) {
+		// A draw reading its instance count from memory, frame skipping (its tables are the GPU
+		// thread's) and one that cannot be queued run on the GPU thread.
+		if ((args.instance_count == 0 && m_num_instances_addr != 0) || FrameSkip::Active()) {
+			m_decode_bail = true;
+			return;
+		}
+		if (args.instance_count == 0) {
+			args.instance_count = m_num_instances;
+		}
+		m_decode_bail = !executor.TryQueueDrawIndex({m_ctx, m_ucfg, m_sh_ctx}, args);
+		return;
+	}
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
 			// Reads guest memory a queued draw may write.
@@ -1165,6 +1213,24 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	auto& executor = m_renderer.GetRenderExecutor();
+	if (m_shadow) {
+		if (args.instance_count == 0) {
+			args.instance_count = m_num_instances;
+		}
+		m_shadow_draw = {.valid = true, .indexed = false, .automatic = args};
+		return;
+	}
+	if (OnDecodeThread()) {
+		if ((args.instance_count == 0 && m_num_instances_addr != 0) || FrameSkip::Active()) {
+			m_decode_bail = true;
+			return;
+		}
+		if (args.instance_count == 0) {
+			args.instance_count = m_num_instances;
+		}
+		m_decode_bail = !executor.TryQueueDrawAuto({m_ctx, m_ucfg, m_sh_ctx}, args);
+		return;
+	}
 	if (args.instance_count == 0) {
 		if (m_num_instances_addr != 0) {
 			executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
@@ -1388,6 +1454,829 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Decode thread, stage 1 (KYTY_DECODE_THREAD=1; docs/mt-rewrite/decode-thread.md).
+//
+// The decode thread runs the packet loop across the packets that keep the draw queue (register
+// writes, indirect register loads, index state, indirect buffers, queueable draws, markers) and
+// posts the queued draws. Any other packet, a draw that cannot be queued, pending guest commands
+// or a pending collection make it stop at a sync: the GPU thread commits everything posted, then
+// runs the packet (its prologue and handler) with the decode thread stopped, then lets it go on.
+// The GPU thread owns the CommandBuffer and everything that records; the decode thread owns the
+// live registers and the posting side of the queue. Ownership changes hands only at a sync.
+//
+// Deadlock rules: the GPU thread never waits on the decode thread without serving guest commands
+// (a decode-time read of a GPU-written page faults on the decode thread and waits for one), and
+// the decode thread checks for guest commands at every packet boundary.
+
+bool CommandProcessor::OnDecodeThread() noexcept {
+	return g_on_decode_thread;
+}
+
+static uint64_t DecodeNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// KYTY_DECODE_THREAD: 0 (default) off, 1 on, verify: on with the shadow decode, the per-draw
+// digest, the sync order and the ownership asserts.
+static int DecodeThreadMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_DECODE_THREAD");
+		if (value == nullptr) return 0;
+		if (std::string_view(value) == "verify") return 2;
+		return value[0] == '1' ? 1 : 0;
+	}();
+	return mode;
+}
+
+static uint64_t DecodeHash(const void* data, size_t size, uint64_t hash = 1469598103934665603ull) {
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	for (size_t i = 0; i < size; i++) {
+		hash = (hash ^ bytes[i]) * 1099511628211ull;
+	}
+	return hash;
+}
+
+// The guest bytes an indirect register load reads (its hash tells a guest race from a bug).
+static uint64_t IndirectSourceHash(const uint32_t* packet) {
+	const auto opcode = (packet[0] >> 8u) & 0xffu;
+	if (opcode != Pm4::IT_SET_CONTEXT_REG_INDIRECT && opcode != Pm4::IT_SET_SH_REG_INDIRECT &&
+	    opcode != Pm4::IT_SET_UCONFIG_REG_INDIRECT) {
+		return 0;
+	}
+	const auto* source = reinterpret_cast<const uint8_t*>((static_cast<uint64_t>(packet[1]) & 0xfffffffcu) |
+	                                                      (static_cast<uint64_t>(packet[2]) << 32u));
+	const auto  count  = packet[4] & 0x3fffu;
+	return source == nullptr ? 0 : DecodeHash(source, uint64_t {count} * 8u);
+}
+
+static std::string UserConfigDiff(const HW::UserConfig& a, const HW::UserConfig& b) {
+	std::string diff;
+	const auto  note = [&](bool same, const char* what) {
+		if (!same) {
+			diff += diff.empty() ? what : std::string(" ") + what;
+		}
+	};
+	note(a.GetPrimType() == b.GetPrimType(), "prim_type");
+	note(a.GetIndexOffset() == b.GetIndexOffset(), "index_offset");
+	note(a.GetObjectId() == b.GetObjectId(), "object_id");
+	note(a.GetPrimitiveResetControl() == b.GetPrimitiveResetControl(), "reset_control");
+	note(a.GetGeControl().primitive_group_size == b.GetGeControl().primitive_group_size &&
+	         a.GetGeControl().vertex_group_size == b.GetGeControl().vertex_group_size,
+	     "ge_cntl");
+	note(a.GetGeUserVgprEn().vgpr1 == b.GetGeUserVgprEn().vgpr1 &&
+	         a.GetGeUserVgprEn().vgpr2 == b.GetGeUserVgprEn().vgpr2 &&
+	         a.GetGeUserVgprEn().vgpr3 == b.GetGeUserVgprEn().vgpr3,
+	     "ge_user_vgpr_en");
+	return diff.empty() ? diff : "user config (" + diff + ")";
+}
+
+static std::string BytesDiff(const void* a, const void* b, size_t size, const char* what) {
+	const auto* x = static_cast<const uint8_t*>(a);
+	const auto* y = static_cast<const uint8_t*>(b);
+	for (size_t i = 0; i < size; i++) {
+		if (x[i] != y[i]) {
+			char text[96];
+			std::snprintf(text, sizeof(text), "%s (byte %zu of %zu: 0x%02x vs 0x%02x)", what, i, size,
+			              x[i], y[i]);
+			return text;
+		}
+	}
+	return {};
+}
+
+void CommandProcessor::CopyDecodeState(const CommandProcessor& from) {
+	m_ctx                              = from.m_ctx;
+	m_saved_ctx                        = from.m_saved_ctx;
+	m_ucfg                             = from.m_ucfg;
+	m_sh_ctx                           = from.m_sh_ctx;
+	m_index_type_and_size              = from.m_index_type_and_size;
+	m_index_buffer_size                = from.m_index_buffer_size;
+	m_index_base_addr                  = from.m_index_base_addr;
+	m_draw_indirect_args_base_addr     = from.m_draw_indirect_args_base_addr;
+	m_dispatch_indirect_args_base_addr = from.m_dispatch_indirect_args_base_addr;
+	m_num_instances                    = from.m_num_instances;
+	m_num_instances_addr               = from.m_num_instances_addr;
+	m_predicate_skip                   = from.m_predicate_skip;
+}
+
+std::string CommandProcessor::DecodeStateDiff(const CommandProcessor& other) const {
+	std::string diff;
+	const auto  note = [&](bool same, const char* what) {
+		if (!same) {
+			diff += diff.empty() ? what : std::string(", ") + what;
+		}
+	};
+	note(m_ctx.SameRegisters(other.m_ctx), "context registers");
+	note(m_saved_ctx.has_value() == other.m_saved_ctx.has_value() &&
+	         (!m_saved_ctx.has_value() || m_saved_ctx->SameRegisters(*other.m_saved_ctx)),
+	     "saved context");
+	if (const auto d = UserConfigDiff(m_ucfg, other.m_ucfg); !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
+	if (const auto d = BytesDiff(&m_sh_ctx, &other.m_sh_ctx, sizeof(m_sh_ctx), "shader registers");
+	    !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
+	note(m_index_type_and_size == other.m_index_type_and_size &&
+	         m_index_buffer_size == other.m_index_buffer_size &&
+	         m_index_base_addr == other.m_index_base_addr,
+	     "index state");
+	note(m_num_instances == other.m_num_instances &&
+	         m_num_instances_addr == other.m_num_instances_addr,
+	     "instances");
+	note(m_draw_indirect_args_base_addr == other.m_draw_indirect_args_base_addr &&
+	         m_dispatch_indirect_args_base_addr == other.m_dispatch_indirect_args_base_addr,
+	     "indirect bases");
+	note(m_predicate_skip == other.m_predicate_skip, "predication");
+	return diff;
+}
+
+std::string CommandProcessor::ShadowDrawDiff(const CommandProcessor& shadow, uint64_t sequence) const {
+	auto&       executor = m_renderer.GetRenderExecutor();
+	const auto& queued   = *executor.m_queued_draws[(sequence - 1) % executor.m_queued_draws.size()];
+	const auto& draw     = shadow.m_shadow_draw;
+	std::string diff;
+	const auto  note = [&](bool same, const char* what) {
+		if (!same) {
+			diff += diff.empty() ? what : std::string(", ") + what;
+		}
+	};
+	note(queued.sequence == sequence, "slot sequence");
+	note(draw.valid, "no draw replayed");
+	if (!diff.empty()) {
+		return diff;
+	}
+	note(queued.registers->SameRegisters(shadow.m_ctx), "context registers");
+	if (const auto d = UserConfigDiff(queued.user_config, shadow.m_ucfg); !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
+	if (const auto d =
+	        BytesDiff(&queued.shaders, &shadow.m_sh_ctx, sizeof(queued.shaders), "shader registers");
+	    !d.empty()) {
+		diff += diff.empty() ? d : ", " + d;
+	}
+	note(queued.indexed == draw.indexed, "kind");
+	if (queued.indexed && draw.indexed) {
+		const auto& a = queued.index_args;
+		const auto& b = draw.index;
+		note(a.index_count == b.index_count && a.index_addr == b.index_addr &&
+		         a.instance_count == b.instance_count &&
+		         a.index_type_and_size == b.index_type_and_size &&
+		         a.base_vertex == b.base_vertex && a.first_instance == b.first_instance &&
+		         a.offset_source == b.offset_source,
+		     "index draw arguments");
+	} else if (!queued.indexed && !draw.indexed) {
+		const auto& a = queued.auto_args;
+		const auto& b = draw.automatic;
+		note(a.vertex_count == b.vertex_count && a.instance_count == b.instance_count &&
+		         a.first_vertex == b.first_vertex && a.first_instance == b.first_instance &&
+		         a.offset_source == b.offset_source,
+		     "auto draw arguments");
+	}
+	return diff;
+}
+
+class DecodeThread {
+public:
+	enum class State : uint32_t { Idle, Running, Sync, SyncDone, Finished, Exit };
+
+	explicit DecodeThread(CommandProcessor& cp): m_cp(cp) {
+		if (const char* spin = std::getenv("KYTY_DECODE_SPIN_US"); spin != nullptr) {
+			handoff.spin_ns = std::strtoull(spin, nullptr, 10) * 1000;
+		}
+		m_stats_enabled = std::getenv("KYTY_DECODE_STATS") != nullptr;
+		verify          = DecodeThreadMode() == 2;
+		handoff.verify  = verify;
+		if (verify) {
+			shadow.reset(new CommandProcessor(cp.m_renderer, cp.m_interrupt_event_id));
+			shadow->m_shadow = true;
+		}
+		// KYTY_DECODE_RUN_UNTIL_DRAW=0: hand every packet back to the decode thread after a sync.
+		const char* until = std::getenv("KYTY_DECODE_RUN_UNTIL_DRAW");
+		m_run_until_draw  = until == nullptr || until[0] != '0';
+		m_thread        = std::thread([this] { Loop(); });
+	}
+	~DecodeThread() {
+		state.store(State::Exit, std::memory_order_release);
+		handoff.to_decode.Notify();
+		m_thread.join();
+	}
+	KYTY_CLASS_NO_COPY(DecodeThread);
+
+	// GPU thread: runs `execution`'s packet loop on the decode thread and commits until it ends.
+	void Run(Pm4Execution& execution, GuestGpu* gpu);
+
+	DecodeHandoff      handoff;
+	std::atomic<State> state {State::Idle};
+	// The sync request (decode thread → GPU thread), and its outcome.
+	CommandProcessor::PacketView view {};
+	bool                         has_view     = false;
+	uint64_t                     requested_ns = 0;
+	bool                         stop         = false;
+	// A dispatch may have left a barrier pending (EndDispatchChain): the next packet that ends a
+	// chain runs on the GPU thread.
+	bool          chain_open = false;
+	GuestGpu*     gpu        = nullptr;
+	Pm4Execution* execution  = nullptr;
+
+	// KYTY_DECODE_THREAD=verify: the decode thread's log of the packets it ran (and the draw each
+	// posted) and of its syncs, replayed by a shadow processor on the GPU thread.
+	struct VerifyEntry {
+		const uint32_t* packet;
+		uint32_t        remaining_dw;
+		uint32_t        total_dw;
+		uint64_t        sequence;    // the draw it posted, or 0
+		uint64_t        source_hash; // indirect register loads: the bytes read
+		bool            sync;        // a sync request (packet: its packet, or null for commands)
+	};
+	bool                              verify = false;
+	std::mutex                        verify_mutex;
+	std::deque<VerifyEntry>           verify_log;
+	std::unique_ptr<CommandProcessor> shadow;
+	bool                              shadow_diverged = false;
+	uint64_t verify_draws = 0, verify_packets = 0, verify_syncs = 0, verify_races = 0;
+	void LogVerify(const VerifyEntry& entry) {
+		std::lock_guard lock(verify_mutex);
+		verify_log.push_back(entry);
+	}
+	// GPU thread: replays the log through draw `through` (0: to the next sync entry, which it
+	// returns through `sync`).
+	void VerifyReplay(uint64_t through, const VerifyEntry** sync);
+	void VerifySeed();
+
+	// KYTY_DECODE_STATS=1: DECODE lines (GPU thread prints).
+	struct Stats {
+		std::atomic<uint64_t> syncs {0}, sync_commands {0}, sync_bails {0};
+		// By reason: 0..255 opcode, 256 + R code of a NOP, 512 collection, 513 dispatch chain.
+		std::array<std::atomic<uint64_t>, 520> by_reason {};
+		std::atomic<uint64_t> sync_wait_ns {0};  // decode thread: request to release
+		std::atomic<uint64_t> ring_wait_ns {0};  // decode thread: waiting for a free slot
+		uint64_t              exec_ns       = 0; // GPU thread: running the syncs
+		uint64_t              seen_ns       = 0; // GPU thread: request to start (when idle at it)
+		uint64_t              seen_count    = 0;
+		uint64_t              idle_ns       = 0; // GPU thread: waiting for the decode thread
+		uint64_t              idle_sync_ns  = 0; // ... of which right after a sync's release
+		uint64_t              idle_count    = 0;
+		uint64_t              gpu_packets   = 0; // run on the GPU thread after a sync
+		std::atomic<uint64_t> decode_user_us {0}, decode_sys_us {0}; // cumulative
+		uint64_t              last_user_us = 0, last_sys_us = 0;
+		uint64_t              start_ns      = 0;
+		uint64_t              posted_start  = 0;
+	} stats;
+	[[nodiscard]] bool StatsEnabled() const { return m_stats_enabled; }
+
+private:
+	void Loop();
+	void ExecuteSync();
+	// After a sync the GPU thread goes on with the packets itself, as ProcessPm4 would, up to the
+	// next draw packet (or the end): around dispatches and labels the packets that need it come
+	// in runs. False if a packet suspended the execution.
+	bool RunUntilDraw();
+	void NoteChain(const CommandProcessor::PacketView& packet) {
+		if (packet.opcode == Pm4::IT_DISPATCH_DIRECT || packet.opcode == Pm4::IT_DISPATCH_INDIRECT) {
+			chain_open = true;
+		} else if (!KeepsDispatchChain(packet.header)) {
+			chain_open = false;
+		}
+	}
+	void PrintStats(uint64_t posted);
+
+	CommandProcessor& m_cp;
+	bool              m_stats_enabled  = false;
+	bool              m_run_until_draw = true;
+	std::thread       m_thread;
+};
+
+void DecodeThread::Loop() {
+#if defined(__linux__)
+	pthread_setname_np(pthread_self(), "KytyGpuDecode");
+	Common::HybridAffinity::ApplyToDecodeThread();
+#endif
+	g_on_decode_thread = true;
+	for (;;) {
+		handoff.to_decode.Wait(
+		    [&] {
+			    const auto s = state.load(std::memory_order_acquire);
+			    return s == State::Running || s == State::Exit;
+		    },
+		    handoff.spin_ns);
+		if (state.load(std::memory_order_acquire) == State::Exit) {
+			return;
+		}
+		g_current_execution = execution;
+		m_cp.ProcessPm4Decode(*execution);
+		g_current_execution = nullptr;
+		if (m_stats_enabled) {
+			// The decode thread's CPU time (its kernel time is not in the command thread's).
+			rusage usage {};
+			if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+				const auto us = [](const timeval& t) {
+					return static_cast<uint64_t>(t.tv_sec) * 1'000'000u + static_cast<uint64_t>(t.tv_usec);
+				};
+				stats.decode_user_us.store(us(usage.ru_utime), std::memory_order_relaxed);
+				stats.decode_sys_us.store(us(usage.ru_stime), std::memory_order_relaxed);
+			}
+		}
+		state.store(State::Finished, std::memory_order_release);
+		handoff.to_commit.Notify();
+		handoff.to_decode.Wait(
+		    [&] {
+			    const auto s = state.load(std::memory_order_acquire);
+			    return s != State::Finished;
+		    },
+		    handoff.spin_ns);
+	}
+}
+
+void DecodeThread::VerifySeed() {
+	shadow->CopyDecodeState(m_cp);
+	shadow_diverged = false;
+}
+
+void DecodeThread::VerifyReplay(uint64_t through, const VerifyEntry** sync) {
+	static VerifyEntry last_sync {};
+	EXIT_IF(g_on_decode_thread);
+	for (;;) {
+		VerifyEntry entry {};
+		{
+			// The decode thread logs a draw just after posting it: wait for the entry.
+			for (uint32_t spins = 0;; spins++) {
+				std::unique_lock lock(verify_mutex);
+				if (!verify_log.empty()) {
+					entry = verify_log.front();
+					verify_log.pop_front();
+					break;
+				}
+				lock.unlock();
+				EXIT_IF(spins > 100'000'000u);
+				KYTY_DECODE_PAUSE();
+			}
+		}
+		if (entry.sync) {
+			EXIT_IF(through != 0);
+			last_sync = entry;
+			*sync     = &last_sync;
+			verify_syncs++;
+			return;
+		}
+		verify_packets++;
+		if (IndirectSourceHash(entry.packet) != entry.source_hash) {
+			// The guest rewrote the bytes after the decode thread read them: a race on the guest's
+			// side, not ours. The shadow is reseeded at the next sync.
+			shadow_diverged = true;
+			verify_races++;
+		}
+		const auto header = entry.packet[0];
+		const auto opcode = (header >> 8u) & 0xffu;
+		shadow->m_shadow_draw.valid = false;
+		(void)g_cp_op_func[opcode](*shadow, header & ~1u, entry.packet + 1, entry.remaining_dw,
+		                           entry.total_dw);
+		if (entry.sequence != 0) {
+			if (!shadow_diverged) {
+				if (const auto diff = m_cp.ShadowDrawDiff(*shadow, entry.sequence); !diff.empty()) {
+					EXIT("KYTY_DECODE_THREAD=verify: posted draw %" PRIu64
+					     " differs from the single-thread decode (%s)\n",
+					     entry.sequence, diff.c_str());
+				}
+				verify_draws++;
+			}
+			if (entry.sequence == through) {
+				return;
+			}
+		}
+	}
+}
+
+void DecodeThread::ExecuteSync() {
+	EXIT_IF(verify && (g_on_decode_thread || !GuestGpu::IsGpuThread()));
+	const auto start = m_stats_enabled ? DecodeNowNs() : 0;
+	if (m_stats_enabled && requested_ns != 0 && start > requested_ns) {
+		stats.seen_ns += start - requested_ns;
+		stats.seen_count++;
+	}
+	if (!has_view) {
+		// Guest commands at a packet boundary: everything posted is committed.
+		if (gpu != nullptr) {
+			gpu->ProcessCommands();
+		}
+		stop = false;
+	} else {
+		bool first_packet = false;
+		m_cp.RunPrologue(view, first_packet);
+		stop = !m_cp.RunHandler(*execution, view);
+		NoteChain(view);
+		if (!stop && m_run_until_draw) {
+			stop = !RunUntilDraw();
+		}
+	}
+	if (m_stats_enabled) {
+		stats.exec_ns += DecodeNowNs() - start;
+	}
+}
+
+static bool IsDrawPacket(uint32_t opcode) {
+	return opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
+	       opcode == Pm4::IT_DRAW_INDEX_AUTO || opcode == Pm4::IT_DRAW_INDEX_MULTI_INST;
+}
+
+bool DecodeThread::RunUntilDraw() {
+	auto&      exec       = *execution;
+	const bool debug_dump = graphics_debug_dump_enabled();
+	while (!exec.m_buffer_stack.empty()) {
+		if (gpu != nullptr && gpu->HasPendingCommands()) {
+			gpu->ProcessCommands();
+		}
+		auto& cursor = exec.m_buffer_stack.back();
+		if (cursor.offset_dw == cursor.commands.size()) {
+			exec.m_buffer_stack.pop_back();
+			continue;
+		}
+		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
+		const auto        remaining_dw  = total_dw - cursor.offset_dw;
+		const auto        packet_header = packet[0];
+		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
+			cursor.offset_dw++;
+			exec.m_made_progress = true;
+			continue;
+		}
+		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		if (debug_dump) {
+			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
+			     " len=%" PRIu32 "\n",
+			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
+		}
+		if ((packet_header & 1u) != 0 && m_cp.ShouldSkipPredicatedPackets()) {
+			auto packet_dw = KYTY_PM4_LEN(packet_header);
+			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			cursor.offset_dw += packet_dw;
+			exec.m_made_progress = true;
+			continue;
+		}
+		if (IsDrawPacket(opcode)) {
+			return true; // the decode thread takes it from here
+		}
+		const CommandProcessor::PacketView packet_view {packet, packet_header, opcode,
+		                                                remaining_dw, total_dw};
+		bool first_packet = false;
+		m_cp.RunPrologue(packet_view, first_packet);
+		if (!m_cp.RunHandler(exec, packet_view)) {
+			return false;
+		}
+		NoteChain(packet_view);
+		if (m_stats_enabled) {
+			stats.gpu_packets++;
+		}
+	}
+	return true;
+}
+
+void DecodeThread::Run(Pm4Execution& exec, GuestGpu* gpu_state) {
+	auto& executor = m_cp.m_renderer.GetRenderExecutor();
+	execution      = &exec;
+	gpu            = gpu_state;
+	stop           = false;
+	// The loop's first packet ends a dispatch chain (ProcessPm4's first_packet).
+	executor.EndDispatchChain(m_cp.CurrentBuffer());
+	chain_open = false;
+	executor.SetDecodeHandoff(&handoff);
+	if (gpu != nullptr) {
+		gpu->SetCommandWake(&handoff.to_commit);
+	}
+	if (m_stats_enabled && stats.start_ns == 0) {
+		stats.start_ns     = DecodeNowNs();
+		stats.posted_start = executor.QueuedPosted();
+	}
+	// The shadow and the verified baseline before the decode thread starts.
+	if (verify) {
+		VerifySeed();
+	}
+	uint64_t verified = executor.QueuedPosted();
+	state.store(State::Running, std::memory_order_release);
+	handoff.to_decode.Notify();
+	bool after_sync = false;
+	for (;;) {
+		if (verify) {
+			EXIT_IF(g_on_decode_thread || !GuestGpu::IsGpuThread());
+			if (const auto posted = executor.QueuedPosted(); posted != verified) {
+				VerifyReplay(posted, nullptr);
+				verified = posted;
+			}
+		}
+		// With verify, only what the shadow decode has checked.
+		if (executor.CommitPosted(m_cp.CurrentBuffer(),
+		                          verify ? verified : executor.QueuedPosted())) {
+			after_sync = false;
+			continue;
+		}
+		const auto s = state.load(std::memory_order_acquire);
+		if (s == State::Sync) {
+			if (executor.QueuedCount() != 0) {
+				continue; // posted before the request
+			}
+			if (verify) {
+				// Every draw before the request is verified and committed; the next log entry is
+				// this sync, and the shadow decode reached the same state.
+				const VerifyEntry* entry = nullptr;
+				VerifyReplay(0, &entry);
+				EXIT_IF(entry == nullptr);
+				if (entry->packet != (has_view ? view.packet : nullptr)) {
+					EXIT("KYTY_DECODE_THREAD=verify: sync out of order: logged %p, requested %p\n",
+					     static_cast<const void*>(entry->packet),
+					     static_cast<const void*>(has_view ? view.packet : nullptr));
+				}
+				if (!shadow_diverged) {
+					if (const auto diff = shadow->DecodeStateDiff(m_cp); !diff.empty()) {
+						EXIT("KYTY_DECODE_THREAD=verify: the decode thread's state differs from the "
+						     "single-thread decode at a sync (%s)\n",
+						     diff.c_str());
+					}
+				}
+			}
+			ExecuteSync();
+			if (verify) {
+				VerifySeed(); // the sync ran on the GPU thread: from its state on
+				verified = executor.QueuedPosted();
+			}
+			state.store(State::SyncDone, std::memory_order_release);
+			handoff.to_decode.Notify();
+			after_sync = true;
+			continue;
+		}
+		if (s == State::Finished) {
+			if (executor.QueuedCount() != 0) {
+				continue;
+			}
+			if (verify) {
+				// The packets after the last draw.
+				std::lock_guard lock(verify_mutex);
+				while (!verify_log.empty()) {
+					const auto entry = verify_log.front();
+					verify_log.pop_front();
+					EXIT_IF(entry.sync || entry.sequence != 0);
+					shadow->m_shadow_draw.valid = false;
+					const auto header = entry.packet[0];
+					shadow_diverged = shadow_diverged ||
+					                  IndirectSourceHash(entry.packet) != entry.source_hash;
+					(void)g_cp_op_func[(header >> 8u) & 0xffu](*shadow, header & ~1u,
+					                                           entry.packet + 1, entry.remaining_dw,
+					                                           entry.total_dw);
+				}
+				if (!shadow_diverged) {
+					if (const auto diff = shadow->DecodeStateDiff(m_cp); !diff.empty()) {
+						EXIT("KYTY_DECODE_THREAD=verify: the decode thread's state differs from the "
+						     "single-thread decode at the end of the loop (%s)\n",
+						     diff.c_str());
+					}
+				}
+			}
+			break;
+		}
+		if (gpu != nullptr && gpu->HasPendingCommands()) {
+			// Everything posted is committed: a packet boundary for the guest.
+			gpu->ProcessCommands();
+			continue;
+		}
+		const auto idle_start = m_stats_enabled ? DecodeNowNs() : 0;
+		handoff.to_commit.Wait(
+		    [&] {
+			    return executor.QueuedCount() != 0 ||
+			           state.load(std::memory_order_acquire) != State::Running ||
+			           (gpu != nullptr && gpu->HasPendingCommands());
+		    },
+		    handoff.spin_ns);
+		if (m_stats_enabled) {
+			const auto idle = DecodeNowNs() - idle_start;
+			stats.idle_ns += idle;
+			stats.idle_sync_ns += after_sync ? idle : 0;
+			stats.idle_count++;
+		}
+	}
+	if (gpu != nullptr) {
+		gpu->SetCommandWake(nullptr);
+	}
+	executor.SetDecodeHandoff(nullptr);
+	state.store(State::Idle, std::memory_order_release);
+	handoff.to_decode.Notify();
+	execution = nullptr;
+	if (m_stats_enabled) {
+		PrintStats(executor.QueuedPosted());
+	}
+}
+
+void DecodeThread::PrintStats(uint64_t posted) {
+	const auto now = DecodeNowNs();
+	if (now - stats.start_ns < 1'000'000'000ull) {
+		return;
+	}
+	const double s     = static_cast<double>(now - stats.start_ns) / 1e9;
+	const auto   syncs = stats.syncs.load(std::memory_order_relaxed);
+	const auto   per   = [&](uint64_t ns, uint64_t n) { return n != 0 ? ns / 1e3 / n : 0.0; };
+	std::printf("DECODE posts_s=%.0f syncs_s=%.0f (commands %.0f, bails %.0f) "
+	            "sync_wait_us=%.2f exec_us=%.2f seen_us=%.2f (n_s=%.0f) "
+	            "gpu_idle_ms_s=%.2f gpu_idle_after_sync_ms_s=%.2f gpu_idle_n_s=%.0f "
+	            "ring_wait_ms_s=%.2f gpu_sleeps_s=%.0f decode_sleeps_s=%.0f gpu_packets_s=%.0f\n",
+	            (posted - stats.posted_start) / s, syncs / s,
+	            stats.sync_commands.load(std::memory_order_relaxed) / s,
+	            stats.sync_bails.load(std::memory_order_relaxed) / s,
+	            per(stats.sync_wait_ns.load(std::memory_order_relaxed), syncs),
+	            per(stats.exec_ns, syncs), per(stats.seen_ns, stats.seen_count),
+	            stats.seen_count / s, stats.idle_ns / s / 1e6, stats.idle_sync_ns / s / 1e6,
+	            stats.idle_count / s, stats.ring_wait_ns.load(std::memory_order_relaxed) / s / 1e6,
+	            handoff.to_commit.Sleeps() / s, handoff.to_decode.Sleeps() / s,
+	            stats.gpu_packets / s);
+	std::fflush(stdout);
+	std::vector<std::pair<uint64_t, uint32_t>> reasons;
+	for (uint32_t r = 0; r < stats.by_reason.size(); r++) {
+		if (const auto n = stats.by_reason[r].exchange(0, std::memory_order_relaxed); n != 0) {
+			reasons.emplace_back(n, r);
+		}
+	}
+	std::ranges::sort(reasons, std::greater {});
+	std::string line;
+	for (size_t i = 0; i < reasons.size() && i < 10; i++) {
+		char item[48];
+		std::snprintf(item, sizeof(item), " %s%02x=%.0f",
+		              reasons[i].second >= 512 ? (reasons[i].second == 512 ? "collect" : "chain")
+		              : reasons[i].second >= 256 ? "nop"
+		                                          : "op",
+		              reasons[i].second & 0xffu, reasons[i].first / s);
+		line += item;
+	}
+	std::printf("DECODE syncs by reason:%s\n", line.c_str());
+	const auto user = stats.decode_user_us.load(std::memory_order_relaxed);
+	const auto sys  = stats.decode_sys_us.load(std::memory_order_relaxed);
+	std::printf("DECODE thread cpu user_ms_s=%.1f sys_ms_s=%.1f user_ns_per_post=%.0f "
+	            "sys_ns_per_post=%.0f\n",
+	            (user - stats.last_user_us) / s / 1e3, (sys - stats.last_sys_us) / s / 1e3,
+	            (user - stats.last_user_us) * 1e3 / std::max<double>(1.0, posted - stats.posted_start),
+	            (sys - stats.last_sys_us) * 1e3 / std::max<double>(1.0, posted - stats.posted_start));
+	stats.last_user_us = user;
+	stats.last_sys_us  = sys;
+	if (verify) {
+		std::printf("DECODE verify draws=%" PRIu64 " packets=%" PRIu64 " syncs=%" PRIu64
+		            " guest_races=%" PRIu64 " (all clean so far)\n",
+		            verify_draws, verify_packets, verify_syncs, verify_races);
+	}
+	stats.syncs = 0;
+	stats.sync_commands = 0;
+	stats.sync_bails = 0;
+	stats.sync_wait_ns = 0;
+	stats.ring_wait_ns = 0;
+	stats.exec_ns = stats.seen_ns = stats.seen_count = 0;
+	stats.idle_ns = stats.idle_sync_ns = stats.idle_count = stats.gpu_packets = 0;
+	stats.start_ns     = now;
+	stats.posted_start = posted;
+}
+
+CommandProcessor::~CommandProcessor() = default;
+
+void CommandProcessor::DecodeThreadDeleter::operator()(DecodeThread* decode) const {
+	delete decode;
+}
+
+void CommandProcessor::RunPacketLoop(Pm4Execution& execution) {
+	// Not with frame skipping: its draw classification is the GPU thread's, so every draw would be
+	// a sync (stage 1).
+	if (DecodeThreadMode() != 0 && !IsAsyncComputeQueue() && g_gpu_state != nullptr &&
+	    !FrameSkip::Active() && m_renderer.GetRenderExecutor().EnsurePrepareLanes()) {
+		if (m_decode == nullptr) {
+			m_decode.reset(new DecodeThread(*this));
+		}
+		m_decode->Run(execution, g_gpu_state);
+		return;
+	}
+	ProcessPm4(execution);
+}
+
+bool CommandProcessor::DecodeSync(const PacketView* view) {
+	auto&      d     = *m_decode;
+	const auto start = d.StatsEnabled() ? DecodeNowNs() : 0;
+	d.has_view       = view != nullptr;
+	if (view != nullptr) {
+		d.view = *view;
+	}
+	d.requested_ns = start;
+	if (d.verify) {
+		d.LogVerify({view != nullptr ? view->packet : nullptr, 0, 0, 0, 0, true});
+	}
+	d.state.store(DecodeThread::State::Sync, std::memory_order_release);
+	d.handoff.to_commit.Notify();
+	d.handoff.to_decode.Wait(
+	    [&] { return d.state.load(std::memory_order_acquire) == DecodeThread::State::SyncDone; },
+	    d.handoff.spin_ns);
+	const bool stop = d.stop;
+	d.state.store(DecodeThread::State::Running, std::memory_order_release);
+	if (d.StatsEnabled()) {
+		d.stats.syncs.fetch_add(1, std::memory_order_relaxed);
+		d.stats.sync_commands.fetch_add(view == nullptr ? 1 : 0, std::memory_order_relaxed);
+		d.stats.sync_wait_ns.fetch_add(DecodeNowNs() - start, std::memory_order_relaxed);
+	}
+	return stop;
+}
+
+void CommandProcessor::ProcessPm4Decode(Pm4Execution& execution) {
+	auto&      d          = *m_decode;
+	const bool debug_dump = graphics_debug_dump_enabled();
+	while (!execution.m_buffer_stack.empty()) {
+		if (d.gpu != nullptr && d.gpu->HasPendingCommands()) {
+			if (DecodeSync(nullptr)) {
+				return;
+			}
+			continue;
+		}
+		auto& cursor = execution.m_buffer_stack.back();
+		if (cursor.offset_dw == cursor.commands.size()) {
+			execution.m_buffer_stack.pop_back();
+			continue;
+		}
+
+		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
+		const auto        remaining_dw  = total_dw - cursor.offset_dw;
+		const auto        packet_header = packet[0];
+		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+
+		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
+			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+
+		if (debug_dump) {
+			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
+			     " len=%" PRIu32 "\n",
+			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
+		}
+
+		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			auto packet_dw = KYTY_PM4_LEN(packet_header);
+			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			cursor.offset_dw += packet_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		const PacketView view {packet, packet_header, opcode, remaining_dw, total_dw};
+		auto             handler = g_cp_op_func[opcode];
+		// The packets that keep the queue run here, as long as no collection is pending before a
+		// packet that reads guest data and no dispatch chain is open before one that ends it.
+		const bool keeps    = handler != nullptr && KeepsQueuedDraw(packet_header);
+		const bool collect  = !DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested();
+		const bool chain    = d.chain_open && !KeepsDispatchChain(packet_header);
+		if (d.StatsEnabled()) {
+			const uint32_t reason = !keeps ? (opcode == Pm4::IT_NOP
+			                                      ? 256u + (KYTY_PM4_R(packet_header) & 0xffu)
+			                                      : opcode)
+			                        : collect ? 512u
+			                        : chain   ? 513u
+			                                  : UINT32_MAX;
+			if (reason != UINT32_MAX) {
+				d.stats.by_reason[reason].fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		if (keeps && !collect && !chain) {
+			m_decode_bail             = false;
+			const auto posted_before  = d.verify ? m_renderer.GetRenderExecutor().QueuedPosted() : 0;
+			const auto source_hash    = d.verify ? IndirectSourceHash(packet) : 0;
+			const auto packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw,
+			                               total_dw) +
+			                       1;
+			if (!m_decode_bail) {
+				if (d.verify && opcode != Pm4::IT_INDIRECT_BUFFER) {
+					const auto posted = m_renderer.GetRenderExecutor().QueuedPosted();
+					d.LogVerify({packet, remaining_dw, total_dw,
+					             posted != posted_before ? posted : 0, source_hash, false});
+				}
+				EXIT_IF(packet_dw > remaining_dw || execution.m_suspended);
+				cursor.offset_dw += packet_dw;
+				execution.m_made_progress = true;
+				if (!execution.m_next_buffer.empty()) {
+					if (execution.m_chain) {
+						cursor = {execution.m_next_buffer};
+					} else {
+						execution.m_buffer_stack.push_back({execution.m_next_buffer});
+					}
+					execution.m_next_buffer = {};
+				}
+				continue;
+			}
+			if (d.StatsEnabled()) {
+				d.stats.sync_bails.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		if (DecodeSync(&view)) {
+			return;
+		}
+	}
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

@@ -261,6 +261,22 @@ inline void ApplyToPrepareThread(uint32_t worker) {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
+// Call from the decode thread (KYTY_DECODE_THREAD): KYTY_DECODE_CPU=<n>, else the emulator's
+// performance cores (it is created by the GPU thread, whose own CPU it must not inherit).
+inline void ApplyToDecodeThread() {
+	ApplyPipelinePriority();
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (const int cpu = EnvCpu("KYTY_DECODE_CPU"); cpu >= 0) {
+		CPU_SET(cpu, &set);
+	} else if (const auto& plan = GetPlan(); plan.active) {
+		set = plan.process;
+	} else {
+		return;
+	}
+	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
 // Call from a thread the game created, once it has its name. The game's threads run on the
 // efficiency cores (all but the recording thread's): since write faults stopped raising signals
 // they are light, and leaving the performance cores to the emulator's threads, the game's main

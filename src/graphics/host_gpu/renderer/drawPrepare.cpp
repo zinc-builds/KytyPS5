@@ -331,7 +331,8 @@ uint64_t Pool::Wait(uint64_t sequence) {
 
 uint64_t Pool::WaitIdle() {
 	uint64_t waited = 0;
-	const auto posted = m_posted_local;
+	// The poster may be another thread (the decode thread): what it has published.
+	const auto posted = m_posted.load(std::memory_order_acquire);
 	for (auto sequence = posted > m_slots ? posted - m_slots + 1 : 1; sequence <= posted; sequence++) {
 		waited += Wait(sequence);
 	}

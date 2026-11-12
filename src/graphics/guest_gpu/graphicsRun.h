@@ -31,6 +31,11 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// While the GPU thread waits on the decode thread (KYTY_DECODE_THREAD) it sleeps on this
+	// signal instead of the work condition: SendCommand bumps it too.
+	void SetCommandWake(DecodeSignal* signal) {
+		m_command_wake.store(signal, std::memory_order_release);
+	}
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);
@@ -69,6 +74,7 @@ private:
 		bool submit_scanned = false;
 	};
 
+	friend class DecodeThread;
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
@@ -83,6 +89,7 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::atomic<DecodeSignal*>                     m_command_wake {nullptr};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

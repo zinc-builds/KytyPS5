@@ -8,6 +8,7 @@
 #include "common/gpuWaitDiag.h"
 #include "common/stallDiag.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/decodeHandoff.h"
 #include "graphics/host_gpu/renderer/deferredRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -366,6 +367,32 @@ public:
 	// outside the command processor's packet loop. KYTY_PREPARE_THREAD=0 draws at once instead.
 	void QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	void QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
+	// The decode thread's posts (KYTY_DECODE_THREAD): from the live registers, never through the
+	// GPU thread's CommandBuffer. False if the draw cannot be queued (nothing was done): it then
+	// runs on the GPU thread as a sync.
+	struct LiveRegisters {
+		const HW::Context&    registers;
+		const HW::UserConfig& user_config;
+		const HW::Shader&     shaders;
+	};
+	[[nodiscard]] bool TryQueueDrawIndex(const LiveRegisters& live, const DrawIndexArgs& args);
+	[[nodiscard]] bool TryQueueDrawAuto(const LiveRegisters& live, const DrawAutoArgs& args);
+	// Set while a decode thread posts (nullptr otherwise); the GPU thread commits with
+	// CommitPosted.
+	void SetDecodeHandoff(DecodeHandoff* handoff) { m_decode_handoff = handoff; }
+	// GPU thread: commits the posted draws through `through`, if any. False if none.
+	bool CommitPosted(CommandBuffer& buffer, uint64_t through) {
+		if (m_queued_taken >= through) {
+			return false;
+		}
+		while (m_queued_taken < through) {
+			FinishQueuedDraw(buffer);
+		}
+		return true;
+	}
+	[[nodiscard]] uint64_t QueuedPosted() const {
+		return m_queued_posted.load(std::memory_order_acquire);
+	}
 	// Why the queue drains (KYTY_DRAIN_STATS=1): a PM4 opcode (0..255), 512 + the R code of an
 	// emulator NOP, or one of these.
 	enum DrainReason : uint32_t {
@@ -377,25 +404,29 @@ public:
 		DrainReasons       = 768,
 	};
 	void FinishQueuedDraws(CommandBuffer& buffer, uint32_t reason = DrainDirectDraw) {
-		if (m_queued_count == 0) {
+		if (QueuedCount() == 0) {
 			return;
 		}
 		m_prepare_stat.drains++;
 		Common::BenchMetrics::Add(Common::BenchMetrics::Counter::Drains);
 		m_drain_reason = reason < DrainReasons ? reason : DrainDirectDraw;
 		m_draining     = true;
-		while (m_queued_count != 0) {
+		while (QueuedCount() != 0) {
 			FinishQueuedDraw(buffer);
 		}
 		m_draining = false;
-		m_post_after_drain = true;
+		m_post_after_drain = m_decode_handoff == nullptr;
 		// The draws posted next refill the queue: their waits are this drain's refill cost.
-		m_refill_until = m_queued_posted + m_queued_draws.size() - 1;
+		m_refill_until = m_queued_posted.load(std::memory_order_relaxed) + m_queued_draws.size() - 1;
 		if (m_drain_stats) {
 			m_drain_stat.count[m_drain_reason]++;
 		}
 	}
-	[[nodiscard]] bool HasQueuedDraw() const { return m_queued_count != 0; }
+	// GPU thread: posted, not yet taken for commit.
+	[[nodiscard]] uint64_t QueuedCount() const {
+		return m_queued_posted.load(std::memory_order_acquire) - m_queued_taken;
+	}
+	[[nodiscard]] bool HasQueuedDraw() const { return QueuedCount() != 0; }
 
 private:
 	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,
@@ -581,11 +612,17 @@ private:
 	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args, QueuedDraw* queued = nullptr);
 	// The slot for a draw to queue, or null when it must be drawn at once: preparation threading
 	// is off, or the registers select a special operation (metadata, resolve, depth copy) or no
-	// draw at all.
-	QueuedDraw* NextQueuedDraw(const CommandBuffer& buffer);
+	// draw at all. On the decode thread, waits for the slot to be free.
+	[[nodiscard]] QueuedDraw* NextQueuedDraw(const LiveRegisters& live);
+public:
+	// Sets up the prepare workers (on first use). False if preparation threading is off.
+	bool EnsurePrepareLanes();
+private:
 	// Copies the registers into the filled slot, hands it to the worker and commits the oldest
 	// queued draws beyond the queue depth.
-	void        PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued);
+	// `commit`: the GPU thread's buffer when the poster is the GPU thread (it commits the oldest
+	// draw when the ring is full); nullptr on the decode thread (it waits for the GPU thread).
+	void        PostQueuedDraw(const LiveRegisters& live, QueuedDraw& queued, CommandBuffer* commit);
 	// Commits the oldest queued draw.
 	void        FinishQueuedDraw(CommandBuffer& buffer);
 	// The queued draw's programs: the worker's if nothing they depend on changed since it was
@@ -599,8 +636,14 @@ private:
 	[[nodiscard]] uint64_t PrepareJob(uint64_t sequence) const {
 		return (sequence - 1) / m_prepare_lanes.size() + 1;
 	}
-	// Waits until every worker has finished its posted jobs.
+	// Waits until every worker has finished its posted jobs. With a decode thread posting, posting
+	// stays paused until ResumePosting.
 	void WaitPrepareIdle();
+	void ResumePosting() {
+		if (m_decode_handoff != nullptr) {
+			m_decode_handoff->pause.store(false, std::memory_order_release);
+		}
+	}
 	[[nodiscard]] uint64_t PrepareBusyNs() const;
 
 	struct GraphicsBindings {
@@ -783,8 +826,15 @@ private:
 	// source). Set at each queued post.
 	uint64_t     m_register_lines_changed = ~uint64_t {0};
 	HW::Context* RegisterSnapshotFor(const HW::Context& live, uint64_t sequence);
-	uint64_t                                         m_queued_posted = 0; // sequences posted
-	uint32_t                                         m_queued_count  = 0; // posted, not committed
+	// Sequences posted (by the poster: the GPU thread, or the decode thread), taken for commit (GPU
+	// thread) and committed (GPU thread, after the commit: the slot and its register snapshot are
+	// free again).
+	alignas(64) std::atomic<uint64_t> m_queued_posted {0};
+	alignas(64) uint64_t              m_queued_taken = 0;
+	alignas(64) std::atomic<uint64_t> m_queued_released {0};
+	DecodeHandoff*                    m_decode_handoff = nullptr;
+	// Register snapshots taken (the poster writes, the GPU thread reports).
+	std::atomic<uint64_t>             m_register_snapshot_count {0};
 	bool                                             m_prepare_verify = false;
 	bool                                             m_prepare_stats  = false;
 	// KYTY_DRAIN_STATS=1: DRAIN lines, the queue drains by reason and the prepare waits each
@@ -805,7 +855,10 @@ private:
 	DrainStats&                 m_drain_stat         = *m_drain_stat_storage;
 	void                        PrintDrainStats();
 	struct PrepareStats {
+		// queued, register_snapshots: from the poster's counters (m_queued_posted,
+		// m_register_snapshot_count) at report time.
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t posted_start = 0, snapshots_start = 0;
 		uint64_t register_snapshots = 0; // new register snapshots (the rest share one)
 		// Adopted although an emulator store came after the post (the unranged epoch would have
 		// dropped them), and the walker page log's distinct pages per draw (buckets 0, 1, 2-3,
