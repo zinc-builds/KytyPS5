@@ -1953,13 +1953,14 @@ void DecodeThread::Run(Pm4Execution& exec, GuestGpu* gpu_state) {
 		stats.start_ns     = DecodeNowNs();
 		stats.posted_start = executor.QueuedPosted();
 	}
-	state.store(State::Running, std::memory_order_release);
-	handoff.to_decode.Notify();
-	bool after_sync = false;
+	// The shadow and the verified baseline before the decode thread starts.
 	if (verify) {
 		VerifySeed();
 	}
 	uint64_t verified = executor.QueuedPosted();
+	state.store(State::Running, std::memory_order_release);
+	handoff.to_decode.Notify();
+	bool after_sync = false;
 	for (;;) {
 		if (verify) {
 			EXIT_IF(g_on_decode_thread || !GuestGpu::IsGpuThread());

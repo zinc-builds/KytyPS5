@@ -758,6 +758,8 @@ private:
 	alignas(64) uint64_t              m_queued_taken = 0;
 	alignas(64) std::atomic<uint64_t> m_queued_released {0};
 	DecodeHandoff*                    m_decode_handoff = nullptr;
+	// Register snapshots taken (the poster writes, the GPU thread reports).
+	std::atomic<uint64_t>             m_register_snapshot_count {0};
 	bool                                             m_prepare_verify = false;
 	bool                                             m_prepare_stats  = false;
 	// KYTY_DRAIN_STATS=1: DRAIN lines, the queue drains by reason and the prepare waits each
@@ -778,7 +780,10 @@ private:
 	DrainStats&                 m_drain_stat         = *m_drain_stat_storage;
 	void                        PrintDrainStats();
 	struct PrepareStats {
+		// queued, register_snapshots: from the poster's counters (m_queued_posted,
+		// m_register_snapshot_count) at report time.
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t posted_start = 0, snapshots_start = 0;
 		uint64_t register_snapshots = 0; // new register snapshots (the rest share one)
 		// Adopted although an emulator store came after the post (the unranged epoch would have
 		// dropped them), and the walker page log's distinct pages per draw (buckets 0, 1, 2-3,

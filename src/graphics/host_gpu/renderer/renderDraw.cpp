@@ -1966,7 +1966,9 @@ HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64
 		}
 	}
 	snapshot->registers = live;
-	m_prepare_stat.register_snapshots++;
+	// The poster's own counter (it may be the decode thread): the GPU thread reports it.
+	m_register_snapshot_count.store(m_register_snapshot_count.load(std::memory_order_relaxed) + 1,
+	                                std::memory_order_relaxed);
 	snapshot->last_sequence    = sequence;
 	m_register_snapshot        = snapshot;
 	m_register_snapshot_source = &live;
@@ -2024,7 +2026,6 @@ void RenderExecutor::PostQueuedDraw(const LiveRegisters& live, QueuedDraw& queue
 	        (m_prepare_pool ? m_prepare_pool->Post() != sequence
 	                        : PrepareWorker(sequence).Post() != PrepareJob(sequence)));
 	m_queued_posted.store(sequence, std::memory_order_release);
-	m_prepare_stat.queued++;
 	if (handoff != nullptr) {
 		handoff->posting.store(false, std::memory_order_release);
 		handoff->to_commit.Notify();
@@ -2376,9 +2377,16 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	if (m_prepare_stats) {
 		auto&      stat = m_prepare_stat;
 		const auto now  = PrepareNowNs();
+		// The poster's counts, from its own counters (it may be the decode thread).
+		const auto posted    = m_queued_posted.load(std::memory_order_relaxed);
+		const auto snapshots = m_register_snapshot_count.load(std::memory_order_relaxed);
+		stat.queued             = posted - stat.posted_start;
+		stat.register_snapshots = snapshots - stat.snapshots_start;
 		if (stat.start_ns == 0) {
-			stat.start_ns       = now;
-			stat.worker_busy_ns = PrepareBusyNs();
+			stat.start_ns        = now;
+			stat.worker_busy_ns  = PrepareBusyNs();
+			stat.posted_start    = posted;
+			stat.snapshots_start = snapshots;
 		} else if (now - stat.start_ns >= 1'000'000'000ull) {
 			const auto busy  = PrepareBusyNs();
 			const auto span  = static_cast<double>(now - stat.start_ns);
@@ -2411,9 +2419,11 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            stat.page_buckets[3], stat.page_buckets[4], stat.page_buckets[5],
 			            stat.page_buckets[6], stat.page_buckets[7],
 			            100.0 * static_cast<double>(stat.register_snapshots) / draws);
-			stat                = {};
-			stat.start_ns       = now;
-			stat.worker_busy_ns = busy;
+			stat                 = {};
+			stat.start_ns        = now;
+			stat.worker_busy_ns  = busy;
+			stat.posted_start    = posted;
+			stat.snapshots_start = snapshots;
 		}
 	}
 }
