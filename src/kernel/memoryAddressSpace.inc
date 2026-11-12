@@ -929,6 +929,20 @@ public:
 		if (alias.aliased) {
 			return false;
 		}
+		// When the page still holds a current token, its marks were cleared when that token was
+		// made, so no scan: stores since then stay marked, the next peek sees them and collects
+		// (conservative), and the next scan reports them. KYTY_LABEL_SCAN_SKIP=0 scans always.
+		static const bool skip = [] {
+			const char* value = std::getenv("KYTY_LABEL_SCAN_SKIP");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (skip) {
+			const auto& slot = m_page_seq[(page >> 12u) % m_page_seq.size()];
+			if (slot.page == page && slot.seq > m_seq_floor) {
+				token = slot.seq;
+				return true;
+			}
+		}
 		m_write_protection.Scan(page, 0x1000, [&](uint64_t begin, uint64_t end) {
 			HideWritesLocked(begin, end, true);
 		});
