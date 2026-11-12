@@ -1505,6 +1505,38 @@ Results, Sky Garden frames 1000–1600 (plain build):
 - Elements: ~1.1k distinct views alive (run peak 1.5k of 65,536). About 1 allocation and 1 retirement per frame with an 8-GC-tick ageing (a GC tick is ~1 per frame). 127 distinct samplers.
 - Off mode: neutral. `ab.sh` against the merge-base: ipd +0.33% ±0.20, cpd −0.34% ±0.80, FPS +0.43% ±1.39, all noise. The first version cost ~1.6% FPS with its hooks inside the hot loops. They are now compiled into a second copy of each loop.
 
+### Resident textures, stage 1b (Track R, 2026-11-12)
+
+`KYTY_RESIDENT_TEXTURES=1` (off by default; `=verify` also runs the classic acquisition and checks each skip; `=shadow` is 1a). Draw stages (never compute) sample their plain sampled images and, when no sampler is indirect, all their samplers through the image heap's set 1 (binding 0 images, binding 1: 4,096 samplers) by 16-bit index words at the end of the stage's shader data. Not resident: storage, heap, atomic, indirectly selected and dynamic-mip images. Per slot, RebindImages skips (the record's remembered element, no acquisition, transition or descriptor write) when the binding epoch, GC tick and `Image::unsettle_generation` / `read_layout_epoch` (or the image's `residency_version`) are those of the last draw that left the image settled in its read layout. A reused set whose counters are unchanged is skipped whole. A slot whose image is also a target or storage image of the draw (`Image::resident_live`, checked in `BindRenderTarget`/`BindImage`) gets a one-draw element in the layout the classic commit picks. Elements are written on the command thread after the draw's commit (update-after-bind, before the draw is published), shared per (image serial, view), retired 8 GC ticks after last use or when the image is unregistered, and reused only once their retirement tick is free.
+
+- **The mode keys the shader store** (`Spirv::Profile::resident_textures` in the store header): switching it recompiles every module once. A/Bs use two install dirs with the same binary.
+- **Capabilities:** without `shaderSampledImageArrayDynamicIndexing` or enough update-after-bind images, samplers or per-stage resources, startup logs "Resident textures unavailable" and draws keep classic bindings.
+- **Validation caught what the gate missed.** Warm-up from the shader store created pipeline layouts before `ImageHeap` existed, so every warmed pipeline had a null set 1 and resident mode drew black. `gate.sh` passed, because its screenshots are compared by eye. The image heap's set layout is now a `RenderContext` member made before the pipeline cache, and creating a heap pipeline layout without it exits. After a change to pipeline layouts or to the warm-up order, run once under `--vulkan-validation`.
+- **Verify found one real bug.** A skip took the read-layout epoch at the end of RebindImages, so an image moved during it (a copy source for another slot's acquisition) was sampled in General through a read-layout element. The epoch is now the prediction's snapshot.
+
+Results (plain build, same binary, mode on vs off):
+
+| | 200–500 (`r1b-ab5`) | 1000–1600, `KYTY_BENCH_PMU=1` (`r1b-pmu`) |
+|---|---|---|
+| `cmd_ns` | −3.93% ±0.77 `!` | −1.85% ±0.37 `!` |
+| `cpd` | −3.42% ±0.53 `!` | −2.50% ±0.47 `!` |
+| `ipd` | −11.27% ±0.17 `!` | −10.10% ±0.15 `!` |
+| `wait_prep` | +86 ns `!` | +66 ns `?` |
+| FPS | +5.19% ±1.14 `!` | +0.53% ±0.39 `~` |
+
+- The command thread's saving turns into prepare wait (worker latency co-limit), so FPS of record barely moves.
+- **Where it comes from** (`r1b-pmu`, per draw): L1 misses 366 → 335, L2 misses 51.7 → 51.5, L3 6.9 → 7.2, cross-core snoop hits 40.5 → 39.4. Top-down: retiring −441 cycles, memory-bound −252, core-bound +207.
+  - Precise L1-miss samples: the bound-image path loses ~41 (CommitBindings −11, `GetBarriers` −10, `AcquireTexture` −7.5, `FindView` −4.4, `TouchImage` −4.1, `FindRenderTarget` −3.5).
+  - New ones: `ResidentStore::TrySkip` +6.6 (its entry and element tables) and `AcquireRenderTargets` +6.1 (target `Image`s the texture path used to warm).
+  - The removed misses hit in L2, so they cost little. The thread's expensive misses (worker-written lines, DRAM) are elsewhere.
+- **Verify:** 3 of 3 full runs clean (~6.7M draws each). Per run: 0–1 late transits and 0–1 verify races.
+- **Stats** (`KYTY_RESIDENT_STATS=1`, one full run):
+  - slots: 92% skip (global counters), 1.5% skip (per-image), 0.5% conflict, 3.1% null;
+  - stages: 9.8% keep shader data in a buffer, 3.4% only because of the index words;
+  - index words per stage (0 / 1–2 / 3–4 / 5–8 / 9–16 / 17+): 27% / 16% / 21% / 0.6% / 23% / 12%;
+  - elements: ~1.08k alive (peak 1.5k), ~470k one-draw conflict elements per run, 127 samplers.
+- **Off mode** against the merge-base: `cmd_ns` −0.94% ±0.98 `~`, `cpd` −0.22% `~`, `ipd` +0.74% `!` (two binaries).
+
 ### Build modes: PGO + ThinLTO (Track P, 2026-11-11)
 
 The research pass (branch `research/60fps-gap`) found PGO + ThinLTO worth +12.5% with no source
