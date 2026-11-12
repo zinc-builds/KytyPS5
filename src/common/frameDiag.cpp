@@ -122,7 +122,8 @@ constexpr std::array DebugFields {
     std::pair {DC::GuestFileReadBytes, "file_rd_b"},
 };
 constexpr std::array OwnNames {"mutex_wait_ns", "mutex_waits", "gc", "gc_ns", "collects", "collect_ns",
-                               "submit_scans", "submit_scan_ns", "tex_new", "buf_new"};
+                               "submit_scans", "submit_scan_ns", "tex_new", "buf_new", "cmd_gpu_waits",
+                               "cmd_gpu_wait_ns"};
 static_assert(OwnNames.size() == static_cast<size_t>(Counter::Count));
 
 struct Totals {
@@ -134,7 +135,33 @@ struct Totals {
 	uint64_t proc_minflt = 0, proc_majflt = 0;
 };
 
-Totals Read() {
+// On the command thread itself, its own clock and rusage are cheaper than /proc.
+ThreadStat ReadSelf() {
+	ThreadStat out;
+#if defined(__linux__)
+	timespec ts {};
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+		out.cpu_ns = static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(ts.tv_nsec);
+	}
+	rusage usage {};
+	if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+		out.minflt = static_cast<uint64_t>(usage.ru_minflt);
+		out.majflt = static_cast<uint64_t>(usage.ru_majflt);
+		out.vcs    = static_cast<uint64_t>(usage.ru_nvcsw);
+		out.ics    = static_cast<uint64_t>(usage.ru_nivcsw);
+	}
+	if (FILE* f = std::fopen("/proc/thread-self/schedstat", "r"); f != nullptr) {
+		unsigned long long run = 0, wait = 0;
+		if (std::fscanf(f, "%llu %llu", &run, &wait) == 2) {
+			out.runq_ns = wait;
+		}
+		std::fclose(f);
+	}
+#endif
+	return out;
+}
+
+Totals Read(bool self) {
 	Totals t;
 	for (size_t i = 0; i < DebugFields.size(); i++) {
 		t.debug[i] = Common::DebugCounters::Get(DebugFields[i].first);
@@ -143,7 +170,7 @@ Totals Read() {
 		t.own[i] = Detail::g_counters[i].load(std::memory_order_relaxed);
 	}
 	namespace B = Common::BenchMetrics;
-	t.cmd          = ReadThread(B::ThreadId(Role::Cmd));
+	t.cmd          = self ? ReadSelf() : ReadThread(B::ThreadId(Role::Cmd));
 	t.prep_wait_ns = B::Value(BM::DrainWaitNs) + B::Value(BM::RefillWaitNs) +
 	                 B::Value(BM::SteadyWaitNs) + B::Value(BM::IdleWaitNs);
 	t.rec_wait_ns  = B::Value(BM::RecorderWaitNs);
@@ -164,9 +191,38 @@ Totals Read() {
 }
 
 struct State {
-	bool   have = false;
-	Totals last;
-} g_state; // presentation thread only
+	bool     have = false;
+	Totals   last;
+	uint64_t last_ns = 0;
+	uint64_t count   = 0;
+};
+State g_presented; // presentation thread only
+State g_guest;     // command thread only
+
+void Print(const char* head, const Totals& now, const Totals& a) {
+	const auto d = [](uint64_t x, uint64_t y) { return static_cast<unsigned long long>(x - y); };
+	char       line[2304];
+	int        n = std::snprintf(
+        line, sizeof(line),
+        "%s cmd_cpu_ns=%llu cmd_runq_ns=%llu cmd_minflt=%llu cmd_majflt=%llu cmd_vcs=%llu "
+               "cmd_ics=%llu prep_wait_ns=%llu rec_wait_ns=%llu rejected=%llu drains=%llu prep_busy_ns=%llu "
+               "prep_cpu_ns=%llu rec_cpu_ns=%llu proc_minflt=%llu proc_majflt=%llu",
+        head, d(now.cmd.cpu_ns, a.cmd.cpu_ns), d(now.cmd.runq_ns, a.cmd.runq_ns),
+        d(now.cmd.minflt, a.cmd.minflt), d(now.cmd.majflt, a.cmd.majflt), d(now.cmd.vcs, a.cmd.vcs),
+        d(now.cmd.ics, a.cmd.ics), d(now.prep_wait_ns, a.prep_wait_ns), d(now.rec_wait_ns, a.rec_wait_ns),
+        d(now.rejected, a.rejected), d(now.drains, a.drains), d(now.prep_busy_ns, a.prep_busy_ns),
+        d(now.prep_cpu_ns, a.prep_cpu_ns), d(now.rec_cpu_ns, a.rec_cpu_ns),
+        d(now.proc_minflt, a.proc_minflt), d(now.proc_majflt, a.proc_majflt));
+	for (size_t i = 0; i < DebugFields.size() && n < static_cast<int>(sizeof(line)) - 48; i++) {
+		n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu", DebugFields[i].second,
+		                   d(now.debug[i], a.debug[i]));
+	}
+	for (size_t i = 0; i < OwnNames.size() && n < static_cast<int>(sizeof(line)) - 48; i++) {
+		n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu", OwnNames[i], d(now.own[i], a.own[i]));
+	}
+	std::printf("%s\n", line);
+	std::fflush(stdout);
+}
 
 } // namespace
 
@@ -182,38 +238,33 @@ void OnFlip(uint64_t frame, double interval_ms) noexcept {
 	if (!Enabled()) {
 		return;
 	}
-	const auto now = Read();
-	if (!g_state.have) {
-		g_state = {true, now};
+	const auto now = Read(false);
+	if (g_presented.have) {
+		char head[160];
+		std::snprintf(head, sizeof(head), "FRAME f=%" PRIu64 " ms=%.2f vbl=%.0f", frame, interval_ms,
+		              std::max(1.0, std::round(interval_ms / (1000.0 / 60.0))));
+		Print(head, now, g_presented.last);
+	}
+	g_presented.have = true;
+	g_presented.last = now;
+}
+
+void OnGuestFlip(uint64_t frame) noexcept {
+	if (!Enabled()) {
 		return;
 	}
-	const auto& a = g_state.last;
-	const auto  d = [](uint64_t x, uint64_t y) { return static_cast<unsigned long long>(x - y); };
-	char        line[2048];
-	int         n = std::snprintf(
-        line, sizeof(line),
-        "FRAME f=%" PRIu64 " ms=%.2f vbl=%.0f cmd_cpu_ns=%llu cmd_runq_ns=%llu cmd_minflt=%llu "
-                "cmd_majflt=%llu cmd_vcs=%llu cmd_ics=%llu prep_wait_ns=%llu rec_wait_ns=%llu rejected=%llu "
-                "drains=%llu prep_busy_ns=%llu prep_cpu_ns=%llu rec_cpu_ns=%llu proc_minflt=%llu "
-                "proc_majflt=%llu",
-        frame, interval_ms, std::max(1.0, std::round(interval_ms / (1000.0 / 60.0))),
-        d(now.cmd.cpu_ns, a.cmd.cpu_ns), d(now.cmd.runq_ns, a.cmd.runq_ns),
-        d(now.cmd.minflt, a.cmd.minflt), d(now.cmd.majflt, a.cmd.majflt), d(now.cmd.vcs, a.cmd.vcs),
-        d(now.cmd.ics, a.cmd.ics), d(now.prep_wait_ns, a.prep_wait_ns),
-        d(now.rec_wait_ns, a.rec_wait_ns), d(now.rejected, a.rejected), d(now.drains, a.drains),
-        d(now.prep_busy_ns, a.prep_busy_ns), d(now.prep_cpu_ns, a.prep_cpu_ns),
-        d(now.rec_cpu_ns, a.rec_cpu_ns), d(now.proc_minflt, a.proc_minflt),
-        d(now.proc_majflt, a.proc_majflt));
-	for (size_t i = 0; i < DebugFields.size() && n < static_cast<int>(sizeof(line)) - 48; i++) {
-		n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu", DebugFields[i].second,
-		                   d(now.debug[i], a.debug[i]));
+	const auto now    = Read(true);
+	const auto now_ns = NowNs();
+	if (g_guest.have) {
+		char head[160];
+		std::snprintf(head, sizeof(head), "GFRAME g=%" PRIu64 " f=%" PRIu64 " ms=%.3f", g_guest.count,
+		              frame, static_cast<double>(now_ns - g_guest.last_ns) / 1e6);
+		Print(head, now, g_guest.last);
 	}
-	for (size_t i = 0; i < OwnNames.size() && n < static_cast<int>(sizeof(line)) - 48; i++) {
-		n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu", OwnNames[i], d(now.own[i], a.own[i]));
-	}
-	std::printf("%s\n", line);
-	std::fflush(stdout);
-	g_state.last = now;
+	g_guest.have    = true;
+	g_guest.last    = now;
+	g_guest.last_ns = now_ns;
+	g_guest.count++;
 }
 
 } // namespace Common::FrameDiag

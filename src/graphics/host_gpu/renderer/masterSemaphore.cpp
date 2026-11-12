@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "common/frameDiag.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -100,8 +101,16 @@ void MasterSemaphore::Wait(uint64_t tick, const std::source_location& site) {
 	const bool diag  = m_wait_diag && Common::StallDiag::OnCommandThread();
 	const auto known = diag ? KnownGpuTick() : 0;
 	const auto start = diag ? Common::GpuWaitDiag::NowNs() : 0;
+	const auto frame_start = Common::FrameDiag::Enabled() && Common::StallDiag::OnCommandThread()
+	                             ? Common::FrameDiag::NowNs()
+	                             : 0;
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (frame_start != 0) {
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::CmdGpuWaits);
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::CmdGpuWaitNs,
+		                       Common::FrameDiag::NowNs() - frame_start);
+	}
 	if (diag) {
 		Common::GpuWaitDiag::NoteWait(tick, CurrentTick(), known, start,
 		                              Common::GpuWaitDiag::NowNs(), site);
