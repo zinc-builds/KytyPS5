@@ -303,6 +303,10 @@ public:
 		if (const char* path = std::getenv("KYTY_SHOT_FILE"); path != nullptr) {
 			m_request = path;
 		}
+		// KYTY_SHOT_COUNT=<n>: also save the next n-1 presented frames, as <out>-<k>.ppm.
+		if (const char* count = std::getenv("KYTY_SHOT_COUNT"); count != nullptr) {
+			m_extra = static_cast<uint32_t>(std::max(std::atoi(count) - 1, 0));
+		}
 	}
 	~BenchShot() {
 		if (m_buffer != nullptr) {
@@ -439,6 +443,15 @@ private:
 		return PerformanceOverlayFlipCount() >= m_flip;
 	}
 	void Finish() {
+		if (m_taken < m_extra && !m_out.empty()) {
+			if (m_taken == 0) {
+				m_base = m_out;
+			}
+			m_taken++;
+			m_out  = m_base + "-" + std::to_string(m_taken) + ".ppm";
+			m_flip = PerformanceOverlayFlipCount() + 1;
+			return;
+		}
 		std::remove(m_request.c_str());
 		m_out.clear();
 	}
@@ -448,6 +461,9 @@ private:
 	std::string     m_out;
 	uint64_t        m_flip  = 0;
 	uint32_t        m_polls = 0;
+	uint32_t        m_extra = 0;
+	uint32_t        m_taken = 0;
+	std::string     m_base;
 	VkBuffer        m_buffer     = VK_NULL_HANDLE;
 	VmaAllocation   m_allocation = nullptr;
 	void*           m_mapped     = nullptr;
