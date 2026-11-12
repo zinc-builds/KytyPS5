@@ -510,7 +510,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 uint64_t CommandScheduler::SubmitQueued(SubmitInfo submit) {
 	// The tick is taken here, in submission order: only this thread submits on this timeline, and
 	// the recording thread submits in queue order. A host wait for it before the recording thread
-	// has submitted is a wait-before-signal, which timeline semaphores allow; the Publish below
+	// has submitted is a wait-before-signal, which timeline semaphores allow; the PublishAndWake below
 	// guarantees the submission follows.
 	if (m_next_wait_value != 0) {
 		submit.AddWait(m_next_wait_semaphore, m_next_wait_value, vk::PipelineStageFlagBits::eTransfer);
@@ -554,7 +554,8 @@ uint64_t CommandScheduler::SubmitQueued(SubmitInfo submit) {
 			    Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws));
 		}
 	});
-	m_recorder->Publish();
+	// A host wait for this tick may follow at once: the recorder must not sleep through it.
+	m_recorder->PublishAndWake();
 	m_command.m_buffer = nullptr;
 	return tick;
 }
