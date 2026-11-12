@@ -94,6 +94,28 @@ struct PreparedBindings {
 		const std::vector<TextureProposal>* proposals = nullptr;
 		std::vector<uint8_t>                flags; // per image
 	} resident;
+	// Resident textures (IR::ImageResource::resident slots; ResidentStore): what this draw's
+	// slots sample, decided in RebindImages and committed in CommitBindings.
+	struct ResidentSlots {
+		enum Kind : uint8_t {
+			None     = 0, // not a resident slot
+			Null     = 1, // no image: element 0
+			Skip     = 2, // the record's element, no per-image work
+			Acquired = 3, // acquired and transitioned here; a shared element
+			Conflict = 4, // also a target or storage image of the draw: a one-draw element
+		};
+		enum Verify : uint8_t {
+			Predicted   = 1, // KYTY_RESIDENT_TEXTURES=verify: a skip, done the classic way
+			SlowAcquire = 2, // and the view lookup did not take the settled path
+		};
+		const std::vector<TextureProposal>* proposals = nullptr;
+		std::vector<uint8_t>                kinds;    // per image
+		std::vector<uint8_t>                verify;   // per image
+		std::vector<uint32_t>               elements; // per image
+		std::vector<uint16_t>               words;    // resident images, then samplers
+		uint64_t                            layout_epoch   = 0; // read_layout_epoch at RebindImages
+		bool                                samplers_valid = false;
+	} resident_slots;
 };
 
 [[nodiscard]] vk::DescriptorType

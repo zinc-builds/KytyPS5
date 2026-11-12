@@ -54,8 +54,13 @@ public:
 	// samples `view` in `layout`, written at the next WriteResidentElements. Retiring one makes
 	// it reusable once the current scheduler tick is free.
 	[[nodiscard]] uint32_t AllocateResident(vk::ImageView view, vk::ImageLayout layout);
+	// Points an element allocated earlier at a view (a feedback element written at commit).
+	void                   SetResident(uint32_t index, vk::ImageView view, vk::ImageLayout layout);
 	void                   RetireResident(uint32_t index);
 	void                   WriteResidentElements() { WriteDescriptors(); }
+	// Resident samplers (binding IR::ResidentSamplerBinding), written at once; never retired.
+	void                   WriteResidentSampler(uint32_t index, vk::Sampler sampler);
+	[[nodiscard]] bool     ResidentElementFree(uint64_t tick);
 
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;

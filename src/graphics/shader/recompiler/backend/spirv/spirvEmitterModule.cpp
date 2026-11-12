@@ -232,11 +232,43 @@ void DefineDescriptors(EmitterState& state) {
 		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
+	// Resident textures: draw stages sample their plain sampled images (not heap, storage,
+	// dynamic-mip or indirectly selected ones) and, without indirect samplers, all samplers
+	// through the image heap's set, by index words in shader data.
+	const bool resident_stage =
+	    state.profile.resident_textures && state.program.stage != ShaderType::Compute;
+	std::vector<bool> indirect(info.images.size(), false);
+	for (uint32_t i = 0; i < info.images.size(); i++) {
+		const auto& image = info.images[i];
+		if (image.indirect_root != IR::ImageResource::NoIndirectImage ||
+		    !image.indirect_resources.empty()) {
+			indirect[i] = true;
+		}
+		for (const auto candidate: image.indirect_resources) {
+			if (candidate < indirect.size()) indirect[candidate] = true;
+		}
+	}
+	bindings.resident_images   = 0;
+	bindings.resident_samplers = 0;
+	for (uint32_t i = 0; i < info.images.size(); i++) {
+		auto& image    = info.images[i];
+		image.resident = resident_stage && !image.heap && !indirect[i] &&
+		                 image.resource_class == IR::ImageResourceClass::Sampled && !image.atomic &&
+		                 image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count == 1u;
+	}
 	for (auto& image: info.images) {
 		const auto kind = IR::DescriptorBindingForImage(image);
 		if (!kind.has_value() || image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
 			EXIT("shader image has an invalid descriptor type or mip count");
+		}
+		if (image.resident) {
+			auto& definition = state.heap_images[IR::ImageBindingIndex(*kind)];
+			if (definition.variable == 0) {
+				DefineImageArray(state, definition, image, IR::ImageHeapCapacity, IR::ImageHeapSet, 0u);
+			}
+			image.descriptor_index = bindings.resident_images++;
+			continue;
 		}
 		if (image.heap) {
 			// Heap kinds alias one array; the root itself is never accessed.
@@ -251,7 +283,33 @@ void DefineDescriptors(EmitterState& state) {
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
 		count += image.mip_count;
 	}
-	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
+	const bool resident_samplers =
+	    resident_stage && !info.samplers.empty() &&
+	    std::ranges::none_of(info.samplers, [](const IR::SamplerResource& sampler) {
+		    return sampler.indirect_root != IR::SamplerResource::NoIndirectSampler ||
+		           !sampler.indirect_resources.empty();
+	    });
+	if (resident_samplers) {
+		bindings.resident_samplers = static_cast<uint32_t>(info.samplers.size());
+		state.sampler_type         = state.builder.Type(spv::OpTypeSampler);
+		state.sampler_pointer_type =
+		    TypePointer(state, spv::StorageClassUniformConstant, state.sampler_type);
+		const auto array = state.builder.Type(spv::OpTypeArray, state.sampler_type,
+		                                      ConstantU32(state, IR::ResidentSamplerCapacity));
+		state.sampler_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassUniformConstant, array),
+		    spv::StorageClassUniformConstant);
+		state.builder.AddName(state.sampler_variable, "resident_samplers");
+		state.builder.AddAnnotation(spv::OpDecorate, state.sampler_variable,
+		                            spv::DecorationDescriptorSet, IR::ImageHeapSet);
+		state.builder.AddAnnotation(spv::OpDecorate, state.sampler_variable,
+		                            spv::DecorationBinding, IR::ResidentSamplerBinding);
+	}
+	if (bindings.ResidentWords() != 0) {
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayDynamicIndexing);
+	}
+	counts[static_cast<size_t>(Kind::Samplers)] =
+	    resident_samplers ? 0u : static_cast<uint32_t>(info.samplers.size());
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;

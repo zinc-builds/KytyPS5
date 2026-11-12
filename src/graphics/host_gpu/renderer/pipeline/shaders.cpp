@@ -294,6 +294,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			const auto native_stage = NativeShaderStage(stage->info.stage);
 			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+			// Resident textures sample through the image heap's set as well.
+			pipeline.uses_image_heap |= stage->info.bindings.ResidentWords() != 0u;
 			pipeline.push_stages |= native_stage;
 		}
 	}

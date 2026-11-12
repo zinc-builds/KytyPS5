@@ -155,7 +155,18 @@ void DecorateNonUniformDescriptor(EmitterState& state, uint32_t id, spv::Capabil
 
 ImageDefinition& ImageDescriptorDefinition(EmitterState& state, const IR::ImageResource& image,
                                            IR::DescriptorBindingKind kind) {
-	return (image.heap ? state.heap_images : state.images)[IR::ImageBindingIndex(kind)];
+	return (image.heap || image.resident ? state.heap_images
+	                                     : state.images)[IR::ImageBindingIndex(kind)];
+}
+
+// Resident textures: index word `word` of the shader data (16 bits, two per dword), a
+// dynamically uniform index into the image heap's arrays.
+uint32_t ResidentIndex(EmitterState& state, uint32_t word) {
+	auto value = EmitShaderDataDwordLoad(state, state.program.bindings.ResidentDword() + word / 2u);
+	if ((word & 1u) != 0u) {
+		value = Binary(state, spv::OpShiftRightLogical, TypeU32(state), value, ConstantU32(state, 16u));
+	}
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, ConstantU32(state, 0xffffu));
 }
 } // namespace
 
@@ -181,9 +192,13 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t a
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Samplers, sampler,
 		                             "sampler resource index is out of range");
 	}
+	const bool resident = state.program.bindings.resident_samplers != 0u;
+	EXIT_IF(resident && array_index != 0u);
 	const auto pointer = DescriptorElementPointer(
 	    state, state.sampler_pointer_type, state.sampler_variable,
-	    array_index == 0u ? ConstantU32(state, sampler) : array_index,
+	    resident             ? ResidentIndex(state, state.program.bindings.resident_images + sampler)
+	    : array_index == 0u ? ConstantU32(state, sampler)
+	                        : array_index,
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
 	const auto sampler_id = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, state.sampler_type, sampler_id, pointer);
@@ -216,8 +231,11 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(mip >= image.mip_count);
 	const auto kind = IR::DescriptorBindingForImage(image);
-	EXIT_IF(!kind.has_value() || (image.heap && array_index == 0u));
-	if (array_index == 0u) {
+	EXIT_IF(!kind.has_value() || (image.heap && array_index == 0u) ||
+	        (image.resident && (array_index != 0u || mip != 0u)));
+	if (image.resident) {
+		array_index = ResidentIndex(state, image.descriptor_index);
+	} else if (array_index == 0u) {
 		array_index = ConstantU32(state, image.descriptor_index + mip);
 	}
 	const auto& definition = ImageDescriptorDefinition(state, image, *kind);
