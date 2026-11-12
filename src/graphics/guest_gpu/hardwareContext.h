@@ -902,7 +902,9 @@ private:
 
 	ShaderRegisters m_sh_regs;
 
-	// Mutable: consumers clear their mask through a const view of the registers.
+	// Mutable: consumers clear their mask through a const view of the registers. Only the command
+	// thread reads, sets or clears them (on the live context); workers read snapshots, whose
+	// copies of the masks nothing uses.
 	mutable std::array<uint64_t, static_cast<uint32_t>(ChangeConsumer::Count)> m_changed {};
 
 	template <typename T>
