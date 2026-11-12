@@ -93,6 +93,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-12 | Hand-off stage A, shared register snapshots: a queued draw points at a command-thread-owned `HW::Context` snapshot instead of carrying a 2.7 KB copy; consecutive draws share one while no written register line changed (89% of draws in Sky Garden). Setters mark the lines they write with flag bytes and the post compares only those lines with the previous snapshot (`m_register_lines_changed`, also for Track B's run check). Per draw, same binary through `KYTY_REGISTER_SNAPSHOT=0` (3 runs a side): command-thread cycles −3.26%±1.02, cross-core snoop-hit loads 42.5 → 38.0 on the command thread and 29.7 → 24.6 on the workers, L1-missing loads 385 → 347. Against dev (two binaries): cycles −2.54%±1.14 and −1.21%±0.76 in two batches, instructions +0.8% (the marking). Two first versions lost the gain: a compare in every setter, then a mask word every setter read-modify-wrote (a store-forwarding chain through runs of register writes). The 55-cycle heuristic undercounts: −4.5 snoop loads would be ~250 cycles, the copy's stores and L1 misses account for the rest (Track B4; gate.sh: ref `dev` e1ad8deb 52.01 / 52.01; `KYTY_REGISTER_SNAPSHOT=verify` + `KYTY_PREPARE_VERIFY` clean) | 52.84 / 52.57 | 275.1k / 275.4k | 38.5 (max 98.5) / 33.5 (max 33.6) | 26.9 / 29.9 |
 | 2026-11-12 | A CP label store skips its one-page `PAGEMAP_SCAN` when the label's page still holds a current token (its marks were cleared when that token was made; stores since stay marked, so the next peek collects and the next scan reports them): label-store scans ~67k → ~5.9k/s, ~70 more collections/s from peeks that now see a store (`KYTY_LABEL_SCAN_SKIP=0` scans always; Track K; gate.sh, same binary, 3 runs a side: `cmd_ns` −2.4% ± 0.5, `cmd_sns` −20.4% ± 1.8, FPS +2.0% ± 0.6; `KYTY_ASYNC_WP_VERIFY` 0 lost). Not done: one lock for the label store's protect and backing store (~4 locked operations per store, ~4 ns/draw, no system calls) | | | | |
 | 2026-11-12 | A resumed submission no longer scans for guest writes at its start when the packet it stopped at collects on its own once satisfied (WAIT_REG_MEM, MEM_SEMAPHORE wait, REWIND; a predication wait still scans): ~520 scans/s fewer on the GPU thread (`KYTY_RESUME_SCAN=1` scans; `=verify` counts the write-watched pages the skip defers, ~175k/s, written while blocked, collected at the wait's release or the next scan; Track K; a pending collection request still forces a full scan; gate.sh, same binary, 3 runs a side: `cmd_ns` −1.3% ± 0.4, `cmd_sns` −19.2% ± 2.6, FPS +2.0% ± 0.7; `KYTY_ASYNC_WP_VERIFY` 0 lost) | | | | |
+| 2026-11-12 | Early submit (`KYTY_EARLY_SUBMIT`, Track W): where a packet already drains, the open command buffer is submitted if the GPU has finished everything earlier and the buffer is ≥300 µs old, so the end-of-frame GPU work no longer waits for the guest's command buffer to end. Same binary, `KYTY_EARLY_SUBMIT=0` as reference, PGO, frames 1000–1600 (gate.sh): FPS +5.00% ±0.39 (ref 55.66 / 54.32; on dev ab68b255+#107; +3.62% on a6a007df), `cmd_ns` +0.4% (noise; ~5.5 extra submits per frame); command-thread GPU wait 0.62 → 0.08 ms/frame, flip completion 4.25 → 2.39 ms after decode | 57.92 / 57.56 | 303.3k / 299.7k | 33.5 / 36.2 (max 66.8) | 27.2 / 27.4 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1748,6 +1749,17 @@ ran ~54.8 FPS: the command thread just became less busy (95.5% → 93.6%). `KYTY
   `WaitPriorityOperations` ~0.8%, `TakeKeptWrites` waiting for in-flight submit scans ~0.3%.
 - Ruled out: vsync (the command thread never runs out of work; flips 1 vblank apart at p50), the
   game's threads, the present path (its own scheduler; the command thread never waits there).
+- **Early submit (`KYTY_EARLY_SUBMIT`, default on, `KYTY_EARLY_SUBMIT_US`=300):** at packets that
+  already drain the draw queue and end dispatch chains and atomic batches, the command processor
+  submits the open command buffer when every earlier submission has finished on the GPU and the
+  buffer is at least 300 µs old. FPS +3.6% / +5.0% (same binary, two bases); GPU wait 0.62 → 0.08 ms per frame
+  (average wait 2.8 → 0.41 ms), flip completion 4.25 → 2.39 ms after decode (measured at 150 µs), ~5.5 early submits
+  per frame; the command thread is ~97% busy again, so FPS follows `cmd_ns` again. 150 vs 300 µs:
+  `cmd_ns` equal, GPU wait 2.5–4.7 vs 1.8–2.1 ms/s, so 300.
+- **Left on purpose:** the same synchronous download still waits ~0.4 ms, 0.2 times per frame
+  (~0.08 ms per frame, `bufferCache.cpp` `DownloadBufferMemory<false>` from
+  `CollectAsyncWrites`). Making it asynchronous is worth little now; re-check with
+  `KYTY_GPU_WAIT_DIAG=1` (`GPUWAITSITE`) if it grows as the command thread gets cheaper.
 
 ## Critical path after B4 (2026-11-07)
 
@@ -1928,6 +1940,9 @@ ran ~54.8 FPS: the command thread just became less busy (95.5% → 93.6%). `KYTY
   `/proc/self/task/<tid>/syscall` every ~200 µs and keys its sleeps by syscall and the return
   addresses on its stack (heuristic: stale words appear). Perf can't record context switches
   here (`perf_event_paranoid` 2).
+- Early submission (Track W): `KYTY_EARLY_SUBMIT=0` submits only where guest command buffers end
+  (and at the existing internal flushes); `KYTY_EARLY_SUBMIT_US=<µs>` sets the minimum age of the
+  open command buffer (default 300). With `KYTY_GPU_WAIT_DIAG`, `GPUWAIT` shows `early_submits_s`.
 - Critical path: `KYTY_STALL_DIAG=1` prints a `STALL` line once per second with the GPU command
   thread's waits by cause (no guest work, blocked guest waits, prepare worker, recorder ring,
   GPU, other threads' synchronous commands and the GPU waits inside them, scheduler callbacks)
