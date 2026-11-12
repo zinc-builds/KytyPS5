@@ -2609,6 +2609,51 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckRetireNoWait() {
+    EnsureRuntimeContext();
+    constexpr const char *name = "RetireNoWait";
+    if (const char *nowait = std::getenv("KYTY_RETIRE_NOWAIT"); nowait != nullptr && nowait[0] == '0') {
+      std::printf("[host]    %-32s skipped (KYTY_RETIRE_NOWAIT=0)\n", name);
+      return; // retirement waits for the held priority operation: the case would block
+    }
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    // A priority operation that runs until released, then a normal one of the same tick.
+    std::atomic<bool> release{false};
+    std::atomic<bool> priority_ran{false};
+    bool normal_ran = false;
+    const auto tick = scheduler.CurrentTick();
+    scheduler.DeferPriorityOperation([&release, &priority_ran] {
+      while (!release.load()) {
+        std::this_thread::yield();
+      }
+      priority_ran = true;
+    });
+    scheduler.DeferOperation([&priority_ran, &normal_ran] {
+      normal_ran = priority_ran.load();
+      if (!normal_ran) {
+        std::abort(); // ran before its tick's priority operation
+      }
+    });
+    scheduler.Flush();
+    scheduler.Wait(tick);
+    // The GPU is done; the priority operation is not: the normal one stays queued, no wait.
+    for (int i = 0; i < 3; i++) {
+      scheduler.RetirePendingOperations();
+      Require(name, "kept", !normal_ran, "retired past an unfinished priority operation");
+    }
+    release = true;
+    scheduler.DrainPriorityOperations();
+    scheduler.RetirePendingOperations();
+    Require(name, "retired", normal_ran, "the operation did not retire after its priority operation");
+    scheduler.Finish();
+    scheduler.Shutdown();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckEarlySubmit() {
     EnsureRuntimeContext();
     constexpr const char *name = "EarlySubmit";
@@ -56557,6 +56602,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
     vulkan.CheckEarlySubmit();
+    vulkan.CheckRetireNoWait();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
@@ -57265,6 +57311,7 @@ int main(int argc, char **argv) {
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckEarlySubmit();
+  vulkan.CheckRetireNoWait();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckVideoOutHdr10ToSdr();
   vulkan.CheckDescriptorHeapLargeSet();

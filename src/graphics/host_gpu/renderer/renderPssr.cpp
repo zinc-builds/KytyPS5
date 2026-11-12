@@ -31,7 +31,7 @@ RenderExecutor::~RenderExecutor() {
 }
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().RetirePendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
 	std::copy_n(request.input, 8, input_descriptor.fields);

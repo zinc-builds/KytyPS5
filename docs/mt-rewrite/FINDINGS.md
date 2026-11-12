@@ -1786,6 +1786,13 @@ ran ~54.8 FPS: the command thread just became less busy (95.5% → 93.6%). `KYTY
   (average wait 2.8 → 0.41 ms), flip completion 4.25 → 2.39 ms after decode (measured at 150 µs), ~5.5 early submits
   per frame; the command thread is ~97% busy again, so FPS follows `cmd_ns` again. 150 vs 300 µs:
   `cmd_ns` equal, GPU wait 2.5–4.7 vs 1.8–2.1 ms/s, so 300.
+- **Scheduler waits (`SCHEDWAIT` lines, `KYTY_GPU_WAIT_DIAG=1`; after early submit, dev 2662671e):**
+  the command thread blocked in `WaitPriorityOperations` 166 times/s, 84 µs each (13.9 ms/s, 1.4%),
+  almost all from the per-draw `PopPendingOperations` (`DrawIndex`, `DrawAuto`, dispatches). In
+  100% of them the GPU had already finished the tick: the wait was for the priority thread to wake
+  from its own semaphore wait and run the tick's callbacks (interrupts, readback publishes, flips).
+  `RetirePendingOperations` (the per-draw/per-dispatch callers) now leaves such an operation queued
+  for a later draw instead (`KYTY_RETIRE_NOWAIT=0` waits again): 13.9 → 0.1–0.6 ms/s.
 - **Left on purpose:** the same synchronous download still waits ~0.4 ms, 0.2 times per frame
   (~0.08 ms per frame, `bufferCache.cpp` `DownloadBufferMemory<false>` from
   `CollectAsyncWrites`). Making it asynchronous is worth little now; re-check with

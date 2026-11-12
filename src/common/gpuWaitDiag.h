@@ -48,6 +48,12 @@ void NoteComplete(uint64_t tick, uint64_t now_ns) noexcept;
 // submitted, known = the GPU tick known when the wait began.
 void NoteWait(uint64_t tick, uint64_t current, uint64_t known, uint64_t start_ns, uint64_t end_ns,
               const std::source_location& site) noexcept;
+// A command-thread wait for the priority-operation thread (CommandScheduler::WaitPriorityOperations)
+// that blocked: gpu_done = the GPU had already finished the blocking operation's tick when the wait
+// began (so the wait is for the runner's wake-up and callbacks); ahead = priority operations queued
+// or running at or before `tick`.
+void NoteSchedulerWait(uint64_t start_ns, uint64_t end_ns, bool gpu_done, uint32_t ahead,
+                       const std::source_location& site) noexcept;
 // Guest events on the command thread (trace only).
 void NoteFlip(uint64_t tick) noexcept;
 void NoteGuestSubmission(uint32_t queue) noexcept;
