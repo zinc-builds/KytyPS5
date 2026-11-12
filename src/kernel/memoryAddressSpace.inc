@@ -1001,8 +1001,9 @@ public:
 
 	// Appends the page runs of asynchronous chunks written since the last scan, and
 	// re-protects them. The caller handles them after the lock is released. Chunks the filter
-	// rejects (nothing there needs its writes) are left as they are: a page that gains a write
-	// watcher is write-protected then, so stores before that need no report.
+	// rejects (nothing there needs its writes) are left as they are: their written marks stay
+	// in the page tables, and once a page there gains a write watcher the chunk is scanned
+	// again, so a store before the watch costs at most one report the watch did not need.
 	// Kept writes are taken after the scan: a store a submit scan took from the page tables is
 	// kept in the same hold of m_kept_mutex (ScanAsyncWritesAtSubmit), so the first collection
 	// that ends after it reports it.
@@ -1384,13 +1385,15 @@ private:
 			// In an asynchronous chunk a page stays write-protected after its last watcher leaves:
 			// a store there costs no signal, and the protection keeps "not written since" provable
 			// (RenderContext::IsCpLabel).
-			// KYTY_ASYNC_WATCH_SCAN=0 (default): an asynchronous page is write-protected already
-			// (a page there stays protected after its last watcher leaves, and every scan that
-			// consumes a mark protects again), so a new watch changes nothing in the page tables.
-			// The marks of stores since the last scan stay there: the next collection reports
-			// them, as it would report them from the kept list. (Its chunk is scanned: the page
-			// is watched now. Marks older than the watch, from a chunk no collection scanned,
-			// report a store the watch did not need: one extra invalidation, never a lost one.)
+			// KYTY_ASYNC_WATCH_SCAN=0 (default): an asynchronous page is either write-protected or
+			// holds a written mark (a store clears the protection and leaves the mark; promotion
+			// and remaps start pages written), and a watch adds nothing to that: no store after
+			// it can land unmarked. Marks stay until a scan consumes them, and the next full or
+			// submit scan reports them, as it would report them from the kept list (kept-only
+			// collections take neither: they wait for the next scan either way). The chunk is
+			// scanned once the page is watched. Marks older than the watch, from a chunk no
+			// collection scanned, report a store the watch did not need: one extra invalidation,
+			// never a lost one.
 			// KYTY_ASYNC_WATCH_SCAN=1: scan and keep them here, as before.
 			static const bool watch_scan = [] {
 				const char* value = std::getenv("KYTY_ASYNC_WATCH_SCAN");
