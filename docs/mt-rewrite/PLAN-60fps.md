@@ -465,6 +465,17 @@ open PR is a weak signal.
 | e5c35553, 79a04b9a, 7d4e0d9b, b510053e, 1b59ee62 set, 7ae328b3, aecd70b6 | Tracker, submit cadence, upload batch, kernel locks, executor targets, image page buckets | Ours is equivalent or supersedes them |
 | PSSR DLSS/FSR, readback changes | — | Off our path |
 
+## Frame pacing (Track R, 2026-11-12)
+
+The target is p99 = 1 refresh (`flip_vbl` p99 1), not only the mean. On Sky Garden 1000–1600
+(before early submit) 7.0% of presented frames took two refreshes. A replay of the measured guest
+frames against the display (`tools/astro-bench/framemodel.py`, within 0.5 points of the measured
+share) says p99 = 1 needs a mean guest frame of ~16.0–16.4 ms: ~1.5 ms less command-thread work
+per frame, or ~1 ms with the guest-late idle gone; the periodic prepare spike and compiles are
+small. FINDINGS, "Frame pacing", has the cause and headroom tables. Judge pacing changes with
+`KYTY_FRAME_DIAG=1` and `framemodel.py` besides `cmd_ns`, and attribute work only per guest frame
+(`GFRAME`), never per presented frame.
+
 ## Status
 
 | Track | Current step | Notes |

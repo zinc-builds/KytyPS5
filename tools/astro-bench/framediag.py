@@ -8,13 +8,14 @@ GFRAME lines (guest frames: between two guest flips decoded on the command threa
 work counted there belongs to that frame. FRAME lines (presented flips) give the refreshes the
 viewer saw; counts between presented flips scale with the interval, so they explain nothing.
 Per window:
-  - presented frames in refreshes (60 Hz), and guest frames by command-thread wall time: histograms;
+  - presented frames in refreshes (60 Hz), and guest frames by command-thread wall time and by
+    demand (ms bins): histograms. A guest frame over 16.7 ms is not a dropped frame by itself:
+    the display queue absorbs single ones (framemodel.py replays it);
   - per-frame means of every field for the fastest half, the slowest 10% and the slowest 1% of
     frames (by interval), and their ratio to the fastest half;
   - the worst 20 frames, each with the fields that stand out most against the median frame and
-    the previous frame's interval (a slow frame after a slow frame: spill-over);
-  - a headroom model: each frame's command-thread demand (CPU + waits) relative to the window's
-    mean; the mean demand at which 99% of frames would fit one refresh.
+    the previous frame's interval (a slow frame after a slow frame: spill-over).
+Headroom (how much faster frames must get for p99 = 1 refresh) is framemodel.py's replay.
 """
 import math
 import os
@@ -78,6 +79,20 @@ def histogram(values, label):
                             for k in range(1, 6)))
 
 
+BINS = (16.7, 18.0, 19.0, 22.0, 33.3)
+
+
+def bins(label, values):
+    n = len(values)
+    edges = (0.0,) + BINS + (math.inf,)
+    parts = []
+    for lo, hi in zip(edges, edges[1:]):
+        count = sum(1 for v in values if lo <= v < hi)
+        name = f"<{hi}" if lo == 0 else (f">={lo}" if hi == math.inf else f"{lo}-{hi}")
+        parts.append(f"{name}: {count} ({100 * count / n:.1f}%)")
+    print(label + "  ".join(parts))
+
+
 def report(frames, presented, label):
     n = len(frames)
     if n < 20:
@@ -90,9 +105,8 @@ def report(frames, presented, label):
           f"p50 {pct(ms, 50):.1f}, p90 {pct(ms, 90):.1f}, p99 {pct(ms, 99):.1f}, max {max(ms):.1f} ms")
     if presented:
         histogram([int(r["vbl"]) for r in presented], f"presented ({len(presented)}), refreshes: ")
-    histogram([max(1, math.ceil(x / REFRESH_MS - 0.02)) for x in ms], "guest frames, wall in refreshes: ")
-    histogram([max(1, math.ceil(demand(r) / REFRESH_MS - 0.02)) for r in frames],
-              "guest frames, cmd demand in refreshes: ")
+    bins("guest frames, wall ms: ", ms)
+    bins("guest frames, cmd demand ms: ", [demand(r) for r in frames])
 
     order = sorted(range(n), key=lambda i: ms[i])
     fast = [frames[i] for i in order[: n // 2]]
@@ -123,20 +137,6 @@ def report(frames, presented, label):
         scores.sort(reverse=True)
         top = "; ".join(f"{name} {v:.0f} (med {m:.0f})" for _, name, v, m in scores[:4])
         print(f"  f={int(r['f_rel']):5d} {r['ms']:6.1f} ms, demand {demand(r):5.1f}, prev {prev:5.1f} | {top}")
-
-    # Headroom: a frame's demand relative to the mean demand; at mean demand X ms, the frames with
-    # ratio * X > one refresh miss it.
-    d = [demand(r) for r in frames]
-    mean_d = st.mean(d)
-    ratios = sorted(x / mean_d for x in d)
-    q99 = ratios[int(len(ratios) * 0.99)]
-    q90 = ratios[int(len(ratios) * 0.90)]
-    miss_at_60 = sum(1 for x in ratios if x * REFRESH_MS > REFRESH_MS) / len(ratios)
-    print(f"\nheadroom: command-thread demand mean {mean_d:.2f} ms (CPU+waits); demand/mean p90 {q90:.2f}, "
-          f"p99 {q99:.2f}, max {ratios[-1]:.2f}")
-    print(f"  mean demand for p99 within one refresh: {REFRESH_MS / q99:.2f} ms "
-          f"({1000 / (REFRESH_MS / q99):.0f} FPS-equivalent average); for p90: {REFRESH_MS / q90:.2f} ms")
-    print(f"  at a mean of exactly one refresh, {100 * miss_at_60:.1f}% of frames would exceed it")
 
 
 def main():

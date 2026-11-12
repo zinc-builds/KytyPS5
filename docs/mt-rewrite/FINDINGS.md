@@ -1942,6 +1942,78 @@ direct calls drain the recorder, which then holds more work. Remaining direct ca
 downloads, the tiler's buffer path, `CopyImage`, the fault buffer) drain ~15 ms/s; image churn
 (~0.37 ms per frame) is next.
 
+### Frame pacing: which guest frames miss a refresh, and why (Track R, 2026-11-12)
+
+`KYTY_FRAME_DIAG=1` (off by default; it reads `/proc` twice per frame and was not A/B-measured, so
+use it to attribute, not to compare FPS) prints one `GFRAME` line per guest flip (on the command
+thread, when it decodes the flip) and one `FRAME` line per presented flip. A `GFRAME` line holds
+what the command thread did since the previous guest flip: its CPU time, run-queue delay, waits on
+the GPU (command thread only), on the render-context mutex and on the prepare workers and
+recorder, plus draws, uploads, creations, compiles, faults and GC. `tools/astro-bench/framediag.py`
+summarises them per window; `framemodel.py` replays the walls against 60 Hz vblanks (display
+queue depth 2) and answers what-ifs.
+
+**Only per-guest-frame boundaries attribute work.** A presented frame that takes two refreshes
+spans more guest work than one that takes one, so per-presented-frame counts are larger in slow
+frames by construction and explain nothing. The first version of this table did that.
+
+PGO build of `dev` before early submit (#108), Sky Garden:
+
+| level frames | guest wall mean | presented in 1 / 2 / 3+ refreshes | replay model, 2+ refreshes |
+|---|---|---|---|
+| 1000–1600 | 17.91 ms | 92.8% / 7.0% / 0.2% | 7.2% |
+| 300–2700 | 18.49 ms | 90.0% / 9.6% / 0.4% | 10.0% |
+
+Guest frames by wall time (1000–1600): <16.7 ms 24.3%, 16.7–18 45.5%, 18–19 11.7%, 19–22 14.5%,
+22–33 3.8%, ≥33 0.2%. A guest frame over 16.7 ms is not a dropped refresh by itself: the
+display queue absorbs single ones, and a 2-refresh frame appears only when the queue runs dry.
+
+**Where a guest frame's time goes (1000–1600):** 17.91 ms = command-thread work 16.72 (CPU +
+GPU, mutex and run-queue waits) + prepare/recorder waits 1.40 (partly spins inside the CPU time)
++ idle 0.41 (the command thread had no guest work: the guest submitted late).
+
+**Causes of the guest frames over 19 ms** (18.5% of frames; first matching rule in
+`framemodel.py cls`):
+
+| share of frames | cause | wall | work | prepare wait |
+|---|---|---|---|---|
+| 8.5% | command thread idle >2 ms (guest late) | 21.3 ms | 16.8 | 1.21 |
+| 7.5% | more command-thread CPU, no single cause | 19.7 | 17.3 | 1.22 |
+| 2.0% | prepare wait >3 ms: a periodic spike | 23.1 | 21.9 | 5.62 |
+| 0.2% | shader/pipeline compile | 62.8 | 61.8 | 1.30 |
+| 0.4% | preempted / major fault; recorder wait | ~21.7 | ~21 | ~1.25 |
+
+- **Guest late:** the command thread finished the previous frame and waited >2 ms for the next
+  submission, with the same work as a normal frame.
+- **The periodic spike:** pairs of frames every 109–112 guest frames (~2 s), same draws; the
+  prepare workers are busy 21 → 29 ms, the command thread waits 5.6 ms for them and spends +5 ms
+  of CPU itself.
+- **One-off hitches** outside this window: level load (frame 63: 908 ms, 4.1 GB of texture uploads;
+  frame 107: 256 ms), streaming bursts (785–788), cold shader compiles (935–1002, 2194).
+- The command thread did not wait on the GPU in steady state (`cmd_gpu_wait_ns` ~0); the GPU sat
+  idle 6.2 ms per frame and the flip completed 5.28 ms after decode.
+
+**Headroom (replay model, 1000–1600):** the share of presented frames taking 2+ refreshes when
+the frames change as listed. p99 = 1 refresh needs it under 1%:
+
+| change | mean wall | 2+ refreshes |
+|---|---|---|
+| as measured | 17.91 ms | 7.2% |
+| no periodic prepare spike | 17.80 | 6.5% |
+| no compiles | 17.83 | 7.0% |
+| no guest-late idle | 17.50 | 4.8% |
+| work −0.5 ms per frame | 17.41 | 4.3% |
+| work −1.0 ms | 16.91 | 1.7% |
+| work −1.5 ms | 16.41 | 0.7% |
+| work −2.0 ms | 15.91 | 0.2% |
+| work −0.5 ms, no guest-late idle | 17.00 | 1.8% |
+| work −1.0 ms, no guest-late idle | 16.50 | 0.5% |
+| no prepare/recorder waits | 16.51 | 0.7% |
+
+So p99 = 1 needs a mean guest frame of ~16.0–16.4 ms: ~1.5 ms (8%) less work per frame, or ~1 ms
+less with the guest-late idle gone. Removing the spikes and compiles alone barely moves it; the
+bulk of the 2-refresh frames is the mean sitting above one refresh.
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
@@ -2063,6 +2135,8 @@ downloads, the tiler's buffer path, `CopyImage`, the fault buffer) drain ~15 ms/
   (`~/AI/emu/tracy-build` has binaries); export with `tracy-csvexport`. Tracy renames the main
   thread, so match the process by command line (`^\./kyty_emulator --game`), never by name.
 - Thread name `KytyGpuCmd` for the GPU thread (top/perf/taskset).
+- `KYTY_FRAME_DIAG=1`: one `GFRAME` line per guest flip and one `FRAME` line per presented flip
+  (FINDINGS, "Frame pacing"); `tools/astro-bench/framediag.py` and `framemodel.py` read them.
 - `KYTY_TIME_DIAG=1` (costs ~1 FPS while on): one `TIMEDIAG` line per second: vblanks, flips on screen with their interval
   in ms and in vblanks (`flip_vbl`, the real-speed check), flip modes, the game's clock and
   video-out calls per second with their top call sites (`eboot.bin+0x…`), and the sites read

@@ -73,6 +73,10 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   offset + 0x1000), e.g. from `/proc/<pid>/maps` or `perf script --show-mmap-events`).
 - `kstats.py <label>` — the GPU command thread's kernel time by call site over the frame window,
   from a run with `KYTY_KERNEL_STATS=1`.
+- `framediag.py <bench log> [A-B …]` — summarise `KYTY_FRAME_DIAG=1` lines: refresh and wall
+  histograms, fast vs slow frames field by field, the worst 20 frames. `framemodel.py <bench log>
+  [A-B]` — replay the guest frames against 60 Hz vblanks: causes of slow frames and what-ifs
+  (FINDINGS, "Frame pacing").
 - `faultsum.py` — summarise `KYTY_FAULT_DIAG=1` output. `offcpu.py` — off-CPU time from
   `perf record -e sched:sched_switch` (needs root for tracepoints).
 - `../re/gamespeed.py [bench logs…]` — **game-speed check**. Astro Bot advances a fixed step per
