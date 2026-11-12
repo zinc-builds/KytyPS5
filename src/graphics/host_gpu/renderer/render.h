@@ -67,6 +67,9 @@ struct DrawIndexArgs {
 	DrawOffsetSource offset_source       = DrawOffsetSource::DrawState;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
+	// CommandProcessor::CtxGeneration and ShGeneration at the draw (0: unknown, copy them).
+	uint64_t         ctx_generation = 0;
+	uint64_t         sh_generation  = 0;
 };
 
 struct DrawAutoArgs {
@@ -76,6 +79,8 @@ struct DrawAutoArgs {
 	uint32_t         first_instance = 0;
 	DrawOffsetSource offset_source  = DrawOffsetSource::DrawState;
 	DrawIndirectArgs indirect;
+	uint64_t         ctx_generation = 0; // as in DrawIndexArgs
+	uint64_t         sh_generation  = 0;
 };
 
 struct SubmitInfo {
@@ -359,6 +364,9 @@ private:
 		PipelineCache::GraphicsResources resources;
 		DrawPrepare::Log                 log;
 		uint64_t                         sequence = 0;
+		// Register generations `registers` and `shaders` were copied at (0: none).
+		uint64_t                         ctx_generation = 0;
+		uint64_t                         sh_generation  = 0;
 		// DrawPrepare::HazardGeneration, GuestSyncEpoch::CurrentUnranged,
 		// DrawPrepare::StoredSequence and DrawPrepare::GpuWriteSequence when it was queued.
 		uint64_t                         hazard_generation  = 0;
@@ -682,6 +690,7 @@ private:
 	void                        PrintDrainStats();
 	struct PrepareStats {
 		uint64_t queued = 0, direct = 0, adopted = 0, failed = 0, hazard = 0, gpu_written = 0;
+		uint64_t register_copies = 0, shader_copies = 0;
 		// Adopted although an emulator store came after the post (the unranged epoch would have
 		// dropped them), and the walker page log's distinct pages per draw (buckets 0, 1, 2-3,
 		// 4-7, ... 64+).

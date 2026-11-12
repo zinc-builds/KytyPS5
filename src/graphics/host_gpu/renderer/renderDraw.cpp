@@ -1841,9 +1841,34 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const CommandBuffer& 
 }
 
 void RenderExecutor::PostQueuedDraw(CommandBuffer& buffer, QueuedDraw& queued) {
-	queued.registers          = buffer.GetRegisters();
+	// The slot's copies from its previous draw stay while their registers' generation holds.
+	// KYTY_POST_COPY=all: always copy; =verify: also compare a kept copy with the registers.
+	static const int copy_mode = [] {
+		const char* value = std::getenv("KYTY_POST_COPY");
+		if (value == nullptr) return 0;
+		return std::string_view(value) == "all" ? 1 : std::string_view(value) == "verify" ? 2 : 0;
+	}();
+	const auto ctx_generation = queued.indexed ? queued.index_args.ctx_generation
+	                                           : queued.auto_args.ctx_generation;
+	const auto sh_generation  = queued.indexed ? queued.index_args.sh_generation
+	                                           : queued.auto_args.sh_generation;
+	if (copy_mode == 1 || ctx_generation == 0 || ctx_generation != queued.ctx_generation) {
+		queued.registers      = buffer.GetRegisters();
+		queued.ctx_generation = ctx_generation;
+		m_prepare_stat.register_copies++;
+	} else if (copy_mode == 2 &&
+	           std::memcmp(&queued.registers, &buffer.GetRegisters(), sizeof(HW::Context)) != 0) {
+		EXIT("KYTY_POST_COPY=verify: a kept context copy differs from the registers\n");
+	}
+	if (copy_mode == 1 || sh_generation == 0 || sh_generation != queued.sh_generation) {
+		queued.shaders       = buffer.GetShaders();
+		queued.sh_generation = sh_generation;
+		m_prepare_stat.shader_copies++;
+	} else if (copy_mode == 2 &&
+	           std::memcmp(&queued.shaders, &buffer.GetShaders(), sizeof(HW::Shader)) != 0) {
+		EXIT("KYTY_POST_COPY=verify: a kept shader-register copy differs from the registers\n");
+	}
 	queued.user_config        = buffer.GetUserConfig();
-	queued.shaders            = buffer.GetShaders();
 	queued.hazard_generation  = DrawPrepare::HazardGeneration();
 	queued.sync_epoch         = GuestSyncEpoch::CurrentUnranged();
 	queued.stored_sequence    = DrawPrepare::StoredSequence();
@@ -2131,7 +2156,8 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            " texture_refreshes=%" PRIu64 " binding_reuse=%.1f%%"
 			            " hazard_gpu=%" PRIu64 " hazard_epoch=%" PRIu64
 			            " kept_by_ranged=%" PRIu64 " kept_by_gpu_range=%" PRIu64 " walker_pages=%.2f pages_hist=%" PRIu64 "/%" PRIu64
-			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+			            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+			            " register_copies=%.1f%% shader_copies=%.1f%%\n",
 			            stat.queued, stat.direct, stat.adopted, stat.failed, stat.hazard,
 			            stat.stored, stat.gpu_written, stat.verified, static_cast<double>(stat.wait_ns) / draws,
 			            stat.waits, stat.drains,
@@ -2148,7 +2174,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			                static_cast<double>(std::max<uint64_t>(stat.adopted, 1)),
 			            stat.page_buckets[0], stat.page_buckets[1], stat.page_buckets[2],
 			            stat.page_buckets[3], stat.page_buckets[4], stat.page_buckets[5],
-			            stat.page_buckets[6], stat.page_buckets[7]);
+			            stat.page_buckets[6], stat.page_buckets[7],
+			            100.0 * static_cast<double>(stat.register_copies) / draws,
+			            100.0 * static_cast<double>(stat.shader_copies) / draws);
 			stat                = {};
 			stat.start_ns       = now;
 			stat.worker_busy_ns = busy;

@@ -179,7 +179,14 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	return *processor;
 }
 
+uint64_t CommandProcessor::NewGenerationBase() {
+	static std::atomic<uint64_t> processors {0};
+	return ((processors.fetch_add(1, std::memory_order_relaxed) + 1) << 48u) + 1;
+}
+
 void CommandProcessor::Reset() {
+	m_ctx_generation++;
+	m_sh_generation++;
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
@@ -195,6 +202,7 @@ void CommandProcessor::Reset() {
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
+	m_ctx_generation++;
 	switch (operation) {
 		case ContextStateOperation::Clear: m_ctx.Reset(); break;
 		case ContextStateOperation::Push:
@@ -958,6 +966,8 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		}
 		args.instance_count = NumInstances();
 	}
+	args.ctx_generation = m_ctx_generation;
+	args.sh_generation  = m_sh_generation;
 	executor.QueueDrawIndex(CurrentBuffer(), args);
 }
 
@@ -1090,6 +1100,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	m_sh_generation++;
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
 	                                              thread_group_z, mode, IsAsyncComputeQueue(),
@@ -1108,6 +1119,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		DispatchDirect(args->x, args->y, args->z, mode);
 		return;
 	}
+	m_sh_generation++;
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
@@ -1121,6 +1133,8 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		}
 		args.instance_count = NumInstances();
 	}
+	args.ctx_generation = m_ctx_generation;
+	args.sh_generation  = m_sh_generation;
 	executor.QueueDrawAuto(CurrentBuffer(), args);
 }
 
