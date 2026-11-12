@@ -64,6 +64,9 @@ private:
 		Pm4Execution              execution;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
+		// The submitting thread collected the guest's writes before enqueueing (KYTY_SUBMIT_SCAN);
+		// cleared once processing starts, so a resumed submission collects for itself.
+		bool submit_scanned = false;
 	};
 
 	void              Enqueue(Submission submission);

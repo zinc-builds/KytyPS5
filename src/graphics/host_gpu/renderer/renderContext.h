@@ -33,6 +33,12 @@ class VideoOutDriver;
 
 namespace Libs::Graphics {
 
+// KYTY_SUBMIT_SCAN: 0 off; unset/1 on; stats adds SUBMITSCAN lines (scan time per submitting
+// thread); verify also scans on the GPU thread at the submission's start and counts the
+// write-watched pages that scan would add (stores between submit and processing).
+enum class SubmitScanMode { Off, On, Stats, Verify };
+SubmitScanMode GetSubmitScanMode();
+
 class GuestGpu;
 
 // The render context's lock. The GPU command thread takes it for every draw and dispatch, the
@@ -90,7 +96,12 @@ public:
 	void               PrepareBda();
 	// Applies guest writes to asynchronously write-protected ranges as if they had faulted.
 	// Call where the guest may have published new data: a submission, a satisfied wait.
-	void               CollectAsyncWrites();
+	// kept_only: no scan of its own, for a submission whose submitting thread scanned
+	// (ScanAsyncWritesAtSubmit); applies what that and other scans kept.
+	void CollectAsyncWrites(bool kept_only = false);
+	// KYTY_SUBMIT_SCAN (default on): a guest thread's scan before it enqueues a submission.
+	// False when it did not scan (switched off, or no asynchronous protection).
+	bool ScanAsyncWritesAtSubmit();
 	// Where the guest may have published data mid-stream (a satisfied wait), the collection
 	// can wait until the next packet that reads guest data: see CollectAsyncWritesIfRequested.
 	void RequestAsyncCollect() noexcept { m_async_collect_requested = true; }

@@ -159,7 +159,16 @@ void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written
                              bool (*wanted)(uint64_t begin, uint64_t end) = nullptr);
 // The [begin, end) ranges under asynchronous write protection (for KYTY_ASYNC_WP_VERIFY).
 void AsyncGuestRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
-// KYTY_ASYNC_WP_VERIFY: appends the asynchronous pages written since the last collection.
+// KYTY_SUBMIT_SCAN: a submitting guest thread's scan of the asynchronous ranges; what it finds is
+// kept for the GPU thread's next collection. False if asynchronous protection is off.
+bool ScanAsyncGuestWritesAtSubmit(bool (*wanted)(uint64_t begin, uint64_t end));
+// The GPU thread's collection without a scan of its own: kept writes (submit scans,
+// re-protections) and pending chunk promotions.
+void TakeKeptAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written);
+// KYTY_ASYNC_WP_VERIFY (GPU thread): the kept writes collections took since the last call.
+void TakeVerifyKeptWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+// KYTY_ASYNC_WP_VERIFY: appends the asynchronous pages written since the last collection, and
+// the writes kept for the next one (after any submit scan in flight).
 void PeekAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written);
 // Whether part of the range is under asynchronous write protection, where a store raises no
 // fault: emulator stores there must invalidate the caches themselves (GPU thread).

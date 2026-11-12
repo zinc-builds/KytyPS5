@@ -80,6 +80,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-11 | The emulator's context-state NOP (push/pop/clear of the context registers) keeps the draw queue, like a register write: queued draws hold their own register copy, and it touches no memory and signals nothing (`KYTY_CONTEXT_STATE_DRAIN=1` drains again). `KYTY_DRAIN_STATS=1` attributes queue drains and the prepare waits they cause (while draining, and refilling after) by packet: all drains cost ~2.1% of the command thread (RELEASE_MEM 0.8%, EVENT_WRITE 0.5%, context state 0.24%, ACQUIRE_MEM 0.2%, guest commands 0.2%, dispatches 0.15%); `KYTY_STALL_DIAG` roughly doubles the measured prepare wait (217 vs 101 ns/draw) (Track B4; same batch: ref `dev` e0999e89 47.93 / 48.64; `KYTY_PREPARE_VERIFY` clean) | 48.38 / 49.46 | 252.5k / 260.5k | 38.5 (max 50.1) / 36.2 (max 50.1) | 28.4 / 29.6 |
 | 2026-11-11 | `KYTY_KERNEL_STATS` diagnostic: the GPU command thread's kernel time by call site, off by default (Track K; findings under "Kernel time on the command thread": ~12% of the thread is sys time, half of it `PAGEMAP_SCAN` walks for async write collection and label stores; same batch: ref `dev` 084ca762 49.70, this build with the diagnostic on 49.86) | 49.70 | 261.0k | 38.5 (max 50.0) | 27.6 |
 | 2026-11-11 | `DrawPrepare::RangedStore` for emulator stores between queued draws (for an ordered RELEASE_MEM item) and a public `CommandProcessor::StoreLabel`; the color-clear expansion uses it (image download publishes stay unranged: they run on the priority thread, where read watches may go while they store). A store is ranged only if the SRT walker logs reads of every page it writes (read-watched pages); the walker reads other pages in place, unlogged, so stores there still drop every queued draw. Most texture publishes land on unwatched pages: prepare hazard drops ~21 → ~15 per frame (ranged without that rule: ~1.8, and unsound) (Track B; same batch, 2 pairs: ref `dev` 85eb0cb6 49.09 / 49.15; +0.3%, neutral; `KYTY_PREPARE_VERIFY` clean) | 49.34 / 49.15 | 259.6k / 257.2k | 33.5 (max 33.9) / 33.4 (max 33.5) | 28.5 / 29.9 |
+| 2026-11-12 | The collection of guest writes at each fresh submission's start runs on the submitting guest thread before it enqueues (`KYTY_SUBMIT_SCAN=0` off; Track K; findings under "Kernel time on the command thread": command-thread sys time `cmd_sns` 447 → 396 ns/draw (−11.4% ± 1.3), collection ~60 ns/draw, `DrawThread` pays 15–17 ms/s and `FluidCalculatio` 7–9; gate.sh, same binary, 3 runs a side: off 48.94 / 48.69 / 48.90, FPS +1.26% ± 0.37; `KYTY_ASYNC_WP_VERIFY` 0 lost writes, and it reports dropped kept writes) | 49.52 / 49.40 / 49.89 | 259.5k / 260.2k / 262.3k | 45.0 (max 83.3) / 37.3 (max 50.0) / 34.7 (max 50.0) | 23.3 / 29.1 / 29.9 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -1301,14 +1302,40 @@ inside locks, and signal delivery. Kernel time by site:
 - **The collection walk is memory-bound in the kernel:** ~1.06 ns per PTE for an empty scan
   (it is already on `PAGEMAP_SCAN`'s fast path: category and return mask exactly
   `PAGE_IS_WRITTEN`). A scan that finds and re-protects written pages costs ~3.7 µs more (TLB
-  shootdown). About 900 of the ~1,160 collections/s are the one at each submission start
-  (`GuestGpu::Process`), ~240 come from waits. Only 53% of the scanned pages have a write watcher
+  shootdown). About 900 of the ~1,160 collections/s are the one at the start of
+  `GuestGpu::Process`: ~450 for fresh submissions and ~450 for blocked submissions that resume;
+  ~240 come from waits. Only 53% of the scanned pages have a write watcher
   (18.3k of 34.6k per collection, in ~87 runs).
 - **Label stores:** 89% hit a page a previous label store protected, with no guest store since,
   but that is only known by scanning; skipping the scan would leave the guest's earlier stores
   in the page, so the next peek on it would collect (~46 µs) instead.
 - The research figure "FillBuffer 11% of kernel entries" is entries, not time: the fill path
   costs ~26 ns/draw in all, and the SRT-walk SIGSEGVs ~0.4 ns/draw of handler time.
+
+**Submit-time collection (P1, `KYTY_SUBMIT_SCAN`).** The collection at a fresh submission's start
+moves to the submitting guest thread. It scans before the submission is enqueued (so before the
+command thread can see it), and the pages it finds are re-protected by the same `PAGEMAP_SCAN`
+call and kept, with their label tokens advanced. Every GPU-thread collection takes the kept list
+after any submit scan in flight; submit scans run one at a time, so a write can be reported
+twice but never lost. A store made after the submit scan is collected where a command buffer can
+first depend on it: a WAIT_REG_MEM satisfied by a guest-written value, a semaphore wait, a valid
+rewind (all `RequestAsyncCollect`), or a resumed submission (which still scans at `Process`).
+Flip preparation scans at its submit. The wait skip for the processor's own labels cannot hide
+such a store, because kept pages' tokens advance. In verify mode ~8.5k write-watched pages/s
+are written between the submit scan and processing (large dynamic ranges); those are
+invalidated at the next collection instead of at processing start.
+- Measured (same binary, two pairs): collection 206 → 155 and 216 → 145 ns/draw (~60 ns/draw,
+  not the ~160 first estimated, because only ~450 collections/s are fresh submissions); command
+  thread `stime` 112 → 103 and 115 → 100 ms/s; FPS 49.62 → 49.92 and 48.67 → 49.48. The scans
+  cost the submitting threads `DrawThread` 15–17 ms/s (~400 scans/s, ~40 µs each) and
+  `FluidCalculatio` 7–9 ms/s.
+- `KYTY_ASYNC_WP_VERIFY` counts kept writes as pending report, as it counts written marks still
+  in the page tables (otherwise a submit scan taking a mark between a collection and the
+  verifier's peek reads as a loss: ~368k false reports), and checks that every kept write a
+  collection takes is among the writes it handled. With P1 on it reports 0 lost writes over the
+  bench window. `KYTY_ASYNC_WP_VERIFY_DROP_KEPT=<n>` (test only) drops every n-th kept write: with
+  n=50 the verifier reports 16 lost writes on watched pages, after which the stale data makes
+  the host GPU fail (device lost at a semaphore wait).
 
 ### Where the command thread's library time goes (2026-11-07)
 

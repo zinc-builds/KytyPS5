@@ -1030,16 +1030,9 @@ void NoteWriteProtectFault(uint64_t vaddr) noexcept {
 } // namespace
 #endif
 
-void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written,
-                             bool (*wanted)(uint64_t begin, uint64_t end)) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	if (g_guest_address_space == nullptr) {
-		return;
-	}
-	auto& backing = g_guest_address_space->Backing();
-	if (!backing.AsyncWriteProtection()) {
-		return;
-	}
+// GPU thread: promotes the chunks write faults asked for.
+static void PromotePendingChunks(GuestBackingStore& backing) {
 	static auto window_start = std::chrono::steady_clock::now();
 	if (const auto now = std::chrono::steady_clock::now(); now - window_start >= std::chrono::seconds(1)) {
 		window_start = now;
@@ -1060,6 +1053,20 @@ void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written
 			     chunk << GuestBackingStore::ASYNC_CHUNK_BITS);
 		}
 	}
+}
+#endif
+
+void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written,
+                             bool (*wanted)(uint64_t begin, uint64_t end)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space == nullptr) {
+		return;
+	}
+	auto& backing = g_guest_address_space->Backing();
+	if (!backing.AsyncWriteProtection()) {
+		return;
+	}
+	PromotePendingChunks(backing);
 	if (Graphics::MemDiag::Enabled()) {
 		const auto start = std::chrono::steady_clock::now();
 		backing.ScanAsyncWrites(written, wanted);
@@ -1075,6 +1082,45 @@ void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written
 #else
 	(void)written;
 	(void)wanted;
+#endif
+}
+
+bool ScanAsyncGuestWritesAtSubmit(bool (*wanted)(uint64_t begin, uint64_t end)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space == nullptr ||
+	    !g_guest_address_space->Backing().AsyncWriteProtection()) {
+		return false;
+	}
+	g_guest_address_space->Backing().ScanAsyncWritesAtSubmit(wanted);
+	return true;
+#else
+	(void)wanted;
+	return false;
+#endif
+}
+
+void TakeVerifyKeptWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	ranges.insert(ranges.end(), g_verify_kept_taken.begin(), g_verify_kept_taken.end());
+	g_verify_kept_taken.clear();
+#else
+	(void)ranges;
+#endif
+}
+
+void TakeKeptAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space == nullptr) {
+		return;
+	}
+	auto& backing = g_guest_address_space->Backing();
+	if (!backing.AsyncWriteProtection()) {
+		return;
+	}
+	PromotePendingChunks(backing);
+	backing.TakeKeptWrites(written);
+#else
+	(void)written;
 #endif
 }
 
