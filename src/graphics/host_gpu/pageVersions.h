@@ -37,7 +37,8 @@ inline std::unique_ptr<std::atomic<Chunk*>[]> g_chunks =
     std::make_unique<std::atomic<Chunk*>[]>(ChunkCount);
 inline std::mutex g_create_mutex;
 
-// The version of a page, creating its table (a page nobody bumped yet is at version 0).
+// The version of page number `page` (vaddr >> PageShift), creating its table (a page nobody
+// bumped yet is at version 0).
 [[nodiscard]] inline std::atomic<uint32_t>* Slot(uint64_t page) noexcept {
 	const auto index = page >> (ChunkShift - PageShift);
 	if (index >= ChunkCount) {
@@ -98,8 +99,9 @@ inline void EndStore(uint64_t vaddr, uint64_t size) noexcept {
 	BeginStore(vaddr, size);
 }
 
-[[nodiscard]] inline uint32_t Read(uint64_t page) noexcept {
-	auto* slot = Slot(page);
+// The version of the page holding vaddr.
+[[nodiscard]] inline uint32_t Read(uint64_t vaddr) noexcept {
+	auto* slot = Slot(vaddr >> PageShift);
 	return slot != nullptr ? slot->load(std::memory_order_acquire) : 1u; // odd: never usable
 }
 

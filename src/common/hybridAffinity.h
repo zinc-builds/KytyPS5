@@ -261,6 +261,49 @@ inline void ApplyToPrepareThread(uint32_t worker) {
 	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
+// The recording thread's CPU: KYTY_RECORDER_CPU, else the last efficiency core (-1: none).
+inline int RecorderCpu() {
+	if (const char* value = std::getenv("KYTY_RECORDER_CPU"); value != nullptr) {
+		return std::atoi(value);
+	}
+	if (!GetPlan().active) {
+		return -1;
+	}
+	const auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
+	return efficiency.empty() ? -1 : *efficiency.rbegin();
+}
+
+// The BDA pre-stager's CPU: KYTY_BDA_PRESTAGE_CPU, else the efficiency core before the
+// recorder's (-1: none).
+inline int StagerCpu() {
+	if (const char* value = std::getenv("KYTY_BDA_PRESTAGE_CPU"); value != nullptr) {
+		return std::atoi(value);
+	}
+	if (!GetPlan().active) {
+		return -1;
+	}
+	const auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
+	const int  recorder   = RecorderCpu();
+	for (auto it = efficiency.rbegin(); it != efficiency.rend(); ++it) {
+		if (*it != recorder) {
+			return *it;
+		}
+	}
+	return -1;
+}
+
+// Call from the BDA pre-stager thread (BdaPrestager): an efficiency core of its own.
+inline void ApplyToStagerThread() {
+	const int cpu = StagerCpu();
+	if (cpu < 0) {
+		return;
+	}
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
 // Call from a thread the game created, once it has its name. The game's threads run on the
 // efficiency cores (all but the recording thread's): since write faults stopped raising signals
 // they are light, and leaving the performance cores to the emulator's threads, the game's main
@@ -276,13 +319,13 @@ inline void ApplyToGuestThread(const std::string& name) {
 			return std::string(value) == "none" ? std::set<int> {} : ParseCpuList(value);
 		}
 		auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
-		// Not the recording thread's CPU (see ApplyToRecorderThread).
-		const int recorder = EnvCpu("KYTY_RECORDER_CPU");
-		if (recorder >= 0) {
-			efficiency.erase(recorder);
-		} else if (!efficiency.empty()) {
-			efficiency.erase(std::prev(efficiency.end()));
-		}
+		// Not the recording thread's CPU (see ApplyToRecorderThread) nor the BDA pre-stager's
+		// (ApplyToStagerThread), whether or not pre-staging is on, so that its kill switch
+		// changes nothing else.
+		const int recorder = RecorderCpu();
+		const int stager   = StagerCpu();
+		efficiency.erase(recorder);
+		efficiency.erase(stager);
 		return efficiency;
 	}();
 	if (cpus.empty()) {
@@ -316,15 +359,7 @@ inline void ApplyToGuestThread(const std::string& name) {
 // free. KYTY_RECORDER_CPU=<n> picks another CPU.
 inline void ApplyToRecorderThread() {
 	ApplyPipelinePriority();
-	int cpu = -1;
-	if (const char* value = std::getenv("KYTY_RECORDER_CPU"); value != nullptr) {
-		cpu = std::atoi(value);
-	} else if (GetPlan().active) {
-		const auto efficiency = ReadCpuList("/sys/devices/cpu_atom/cpus");
-		if (!efficiency.empty()) {
-			cpu = *efficiency.rbegin();
-		}
-	}
+	const int cpu = RecorderCpu();
 	if (cpu < 0) {
 		return;
 	}

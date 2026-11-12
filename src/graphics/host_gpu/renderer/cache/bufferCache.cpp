@@ -1005,13 +1005,38 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	// PrepareBda: pages the pre-stager copied ahead are copied by the GPU from its arena.
+	const bool prestage = m_prestager != nullptr && g_sync_kind == MemDiag::Sync::Bda;
+	auto&      staged   = m_prestaged_copies;
+	staged.clear();
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
+		    if (!prestage) {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    total_size += bytes;
+			    return;
+		    }
+		    m_prestage_fresh.clear();
+		    m_prestager->Take(address, bytes, buffer.Offset(address), staged, m_prestage_fresh);
+		    for (const auto& [fresh, fresh_bytes]: m_prestage_fresh) {
+			    copies.emplace_back(total_size, buffer.Offset(fresh), fresh_bytes);
+			    total_size += fresh_bytes;
+		    }
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	const vk::Buffer arena = staged.empty() ? vk::Buffer {} : m_prestager->ArenaHandle();
+	// Records the copies into `buffer` (the barriers around them are the caller's).
+	const auto record = [&](vk::CommandBuffer native) {
+		if (source) {
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+		}
+		if (arena) {
+			native.copyBuffer(arena, buffer.Handle(), static_cast<uint32_t>(staged.size()),
+			                  staged.data());
+		}
+	};
 	if (MemDiag::BdaStatsMode() != 0 && source && g_sync_kind == MemDiag::Sync::Bda) {
 		BdaStats::NoteUpload(buffer, copies);
 	}
@@ -1056,7 +1081,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		}
 	}
 #endif
-	if (source && m_upload_batch.active && !AsyncUploadVerifyEnabled()) {
+	if ((source || arena) && m_upload_batch.active && !AsyncUploadVerifyEnabled()) {
 		// One barrier pair for the whole batch: the global barriers cover every destination.
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -1071,9 +1096,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1,
 			                       &before, 0, nullptr, 0, nullptr);
 		}
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-	} else if (source) {
+		record(native);
+	} else if (source || arena) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -1090,15 +1114,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
+		record(native);
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
-		if (m_last_upload_async && AsyncUploadVerifyEnabled()) {
+		if (source && m_last_upload_async && AsyncUploadVerifyEnabled()) {
 			VerifyAsyncUpload(buffer, copies, total_size);
 		}
 	}
@@ -2146,9 +2169,23 @@ void Print(double seconds, uint64_t frames) {
 } // namespace
 } // namespace BdaStats
 
+void BufferCache::StartPrestager(BdaPrestager::ForEachMapped for_each_mapped) {
+	if (BdaPrestager::Mode() == 0 || m_prestager != nullptr) {
+		return;
+	}
+	auto prestager =
+	    std::make_unique<BdaPrestager>(m_graphics, m_scheduler, std::move(for_each_mapped));
+	if (prestager->Active()) {
+		m_prestager = std::move(prestager);
+	}
+}
+
 void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (m_prestager != nullptr) {
+		m_prestager->Enqueue(begin, end);
+	}
 	std::lock_guard lock(m_bda_sync_mutex);
 	m_bda_sync.Add(begin, end - begin);
 	if (MemDiag::BdaStatsMode() != 0) {

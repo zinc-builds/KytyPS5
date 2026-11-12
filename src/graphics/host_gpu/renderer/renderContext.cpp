@@ -87,6 +87,12 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 		    return ShaderTryReadGuest(vaddr, value, sizeof(*value)) ? SrtWalkerRead::Ok
 		                                                            : SrtWalkerRead::Failed;
 	    });
+	// The pre-stager takes only what PrepareBda will: the queued ranges that are GPU-mapped.
+	m_buffer_cache.StartPrestager([this](uint64_t vaddr, uint64_t size,
+	                                     const std::function<void(uint64_t, uint64_t)>& func) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEachInRange(vaddr, size, func);
+	});
 }
 
 RenderContext::~RenderContext() {
@@ -94,6 +100,7 @@ RenderContext::~RenderContext() {
 	ShaderSetGuestReader(nullptr);
 	g_shader_reader_context = nullptr;
 	ShutdownGpu();
+	m_buffer_cache.StopPrestager(); // its thread reads m_mapped_ranges, destroyed first
 	m_command_scheduler.Shutdown();
 }
 

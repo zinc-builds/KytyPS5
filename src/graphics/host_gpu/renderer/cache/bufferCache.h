@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/asyncUploader.h"
+#include "graphics/host_gpu/renderer/cache/bdaPrestager.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/workerStreamRing.h"
 
@@ -105,6 +106,10 @@ public:
 	enum class BdaSource : uint8_t { Invalidate, CpuWrite, NewBuffer, Map, Count };
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size, BdaSource source);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	// BDA pre-staging (BdaPrestager, KYTY_BDA_PRESTAGE): started once the owner can say which
+	// ranges PrepareBda takes; stopped before that owner's ranges go away.
+	void                   StartPrestager(BdaPrestager::ForEachMapped for_each_mapped);
+	void                   StopPrestager() noexcept { m_prestager.reset(); }
 	// KYTY_BDA_STATS: per-second report; with `access`, also reads back the DMA access bitmap.
 	void                   BdaStatsTick();
 	void               RunGarbageCollector();
@@ -268,6 +273,9 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	AsyncUploader                                     m_async_uploader;
+	std::unique_ptr<BdaPrestager>                     m_prestager;
+	std::vector<vk::BufferCopy>                       m_prestaged_copies; // SynchronizeBuffer
+	std::vector<std::pair<uint64_t, uint64_t>>        m_prestage_fresh;   // SynchronizeBuffer
 	std::unique_ptr<Buffer>                           m_bda_access_download; // KYTY_BDA_STATS=access
 	bool                                              m_last_upload_async = false;
 	struct UploadBatch {

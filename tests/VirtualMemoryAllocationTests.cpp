@@ -4,6 +4,8 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/pageVersions.h"
+#include "graphics/host_gpu/renderer/cache/bdaPrestager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -5961,11 +5963,129 @@ void TestTlsStubsPreserveFlags() {
 
 int RunTrinityTests();
 
+
+// BDA pre-staging (BdaPrestager): a staged copy is served only while the page's version and the
+// remap generation are those it was taken at; stores through the backing, GPU-reported writes
+// and remaps send it to a fresh copy; verify catches a store nothing reported, however late.
+void TestBdaPrestagerVersionRule() {
+	const char*        test  = "BdaPrestagerVersionRule";
+	constexpr uint64_t Page  = 4096;
+	constexpr uint64_t Pages = 24;
+	namespace Graphics       = Libs::Graphics;
+	const uint64_t base = MapNamedFlexible(test, Pages * Page, SceKernelProtCpuRw, "bda_prestage");
+	for (uint64_t i = 0; i < Pages; i++) {
+		std::memset(reinterpret_cast<void*>(base + i * Page), static_cast<int>(0x10 + i), Page);
+	}
+	std::vector<uint8_t>         arena(16 * Page);
+	Graphics::BdaPrestager::TestSetup setup;
+	setup.mode         = 2; // verify
+	setup.arena        = arena;
+	setup.arm          = [](uint64_t, uint64_t) -> std::optional<uint64_t> {
+		return Libs::LibKernel::Memory::GuestRemapGeneration();
+	};
+	setup.current_tick = [] { return uint64_t {1}; };
+	setup.is_free      = [](uint64_t) { return true; };
+	Graphics::BdaPrestager prestager(std::move(setup));
+	const auto&            stat = prestager.Counters();
+
+	std::vector<vk::BufferCopy>                staged;
+	std::vector<std::pair<uint64_t, uint64_t>> fresh;
+	const auto take = [&](uint64_t address, uint64_t size, uint64_t dst) {
+		staged.clear();
+		fresh.clear();
+		prestager.Take(address, size, dst, staged, fresh);
+	};
+	const auto page = [&](uint64_t i) { return base + i * Page; };
+
+	// Unchanged: served from the arena, holding the page's bytes.
+	prestager.Stage(page(0), page(1));
+	take(page(0), Page, 0);
+	Check(test, staged.size() == 1 && fresh.empty() && staged[0].size == Page &&
+	                staged[0].dstOffset == 0,
+	      "an unchanged staged page was not served");
+	Check(test, arena[staged[0].srcOffset] == 0x10 && arena[staged[0].srcOffset + Page - 1] == 0x10,
+	      "the arena does not hold the staged bytes");
+	Check(test, stat.mismatched.load() == 0, "verify flagged an unchanged page");
+	// Used once: a second upload copies fresh.
+	take(page(0), Page, 0);
+	Check(test, staged.empty() && fresh.size() == 1, "a staged copy was served twice");
+
+	// An emulator store through the backing (labels, publishes, fills) after the copy.
+	prestager.Stage(page(1), page(2));
+	const uint64_t value = 0x1122334455667788ull;
+	Check(test, Libs::LibKernel::Memory::TryWriteBacking(page(1) + 8, &value, sizeof(value)),
+	      "TryWriteBacking failed");
+	const auto version_before = stat.fresh_version.load();
+	take(page(1), Page, 0);
+	Check(test, staged.empty() && fresh.size() == 1 && fresh[0].first == page(1),
+	      "a page stored through the backing after staging was served from the arena");
+	Check(test, stat.fresh_version.load() == version_before + 1,
+	      "the fallback was not counted as a version move");
+
+	// A write the command processor reports (RenderContext::NoteGpuWrite bumps the version).
+	prestager.Stage(page(2), page(3));
+	*reinterpret_cast<volatile uint32_t*>(page(2) + 64) = 0xdeadbeefu;
+	Graphics::PageVersions::Bump(page(2) + 64, 4);
+	take(page(2), Page, 0);
+	Check(test, staged.empty() && fresh.size() == 1,
+	      "a page with a reported write after staging was served from the arena");
+
+	// A remap anywhere moves the generation: nothing staged before it is served.
+	prestager.Stage(page(3), page(4));
+	const uint64_t other = MapNamedFlexible(test, 4 * Page, SceKernelProtCpuRw, "bda_prestage_remap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(other, 4 * Page), "KernelMunmap");
+	const auto generation_before = stat.fresh_generation.load();
+	take(page(3), Page, 0);
+	Check(test, staged.empty() && fresh.size() == 1 &&
+	                stat.fresh_generation.load() == generation_before + 1,
+	      "a page staged before a remap was served from the arena");
+
+	// Part of a page (a buffer that starts and ends inside it).
+	prestager.Stage(page(4), page(5));
+	take(page(4) + 100, 200, 7);
+	Check(test, staged.size() == 1 && fresh.empty() && staged[0].dstOffset == 7 &&
+	                staged[0].size == 200 && staged[0].srcOffset % Page == 100,
+	      "a partial page was not served from the right arena offset");
+
+	// Fault injection: a store nothing reports (no version move), used seconds later. Verify must
+	// count it, however old the copy is.
+	prestager.Stage(page(5), page(6));
+	std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+	*reinterpret_cast<volatile uint8_t*>(page(5) + 4095) = 0xee;
+	const auto mismatched_before = stat.mismatched.load();
+	take(page(5), Page, 0);
+	Check(test, staged.size() == 1 && stat.mismatched.load() == mismatched_before + 1,
+	      "verify did not catch an unreported store into a staged page");
+
+	// A full arena evicts the oldest copies; those pages copy fresh, counted as evicted.
+	prestager.Stage(page(6), page(14)); // 8 pages, then 10 more into the 16 slots
+	prestager.Stage(page(14), page(Pages));
+	Check(test, stat.evicted.load() >= 2, "a full arena did not evict");
+	const auto evicted_before = stat.fresh_evicted.load();
+	take(page(6), 2 * Page, 0);
+	Check(test, staged.empty() && fresh.size() == 1 && fresh[0].second == 2 * Page &&
+	                stat.fresh_evicted.load() == evicted_before + 2,
+	      "evicted pages were not merged into one fresh run or not counted");
+	take(page(8), (Pages - 8) * Page, 0);
+	uint64_t served_bytes = 0;
+	for (const auto& copy: staged) {
+		served_bytes += copy.size;
+	}
+	Check(test, fresh.empty() && served_bytes == (Pages - 8) * Page,
+	      "the surviving staged pages were not all served");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, Pages * Page), "KernelMunmap");
+}
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
 	}
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--bda-prestage-only") == 0) {
+		RunTest(TestBdaPrestagerVersionRule);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
@@ -6081,6 +6201,7 @@ int main(int argc, char** argv) {
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
 	RunTest(TestTrackerProtectSharesBackingReads);
+	RunTest(TestBdaPrestagerVersionRule);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFragmentedGuestFreeRangeHints);
