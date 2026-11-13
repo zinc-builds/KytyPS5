@@ -49,6 +49,9 @@ public:
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
+	[[nodiscard]] bool HeldByCurrentThread() const noexcept {
+		return m_owner.load(std::memory_order_relaxed) == CurrentThread();
+	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
@@ -99,6 +102,26 @@ public:
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(offset, size);
 		return GetBits<source>().FirstRangeFrom(start).first < end;
+	}
+
+	// Whether every page of the range is GPU-dirty, without the lock (the GPU-dirty bits' owner).
+	[[nodiscard]] bool IsFullyGpuModifiedUnlocked(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(offset, size);
+		const auto first        = start / 64;
+		const auto last         = (end - 1) / 64;
+		for (auto word = first; word <= last; word++) {
+			auto mask = ~uint64_t {0};
+			if (word == first) {
+				mask &= ~uint64_t {0} << (start % 64);
+			}
+			if (word == last && end % 64 != 0) {
+				mask &= (uint64_t {1} << (end % 64)) - 1;
+			}
+			if ((m_gpu_words[word].load(std::memory_order_acquire) & mask) != mask) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	// IsModified without the lock, for the thread that owns GPU-dirty bits and clears CPU-dirty

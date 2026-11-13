@@ -183,6 +183,22 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	void TakeOwnershipWrites(uint64_t vaddr, uint64_t size);
+public:
+	// The GPU thread is invalidating pages an asynchronous write collection (or a take) found
+	// written: the only merges KYTY_OWNERSHIP_TAKE=verify expects to be no-ops (a store the
+	// collection reports was made before the page's ownership; direct invalidations and label
+	// stores bring new bytes).
+	class CollectionScope final {
+	public:
+		CollectionScope() noexcept { t_in_collection = true; }
+		~CollectionScope() { t_in_collection = false; }
+		CollectionScope(const CollectionScope&)            = delete;
+		CollectionScope& operator=(const CollectionScope&) = delete;
+	};
+	static inline thread_local bool t_in_collection = false;
+private:
+	void VerifyMergeIsNoOp(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,

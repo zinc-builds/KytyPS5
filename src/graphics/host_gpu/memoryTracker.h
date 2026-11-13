@@ -45,6 +45,27 @@ public:
 			index++;
 		}
 	}
+	// GPU thread: whether every page of the range is GPU-dirty (an untracked page is not).
+	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || vaddr / TRACKER_REGION_SIZE >= REGION_COUNT ||
+		    (vaddr + size - 1) / TRACKER_REGION_SIZE >= REGION_COUNT) {
+			return false;
+		}
+		uint64_t remaining = size;
+		uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+		uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+		while (remaining != 0) {
+			const auto  bytes  = std::min(TRACKER_REGION_SIZE - offset, remaining);
+			const auto* region = m_regions[index].load(std::memory_order_acquire);
+			if (region == nullptr || !region->IsFullyGpuModifiedUnlocked(offset, bytes)) {
+				return false;
+			}
+			remaining -= bytes;
+			offset = 0;
+			index++;
+		}
+		return true;
+	}
 	[[nodiscard]] bool IsRegionCpuCleanNoCreate(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || vaddr / TRACKER_REGION_SIZE >= REGION_COUNT ||
 		    (vaddr + size - 1) / TRACKER_REGION_SIZE >= REGION_COUNT) {

@@ -48,6 +48,12 @@ enum class Counter {
 	IndirectPredicated, // multi-draw indirect packets skipped by predication
 	IndirectVerified,   // queued draws whose GPU count was checked (KYTY_INDIRECT_QUEUE=verify)
 	TextureFrees,
+	OwnershipTakes,     // KYTY_OWNERSHIP_TAKE: write collections limited to a range taking GPU ownership
+	OwnershipUncertain, // of which the take could not handle (the readback stays the fallback)
+	CollisionReadbacks, // GPU-thread synchronous merges: a written page found GPU-dirty
+	OwnershipTakeNs,    // time in RenderContext::TakeAsyncWrites
+	OwnershipCheckNs,   // time in the "already GPU-owned?" pre-check (1 in 16 timed, scaled)
+	CollisionRealMerges, // KYTY_OWNERSHIP_TAKE=verify: collection merges that were not no-ops
 	Count
 };
 

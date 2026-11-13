@@ -39,6 +39,8 @@ void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 
 class TextureCache {
 public:
+	// Whether this thread holds the cache's lock (a nested InvalidateMemory would take it again).
+	[[nodiscard]] bool LockHeldByCurrentThread() const noexcept { return m_lock.HeldByCurrentThread(); }
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {

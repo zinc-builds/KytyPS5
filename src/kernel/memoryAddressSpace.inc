@@ -1125,6 +1125,78 @@ public:
 		TakeKeptWrites(written);
 	}
 
+	// ScanAsyncWrites limited to [begin, end) (page-aligned): the written marks of the range's
+	// asynchronous pages are taken and the pages re-protected, then the kept writes overlapping the
+	// range are taken (an entry that straddles an edge keeps its part outside). Marks and kept
+	// writes outside the range stay for the next collection. Consumed marks move staged pages'
+	// versions, as in a collection.
+	// Two passes, as the submit scan (ScanAsyncWritesAtSubmit): a mark is only cleared after its
+	// page's tokens moved. A take covers one range, not the whole guest: a label page's mark is a
+	// guest store a waiter's IsCpLabel must see ("the guest touched the label page", so it may have
+	// published data elsewhere that only a full collection picks up); consuming the mark without
+	// voiding the page's token would hide it (Sol, #151 S1).
+	//  1. find the range's written pages, leaving their marks;
+	//  2. in one hold of m_kept_mutex: void those pages' tokens, then take exactly their marks
+	//     (re-protecting them). Stores to other pages keep their marks.
+	void ScanAsyncWritesIn(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>& written) {
+		static thread_local std::vector<std::pair<uint64_t, uint64_t>> found;
+		found.clear();
+		{
+			std::shared_lock lock(m_mutex);
+			ForEachAsyncChunk(begin, end - begin, [&](uint64_t start, uint64_t bytes) {
+				m_write_protection.Scan(
+				    start, bytes,
+				    [&](uint64_t found_begin, uint64_t found_end) {
+					    if (!found.empty() && found.back().second == found_begin) {
+						    found.back().second = found_end;
+					    } else {
+						    found.emplace_back(found_begin, found_end);
+					    }
+				    },
+				    false);
+			});
+		}
+		if (!found.empty()) {
+			std::shared_lock lock(m_mutex);
+			std::lock_guard  kept_lock(m_kept_mutex);
+			for (const auto& [found_begin, found_end]: found) {
+				HideWritesLocked(found_begin, found_end, false);
+			}
+			for (const auto& [found_begin, found_end]: found) {
+				m_write_protection.Scan(found_begin, found_end - found_begin, [&](uint64_t written_begin, uint64_t written_end) {
+					StagedConsumedLocked(written_begin, written_end);
+					if (!written.empty() && written.back().second == written_begin) {
+						written.back().second = written_end;
+					} else {
+						written.emplace_back(written_begin, written_end);
+					}
+				});
+			}
+		}
+		WaitSerialSubmitScan();
+		std::lock_guard kept_lock(m_kept_mutex);
+		static thread_local std::vector<std::pair<uint64_t, uint64_t>> rest;
+		rest.clear();
+		for (const auto& entry: m_kept_writes) {
+			if (entry.second <= begin || entry.first >= end) {
+				rest.push_back(entry);
+				continue;
+			}
+			const std::pair<uint64_t, uint64_t> taken {std::max(entry.first, begin), std::min(entry.second, end)};
+			written.push_back(taken);
+			if (g_log_alias_writes) {
+				g_verify_kept_taken.push_back(taken);
+			}
+			if (entry.first < begin) {
+				rest.emplace_back(entry.first, begin);
+			}
+			if (entry.second > end) {
+				rest.emplace_back(end, entry.second);
+			}
+		}
+		m_kept_writes.swap(rest);
+	}
+
 	// Appends the kept writes (re-protections and submit scans).
 	void TakeKeptWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
 		WaitSerialSubmitScan();
