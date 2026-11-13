@@ -336,7 +336,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 			const auto vaddr = reinterpret_cast<uint64_t>(output);
 			if (!GuestRange {vaddr, sizeof(uint32_t)}.Valid() ||
 			    buffers.HasGpuDirtyBytes(vaddr, sizeof(uint32_t)) ||
-			    !m_renderer.StoreCpLabel(vaddr, &src[i], sizeof(uint32_t), true)) {
+			    !m_renderer.StoreCpLabel(vaddr, &src[i], sizeof(uint32_t), true, dw_num)) {
 				*output = src[i];
 				m_renderer.NoteGpuWrite(vaddr, sizeof(uint32_t));
 			}
@@ -359,7 +359,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 			const auto     n     = static_cast<uint32_t>(std::min<uint64_t>(dw_num - i, (0x1000 - (vaddr & 0xfff)) / 4));
 			const uint64_t size  = uint64_t {n} * sizeof(uint32_t);
 			if (!GuestRange {vaddr, size}.Valid() || buffers.HasGpuDirtyBytes(vaddr, size) ||
-			    !m_renderer.StoreCpLabels(vaddr, &src[i], sizeof(uint32_t), n, sizeof(uint32_t), true)) {
+			    !m_renderer.StoreCpLabels(vaddr, &src[i], sizeof(uint32_t), n, sizeof(uint32_t), true,
+			                              dw_num)) {
 				per_dword(i, i + n);
 			}
 			i += n;

@@ -909,7 +909,7 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool r
 }
 
 bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size,
-                                 bool invalidate) {
+                                 bool invalidate, uint32_t source) {
 	EXIT_IF(g_on_decode_thread); // GPU thread only (sync packets)
 	const auto page = vaddr & ~uint64_t {0xfff};
 	if (size == 0 || size > sizeof(uint64_t) || ((vaddr + size - 1) & ~uint64_t {0xfff}) != page) {
@@ -931,10 +931,15 @@ bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t siz
 	if (invalidate) {
 		(void)InvalidateMemory(vaddr, size);
 	}
-	m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()] = {vaddr, stored, size, generation, token};
+	const auto bytes = static_cast<uint32_t>(size);
+	m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()] = {vaddr, stored, bytes, source, generation,
+	                                                   token};
 	if (size == sizeof(uint64_t)) {
 		m_cp_labels[((vaddr + 4) >> 2u) % m_cp_labels.size()] = {vaddr + 4, stored >> 32u, 4,
-		                                                           generation, token};
+		                                                           source, generation, token};
+	}
+	if (LabelHitStatsEnabled()) {
+		NoteLabelStores(source, size == sizeof(uint64_t) ? 2 : 1);
 	}
 	return true;
 }
@@ -979,7 +984,7 @@ bool RenderContext::WriteDataRanged() noexcept {
 }
 
 bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
-                                  uint32_t stride, bool invalidate) {
+                                  uint32_t stride, bool invalidate, uint32_t source) {
 	EXIT_IF(g_on_decode_thread); // GPU thread only (sync packets)
 	if (count == 0 || (elem != 4 && elem != 8) || stride < elem) {
 		return false;
@@ -1018,14 +1023,17 @@ bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t e
 		const uint64_t at     = vaddr + uint64_t {i} * stride;
 		uint64_t       stored = 0;
 		std::memcpy(&stored, bytes + uint64_t {i} * elem, elem);
-		m_cp_labels[(at >> 2u) % m_cp_labels.size()] = {at, stored, elem, generation, token};
+		m_cp_labels[(at >> 2u) % m_cp_labels.size()] = {at, stored, elem, source, generation, token};
 		if (elem == sizeof(uint64_t)) {
-			m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()] = {at + 4, stored >> 32u, 4,
+			m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()] = {at + 4, stored >> 32u, 4, source,
 			                                                       generation, token};
 		}
 	}
+	if (LabelHitStatsEnabled()) {
+		NoteLabelStores(source, count * (elem / 4));
+	}
 	if (GetWriteDataMode() == WriteDataMode::Verify) {
-		VerifyCpLabels(vaddr, values, elem, count, stride, invalidate, token, invalidated);
+		VerifyCpLabels(vaddr, values, elem, count, stride, invalidate, token, invalidated, source);
 	}
 	return true;
 }
@@ -1040,7 +1048,7 @@ bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t e
 // invalidated are the values' bytes. A remap since counts as raced.
 void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t elem,
                                    uint32_t count, uint32_t stride, bool invalidate,
-                                   uint64_t token, uint64_t invalidated) {
+                                   uint64_t token, uint64_t invalidated, uint32_t source) {
 	const auto  page       = vaddr & ~uint64_t {0xfff};
 	const auto  generation = m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()].generation;
 	const auto* bytes      = static_cast<const uint8_t*>(values);
@@ -1055,8 +1063,8 @@ void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t 
 		EXIT("WDVERIFY FAIL (%s): 0x%016" PRIx64 " ranged label {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64
 		     " gen %" PRIu64 " token %" PRIu64 "}, per-dword {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64
 		     " gen %" PRIu64 " token %" PRIu64 "}\n",
-		     what, at, ranged.vaddr, ranged.value, ranged.size, ranged.generation, ranged.token,
-		     dword.vaddr, dword.value, dword.size, dword.generation, dword.token);
+		     what, at, ranged.vaddr, ranged.value, uint64_t {ranged.size}, ranged.generation, ranged.token,
+		     dword.vaddr, dword.value, uint64_t {dword.size}, dword.generation, dword.token);
 	};
 	// The ranged token, or one it was voided for.
 	const auto same = [&](const CpLabel& ranged, const CpLabel& dword) {
@@ -1084,8 +1092,8 @@ void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t 
 			}
 			fail("the per-dword protection fails", at, {}, {});
 		}
-		const CpLabel dword {at, expected, elem, generation, dword_token};
-		const CpLabel dword_hi {at + 4, expected >> 32u, 4, generation, dword_token};
+		const CpLabel dword {at, expected, elem, source, generation, dword_token};
+		const CpLabel dword_hi {at + 4, expected >> 32u, 4, source, generation, dword_token};
 		const auto&   ranged    = m_cp_labels[(at >> 2u) % m_cp_labels.size()];
 		const auto&   ranged_hi = m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()];
 		if (!same(ranged, dword)) {
@@ -1121,6 +1129,51 @@ void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t 
 		std::fflush(stdout);
 		v.last_report = now;
 	}
+}
+
+namespace {
+
+// KYTY_LABEL_HIT_STATS: buckets by the WRITE_DATA packet's dwords (0: another label store).
+constexpr int         kLabelBuckets                 = 7;
+constexpr const char* kLabelBucketNames[kLabelBuckets] = {"other", "1", "2", "3-4", "5-16", "17-64", "65+"};
+int LabelBucket(uint32_t source) {
+	return source == 0 ? 0 : source == 1 ? 1 : source == 2 ? 2 : source <= 4 ? 3 : source <= 16 ? 4 : source <= 64 ? 5 : 6;
+}
+struct LabelHitStats {
+	uint64_t checks[5][kLabelBuckets] {}; // by RenderContext::LabelCheck
+	uint64_t slots[kLabelBuckets] {};
+	uint64_t last_report = 0;
+};
+LabelHitStats g_label_hits; // GPU thread only
+
+void ReportLabelHits() {
+	auto&      s   = g_label_hits;
+	const auto now = Common::FrameDiag::NowNs();
+	if (now - s.last_report < 1'000'000'000ull) {
+		return;
+	}
+	s.last_report = now;
+	char line[1024];
+	int  n = std::snprintf(line, sizeof(line), "LABELHIT (cumulative; per bucket slots/other_addr/mismatch/hit/stale/written)");
+	for (int b = 0; b < kLabelBuckets && n < static_cast<int>(sizeof(line)) - 96; b++) {
+		n += std::snprintf(line + n, sizeof(line) - n, " %s=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+		                   kLabelBucketNames[b], s.slots[b], s.checks[0][b], s.checks[1][b], s.checks[2][b],
+		                   s.checks[3][b], s.checks[4][b]);
+	}
+	std::printf("%s\n", line);
+	std::fflush(stdout);
+}
+
+} // namespace
+
+void RenderContext::NoteLabelCheck(LabelCheck check, uint32_t source) noexcept {
+	g_label_hits.checks[static_cast<int>(check)][LabelBucket(source)]++;
+	ReportLabelHits();
+}
+
+void RenderContext::NoteLabelStores(uint32_t source, uint32_t slots) noexcept {
+	g_label_hits.slots[LabelBucket(source)] += slots;
+	ReportLabelHits();
 }
 
 void RenderContext::PrepareBda() {
