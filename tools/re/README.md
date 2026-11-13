@@ -11,3 +11,8 @@ Addresses below are for the Astro Bot dump (PPSA21567) eboot.
 - `callers.py eboot.img <target>...`: rel32 call/jmp sites; `refs.py` / `riprefs.py`: RIP-relative references.
 - `gamespeed.py [bench logs...]`: game speed from the game's own `veg_chibi 6->7` event and from
   frames 1000-1600 (see the docstring); default all `/tmp/bench-*.log`.
+- `patchstats.cpp` (target `patch_stats`; `tools/astro-bench/build.sh patch_stats`): the guest
+  instruction patcher (`--amd-cpu`) run offline on an `eboot.img`, with why each VRSQRTPS site
+  still traps: `patch_stats eboot.img 0x74bd57c 0x74c0000 0x269b04` (exec segment size,
+  eh_frame_hdr offset and size for Astro Bot). In the emulator, `KYTY_TRAP_DIAG=1` prints which
+  sites and threads actually trap.

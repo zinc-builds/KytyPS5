@@ -103,6 +103,7 @@ and `low1` is the mean 1% low FPS.
 | 2026-11-12 | Watching an asynchronous page no longer runs a `PAGEMAP_SCAN` (#125, Track K; `KYTY_ASYNC_WATCH_SCAN=1` restores): such a page is write-protected or holds a written mark already, so the scan only moved the marks of stores since the last collection into the kept list; the next full or submit scan now reports them from the page tables. Watch scans 4.9k → 56/s, watch site 46 → 30 ns/draw, collection hits +2; invalidations unchanged (~263k pages/s); `KYTY_ASYNC_WP_VERIFY` 0 lost. Same binary, 3 runs a side, frames 1000–1600: `cmd_sns` −8.1% ± 2.6, `cmd_ns` −0.87% ± 0.30, FPS noise. Found on the way (hot-dirty study with Track B, not built; probes on branches trackK/churn-diag, trackK/waitscan-diag): the ~4.6k watched pages/frame the async scans invalidate are Sky Garden's triple-buffered per-frame data (94% rewritten every 3rd frame, ~93 pages/frame every frame); per write they get ~1.0 PrepareBda upload, 0.23 obtain syncs and ~12.8 clean binds through the workers' lookup (58% of writes none, 17% nine or more), so treating them as always dirty would cost ~5.6 command-thread copies per write instead of 1. Wait-time full collections (~350/s, ~57 µs, ~64 chunks/32.8k PTEs, 57% of them watched in ~85 runs) are at their floor: page-level scanning adds as many calls as it saves, an exact 2 MiB filter saves ~6 ns/draw | | | | |
 | 2026-11-12 | Prepare pipeline under random delays, verify off (Track B4, from an independent review: `KYTY_PREPARE_VERIFY` drains the queue per adopted draw, so it changes the orderings it checks). `KYTY_PREPARE_CHAOS=<seed>`: random spins (0–20 µs), yields and rare 200 µs sleeps at a worker's claim and publication, the command thread's wait, adoption and slot release, the poster's slot reuse and register-snapshot retirement, and the decode thread's posts and sync hand-offs; the decode hand-off's ownership asserts on; non-draining invariants (the worker stamps each slot with the sequence it ran and a digest of the inputs it read, checked at adoption; no register snapshot rewritten while an unreleased draw uses it). Sky Garden and the four heavy levels, frames 0–1600, decode thread off (seed 1) and on (seed 2): all ten runs reach the last frame, **0 invariant or assert failures** over ~83M checked draws (1.0–1.4M decode posts and 52k–593k decode syncs delayed per run). Host test `prepare_pool_tests` (now in the CI selection): a real `Pool` with two workers and an overflow worker, a poster and a committer, 200k draws per seed, clean, and an injected off-by-one snapshot retirement is caught every time. The snapshot retirement rule moved into `DrawPrepare::SnapshotRing` so the test runs the production code | – | – | – | – |
 | 2026-11-13 | Occlusion proxy draws skipped in always-visible mode (Track B4; `KYTY_OCCLUSION_PROXY_SKIP=0` renders them, `=verify` renders them and checks their shaders write nothing). The heavy levels' burst (3 frames in 33 with ~2× draws) is the occlusion-query pass: per object WRITE_DATA (zero), EVENT_WRITE 0x39, a 36-vertex box, EVENT_WRITE 0x39 (Track B's pass diag); every box drained the prepare queue (the dump is a non-keeping packet), and with host queries off the dumps store a synthetic always-visible result, so the boxes only feed a count nobody reads. A draw inside an open synthetic query is not rendered when its only effect is the count: CB mode Normal with target mask 0 (or Disable), no depth write, no stencil test, no clear/copy/resummarize, no DB_RENDER_OVERRIDE force bits, not tessellated, no object/primitive-ID output, and its shader set (keyed with VGT_SHADER_STAGES_EN; forgotten when a shader is mapped) seen at commit to write no buffer, image, raw address, DMA or GDS. The dumps store the same values in the same order. Refused: 0.14% of proxy-shaped draws (shader sets not yet seen, or writing). Same binary through the switch, frames 1000–1600, burst frames (cmd CPU > 50 ms): Pirate Island draws 11,836 → 5,122, drains 6,734 → 44, cmd 98.8 → 83.7 ms; Ninja Castle 14,295 → 4,453, 9,896 → 41, 133.4 → 112.0 ms; Clock Tower 8,218 → 4,902, 3,368 → 46, 58.0 → 51.4 ms; normal-frame drains 223/114/151 → 59/49/55. Sky Garden (its own per-frame queries): `cmd_ns` −4.77% (!), cycles/draw −3.45% (!), frames over 100 ms 3 → 0. What remains of a burst frame is the boxes' WRITE_DATA (~10 µs a box, per-dword label stores; Track K) | – | – | – | – |
+| 2026-11-13 | VRSQRTPS sites in functions with unresolved indirect branches made native: the jump goes over the preceding instruction of 5+ bytes, the site keeps its trap form for jumps past it (Track S; `KYTY_RSQRT_PRECEDING_JUMP=0` restores; Astro Bot trapped sites 1,088 → 10; bit-identical, exhaustive 2^32 test). PGO, same binary, one pair per level, frames 1000–1600: Sky Aztec SIGILL/s 654,889 → 0, process CPU 189 → 145 ms/frame (−23%), no guest work 2.54 → 0.00 ms/frame, 2+ refreshes 1.7% → 0%, FPS 59.21 → 60.00; Sky Garden SIGILL/s 285,958 → 0, process CPU −12%, already at 60; `cmd_ns` unchanged. ~4.0 µs of process CPU per trap. See "The trapped VRSQRTPS sites" | 60.00 (Sky Aztec) | 380k | 18.1 | 58.9 |
 
 ¹ From a short screenshot run; the two baseline runs predate the `worst_ms`/`low1` columns.
 
@@ -489,20 +490,76 @@ did the compare read it.
 shared. Write-fault SIGBUS is ~3% of tbb time. SIGILL from the 1,088 VRSQRTPS sites the
 `--amd-cpu` patcher couldn't relocate (~85k traps/s) is ~6%.
 
-### The trapped VRSQRTPS sites (measured, not pursued)
+### The trapped VRSQRTPS sites: made native by a jump over the preceding instruction (Track S, 2026-11-13)
 
-After C2 the SIGILL traps (~123k/s) are the main signal source on guest threads.
-- **Ceiling:** `KYTY_AMD_SKIP_RSQRT=1` (host-precision VRSQRTPS, no traps) against the default on
-  `dev` 74b1d351: 26.48 / 26.25 vs 25.79 / 26.05 FPS, at most **+1.7%**. Draws per frame also
-  change (5,400 vs 5,490): the precision changes game state, so AMD-exact results stay.
-- **Why they trap:** all 1,088 sites are 4-byte `vrsqrtps xmm, xmm` in 472 functions with an
-  indirect jump the patcher can't resolve, so it may not move neighbouring instructions to fit a
-  5-byte jump.
-- **Padding caves:** only 7 sites have ≥ 5 bytes of int3 padding within short-jump reach.
-- **Treating `jmp [reg+disp]` as a tail call** (it leaves the function) would unblock 516 sites
-  (47%). The other functions also contain `jmp reg`, which can't be told apart from an
-  unresolved jump table. Expected gain: about half the ceiling (~0.8%), for a guest-code
-  heuristic. Not worth the risk now; revisit if guest threads become the bottleneck.
+**What trapped.** `--amd-cpu` rewrites VRSQRTPS to a native double-precision sequence (the
+deterministic, correctly rounded 1/sqrt). It left 1,088 of 10,848 sites in Astro Bot's eboot
+to trap (SIGILL, then emulation).
+- All 1,088 are 4-byte `vrsqrtps xmm, xmm` in functions with an unresolved indirect branch.
+  There the patcher may not move neighbouring instructions to fit a 5-byte jump, because an
+  unknown jump could land inside the moved bytes.
+- Unresolved kinds (`tools/re/patchstats.cpp`, the patcher run offline on the eboot): sites in
+  functions with only `jmp [reg+disp]` 516, only `jmp reg` 555, both 17.
+
+**The fix.** The near jump goes over the first five bytes of the nearest preceding instruction
+of 5+ bytes, in straight-line code (no branch, call, syscall or interrupt; boundaries from the
+patcher's recursive decode).
+- The trampoline runs copies of that instruction through the site, the site with the native
+  sequence, and returns after the site.
+- Everything after the overwritten instruction stays in place and the site keeps its trap form.
+  So a jump into any of them still runs correctly, through the trap.
+- No instruction starts inside the five jump bytes.
+- Coverage: 1,078 sites recovered, 10 left (`KYTY_RSQRT_PRECEDING_JUMP=0` restores the old
+  rule). The 10 start a block (right after a branch, or after padding that follows a `jmp`).
+  None of them ran in the Sky Garden and Sky Aztec windows.
+- Exact: an exhaustive test compares the native sequence with the trap emulation on all 2^32
+  inputs, 0 differences.
+
+**What a trap cost.**
+- Bare round trip (SIGILL, a 4-lane emulation, sigreturn; `SA_ONSTACK`): 1.35 µs on a P-core,
+  1.79 µs on an E-core.
+- In the emulator, from same-binary on/off runs: **~4.0 µs of process CPU per trap**. That is
+  44.3 ms per Sky Aztec frame for 11,088 traps, and 20.8 ms per Sky Garden frame for 4,754.
+- `KYTY_TRAP_DIAG` puts the emulator's own handler at 70–150 ns. The threads' *system* time
+  alone was 4.2–4.4 µs per trap, so the excess over the bare round trip is in the kernel's
+  signal path for these threads. Not attributed further: the trap path makes no system call.
+
+**Where they were** (`KYTY_TRAP_DIAG=1`; Sky Aztec ~589k/s, Sky Garden ~254k/s):
+- Each of the game's 11 `tbb_thead` job workers (E-cores) took 43–47k/s on Sky Aztec, ~19k/s
+  on Sky Garden. Kernel time was ~200 of their ~490 ms/s CPU on Sky Aztec: about 40%.
+- The main guest thread took 53k/s (Sky Aztec) and 38k/s (Sky Garden). The 8 `BackgroundTaskW`
+  threads took 5–6.5k/s each on Sky Aztec.
+- `DrawThread` and the `Draw*` render workers took none.
+- Concentrated:
+  - Sky Garden: two sites (`eboot+0xb1194e`, `+0xb12434`) carry 95% of the traps.
+  - Sky Aztec: the same two carry 58%, and five (adding `+0x51479e5`, `+0x5147a4e`,
+    `+0x514769c`) carry 99.9%.
+- What they compute: one inlined vector-length idiom from the game's math library: dot(v,v), an
+  epsilon test, `vrsqrtps`, two Newton steps, length = dot × estimate.
+
+**Result** (PGO, same binary, switch 0 → 1, frames 1000–1600, one pair per level):
+
+| | SIGILL/s | process CPU ms/frame | no guest work ms/frame | 2+ refreshes | FPS | low1 |
+|---|---|---|---|---|---|---|
+| Sky Aztec | 654,889 → 0 | 189.2 → 144.9 | 2.54 → 0.00 | 1.7% → 0% | 59.21 → 60.00 | 38.2 → 58.9 |
+| Sky Garden | 285,958 → 0 | 178.9 → 158.1 | 0.03 → 0.02 | 0.2% → 0.2% | 60.0 → 60.0 | 53.9 → 55.0 |
+
+- `cmd_ns` unchanged (2241 → 2233, 2913 → 2911): the gain is all on the game's side.
+- Sky Aztec's late game (Track R's "guest-late" gaps, with `DrawThread` running) was its job
+  workers' trap time.
+- Screenshots at level frame 1,400 match. Sky Garden's own game-speed event lands at 828 vs 834
+  flips, inside the spread of identical runs (832–902).
+
+**Host precision is not an option.** `KYTY_AMD_SKIP_RSQRT=1` (the host's VRSQRTPS, no traps)
+crashed Sky Aztec in 2 of 2 runs at frame ~400. The faults were a null dereference of a tagged
+handle (`eboot+0x39cca5`) and a store through a null array (`+0x7d1239`).
+- Game state diverged upstream into paths with invalid objects. The simulation is
+  precision-sensitive, so the native path stays bit-identical to the emulation.
+- The earlier ceiling measured with that switch (+1.7%, below) is superseded.
+
+Earlier (C2-era) notes: ~123k traps/s then. The ceiling with `KYTY_AMD_SKIP_RSQRT=1` was +1.7%,
+with draws per frame changing. 516 sites would have been unblocked by treating `jmp [reg+disp]`
+as a tail call. Only 7 sites have int3 padding in short-jump reach.
 
 ### Notes for Tracks B and C (from the Track A agent, 2026-11-06)
 
