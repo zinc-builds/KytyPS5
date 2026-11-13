@@ -20,7 +20,7 @@ target=${1:-kyty_emulator}
 bdir=$repo/_Build/linux${mode_tag:+-$mode}
 [ "$KYTY_BENCH_LOCKED" = x ] && { echo "build.sh: not inside an exclusive hold (batch.sh); build first" >&2; exit 1; }
 . "$repo/tools/astro-bench/benchlock.sh"
-benchlock_acquire s "build.sh $mode $repo" >&2 || exit 1
+benchlock_acquire s "build.sh $mode $repo" >&2 || exit $?
 t0=$SECONDS
 echo "build.sh: $(git -C "$repo" rev-parse --short HEAD) $mode_desc -> $bdir" >&2
 [ -f "$repo/3rdparty/ffmpeg-core/CMakeLists.txt" ] || git -C "$repo/3rdparty/ffmpeg-core" checkout -qf HEAD >&2

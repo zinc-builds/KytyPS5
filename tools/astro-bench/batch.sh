@@ -9,7 +9,7 @@
 # once; the void one's summary is kept as /tmp/garden-<label>.void.out. A second VOID leaves no
 # /tmp/garden-<label>.json (only .void.json): callers treat it as a failed run.
 . "$(dirname "$0")/benchlock.sh"
-benchlock_acquire x "batch.sh" || exit 1
+benchlock_acquire x "batch.sh" || exit $?
 run_line() { # run_line <line> [extra env]: runs one configuration, prints garden.sh's summary line
 	local line=$1 label rest envs flags
 	label=${line%% *}; rest=${line#"$label"}

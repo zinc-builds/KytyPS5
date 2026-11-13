@@ -33,7 +33,7 @@ flock 7 # one builder per commit; later callers wait and reuse its result
 [ -f "$done_marker" ] && { echo "$dst/install"; exit 0; }
 # The whole preparation (worktree, submodules, configure, build) is build work: shared bench lock.
 . "$repo/tools/astro-bench/benchlock.sh"
-benchlock_acquire s "refbuild.sh $key" >&2 || exit 1
+benchlock_acquire s "refbuild.sh $key" >&2 || exit $?
 t0=$SECONDS
 
 src=$root/$key.src

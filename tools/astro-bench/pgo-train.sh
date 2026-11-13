@@ -84,7 +84,7 @@ tmp=$dir/$name.tmp.$$
 rm -rf "$tmp"; mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT
 . "$bench/benchlock.sh"
-benchlock_acquire x "pgo-train.sh $sha" >&2 || exit 1
+benchlock_acquire x "pgo-train.sh $sha" >&2 || exit $?
 t1=$SECONDS
 # The exclusive lock means no benchmark is running: an emulator now is the user playing.
 if pgrep -x kyty_emulator >/dev/null; then

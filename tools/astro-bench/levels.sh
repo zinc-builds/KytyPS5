@@ -56,7 +56,7 @@ esac
 # below cannot touch another sweep's live files, and a run that never happens cannot leave an
 # earlier run's files to be read as its own.
 . "$here/benchlock.sh"
-benchlock_acquire x "levels.sh $tag-$mode" || exit 1
+benchlock_acquire x "levels.sh $tag-$mode" || exit $?
 for l in "${levels[@]}"; do
 	rm -f "/tmp/garden-$tag-$mode-$l.out" "/tmp/bench-$tag-$mode-$l.log" "/tmp/garden-$tag-$mode-$l-shot.png"
 done

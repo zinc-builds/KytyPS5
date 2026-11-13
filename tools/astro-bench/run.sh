@@ -11,7 +11,7 @@ if [ -n "${KYTY_INSTALL+x}" ] && [ ! -x "$KYTY_INSTALL/kyty_emulator" ]; then
 	exit 1
 fi
 . "$(dirname "$0")/benchlock.sh"
-benchlock_acquire x "run.sh $(basename "$log")" || exit 1
+benchlock_acquire x "run.sh $(basename "$log")" || exit $?
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 # Whole seconds: cmake --install copies the build's mtime but drops the fraction.
 built=$(stat -c %Y "$repo/_Build/linux/kyty_emulator" 2>/dev/null || echo 0)
