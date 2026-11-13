@@ -2008,7 +2008,10 @@ If usage is still critical, an aggressive pass follows: up to 40 candidates aged
   - 302 ms for ~2.0 GiB (Pirate Island, level frame 300);
   - 262 ms for ~1.7 GiB (Sky Garden, frame 192);
   - 708 ms for ~2.0 GiB (final_stage, frame 1334).
-- **Slow frames without a large upload.** On Ninja Castle and Pirate Island these are the occlusion-query burst frames. final_stage's 49 are not attributed: for example, frame 439 took 62 ms with 2 KiB uploaded and 697 draws.
+- **Slow frames without a large upload.**
+  - On Ninja Castle and Pirate Island, some coincide with occlusion-query burst frames (~9–10k WRITE_DATA and ~580–640 command-thread minor faults per frame).
+  - Others don't, and stay unattributed: Ninja Castle frame 362 (53 ms, 272 WRITE_DATA, 35 faults), Pirate Island frame 696 (51 ms, 233 WRITE_DATA, 15 faults).
+  - final_stage's 49 are not attributed either: for example, frame 439 took 62 ms with 2 KiB uploaded and 697 draws.
 - **Exceptions.**
   - Eviction near a slow frame: Sky Garden 1, Ninja Castle 1, Clock Tower 2, final_stage 4.
   - Re-creation near a slow frame: Clock Tower 1, final_stage 5. final_stage's worst is frame 1531: 42 images, 120 MiB, in a 58 ms frame.
