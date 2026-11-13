@@ -336,8 +336,8 @@ def main():
         top.append(f"{g['cause']}: {g['count']} incident(s), {g['lost_ms']:.0f} ms lost; worst {w['worst_ms']} ms "
                    f"at {fmt_t(w['t'] or 0)} ({w['file']}): {w['summary']}")
     # Throttling keeps a top-three slot (after up to two others) when the clocks dropped with it.
-    if thermal and (not thermal['core_mhz_at_limit'] or not thermal['core_mhz_otherwise'] or
-                    thermal['core_mhz_at_limit'] < 0.97 * thermal['core_mhz_otherwise']):
+    if thermal and thermal['core_mhz_at_limit'] and thermal['core_mhz_otherwise'] and \
+            thermal['core_mhz_at_limit'] < 0.97 * thermal['core_mhz_otherwise']:
         del top[2:]
         top.append(f"not the emulator: the CPU package reached its thermal limit ({thermal['limit_c']:.0f} °C) in "
                    f"{thermal['samples_at_limit']} of {thermal['samples']} system samples (first at "
@@ -435,12 +435,13 @@ def main():
         if th:
             clk = (f"; the emulator's cores ran at {th['core_mhz_at_limit']} MHz then vs {th['core_mhz_otherwise']} MHz "
                    f"otherwise" if th['core_mhz_at_limit'] and th['core_mhz_otherwise'] else '')
-            dropped = not (th['core_mhz_at_limit'] and th['core_mhz_otherwise']) or \
-                th['core_mhz_at_limit'] < 0.97 * th['core_mhz_otherwise']
+            measured = bool(th['core_mhz_at_limit'] and th['core_mhz_otherwise'])
+            dropped = measured and th['core_mhz_at_limit'] < 0.97 * th['core_mhz_otherwise']
             p(f"THERMAL: CPU package at its limit ({th['limit_c']:.0f} °C) in {th['samples_at_limit']} of "
               f"{th['samples']} samples, first at {fmt_t(th['first_t'])}{clk}: " +
               ("the CPU throttles there, so slow frames in those seconds are partly the cooling's doing "
-               "(an outside cause)" if dropped else "no clock loss seen with it (no throttling cost)"))
+               "(an outside cause)" if dropped else "no clock loss seen with it (no throttling cost)" if measured
+               else "no clock comparison (no readings away from the limit), so throttling is not measured"))
     if report['dropped']['events'] or report['dropped']['frames']:
         p(f"dropped: {report['dropped']['events']} events, {report['dropped']['frames']} frame records")
     p('top three things to fix:')

@@ -93,6 +93,14 @@ def main():
               f'if this build is new, expect a long first load (shaders compile as they appear)')
         return
     have = size(mine) if header_matches(mine, key) else 0
+    try:
+        with open(mine, 'rb') as f:
+            manual = f.read(8)[4:8] not in (b'', b'\0\0\0\0')
+    except OSError:
+        manual = False
+    if manual or os.environ.get('KYTY_SHADER_CACHE_STAMP'):
+        print('left alone: the shader store uses a manual stamp (KYTY_SHADER_CACHE_STAMP)')
+        return
     donor, donor_size = None, 0
     try:
         dirs = sorted(os.listdir(builds))
