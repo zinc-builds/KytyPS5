@@ -1949,6 +1949,62 @@ Those frames also take ~450–640 command-thread minor faults against ~15 in oth
 
 **Classifier note.** cmdsplit's categories now match a function's own name, not its demangled parameter types. Before, `CommitBindings(…PipelineCache::Pipeline const*…)` counted as pipeline lookup.
 
+### VRAM pressure is not what makes the streaming hitches (Track K, 2026-11-13)
+
+**Question.** Do the 55–700 ms frames that remain after the GC revert (#128) come from VRAM pressure: the texture collector evicting, then re-uploading what it evicted? And would a bigger or smaller budget help?
+
+**Answer: no.** The slow frames that aren't burst triplets are first uploads of new textures, 50–2,088 MB in one frame. They don't coincide with evictions or re-creations, and moving the budget ±1.6 GB changes neither memory use nor hitch counts. Don't reopen this without new data. The lever is the upload path; see the plan for the big-upload hitch.
+
+**Method.** Diagnostic build `trackK/vram-diag` (dev 7c52251f, not for merge). `KYTY_VRAM_DIAG=1` prints a VRAM line per GC tick: device memory in use, the collector's state, evictions by mode, and re-creations of images evicted earlier (same guest address and size). `KYTY_VRAM_BUDGET_DELTA_MB` shifts the budget the thresholds come from. Runs: levels.sh frames 0-3000 with `KYTY_FRAME_DIAG=1`; outside load checked, no run void. Analysis: `vramtable.py`, matching frames over 50 ms (level-load frames excluded, as hitches.py does) to the GC ticks inside them.
+
+**Budget and thresholds.**
+- The driver reports 12.15–12.20 GB: the VMA device-local heap budget minus 1 GB, discrete GPU.
+- `TextureCache` derives its thresholds from that: trigger ~2.0 GB, pressure ~7.3 GB, critical ~10.5 GB.
+- Device memory is everything VMA allocated: images, buffers, stream rings, the resident heap and render targets. Only images are evictable.
+
+| level | device memory min / mean / max (GB) | GC ticks: < trigger / trigger–pressure / pressure–critical / ≥ critical |
+|---|---|---|
+| Sky Garden | 3.96 / 10.58 / 11.03 | 0 / 3.1 / 6.0 / 90.9% |
+| Ninja Castle | 3.96 / 10.66 / 11.27 | 0 / 4.1 / 5.6 / 90.2% |
+| Pirate Island | 3.96 / 11.83 / 12.68 | 0 / 9.5 / 0.6 / 89.9% |
+| Clock Tower | 3.96 / 11.52 / 11.94 | 0 / 4.1 / 0.3 / 95.6% |
+| final_stage | 3.96 / 7.74 / 9.58 | 0 / 44.0 / 56.0 / 0% |
+
+That explains the "set point" (9.7–12.2 GB peak across 21 runs, nearly regardless of level). Usage settles just above critical because most of it isn't images. The collector is in its aggressive mode almost every frame, yet finds few images idle for 160 ticks to evict.
+
+**Evictions, re-creations, and slow frames.**
+
+| level | evictions: normal / pressured / aggressive (per s, MB) | re-created after eviction | frames > 50 ms (> 100) | of those: upload ≥ 40 MB / eviction in the frame / re-creation |
+|---|---|---|---|---|
+| Sky Garden | 0 / 2 / 29 (0.53/s, 138 MB) | 1 (0 MB) | 6 (1) | 6 / 1 / 0 |
+| Ninja Castle | 0 / 1 / 14 (0.23/s, 29 MB) | 1 (0 MB) | 27 (3) | 16 / 1 / 0 |
+| Pirate Island | 0 / 1 / 9 (0.16/s, 25 MB) | 1 (0 MB) | 14 (4) | 11 / 0 / 0 |
+| Clock Tower | 0 / 1 / 83 (1.48/s, 324 MB) | 2 (0 MB) | 18 (5) | 13 / 2 / 1 |
+| final_stage | 0 / 465 / 0 (7.98/s, 1,412 MB) | 107 (272 MB; 23 within 1 s, 60 within 5 s, 24 within 30 s) | 76 (7) | 27 / 4 / 5 |
+
+- The worst frames are uploads: 302 ms for 2.0 GB (Pirate Island, level frame 300), 262 ms for 1.8 GB (Sky Garden, frame 192), 708 ms for 2.1 GB (final_stage, frame 1334).
+- On Ninja Castle and Pirate Island, the slow frames without an upload are the occlusion-query burst triplets.
+- final_stage is the only level that thrashes mildly. It sits between pressure and critical, and 78% of its re-creations come within 5 s of the eviction. Even there only 5 of its 76 slow frames coincide with a re-creation (worst: frame 1531, 42 images, 120 MB).
+
+**Budget ±1.6 GB** (Sky Garden, Ninja Castle):
+
+| | −1.6 GB | base | +1.6 GB |
+|---|---|---|---|
+| Sky Garden device memory mean / max (GB) | 10.12 / 10.39 | 10.58 / 11.03 | 10.37 / 10.81 |
+| Sky Garden frames > 50 ms (> 100) | 7 (1) | 6 (1) | 8 (0) |
+| Ninja Castle device memory mean (GB) | 11.10 | 10.66 | 11.77 |
+| Ninja Castle frames > 50 ms (> 100) | 27 (3) | 27 (3) | 19 (3) |
+| evictions/s, Sky Garden / Ninja Castle | 0.54 / 0.27 | 0.53 / 0.23 | 0.03 / 0.22 |
+
+- Nothing moves outside run-to-run spread, and re-uploads stay at about 0.
+- A lower budget doesn't make the collector evict more, because there is nothing evictable.
+- A higher one only moves Sky Garden from "critical" to "pressure".
+
+**What follows.**
+1. The collector's pressure measure is wrong even though it's harmless today. It should judge pressure on evictable bytes, or on device memory minus a non-evictable floor taken at level start. final_stage's re-creations call for a ghost list of recently evicted keys. Both go behind a switch (Track K, next).
+2. The big first uploads are the largest hitch a player feels. They are a matter for the upload path: copy cost and lead time, not memory.
+3. The burst-frame minor faults on Ninja Castle (~636 per frame) are not glibc heap trimming. With `GLIBC_TUNABLES` trim and mmap thresholds of 1 GiB and top_pad of 256 MiB, they went 635 → 636 per burst frame; the emulator uses glibc malloc. Fault addresses are next.
+
 ### Commit-side prefetch: early hand-off lines don't buy cycles (Track R, 2026-11-12)
 
 The question was whether the command thread's cross-core hand-off loads cost cycles because they are late. The test: while committing queued draw N, the command thread prefetches what it will read for the draws behind it, one pointer level per draw of distance. Prototype on branch `trackR/commit-prefetch` (`KYTY_COMMIT_PREFETCH=1`, `KYTY_COMMIT_PREFETCH_LEVELS` bit mask), not merged. The levels:
