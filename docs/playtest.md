@@ -15,8 +15,16 @@ tools/playtest.sh aerial_garden    # straight into a level (the game's "-lvl" na
   Mailbox at 60 Hz vblanks, 1920x1080) and the default thread placement, so what is played is
   what the bench measures. The performance overlay stays hidden (F2 shows it); the recorder counts
   without it.
-- It refuses to start while an agent benchmark holds the bench lock or another emulator runs,
-  waits for agent builds, and holds the lock for the session (`--no-lock` doesn't).
+- If an agent benchmark or build holds the bench lock, it waits for it: queued at priority 1
+  (ahead of every queued agent job) for at most 30 minutes, printing the elapsed time and the
+  holder every 30 s (Ctrl+C cancels). It then holds the lock for the session, so no agent
+  benchmark runs while you play (`--no-lock` doesn't take it). It refuses only when your own
+  emulator is running (one not started from an agent worktree or the build cache) or another
+  playtest session is.
+- The shader store is per install, so a new build starts cold: `tools/playtest-store.py` computes
+  the build's store key from git (as `shader_store_key.cmake` does) and, when the install's store
+  is missing, from another build or under half the size of the largest same-key store in the build
+  cache, copies that one in; with none it says to expect a long first load.
 - At exit it converts the screenshots to PNG, prints the one-page report and the session dir.
 - Saves are the install's own `_SaveData` (seeded from the play checkout when the install was
   built).
@@ -52,7 +60,14 @@ game's `StartLevel <name>` and `Level has started: <name>` lines); markers; inje
 
 System, every 2 s, read-only (`tools/playtest-sample.py`, nice 19): per-core busy % and MHz,
 temperatures, the emulator's RSS and named threads with their CPUs, other processes that ran on
-those CPUs or their SMT siblings, and VRAM, GPU load, temperature and clock (`nvidia-smi`).
+those CPUs or their SMT siblings, and VRAM, GPU load, temperature and clock (`nvidia-smi`). The
+report flags samples with the CPU package at its critical temperature (where it throttles) and the
+clock of the emulator's cores then: an outside cause (cooling).
+
+`tools/playtest-check.sh` runs the user's launch end to end from a clean environment (`env -i`, no
+`KYTY_*`, no lock held), to the level start and 20 s in, stops the emulator and checks the session;
+`--hold shared|exclusive` first holds the lock as an agent build or benchmark would, and
+`--user-emulator` checks the refusal. Re-run it after any change to `playtest.sh` or `benchlock.sh`.
 
 ## Triggers and incidents
 

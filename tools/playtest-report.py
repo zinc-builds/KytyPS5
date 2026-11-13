@@ -244,11 +244,32 @@ def main():
         for k, v in x.get('temps', {}).items():
             temps_max[k] = max(temps_max[k], v)
     n_sys = max(1, len(system))
+    # Thermal throttling: samples with the CPU package at its critical temperature, and the clock of
+    # the emulator's cores then against the rest of the session. An outside cause (cooling).
+    limits = next((x['temp_limits'] for x in system if x.get('temp_limits')), None)
+    if limits is None:  # sessions from before the sampler read the limit: Intel's usual TjMax
+        limits = {k: 100.0 for x in system[:1] for k in x.get('temps', {}) if k.startswith('coretemp:Package')}
+    hot_t, mhz_hot, mhz_ok = [], [], []
+    for x in system:
+        cores = x.get('cores', {})
+        mhz = [cores[str(c)]['mhz'] for c in x.get('hot_cores', []) if cores.get(str(c), {}).get('mhz')]
+        at_limit = any(x.get('temps', {}).get(k, 0) >= lim - 1.0 for k, lim in limits.items())
+        if at_limit and 'start_mono_s' in start:
+            hot_t.append(x['t'] - start['start_mono_s'])
+        if mhz:
+            (mhz_hot if at_limit else mhz_ok).append(sum(mhz) / len(mhz))
+    thermal = None
+    if hot_t:
+        thermal = {'samples_at_limit': len(hot_t), 'samples': len(system), 'first_t': round(hot_t[0], 1),
+                   'limit_c': max(limits.values()),
+                   'core_mhz_at_limit': round(sum(mhz_hot) / len(mhz_hot)) if mhz_hot else None,
+                   'core_mhz_otherwise': round(sum(mhz_ok) / len(mhz_ok)) if mhz_ok else None}
     sys_info = {
         'samples': len(system),
         'intruders': sorted(({'comm': k, 'avg_pct': round(v[0] / n_sys, 2), 'seen': v[1]} for k, v in intruders.items()),
                             key=lambda d: -d['avg_pct'])[:5],
         'temps_max': {k: round(v, 1) for k, v in sorted(temps_max.items())},
+        'thermal_limit': thermal,
     }
     # Levels.
     levels = []
@@ -314,6 +335,12 @@ def main():
         w = g['worst']
         top.append(f"{g['cause']}: {g['count']} incident(s), {g['lost_ms']:.0f} ms lost; worst {w['worst_ms']} ms "
                    f"at {fmt_t(w['t'] or 0)} ({w['file']}): {w['summary']}")
+    if thermal and len(top) < 3 and (not thermal['core_mhz_at_limit'] or not thermal['core_mhz_otherwise'] or
+                                     thermal['core_mhz_at_limit'] < 0.97 * thermal['core_mhz_otherwise']):
+        top.append(f"not the emulator: the CPU package reached its thermal limit ({thermal['limit_c']:.0f} °C) in "
+                   f"{thermal['samples_at_limit']} of {thermal['samples']} system samples (first at "
+                   f"{fmt_t(thermal['first_t'])}), the emulator's cores at {thermal['core_mhz_at_limit']} MHz then vs "
+                   f"{thermal['core_mhz_otherwise']}; check the cooling (fan curve, dust, power profile)")
     if len(top) < 3 and pres['two_refresh_pct'] > 1.0:
         top.append(f"pacing: {pres['two_refresh_pct']}% of presented frames took two refreshes outside loads "
                    f"(target < 1%)")
@@ -402,6 +429,13 @@ def main():
         intr = ', '.join(f"{i['comm']} {i['avg_pct']}%" for i in sys_info['intruders']) or 'none'
         tm = ', '.join(f'{k} {v}' for k, v in sys_info['temps_max'].items())
         p(f"system ({sys_info['samples']} samples): other processes on the emulator's cores: {intr}; max temps: {tm}")
+        th = sys_info['thermal_limit']
+        if th:
+            clk = (f"; the emulator's cores ran at {th['core_mhz_at_limit']} MHz then vs {th['core_mhz_otherwise']} MHz "
+                   f"otherwise" if th['core_mhz_at_limit'] and th['core_mhz_otherwise'] else '')
+            p(f"THERMAL: CPU package at its limit ({th['limit_c']:.0f} °C) in {th['samples_at_limit']} of "
+              f"{th['samples']} samples, first at {fmt_t(th['first_t'])}{clk}: the CPU throttles there, so slow "
+              f"frames in those seconds are partly the cooling's doing (an outside cause)")
     if report['dropped']['events'] or report['dropped']['frames']:
         p(f"dropped: {report['dropped']['events']} events, {report['dropped']['frames']} frame records")
     p('top three things to fix:')
