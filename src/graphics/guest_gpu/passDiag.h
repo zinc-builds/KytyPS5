@@ -7,9 +7,10 @@
 // draw sequence range; plus the frame's graphics submissions by guest thread. Diagnostic only:
 // draws and drains are noted on the command thread (not with KYTY_DECODE_THREAD), submissions on
 // the submitting threads. Debug markers (NOP push/pop) name the passes. Summary: passdiag.py.
-// Lines, printed at the guest flip: "PASS f=..." per frame, "PASST f=..." per target set (with
+// Lines, printed at the guest flip, keyed by g= (this diagnostic's own guest-frame sequence; f= is
+// the presented-flip count, which can repeat): "PASS g=..." per frame, "PASST g=..." per target set (with
 // EVENT_WRITE types, depth/stencil state and DB_COUNT_CONTROL, the packets before its first draws
-// and its debug markers) and "PASSM f=..." per debug-marker path.
+// and its debug markers) and "PASSM g=..." per debug-marker path.
 
 #include "graphics/guest_gpu/hardwareContext.h"
 
@@ -65,6 +66,7 @@ struct State {
 	Key                          current_key;
 	bool                         have_current = false;
 	uint32_t                     seq = 0, drains = 0;
+	uint64_t                     guest_frames = 0; // PASS g=: one per guest flip, never repeats
 	std::map<uint32_t, uint32_t> events;
 	std::string                  packets;
 	uint32_t                     count_control = 0;
@@ -257,9 +259,9 @@ inline void OnGuestFlip(uint64_t frame) {
 		t += (t.empty() ? "" : ",") + name + ":" + std::to_string(n);
 		submits += n;
 	}
-	std::printf("PASS f=%" PRIu64 " draws=%u targets=%zu drains=%u submits=%u threads=%s reasons=%s"
+	std::printf("PASS g=%" PRIu64 " f=%" PRIu64 " draws=%u targets=%zu drains=%u submits=%u threads=%s reasons=%s"
 	            " events=%s\n",
-	            frame, s.seq, s.groups.size(), s.drains, submits, t.empty() ? "-" : t.c_str(),
+	            s.guest_frames, frame, s.seq, s.groups.size(), s.drains, submits, t.empty() ? "-" : t.c_str(),
 	            Reasons(s.reasons).c_str(), Events(s.events).c_str());
 	for (const auto& [k, g] : s.groups) {
 		const auto& sc = *g.scissors.begin();
@@ -275,18 +277,19 @@ inline void OnGuestFlip(uint64_t frame) {
 		for (const auto& p : g.between) {
 			between += (between.empty() ? "" : "|") + p;
 		}
-		std::printf("PASST f=%" PRIu64 " c0=0x%" PRIx64 " fmt=%u w=%u h=%u z=0x%" PRIx64
+		std::printf("PASST g=%" PRIu64 " f=%" PRIu64 " c0=0x%" PRIx64 " fmt=%u w=%u h=%u z=0x%" PRIx64
 		            " zfmt=%u zw=%u zh=%u mask=0x%x draws=%u idx=%u auto=%u ind=%u drains=%u"
 		            " seq=%u-%u shaders=%zu scissors=%zu s0=%d,%d,%d,%d reasons=%s events=%s ds=%s"
 		            " between=%s markers=%s\n",
-		            frame, k.c0, k.fmt, k.w, k.h, k.z, k.zfmt, k.zw, k.zh, k.mask, g.draws, g.indexed,
+		            s.guest_frames, frame, k.c0, k.fmt, k.w, k.h, k.z, k.zfmt, k.zw, k.zh, k.mask, g.draws, g.indexed,
 		            g.automatic, g.indirect, g.drains, g.first, g.last, g.shaders.size(),
 		            g.scissors.size(), std::get<0>(sc), std::get<1>(sc), std::get<2>(sc),
 		            std::get<3>(sc), Reasons(g.reasons).c_str(), Events(g.events).c_str(), ds.c_str(),
 		            between.c_str(), markers.c_str());
 	}
 	for (const auto& [m, dd] : s.marker_draws) {
-		std::printf("PASSM f=%" PRIu64 " draws=%u drains=%u marker=%s\n", frame, dd.first, dd.second, m.c_str());
+		std::printf("PASSM g=%" PRIu64 " f=%" PRIu64 " draws=%u drains=%u marker=%s\n", s.guest_frames, frame,
+		            dd.first, dd.second, m.c_str());
 	}
 	s.marker_draws.clear();
 	s.groups.clear();
@@ -294,6 +297,7 @@ inline void OnGuestFlip(uint64_t frame) {
 	s.events.clear();
 	s.have_current = false;
 	s.seq = s.drains = 0;
+	s.guest_frames++;
 }
 
 } // namespace Libs::Graphics::PassDiag

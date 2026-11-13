@@ -98,16 +98,17 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   histograms, fast vs slow frames field by field, the worst 20 frames. `framemodel.py <bench log>
   [A-B]` — replay the guest frames against 60 Hz vblanks: causes of slow frames and what-ifs
   (FINDINGS, "Frame pacing").
-- `passdiag.py <bench log> [--heavy N] [--frame F]` — summarise `KYTY_PASS_DIAG=1` output: heavy
+- `passdiag.py <bench log> [--heavy N] [--frame G]` — summarise `KYTY_PASS_DIAG=1` output: heavy
   frames (draws over 1.3× the median, or N) vs the rest, with drains, drain reasons, EVENT_WRITE
-  types and the debug-marker paths with the most drains per frame; `--frame F` prints that
-  frame's render-target groups. The emulator prints, per guest frame: `PASS` (draws, drains and
-  their reasons, EVENT_WRITE types, guest submits per thread), `PASST` per render-target group
-  (colour 0 / depth address, format, size, CB_TARGET_MASK, draws by kind, drains, `ds=` depth
-  test/write, stencil and DB_COUNT_CONTROL, distinct VS/PS pairs and scissors, the packets before
-  its first three draws, the innermost debug markers) and `PASSM` per debug-marker path (draws,
-  drains). Command-thread only: not for `KYTY_DECODE_THREAD`. It found the heavy levels'
-  every-33-frames burst (the game's occlusion-query box pass).
+  types and the debug-marker paths with the most drains per frame; `--frame G` prints guest frame
+  G's render-target groups (lines are keyed by `g=`, the diagnostic's own guest-frame sequence). The
+  emulator prints, per guest frame: `PASS` (draws, drains and their reasons, EVENT_WRITE types,
+  guest submits per thread), `PASST` per render-target group (colour 0 / depth address, format,
+  size, CB_TARGET_MASK, draws by kind, drains, `ds=` depth test/write, stencil and DB_COUNT_CONTROL,
+  distinct VS/PS pairs and scissors, the packets before its first three draws, the innermost debug
+  markers) and `PASSM` per debug-marker path (draws, drains). Command-thread only: not for
+  `KYTY_DECODE_THREAD`. It found the heavy levels' every-33-frames burst (the game's occlusion-query
+  box pass).
 - `faultsum.py` — summarise `KYTY_FAULT_DIAG=1` output. `offcpu.py` — off-CPU time from
   `perf record -e sched:sched_switch` (needs root for tracepoints).
 - `../re/gamespeed.py [bench logs…]` — **game-speed check**. Astro Bot advances a fixed step per

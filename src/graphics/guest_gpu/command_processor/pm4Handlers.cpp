@@ -1796,7 +1796,9 @@ static constexpr auto MakeContextIndirectTable() {
 	}
 	table[Pm4::DB_COUNT_CONTROL] = [](KYTY_HW_REG_ARGS) {
 		(void)cp;
-		PassDiag::SetCountControl(value);
+		if (PassDiag::Enabled()) {
+			PassDiag::SetCountControl(value);
+		}
 	};
 	table[Pm4::PA_CL_VS_OUT_CNTL]  = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetClVsOutCntl(value); };
 	table[Pm4::GE_NGG_SUBGRP_CNTL] = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetNggSubgrpCntl(value); };

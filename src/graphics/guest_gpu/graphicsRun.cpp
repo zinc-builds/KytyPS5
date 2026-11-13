@@ -1131,10 +1131,11 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	    SkipOcclusionProxy()) {
 		return;
 	}
+	executor.QueueDrawIndex(CurrentBuffer(), args);
+	// After the queue call: a direct fallback drains the previous target's draws first.
 	if (PassDiag::Enabled()) {
 		PassDiag::OnDraw(CurrentBuffer().GetRegisters(), CurrentBuffer().GetShaders(), 0);
 	}
-	executor.QueueDrawIndex(CurrentBuffer(), args);
 }
 
 const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
@@ -1333,10 +1334,11 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	    SkipOcclusionProxy()) {
 		return;
 	}
+	executor.QueueDrawAuto(CurrentBuffer(), args);
+	// After the queue call: a direct fallback drains the previous target's draws first.
 	if (PassDiag::Enabled()) {
 		PassDiag::OnDraw(CurrentBuffer().GetRegisters(), CurrentBuffer().GetShaders(), 1);
 	}
-	executor.QueueDrawAuto(CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

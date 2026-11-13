@@ -3,7 +3,7 @@
 
 Frames after the level start are split into heavy (more than N draws, default 1.3x the median)
 and the rest; per kind: draws, queue drains, drain reasons and EVENT_WRITE types per frame, then
-the debug-marker paths with the most drains. --frame F prints that frame's target groups (PASST)."""
+the debug-marker paths with the most drains. --frame G prints that guest frame's target groups (PASST g=G)."""
 import argparse
 import collections
 import re
@@ -32,11 +32,11 @@ def main():
     for l in lines[start:]:
         if l.startswith("PASS "):
             kv = dict(KV.findall(l))
-            frames[int(kv["f"])] = kv
+            frames[int(kv.get("g", kv["f"]))] = kv
         elif l.startswith("PASSM "):
             kv = dict(KV.findall(l))
-            markers[int(kv["f"])].append((kv["marker"], int(kv["draws"]), int(kv["drains"])))
-        elif a.frame is not None and l.startswith(f"PASST f={a.frame} "):
+            markers[int(kv.get("g", kv["f"]))].append((kv["marker"], int(kv["draws"]), int(kv["drains"])))
+        elif a.frame is not None and l.startswith("PASST ") and dict(KV.findall(l)).get("g") == str(a.frame):
             print(l)
     if not frames:
         print("passdiag: no PASS lines (run with KYTY_PASS_DIAG=1)")
