@@ -21,7 +21,7 @@ label=$1
 shift
 # Exclusive host-wide lock; the emulator inherits it (see benchlock.sh).
 . "$(dirname "$0")/benchlock.sh"
-benchlock_acquire x "garden.sh $label" || exit 1
+benchlock_acquire x "garden.sh $label" || exit $?
 log=/tmp/bench-$label.log
 # A FIFO without a reader (vpad.py gone) would block forever while holding the bench lock.
 pad() { timeout 5 bash -c 'echo "$1" > /tmp/vpad.fifo' _ "$*" || { echo "vpad.py is not reading /tmp/vpad.fifo" >&2; exit 1; }; }

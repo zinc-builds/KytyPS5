@@ -10,7 +10,11 @@
 #
 # Waiters queue: each drops a ticket in $KYTY_BENCH_LOCK.queue/ and only the head of the queue
 # tries for the lock (flock on $KYTY_BENCH_LOCK, which stays the actual mutual exclusion).
-# Order: KYTY_BENCH_PRIO (1 = critical path, 5 = default, 9 = background), then arrival. Shared
+# Order: effective priority, then arrival. The effective priority starts at KYTY_BENCH_PRIO (1 =
+# critical path, 5 = default, 9 = background) and improves by one step for every KYTY_BENCH_AGE
+# seconds waited (default 1200, 20 min; floor 1), so no class starves: a priority-9 ticket is
+# ahead of priority-5 tickets that arrive 4 steps (80 min) after it, and reaches 1 in 160 min.
+# KYTY_BENCH_AGE must be the same for every waiter on the host (each one orders the queue). Shared
 # tickets right behind each other at the head go together; an exclusive ticket at the head holds
 # back every shared ticket behind it, so neither side can starve the other. A ticket is removed as
 # soon as its waiter holds the lock or gives up, and any waiter removes the tickets of processes
@@ -20,7 +24,9 @@
 # The exclusive lock lives on an inherited file descriptor (9), so an emulator left running
 # (KEEP_RUNNING=1) keeps holding it until it exits: kill your emulator when you are done.
 # KYTY_BENCH_LOCKED (set while held) makes nested calls no-ops.
-# KYTY_BENCH_LOCK_TIMEOUT: seconds to wait in all (default 5400). KYTY_BENCH_LOCK: lock file path.
+# KYTY_BENCH_LOCK_TIMEOUT: seconds to wait in all (default 5400); on a timeout benchlock_acquire
+# prints "timed out waiting for the bench lock" and returns 75, and the scripts exit with it.
+# KYTY_BENCH_LOCK: lock file path.
 #
 # Sourced by the bench scripts for benchlock_acquire; executed for the subcommands above.
 
@@ -41,11 +47,25 @@ benchlock_starttime() {
 	echo "${20}"
 }
 
-# Prints the live tickets in queue order ("<file> <prio> <mode> <pid> <what...>"), removing dead
-# ones. A ticket's name is <prio>-<ns>-<pid>-<x|s>; its content "<pid> <starttime> <what>".
+# Nanoseconds since the epoch (EPOCHREALTIME: no fork).
+benchlock_now_ns() {
+	if [ -n "$EPOCHREALTIME" ]; then
+		local t=${EPOCHREALTIME/[.,]/}
+		echo "$((10#$t * 1000))"
+	else
+		date +%s%N
+	fi
+}
+
+# Prints the live tickets in queue order ("<file> <effective prio> <mode> <pid> <prio> <what...>"),
+# removing dead ones. A ticket's name is <prio>-<arrival ns>-<pid>-<x|s>; its content "<pid>
+# <starttime> <what>". Order: effective priority (KYTY_BENCH_PRIO minus one per KYTY_BENCH_AGE
+# seconds waited, floor 1), then arrival.
 benchlock_tickets() {
-	local dir f name pid start what
+	local dir f name pid start what prio ns eff now age=${KYTY_BENCH_AGE:-1200}
+	[[ "$age" =~ ^[1-9][0-9]*$ ]] || age=1200
 	dir=$(benchlock_queue_dir)
+	now=$(benchlock_now_ns)
 	for f in "$dir"/[1-9]-*; do
 		[ -e "$f" ] || continue
 		name=${f##*/}
@@ -54,8 +74,13 @@ benchlock_tickets() {
 			rm -f "$f"
 			continue
 		fi
-		echo "$name ${name%%-*} ${name##*-} $pid $what"
-	done
+		prio=${name%%-*}
+		ns=${name#*-}
+		ns=${ns%%-*}
+		eff=$((prio - (now - 10#$ns) / (age * 1000000000)))
+		((eff < 1)) && eff=1
+		echo "$eff $ns $name $eff ${name##*-} $pid $prio $what"
+	done | sort -k1,1n -k2,2 | cut -d' ' -f3-
 }
 
 # Whether ticket <name> may try for the lock now: it is first, or it is shared and only shared
@@ -81,7 +106,7 @@ benchlock_acquire() {
 	local timeout=${KYTY_BENCH_LOCK_TIMEOUT:-5400} prio=${KYTY_BENCH_PRIO:-5}
 	[[ "$prio" =~ ^[1-9]$ ]] || { echo "benchlock: KYTY_BENCH_PRIO must be 1-9" >&2; exec 9>&-; return 1; }
 	# The ticket names this process: BASHPID, not $$, which a subshell shares with its parent.
-	local dir ticket name me=$BASHPID start deadline=$((SECONDS + timeout)) said= ahead
+	local dir ticket name me=$BASHPID start deadline=$((SECONDS + timeout)) said= ahead eff
 	dir=$(benchlock_queue_dir)
 	mkdir -p "$dir" 2>/dev/null && chmod 1777 "$dir" 2>/dev/null
 	start=$(benchlock_starttime "$me")
@@ -113,14 +138,14 @@ benchlock_acquire() {
 		fi
 		if ((SECONDS > deadline)); then
 			rm -f "$ticket"
-			echo "benchlock: gave up after ${timeout}s" >&2
+			echo "benchlock: timed out waiting for the bench lock after ${timeout}s (KYTY_BENCH_LOCK_TIMEOUT): $what did not start" >&2
 			exec 9>&-
-			return 1
+			return 75
 		fi
 		# Say where we are when it changes, at most once a minute.
-		ahead=$(benchlock_tickets | awk -v me="$name" '$1 == me { exit } { n++ } END { print n + 0 }')
+		read -r ahead eff < <(benchlock_tickets | awk -v me="$name" '$1 == me { e = $2; exit } { n++ } END { print n + 0, e }')
 		if [ "$ahead" != "${said%%:*}" ] && { [ -z "$said" ] || ((SECONDS - ${said#*:} >= 60)); }; then
-			echo "benchlock: waiting ($mode, priority $prio), $ahead ahead in the queue; holder: $(cat "$(benchlock_owner_file)" 2>/dev/null || echo unknown)" >&2
+			echo "benchlock: waiting ($mode, priority $prio${eff:+, now $eff}), $ahead ahead in the queue; holder: $(cat "$(benchlock_owner_file)" 2>/dev/null || echo unknown)" >&2
 			said=$ahead:$SECONDS
 		fi
 	done
@@ -134,11 +159,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	shift
 	case "$cmd" in
 	run)
-		benchlock_acquire x "run: $*" || exit 1
+		benchlock_acquire x "run: $*" || exit $?
 		exec "$@"
 		;;
 	build)
-		benchlock_acquire s "build: $*" || exit 1
+		benchlock_acquire s "build: $*" || exit $?
 		exec "$@"
 		;;
 	status)
@@ -150,14 +175,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 			echo "exclusive: $(cat "$(benchlock_owner_file)" 2>/dev/null || echo unknown)"
 		fi
 		i=0
-		while read -r name prio m pid what; do
+		while read -r name eff m pid prio what; do
 			i=$((i + 1))
-			echo "  $i. priority $prio, $( [ "$m" = x ] && echo exclusive || echo shared), pid $pid: $what"
+			echo "  $i. priority $prio$([ "$eff" != "$prio" ] && echo " (aged to $eff)"), $( [ "$m" = x ] && echo exclusive || echo shared), pid $pid: $what"
 		done < <(benchlock_tickets)
 		[ "$i" = 0 ] && echo "  queue empty"
 		;;
 	*)
-		sed -n '2,25p' "$0"
+		sed -n '2,31p' "$0"
 		exit 2
 		;;
 	esac

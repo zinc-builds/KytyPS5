@@ -2,8 +2,8 @@
 # test-benchlock.sh: tests benchlock.sh's queue with dummy commands on a private lock file (never
 # the real one): FIFO order, shared tickets going together, an exclusive ticket holding back later
 # shared ones, priorities, a killed waiter, a timeout, nested holds, and mutual exclusion against
-# old-style (flock-only) competitors, a zombie waiter, a late higher-priority ticket. Takes about
-# 40 s. Exit status 0 when every case passes.
+# old-style (flock-only) competitors, a zombie waiter, a late higher-priority ticket, ageing.
+# Takes about a minute. Exit status 0 when every case passes.
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d) || exit 1
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$tmp"' EXIT
@@ -31,7 +31,9 @@ acq() {
 			fi
 			echo "$label end $(now)" >> "$log"
 		else
+			rc=$?
 			echo "$label failed $(now)" >> "$log"
+			echo "$label rc $rc" >> "$log"
 		fi
 	) &
 }
@@ -111,12 +113,31 @@ for i in 1 2 3; do
 done
 check drained "queue empty"
 
+echo "4d. ageing: a waiting priority-9 ticket overtakes priority-5 tickets that arrive later (KYTY_BENCH_AGE=1)"
+log=$tmp/4d.log
+export KYTY_BENCH_AGE=1 # one step per second for every waiter (each one orders the queue)
+acq "$log" H x "$tmp/4d.release"; sleep 0.3
+acq "$log" P9 x 0.2 KYTY_BENCH_PRIO=9
+for i in 1 2 3 4 5 6 7; do sleep 1; acq "$log" "P5_$i" x 0.2; done # at ~1.3 s .. ~7.3 s
+sleep 0.3
+check '[ "$("$here/benchlock.sh" status | grep -c "aged to")" -ge 1 ]' "status shows an aged priority"
+touch "$tmp/4d.release"
+wait
+unset KYTY_BENCH_AGE
+# At the release (~7.3 s after P9 arrived) P9 has aged 7 steps, to 2; P5_i, which arrived i s after
+# P9, is at max(1, 5 - floor(7.3 - i)): 1 for i <= 3 (ahead of P9), 2 for i = 4 (a tie: P9
+# arrived first), 3 to 5 for i >= 5 (behind P9). Without ageing P9 would go last.
+check '[ "$(t $log P9 start)" -lt "$(t $log P5_5 start)" ] && [ "$(t $log P9 start)" -lt "$(t $log P5_7 start)" ]' "P9 before the priority-5 tickets that arrived 5+ s after it"
+check '[ "$(t $log P5_1 start)" -lt "$(t $log P9 start)" ]' "P5_1 (arrived 1 s after P9) still before it"
+check drained "queue empty"
+
 echo "5. a timeout removes the ticket"
 log=$tmp/5.log
 acq "$log" H x 4; sleep 0.3
 acq "$log" T x 0.5 KYTY_BENCH_LOCK_TIMEOUT=1
 sleep 2.9
 check '[ -n "$(t $log T failed)" ]' "T gave up"
+check '[ "$(t $log T rc)" = 75 ]' "T's benchlock_acquire returned 75 (timeout)"
 check '! ls "$KYTY_BENCH_LOCK.queue" | grep -q -- "-x$"' "no ticket left while H still holds"
 wait
 

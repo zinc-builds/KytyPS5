@@ -7,7 +7,7 @@ label=$1
 shift
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/benchlock.sh"
-benchlock_acquire x "c0-profile.sh $label" || exit 1
+benchlock_acquire x "c0-profile.sh $label" || exit $?
 out=/tmp/c0-$label
 rm -rf "$out"
 mkdir -p "$out"
