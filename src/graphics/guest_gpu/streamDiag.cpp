@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -18,6 +19,9 @@
 
 #if defined(__linux__)
 #include <pthread.h>
+#endif
+#if defined(__x86_64__)
+#include <x86intrin.h>
 #endif
 
 namespace Libs::Graphics::StreamDiag {
@@ -38,7 +42,32 @@ struct ThreadStats {
 	char                  name[32] = {};
 	std::atomic<uint32_t> calls[MaxFuncs] {};
 	std::atomic<uint32_t> submits[2] {};
+	std::atomic<uint32_t> patches {0}, late_patches {0};
+	// The first and last packet this thread wrote since the game's last suspend point (TSC).
+	std::atomic<uint64_t> first_tsc {0}, last_tsc {0};
 };
+
+uint64_t Tsc() noexcept {
+#if defined(__x86_64__)
+	return __rdtsc();
+#else
+	return 0;
+#endif
+}
+
+uint64_t NowNs() noexcept {
+	timespec ts {};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+// Advanced at every AgcSuspendPoint: the game's frame boundary on its submitting thread.
+std::atomic<uint64_t> g_build_epoch {1};
+bool                  g_func_draw[MaxFuncs]    = {};
+bool                  g_func_suspend[MaxFuncs] = {};
+thread_local uint64_t        t_epoch        = 0;
+thread_local const uint32_t* t_seal         = nullptr; // this thread's last draw packet
+thread_local bool            t_draw_pending = false;
 
 ThreadStats           g_threads[MaxThreads];
 std::atomic<uint32_t> g_thread_count {0};
@@ -79,6 +108,7 @@ struct SubmitRecord {
 	const uint32_t* commands;
 	uint32_t        dw;
 	uint32_t        thread;
+	uint64_t        tsc, built_first, built_last;
 };
 std::mutex               g_submit_mutex;
 std::deque<SubmitRecord> g_submits[2];
@@ -146,6 +176,7 @@ struct RegClass {
 
 struct Segment {
 	uint64_t e, p, s, de, dp;
+	uint64_t state[4]; // parameterized register state by class at the draw
 	uint32_t kv_begin, kv_count;
 	uint32_t packets, dwords, deps, written;
 	bool     draw;
@@ -161,6 +192,12 @@ struct Submission {
 	uint32_t calls = 0, ctx_ops = 0, labels = 0, waits = 0, events = 0, e39 = 0, dma = 0;
 	int32_t  first_ctx_op = -1;
 	bool     continued = false, has_first = false;
+	uint64_t t_submit = 0, t_built_first = 0, t_built_last = 0, t_begin = 0, t_end = 0;
+	// Draws that take a register from an earlier submission: any context register; a shader
+	// program address; a user-data register of a stage whose program this submission set; a
+	// user-config register; persistent draw state (index type and buffer, instances, bases).
+	uint32_t d_inh_cx = 0, d_inh_pgm = 0, d_inh_ud = 0, d_inh_ud_regs = 0, d_inh_uc = 0, d_inh_misc = 0;
+	std::vector<uint64_t> cx_values; // per context register: a signature of the values written
 	std::array<uint32_t, Classes>             inh_first {}, inh_max {};
 	std::vector<std::pair<uint32_t, uint32_t>> builders; // thread, draws
 	std::vector<std::pair<uint32_t, uint32_t>> targets;  // colour 0 base, depth write base
@@ -203,7 +240,15 @@ struct State {
 	// The guest's debug markers: a path per nesting of names, and this frame's units by path.
 	struct MarkerStat {
 		uint32_t draws = 0, dispatches = 0, events = 0, e39 = 0;
+		// The first draw's output state, and whether every draw of the path had the same.
+		bool     have = false, uniform = true;
+		uint32_t target_mask = 0, depth_control = 0, count_control = 0, render_override = 0;
+		uint32_t colour = 0, depth = 0, set = 0;
 	};
+	uint64_t tsc0 = 0, ns0 = 0;
+	std::vector<std::vector<uint64_t>> prev_cx_values;
+	std::unordered_map<uint32_t, uint64_t> inherited_draw, cx_changed;
+	uint64_t inherited_draws = 0, cx_changed_subs = 0;
 	std::vector<std::string>                 marker_paths {"-"};
 	std::unordered_map<std::string, uint32_t> marker_ids {{"-", 0}};
 	std::vector<uint32_t>                    marker_stack;
@@ -237,6 +282,8 @@ struct State {
 			reg[c].seg.assign(ClassSize[c], 0);
 		}
 		last_calls.assign(static_cast<size_t>(MaxThreads) * MaxFuncs, 0);
+		tsc0 = Tsc();
+		ns0  = NowNs();
 	}
 };
 
@@ -308,6 +355,12 @@ void Write(State& s, uint32_t c, uint32_t offset, uint32_t value) {
 	}
 	r.val[offset] = value;
 	r.max_offset  = std::max(r.max_offset, offset);
+	if (c == CX && s.sub_open) {
+		if (s.sub.cx_values.empty()) {
+			s.sub.cx_values.assign(ClassSize[CX], 0);
+		}
+		s.sub.cx_values[offset] |= 1ull << (Mix(value + 0x51ed270b) & 63u);
+	}
 
 	const uint32_t key = (c << 28u) | offset;
 	Seq(s.seg_s, key);
@@ -429,6 +482,7 @@ void FinishSubmission(State& s) {
 		return;
 	}
 	FinishSpan(s);
+	s.sub.t_end = Tsc();
 	s.subs.push_back(std::move(s.sub));
 	s.sub      = {};
 	s.sub_open = false;
@@ -478,6 +532,73 @@ void EndUnit(State& s, const uint32_t* packet, uint32_t opcode, bool draw) {
 		sub.has_first = true;
 	}
 	if (draw) {
+		const auto& cxr = s.reg[CX];
+		const auto& shr = s.reg[SH];
+		const auto& ucr = s.reg[UC];
+		const auto& mir = s.reg[MISC];
+		const auto  note = [&](uint32_t c, uint32_t offset) { s.inherited_draw[(c << 28u) | offset]++; };
+		const auto  old  = [&](const RegClass& r, uint32_t offset) {
+            return r.sub[offset] != 0 && r.sub[offset] != s.cur_sub;
+		};
+		s.inherited_draws++;
+		if (cxr.live != cxr.sub_written) {
+			sub.d_inh_cx++;
+		}
+		bool pgm = false;
+		uint32_t ud = 0;
+		for (uint32_t base = 0; base < 0x180u; base += 0x40u) {
+			if (old(shr, base + 8u)) {
+				pgm = true;
+				note(SH, base + 8u);
+			} else if (shr.sub[base + 8u] == s.cur_sub) {
+				for (uint32_t i = base + 0xcu; i < base + 0x2cu; i++) {
+					if (old(shr, i)) {
+						ud++;
+						note(SH, i);
+					}
+				}
+			}
+		}
+		sub.d_inh_pgm += pgm ? 1u : 0u;
+		sub.d_inh_ud += ud != 0 ? 1u : 0u;
+		sub.d_inh_ud_regs += ud;
+		if (ucr.live != ucr.sub_written) {
+			sub.d_inh_uc++;
+			for (uint32_t i = 0; i <= ucr.max_offset; i++) {
+				if (old(ucr, i)) {
+					note(UC, i);
+				}
+			}
+		}
+		if (mir.live != mir.sub_written) {
+			sub.d_inh_misc++;
+			for (uint32_t i = 0; i < ClassSize[MISC]; i++) {
+				if (old(mir, i)) {
+					note(MISC, i);
+				}
+			}
+		}
+		{
+			auto&          m    = MarkerStats(s);
+			const auto     get  = [&](uint32_t offset) { return cxr.sub[offset] != 0 ? cxr.val[offset] : 0u; };
+			const uint32_t set  = (cxr.sub[Pm4::CB_TARGET_MASK] != 0 ? 1u : 0u) |
+			                      (cxr.sub[Pm4::DB_DEPTH_CONTROL] != 0 ? 2u : 0u) |
+			                      (cxr.sub[Pm4::DB_COUNT_CONTROL] != 0 ? 4u : 0u) |
+			                      (cxr.sub[Pm4::DB_RENDER_OVERRIDE] != 0 ? 8u : 0u);
+			const uint32_t mask = get(Pm4::CB_TARGET_MASK), dc = get(Pm4::DB_DEPTH_CONTROL);
+			if (!m.have) {
+				m.have            = true;
+				m.target_mask     = mask;
+				m.depth_control   = dc;
+				m.count_control   = get(Pm4::DB_COUNT_CONTROL);
+				m.render_override = get(Pm4::DB_RENDER_OVERRIDE);
+				m.colour          = get(Pm4::CB_COLOR0_BASE);
+				m.depth           = get(Pm4::DB_Z_WRITE_BASE);
+				m.set             = set;
+			} else if (m.target_mask != mask || m.depth_control != dc || m.set != set) {
+				m.uniform = false;
+			}
+		}
 		sub.draws++;
 		const auto page    = reinterpret_cast<uint64_t>(packet) >> 12u;
 		const auto entry   = g_chunks[ChunkSlot(page)].load(std::memory_order_relaxed);
@@ -514,6 +635,9 @@ void EndUnit(State& s, const uint32_t* packet, uint32_t opcode, bool draw) {
 	}
 	seg.de       = de;
 	seg.dp       = dp;
+	for (uint32_t c = 0; c < Classes; c++) {
+		seg.state[c] = s.reg[c].h_param;
+	}
 	seg.kv_begin = s.seg_kv_begin;
 	seg.kv_count = static_cast<uint32_t>(s.kv_keys.size()) - s.seg_kv_begin;
 	seg.packets  = s.seg_packets;
@@ -655,6 +779,19 @@ void PrintSubmissions(State& s, uint64_t frame) {
 	uint32_t labels = 0, waits = 0, events = 0, e39 = 0, dma = 0, inheriting = 0, ctx_first = 0;
 	std::array<uint32_t, Classes>             inherited {};
 	std::vector<uint32_t>                     per_sub;
+	uint32_t d_cx = 0, d_pgm = 0, d_ud = 0, d_ud_regs = 0, d_uc = 0, d_misc = 0;
+	const double ns_per_tick = static_cast<double>(NowNs() - s.ns0) / static_cast<double>(Tsc() - s.tsc0 + 1);
+	uint64_t     t0 = 0, first_begin = 0, last_end = 0, last_submit = 0;
+	double       lead_ms = 0;
+	const auto   ms      = [&](uint64_t t) {
+        return t == 0 || t0 == 0 ? -1.0
+                                 : (static_cast<double>(t) - static_cast<double>(t0)) * ns_per_tick / 1e6;
+	};
+	for (const auto& sub: s.subs) {
+		if (!sub.continued && sub.t_submit != 0 && (t0 == 0 || sub.t_submit < t0)) {
+			t0 = sub.t_submit;
+		}
+	}
 	std::unordered_map<std::string, uint32_t> by_submitter, by_builder;
 	std::unordered_map<uint32_t, uint32_t>    colour_subs, depth_subs;
 	for (const auto& sub: s.subs) {
@@ -674,6 +811,18 @@ void PrintSubmissions(State& s, uint64_t frame) {
 		}
 		for (const auto& [thread, n]: sub.builders) {
 			by_builder[ThreadName(thread)] += n;
+		}
+		d_cx += sub.d_inh_cx;
+		d_pgm += sub.d_inh_pgm;
+		d_ud += sub.d_inh_ud;
+		d_ud_regs += sub.d_inh_ud_regs;
+		d_uc += sub.d_inh_uc;
+		d_misc += sub.d_inh_misc;
+		if (!sub.continued && sub.t_submit != 0) {
+			lead_ms += (static_cast<double>(sub.t_begin) - static_cast<double>(sub.t_submit)) * ns_per_tick / 1e6;
+			first_begin = first_begin == 0 ? sub.t_begin : first_begin;
+			last_end    = std::max(last_end, sub.t_end);
+			last_submit = std::max(last_submit, sub.t_submit);
 		}
 		if (sub.draws == 0) {
 			continue;
@@ -711,12 +860,39 @@ void PrintSubmissions(State& s, uint64_t frame) {
 	std::printf("STRM f=%" PRIu64 " subs=%zu dsubs=%u csubs=%u draws=%u disp=%u cdisp=%u pk=%u dw=%u"
 	            " spans=%u calls=%u max_sub=%u top3=%u ctx_first=%u inh_subs=%u inh_cx=%u inh_sh=%u"
 	            " inh_uc=%u inh_misc=%u labels=%u waits=%u events=%u e39=%u dma=%u targets=%u"
-	            " shared_targets=%u tail_pk=%u oob=%u submitters=%s builders=%s\n",
+	            " shared_targets=%u tail_pk=%u oob=%u d_inh_cx=%u d_inh_pgm=%u d_inh_ud=%u"
+	            " d_inh_ud_regs=%u d_inh_uc=%u d_inh_misc=%u submit_span_ms=%.3f begin_ms=%.3f"
+	            " end_ms=%.3f lead_ms=%.3f submitters=%s builders=%s\n",
 	            frame, s.subs.size(), with_draws, s.compute_subs, draws, dispatches,
 	            s.compute_dispatches, packets, dw, spans, calls, per_sub.empty() ? 0u : per_sub[0],
 	            top3, ctx_first, inheriting, inherited[CX], inherited[SH], inherited[UC],
 	            inherited[MISC], labels, waits, events, e39, dma, targets, shared, s.tail_packets,
-	            s.out_of_range, Join(by_submitter).c_str(), Join(by_builder).c_str());
+	            s.out_of_range, d_cx, d_pgm, d_ud, d_ud_regs, d_uc, d_misc, ms(last_submit),
+	            ms(first_begin), ms(last_end), lead_ms, Join(by_submitter).c_str(),
+	            Join(by_builder).c_str());
+	// Context registers whose set of written values differs from the previous frame's
+	// submission at the same position.
+	{
+		uint32_t index = 0;
+		std::vector<std::vector<uint64_t>> now;
+		for (const auto& sub: s.subs) {
+			if (sub.continued || sub.draws == 0) {
+				continue;
+			}
+			if (index < s.prev_cx_values.size() && !sub.cx_values.empty() &&
+			    !s.prev_cx_values[index].empty()) {
+				s.cx_changed_subs++;
+				for (uint32_t i = 0; i < ClassSize[CX]; i++) {
+					if (sub.cx_values[i] != s.prev_cx_values[index][i]) {
+						s.cx_changed[(CX << 28u) | i]++;
+					}
+				}
+			}
+			now.push_back(sub.cx_values);
+			index++;
+		}
+		s.prev_cx_values.swap(now);
+	}
 	if (frame % 400u < 40u) {
 		uint32_t index = 0;
 		for (const auto& sub: s.subs) {
@@ -732,14 +908,17 @@ void PrintSubmissions(State& s, uint64_t frame) {
 			}
 			std::printf("STRB f=%" PRIu64 " i=%u thread=%s cont=%d dw=%u pk=%u draws=%u disp=%u"
 			            " spans=%u calls=%u ctx0=%d ctx_ops=%u inh1=%u/%u/%u/%u inhmax=%u/%u/%u/%u"
-			            " labels=%u waits=%u events=%u e39=%u dma=%u ntargets=%zu builders=%s"
-			            " targets=%s\n",
+			            " labels=%u waits=%u events=%u e39=%u dma=%u ntargets=%zu"
+			            " d_inh=%u/%u/%u/%u/%u built_ms=%.3f..%.3f submit_ms=%.3f begin_ms=%.3f"
+			            " end_ms=%.3f builders=%s targets=%s\n",
 			            frame, index++, ThreadName(sub.thread).c_str(), sub.continued ? 1 : 0, sub.dw,
 			            sub.packets, sub.draws, sub.dispatches, sub.spans, sub.calls, sub.first_ctx_op,
 			            sub.ctx_ops, sub.inh_first[CX], sub.inh_first[SH], sub.inh_first[UC],
 			            sub.inh_first[MISC], sub.inh_max[CX], sub.inh_max[SH], sub.inh_max[UC],
 			            sub.inh_max[MISC], sub.labels, sub.waits, sub.events, sub.e39, sub.dma,
-			            sub.targets.size(), builders.empty() ? "-" : builders.c_str(),
+			            sub.targets.size(), sub.d_inh_cx, sub.d_inh_pgm, sub.d_inh_ud, sub.d_inh_uc,
+			            sub.d_inh_misc, ms(sub.t_built_first), ms(sub.t_built_last), ms(sub.t_submit),
+			            ms(sub.t_begin), ms(sub.t_end), builders.empty() ? "-" : builders.c_str(),
 			            targets_text.empty() ? "-" : targets_text.c_str());
 		}
 	}
@@ -802,7 +981,7 @@ void PrintSegments(State& s, uint64_t frame) {
 	Runs(seq_e, prev_e, s.prev_first_e, s.run_e, run_e8, run_e64);
 
 	// Each segment against the previous frame's segment of the same shape, in order.
-	uint32_t paired = 0, same = 0;
+	uint32_t paired = 0, same = 0, same_class[Classes] = {};
 	uint64_t differing = 0, compared = 0;
 	std::unordered_map<uint64_t, uint32_t> cursor;
 	for (const auto& seg: s.segments) {
@@ -826,6 +1005,9 @@ void PrintSegments(State& s, uint64_t frame) {
 			}
 		}
 		paired++;
+		for (uint32_t c = 0; c < Classes; c++) {
+			same_class[c] += seg.state[c] == old.state[c] ? 1u : 0u;
+		}
 		same += n == 0 ? 1u : 0u;
 		differing += n;
 		compared += seg.kv_count;
@@ -853,12 +1035,14 @@ void PrintSegments(State& s, uint64_t frame) {
 	}
 	std::printf(" Eany=%u Pany=%u DPany=%u runP8=%u runP64=%u runE8=%u runE64=%u span_same=%u"
 	            " span_content=%u pk_seg=%.2f dw_seg=%.1f wr_seg=%.1f deps=%.1f paired=%u"
-	            " pair_same=%u pair_diff=%.2f pair_vals=%.1f\n",
+	            " pair_same=%u pair_diff=%.2f pair_vals=%.1f pair_cx=%u pair_sh=%u pair_uc=%u"
+	            " pair_misc=%u\n",
 	            any_e, any_p, any_dp, run_p8, run_p64, run_e8, run_e64, span_same, span_content,
 	            static_cast<double>(packets) / n, static_cast<double>(dwords) / n,
 	            static_cast<double>(written) / n, static_cast<double>(deps) / n, paired, same,
 	            paired != 0 ? static_cast<double>(differing) / paired : 0.0,
-	            paired != 0 ? static_cast<double>(compared) / paired : 0.0);
+	            paired != 0 ? static_cast<double>(compared) / paired : 0.0, same_class[CX],
+	            same_class[SH], same_class[UC], same_class[MISC]);
 
 	// Rotate the history.
 	if (s.frames >= AnyFrames) {
@@ -937,6 +1121,8 @@ void PrintPeriod(State& s, uint64_t frame) {
 		if (total == 0 && submits[0] == 0 && submits[1] == 0) {
 			continue;
 		}
+		const auto patches = g_threads[t].patches.exchange(0, std::memory_order_relaxed);
+		const auto late    = g_threads[t].late_patches.exchange(0, std::memory_order_relaxed);
 		std::sort(top.begin(), top.end(), std::greater<>());
 		std::string text;
 		for (size_t i = 0; i < top.size() && i < 8; i++) {
@@ -944,8 +1130,8 @@ void PrintPeriod(State& s, uint64_t frame) {
 			        std::to_string(top[i].first);
 		}
 		std::printf("STRH f=%" PRIu64 " thread=%s calls=%" PRIu64 " dcb_submits=%u acb_submits=%u"
-		            " top=%s\n",
-		            frame, ThreadName(t).c_str(), total, submits[1], submits[0],
+		            " patches=%u late_patches=%u top=%s\n",
+		            frame, ThreadName(t).c_str(), total, submits[1], submits[0], patches, late,
 		            text.empty() ? "-" : text.c_str());
 	}
 	std::string text;
@@ -972,6 +1158,13 @@ void PrintPeriod(State& s, uint64_t frame) {
 	            Top(s.inherited, 48).c_str());
 	std::printf("STRD f=%" PRIu64 " pairs=%" PRIu64 " %s\n", frame, s.differing_pairs,
 	            Top(s.differing, 48).c_str());
+	std::printf("STRJ f=%" PRIu64 " draws=%" PRIu64 " %s\n", frame, s.inherited_draws,
+	            Top(s.inherited_draw, 48).c_str());
+	std::printf("STRC f=%" PRIu64 " subs=%" PRIu64 " %s\n", frame, s.cx_changed_subs,
+	            Top(s.cx_changed, 48).c_str());
+	s.inherited_draw.clear();
+	s.cx_changed.clear();
+	s.inherited_draws = s.cx_changed_subs = 0;
 	text.clear();
 	for (uint32_t type = 0; type < 64; type++) {
 		if (s.event_types[type] != 0) {
@@ -1007,30 +1200,65 @@ uint32_t RegisterHle(const char* name) {
 	if (count >= MaxFuncs) {
 		return MaxFuncs - 1;
 	}
-	g_func_names[count] = name;
+	g_func_names[count]   = name;
+	g_func_draw[count]    = std::strncmp(name, "AgcDcbDraw", 10) == 0;
+	g_func_suspend[count] = std::strcmp(name, "AgcSuspendPoint") == 0;
 	g_func_count.store(count + 1, std::memory_order_relaxed);
 	return count;
 }
 
 void OnHle(uint32_t id) noexcept {
 	Bump(g_threads[ThisThread()].calls[id]);
+	if (g_func_draw[id]) {
+		t_draw_pending = true;
+	} else if (g_func_suspend[id]) {
+		g_build_epoch.fetch_add(1, std::memory_order_relaxed);
+	}
 }
 
 void OnAllocate(const uint32_t* cmd) noexcept {
-	const auto page = reinterpret_cast<uint64_t>(cmd) >> 12u;
-	g_chunks[ChunkSlot(page)].store((page << 8u) | (ThisThread() & 0xffu), std::memory_order_relaxed);
+	const auto thread = ThisThread();
+	const auto page   = reinterpret_cast<uint64_t>(cmd) >> 12u;
+	g_chunks[ChunkSlot(page)].store((page << 8u) | (thread & 0xffu), std::memory_order_relaxed);
+	const auto tsc   = Tsc();
+	const auto epoch = g_build_epoch.load(std::memory_order_relaxed);
+	if (t_epoch != epoch) {
+		t_epoch = epoch;
+		t_seal  = nullptr;
+		g_threads[thread].first_tsc.store(tsc, std::memory_order_relaxed);
+	}
+	g_threads[thread].last_tsc.store(tsc, std::memory_order_relaxed);
+	if (t_draw_pending) {
+		t_draw_pending = false;
+		t_seal         = cmd;
+	}
+}
+
+void OnPatch(const uint32_t* cmd) noexcept {
+	auto& stats = g_threads[ThisThread()];
+	Bump(stats.patches);
+	// A register packet changed after a draw that follows it in the same buffer was written.
+	if (t_seal != nullptr && cmd < t_seal && static_cast<uint64_t>(t_seal - cmd) < (64u << 20u)) {
+		Bump(stats.late_patches);
+	}
 }
 
 void OnSubmit(const uint32_t* commands, uint32_t dw, bool graphics) {
-	const auto thread = ThisThread();
+	const auto thread  = ThisThread();
+	const auto page    = reinterpret_cast<uint64_t>(commands) >> 12u;
+	const auto entry   = g_chunks[ChunkSlot(page)].load(std::memory_order_relaxed);
+	const auto builder = (entry >> 8u) == page ? static_cast<uint32_t>(entry & 0xffu) : thread;
 	Bump(g_threads[thread].submits[graphics ? 1 : 0]);
 	std::scoped_lock lock(g_submit_mutex);
-	g_submits[graphics ? 1 : 0].push_back({commands, dw, thread});
+	g_submits[graphics ? 1 : 0].push_back(
+	    {commands, dw, thread, Tsc(), g_threads[builder].first_tsc.load(std::memory_order_relaxed),
+	     g_threads[builder].last_tsc.load(std::memory_order_relaxed)});
 }
 
 void OnSubmissionBegin(bool graphics, const uint32_t* commands, uint32_t dw) {
-	auto&    s      = Cmd();
-	uint32_t thread = UINT32_MAX;
+	auto&        s      = Cmd();
+	uint32_t     thread = UINT32_MAX;
+	SubmitRecord record {};
 	{
 		std::scoped_lock lock(g_submit_mutex);
 		auto&            queue = g_submits[graphics ? 1 : 0];
@@ -1039,6 +1267,7 @@ void OnSubmissionBegin(bool graphics, const uint32_t* commands, uint32_t dw) {
 		});
 		if (found != queue.end()) {
 			thread = found->thread;
+			record = *found;
 			queue.erase(found);
 		}
 	}
@@ -1055,10 +1284,14 @@ void OnSubmissionBegin(bool graphics, const uint32_t* commands, uint32_t dw) {
 		r.sub_written = 0;
 	}
 	BeginSegment(s);
-	s.sub        = {};
-	s.sub.thread = thread;
-	s.sub_open   = true;
-	s.next_packet = nullptr;
+	s.sub               = {};
+	s.sub.thread        = thread;
+	s.sub.t_submit      = record.tsc;
+	s.sub.t_built_first = record.built_first;
+	s.sub.t_built_last  = record.built_last;
+	s.sub.t_begin       = Tsc();
+	s.sub_open          = true;
+	s.next_packet       = nullptr;
 	s.marker_stack.clear();
 }
 
@@ -1249,6 +1482,21 @@ void OnGuestFlip(uint64_t frame) {
 			text += item;
 		}
 		std::printf("STRK f=%" PRIu64 " paths=%zu %s\n", frame, order.size(), text.empty() ? "-" : text.c_str());
+		if (frame % 400u < 40u) {
+			for (size_t i = 0; i < order.size() && i < 40; i++) {
+				const auto& m = s.marker_stats[order[i].second];
+				if (!m.have) {
+					continue;
+				}
+				// set: bit 0 target mask, 1 depth control, 2 count control, 3 render override
+				// written since the context registers were last cleared.
+				std::printf("STRS f=%" PRIu64 " path=%s draws=%u e39=%u target_mask=%x depth_control=%x"
+				            " count_control=%x render_override=%x set=%x colour=%x depth=%x uniform=%d\n",
+				            frame, s.marker_paths[order[i].second].c_str(), m.draws, m.e39,
+				            m.target_mask, m.depth_control, m.count_control, m.render_override, m.set,
+				            m.colour, m.depth, m.uniform ? 1 : 0);
+			}
+		}
 		s.marker_stats.clear();
 	}
 	s.subs.clear();

@@ -870,6 +870,9 @@ static void reg_indirect_write_packet(uint32_t* cmd, uint64_t vaddr, uint32_t nu
 
 static int reg_indirect_patch_set_address(uint32_t* cmd, uint64_t vaddr, RegIndirectPacket type) {
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	if (StreamDiag::Enabled()) {
+		StreamDiag::OnPatch(cmd);
+	}
 
 	if (is_native_reg_indirect_packet(cmd, type)) {
 		cmd[1] = (cmd[1] & 0x3u) | (static_cast<uint32_t>(vaddr) & 0xfffffffcu);
@@ -883,6 +886,9 @@ static int reg_indirect_patch_set_address(uint32_t* cmd, uint64_t vaddr, RegIndi
 static int reg_indirect_patch_set_num_registers(uint32_t* cmd, uint32_t num_regs,
                                                 RegIndirectPacket type) {
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	if (StreamDiag::Enabled()) {
+		StreamDiag::OnPatch(cmd);
+	}
 
 	if (is_native_reg_indirect_packet(cmd, type)) {
 		cmd[4] = (cmd[4] & ~0x3fffu) | (num_regs & 0x3fffu);
@@ -895,6 +901,9 @@ static int reg_indirect_patch_set_num_registers(uint32_t* cmd, uint32_t num_regs
 static int reg_indirect_patch_add_registers(uint32_t* cmd, uint32_t num_regs,
                                             RegIndirectPacket type) {
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	if (StreamDiag::Enabled()) {
+		StreamDiag::OnPatch(cmd);
+	}
 
 	if (is_native_reg_indirect_packet(cmd, type)) {
 		auto new_num_regs = ((cmd[4] & 0x3fffu) + num_regs) & 0x3fffu;

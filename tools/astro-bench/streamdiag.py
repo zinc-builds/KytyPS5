@@ -40,6 +40,7 @@ def main():
     log = sys.argv[1]
     first, last = (int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "200-800").split("-"))
     strm, stra, strk, strb, period = {}, {}, {}, collections.defaultdict(list), collections.defaultdict(list)
+    strs = collections.defaultdict(list)
     start = None
     with open(log, errors="replace") as handle:
         for line in handle:
@@ -64,6 +65,8 @@ def main():
                 strk[level] = line.split()[3:]
             elif tag == "STRB ":
                 strb[level].append(f)
+            elif tag == "STRS ":
+                strs[level].append(f)
             else:
                 period[tag.strip()].append((level, line.split(None, 2)[2].strip() if len(line.split(None, 2)) > 2 else ""))
     frames = [n for n in sorted(strm) if first <= n <= last and n in stra]
@@ -95,6 +98,29 @@ def main():
         print(f"  per frame: labels {mean('labels'):.0f} waits {mean('waits'):.0f} EVENT_WRITE {mean('events'):.0f} "
               f"(occlusion dumps {mean('e39'):.0f}) dma/copy {mean('dma'):.0f}; targets {mean('targets'):.1f}, "
               f"drawn to from more than one submission {mean('shared_targets'):.1f}")
+        if "d_inh_cx" in strm[group[0]]:
+            d = max(total("draws"), 1)
+            print(f"  draws taking a register from an earlier submission: context {100 * total('d_inh_cx') / d:.2f}%, "
+                  f"shader program {100 * total('d_inh_pgm') / d:.2f}%, user data of a stage the submission bound "
+                  f"{100 * total('d_inh_ud') / d:.2f}% ({total('d_inh_ud_regs') / d:.2f} registers/draw), "
+                  f"user config {100 * total('d_inh_uc') / d:.2f}%, index/instance state {100 * total('d_inh_misc') / d:.2f}%")
+            print(f"  per frame, ms from the first submit: last submit {mean('submit_span_ms'):.2f}, command thread "
+                  f"begins {mean('begin_ms'):.2f}, ends {mean('end_ms'):.2f}; summed wait of the submissions "
+                  f"before the command thread reaches them {mean('lead_ms'):.2f}")
+            rows = collections.defaultdict(lambda: collections.defaultdict(list))
+            for n in group:
+                for sub in strb.get(n, []):
+                    if sub.get("cont") == "1" or "built_ms" not in sub:
+                        continue
+                    key = sub.get("builders", "-").split(":")[0]
+                    a, _, b = sub["built_ms"].partition("..")
+                    for name, value in (("draws", sub["draws"]), ("built0", a), ("built1", b), ("submit", sub["submit_ms"]),
+                                        ("begin", sub["begin_ms"]), ("end", sub["end_ms"])):
+                        rows[key][name].append(num(value))
+            for key, r in rows.items():
+                m = lambda name: statistics.mean(r[name])
+                print(f"    {key}: draws {m('draws'):.0f}, built {m('built0'):.2f}..{m('built1'):.2f} ms, submitted "
+                      f"{m('submit'):.2f}, command thread {m('begin'):.2f}..{m('end'):.2f} ({len(r['draws'])} samples)")
         for key in ("submitters", "builders"):
             counts = collections.Counter()
             for n in group:
@@ -117,6 +143,21 @@ def main():
         print(f"  same-shape pairs with the previous frame: {100 * paired / max(units, 1):.1f}% of units, "
               f"identical {100 * total('pair_same', stra) / max(paired, 1):.1f}%, "
               f"{pair_weighted('pair_diff'):.2f} of {pair_weighted('pair_vals'):.1f} values differ")
+        if "pair_cx" in stra[group[0]]:
+            print("  same-shape pairs whose whole parameterized state matches, by class: "
+                  + ", ".join(f"{name} {100 * total('pair_' + key, stra) / max(paired, 1):.1f}%"
+                              for name, key in (("context", "cx"), ("shader", "sh"), ("user config", "uc"), ("index type", "misc"))))
+        seen = {}
+        for n in group:
+            for f in strs.get(n, []):
+                if num(f.get("draws", 0)) >= 20:
+                    seen.setdefault(f["path"], f)
+        for path, f in list(seen.items())[:60]:
+            if "Occlusion" in path or "Culling" in path or num(f["e39"]) > 0:
+                print(f"  state {path}: draws {f['draws']} dumps {f['e39']} target_mask={f['target_mask']} "
+                      f"depth_control={f['depth_control']} count_control={f['count_control']} "
+                      f"render_override={f['render_override']} set={f['set']} colour={f['colour']} depth={f['depth']} "
+                      f"uniform={f['uniform']}")
         markers = collections.defaultdict(lambda: [0, 0, 0, 0])
         for n in group:
             for item in strk.get(n, []):
@@ -129,7 +170,7 @@ def main():
         print("  draws per frame by marker path (draws/dispatches/EVENT_WRITE/occlusion dumps):")
         for name, c in top:
             print(f"    {name}: {c[0] / len(group):.0f}/{c[1] / len(group):.1f}/{c[2] / len(group):.0f}/{c[3] / len(group):.0f}")
-    for tag in ("STRH", "STRF", "STRO", "STRI", "STRD", "STRL"):
+    for tag in ("STRH", "STRF", "STRO", "STRI", "STRJ", "STRC", "STRD", "STRL"):
         lines = [text for level, text in period[tag] if first <= level <= last + 100]
         if lines:
             print(f"\n{tag} (last period in the window):")

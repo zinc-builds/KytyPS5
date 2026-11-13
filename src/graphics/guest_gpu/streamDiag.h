@@ -24,10 +24,18 @@
 //         sizes, and how many values differ between a segment and the previous frame's segment
 //         of the same shape.
 //   STRK  draws/dispatches/EVENT_WRITEs/occlusion-counter dumps by the guest's debug-marker path.
-//   STRB  one line per graphics submission, for 40 consecutive frames in every 400.
+//   STRB  one line per graphics submission, for 40 consecutive frames in every 400: who built
+//         it and when (ms from the frame's first submit), when it was submitted and when the
+//         command thread began and ended it; draws that take a register from an earlier
+//         submission (d_inh: context / shader program / user data of a stage it bound /
+//         user config / index and instance state).
+//   STRS  per marker path, same frames: the first draw's target mask, depth control, count
+//         control and targets, and whether all its draws share them.
 // Every 100 frames: STRH (AGC HLE calls by guest thread), STRF (by function), STRO (packets the
 // command thread ran, by opcode), STRI (registers inherited across submissions), STRD (the
-// registers whose values differ between same-shape segments), STRL (histograms).
+// registers whose values differ between same-shape segments), STRJ (registers draws take from
+// an earlier submission), STRC (context registers whose written values change from frame to
+// frame), STRL (histograms).
 // The model follows the in-order command thread; KYTY_DECODE_THREAD must be off.
 // tools/astro-bench/streamdiag.py summarizes the lines.
 namespace Libs::Graphics::StreamDiag {
@@ -43,6 +51,7 @@ namespace Libs::Graphics::StreamDiag {
 [[nodiscard]] uint32_t RegisterHle(const char* name); // once per call site
 void OnHle(uint32_t id) noexcept;                     // an AGC HLE function was entered
 void OnAllocate(const uint32_t* cmd) noexcept;        // this thread wrote a packet at cmd
+void OnPatch(const uint32_t* cmd) noexcept;           // this thread patched a register packet
 void OnSubmit(const uint32_t* commands, uint32_t dw, bool graphics);
 
 // Command thread.
