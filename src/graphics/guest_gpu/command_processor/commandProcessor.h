@@ -204,6 +204,13 @@ private:
 	// read only when a later draw inherits it.
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
+	// KYTY_INDIRECT_QUEUE: NUM_INSTANCES comes from the last record of a multi-draw whose count
+	// the GPU reads (m_num_instances_addr == NumInstancesFromCount): read when needed.
+	static constexpr uint64_t NumInstancesFromCount = 1;
+	uint64_t                  m_num_instances_count_addr = 0;
+	uint64_t                  m_num_instances_records    = 0;
+	uint32_t                  m_num_instances_stride     = 0;
+	uint32_t                  m_num_instances_max        = 0;
 
 	const int m_interrupt_event_id;
 	uint64_t  m_synthetic_occlusion_counter = 0;

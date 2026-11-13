@@ -46,6 +46,10 @@ struct GraphicContext {
 	// textures and samplers from the image heap's set by indices in shader data.
 	bool                               resident_textures                      = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// vkCmdDraw[Indexed]IndirectCount (Vulkan 1.2 drawIndirectCount), and the device's bound on
+	// one indirect draw's record count.
+	bool                                      draw_indirect_count_enabled           = false;
+	uint32_t                                  max_draw_indirect_count               = 0;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
