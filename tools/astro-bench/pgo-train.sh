@@ -35,8 +35,9 @@ else
 	[[ "$name" =~ ^[0-9a-f]{40}-[A-Za-z0-9._-]+$ ]] || { echo "pgo-train: bad KYTY_PGO_SET" >&2; exit 1; }
 fi
 out=$dir/$name.profdata
-# A named set reused with other levels would silently return the old profile: checked before
-# reusing a profile, and again under the trainer lock (a concurrent trainer may have just made it).
+# A named set reused with other levels would silently return the old profile: checked up front,
+# whenever an existing profile is reused (a concurrent trainer may have just published it; its
+# .levels is published first), and again under the trainer lock.
 check_levels() {
 	if [ -f "$out.levels" ] && [ "$(cat "$out.levels")" != "$levels" ]; then
 		echo "pgo-train: $name was trained on \"$(cat "$out.levels")\", not \"$levels\"; pick another KYTY_PGO_SET" >&2
@@ -66,7 +67,7 @@ update_current() {
 	log "current.profdata -> $sha.profdata"
 }
 
-if [ -f "$out" ]; then update_current; echo "$out"; exit 0; fi
+if [ -f "$out" ]; then check_levels; update_current; echo "$out"; exit 0; fi
 [ -n "$KYTY_BENCH_LOCKED" ] && { echo "pgo-train: call it outside any bench-lock hold (it builds, then runs)" >&2; exit 1; }
 exec 7>"$dir/$name.lock"
 flock 7 # one trainer per commit and set; later callers wait and reuse its profile
