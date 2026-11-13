@@ -953,12 +953,36 @@ public:
 
 	// Write-protects one asynchronously tracked page now (false if it is not one) and returns
 	// a token for AsyncPageUntouched. Stores found on it go to the next ScanAsyncWrites.
-	bool ProtectAsyncPage(uint64_t page, uint64_t& token) {
+	bool ProtectAsyncPage(uint64_t page, uint64_t& token, LabelMemo* memo = nullptr) {
 		std::shared_lock lock(m_mutex);
 		if (!AsyncPageTrackedUnlocked(page)) {
 			return false;
 		}
 		std::lock_guard kept_lock(m_kept_mutex);
+		// KYTY_WRITE_DATA_MEMO: snapshots for a later store to the page without this call (the
+		// translation sequence cannot move while m_mutex is held shared).
+		const auto fill_memo = [&] {
+			if (memo == nullptr) {
+				return;
+			}
+			memo->page        = page;
+			memo->token       = token;
+			memo->seq         = m_seq.load(std::memory_order_relaxed);
+			memo->translation = g_translation_seq.load(std::memory_order_acquire);
+			memo->remap       = g_remap_generation.load(std::memory_order_relaxed);
+			memo->host        = nullptr;
+			auto it           = m_maps.upper_bound(page);
+			if (it != m_maps.begin()) {
+				--it;
+				const auto& entry = it->second;
+				if (page >= entry.vaddr && page + 0x1000 <= entry.vaddr + entry.size) {
+					memo->host = m_backing_base + (entry.backing_offset + page - entry.vaddr);
+				}
+			}
+		};
+		if (memo != nullptr) {
+			memo->seq_at_entry = m_seq.load(std::memory_order_relaxed);
+		}
 		// A store through another guest view of the same bytes leaves this view's page clean,
 		// so no proof for aliased pages. (A later alias advances the remap generation.)
 		const auto generation = g_remap_generation.load(std::memory_order_relaxed);
@@ -980,6 +1004,7 @@ public:
 			const auto& slot = m_page_seq[(page >> 12u) % m_page_seq.size()];
 			if (slot.page == page && slot.seq > m_seq_floor) {
 				token = slot.seq;
+				fill_memo();
 				return true;
 			}
 		}
@@ -987,6 +1012,46 @@ public:
 			HideWritesLocked(begin, end, true);
 		});
 		token = PageTokenLocked(page);
+		fill_memo();
+		return true;
+	}
+
+	// KYTY_WRITE_DATA_MEMO: the stores of StoreLabels for the memo's page, if its snapshots still
+	// hold (LabelMemo); advance() runs before and after the stores, only when they happen.
+	template <typename Advance>
+	bool StoreLabelsMemo(const LabelMemo& memo, uint64_t vaddr, const void* values, uint32_t elem,
+	                     uint32_t count, uint32_t stride, uint64_t& token, Advance&& advance) {
+		if (memo.host == nullptr || count == 0 || (elem != 4 && elem != 8) || stride < elem ||
+		    (stride % elem) != 0 || (vaddr & (elem - 1)) != 0) {
+			return false;
+		}
+		const uint64_t size = uint64_t {count - 1} * stride + elem;
+		if ((vaddr & ~uint64_t {0xfff}) != memo.page || ((vaddr + size - 1) & ~uint64_t {0xfff}) != memo.page) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex); // no mapping or backing writer during the stores
+		if (g_translation_seq.load(std::memory_order_acquire) != memo.translation ||
+		    g_remap_generation.load(std::memory_order_relaxed) != memo.remap ||
+		    m_seq.load(std::memory_order_acquire) != memo.seq) {
+			return false;
+		}
+		LogAliasWrite(vaddr, size);
+		advance();
+		auto*       target = memo.host + (vaddr - memo.page);
+		const auto* src    = static_cast<const uint8_t*>(values);
+		for (uint32_t i = 0; i < count; i++, target += stride, src += elem) {
+			if (elem == 4) {
+				uint32_t v = 0;
+				std::memcpy(&v, src, 4);
+				*reinterpret_cast<volatile uint32_t*>(target) = v;
+			} else {
+				uint64_t v = 0;
+				std::memcpy(&v, src, 8);
+				*reinterpret_cast<volatile uint64_t*>(target) = v;
+			}
+		}
+		advance();
+		token = memo.token;
 		return true;
 	}
 
@@ -1634,7 +1699,7 @@ private:
 		uint64_t seq  = 0;
 	};
 	mutable std::array<PageSeq, 4096> m_page_seq {};
-	mutable uint64_t                  m_seq       = 0;
+	mutable std::atomic<uint64_t>     m_seq {0}; // read without m_kept_mutex by StoreLabelsMemo
 	mutable uint64_t                  m_seq_floor = 0; // tokens at or below are void
 	struct AliasMemo {
 		uint64_t page       = 0;
@@ -1755,6 +1820,15 @@ public:
 		}
 		std::shared_lock lock(m_mutex);
 		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->StoreLabel(vaddr, value, size);
+	}
+
+	// KYTY_WRITE_DATA_MEMO=verify: TryStoreLabelsBacking's own checks, without storing.
+	bool CanStoreLabelsBacking(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || !Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size);
 	}
 
 	bool TryStoreLabelsBacking(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,

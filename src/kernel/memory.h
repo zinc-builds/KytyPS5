@@ -204,6 +204,38 @@ void RequestAsyncWriteTracking(uint64_t vaddr) noexcept;
 // go to the next collection) and gives a token; false if the page is not one.
 // AsyncGuestPageUntouched: no guest view has stored to the page since the token was given.
 bool               ProtectAsyncGuestPage(uint64_t page, uint64_t& token);
+// What a label store needs to store to the same page again without ProtectAsyncGuestPage and the
+// backing lookups (KYTY_WRITE_DATA_MEMO), valid while all four snapshots, taken in
+// ProtectAsyncGuestPage under its locks, still hold:
+//  - seq: the tracker's token counter. Every token issued and every floor raise advances it
+//    (HideWritesLocked, PageTokenLocked, the submit scan's token pass), so while it stands the
+//    page's token is still current.
+//  - translation: GuestBackingStore's translation sequence. Every writer of the mappings or
+//    the backing (map, unmap, protect, zero, backing writes) advances it, so the page's backing
+//    address, its write-protected view and whether a private mapping replaced it still hold.
+//  - remap: the remap generation (aliases, remaps, unmaps, zeroing), so the page is still
+//    unaliased.
+//  - page.
+// host: the page's backing address (null: the page is not in one mapping; no memo).
+// seq_at_entry: the counter when ProtectAsyncGuestPage took its lock (verify only).
+struct LabelMemo {
+	uint64_t page         = ~uint64_t {0};
+	uint64_t token        = 0;
+	uint64_t seq          = 0;
+	uint64_t translation  = 0;
+	uint64_t remap        = 0;
+	uint8_t* host         = nullptr;
+	uint64_t seq_at_entry = 0;
+};
+bool ProtectAsyncGuestPage(uint64_t page, uint64_t& token, LabelMemo* memo);
+// count values at vaddr + i * stride (one page, the memo's), stored through the memo's backing
+// address with the same epoch-advance pair as TryStoreLabelsBacking, if the memo still holds;
+// false (nothing stored) otherwise. token: the memo's.
+bool TryStoreLabelsMemo(const LabelMemo& memo, uint64_t vaddr, const void* values, uint32_t elem,
+                        uint32_t count, uint32_t stride, uint64_t& token);
+// KYTY_WRITE_DATA_MEMO=verify: whether TryStoreLabelsBacking's address-space checks pass for the
+// range (owned, no private mapping, one backing mapping), without storing.
+bool CanStoreLabelsBacking(uint64_t vaddr, uint64_t size);
 // stale (optional): set when it is false because the token was voided (no longer the page's
 // current one), not because of a guest store.
 [[nodiscard]] bool AsyncGuestPageUntouched(uint64_t page, uint64_t token, bool* stale = nullptr);

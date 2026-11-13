@@ -130,7 +130,7 @@ constexpr std::array OwnNames {"mutex_wait_ns", "mutex_waits", "gc", "gc_ns", "c
                                "submit_scans", "submit_scan_ns", "tex_new", "buf_new", "cmd_gpu_waits",
                                "cmd_gpu_wait_ns", "cmd_idles", "cmd_idle_ns", "cmd_blocks",
                                "cmd_blocked_ns", "wd", "wd_ns", "wd_dw", "label_stale",
-                               "label_written"};
+                               "label_written", "wd_memo"};
 static_assert(OwnNames.size() == static_cast<size_t>(Counter::Count));
 
 struct Totals {

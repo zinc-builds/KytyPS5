@@ -168,14 +168,43 @@ public:
 	// value (IsCpLabel). invalidate: drop cached copies, as the guest mapping's fault would.
 	// False: store through the guest mapping instead (and the page's chunk is asked to become
 	// asynchronous).
-	bool StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size, bool invalidate);
+	// source: the WRITE_DATA packet's dword count (0: another label store), for
+	// KYTY_LABEL_HIT_STATS.
+	bool StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size, bool invalidate,
+	                  uint32_t source = 0);
 	// count values of elem bytes (4 or 8) at vaddr + i * stride, all in one page, stored as
 	// StoreCpLabel stores each one, in address order, with one protection (one token for all),
 	// one backing store and one invalidation of the bytes stored. False: nothing was stored
 	// (store them one at a time). values must not overlap the bytes stored: the label slots read
 	// them again after the stores.
 	bool StoreCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
-	                   uint32_t stride, bool invalidate);
+	                   uint32_t stride, bool invalidate, uint32_t source = 0);
+	// Whether a label store from this source fills its label slots. A slot is a positive cache:
+	// IsCpLabel is true only for a slot that matches, so a slot never written (or overwritten)
+	// only makes the waiter collect. WRITE_DATA packets of more than kWriteDataLabelMaxDwords
+	// dwords leave the slots alone: no wait was seen on such a slot (KYTY_LABEL_HIT_STATS on Sky
+	// Garden and Ninja Castle), and their slots evicted labels waits did hit.
+	// KYTY_WRITE_DATA_LABELS=all fills them for every packet.
+	static constexpr uint32_t kWriteDataLabelMaxDwords = 16;
+	[[nodiscard]] static bool FillsLabelSlots(uint32_t source) noexcept;
+	// KYTY_WRITE_DATA_MEMO (default on; =0 off, =verify checks each memo store against the full
+	// path): StoreCpLabels to the page of the previous one stores through LibKernel::Memory::
+	// LabelMemo while its snapshots hold, without the protection call and the backing lookups.
+	enum class MemoMode { Off, On, Verify };
+	[[nodiscard]] static MemoMode GetMemoMode() noexcept;
+	void                          VerifyLabelMemo(uint64_t vaddr, uint64_t size, uint64_t token);
+	// KYTY_LABEL_HIT_STATS=1 (off by default): per second, label checks (IsCpLabel) by outcome and
+	// by the size of the WRITE_DATA packet that wrote the slot, and slots written by size.
+	enum class LabelCheck { OtherAddress, Mismatch, Hit, Stale, Written };
+	[[nodiscard]] static bool LabelHitStatsEnabled() noexcept {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_LABEL_HIT_STATS");
+			return value != nullptr && value[0] == '1';
+		}();
+		return enabled;
+	}
+	static void NoteLabelCheck(LabelCheck check, uint32_t source) noexcept;
+	static void NoteLabelStores(uint32_t source, uint32_t slots) noexcept;
 	// WriteData stores each page of its range with StoreCpLabels (KYTY_WRITE_DATA_RANGED=0: one
 	// StoreCpLabel per dword; =verify: after each ranged store, builds the label slots the
 	// per-dword path would write, without storing again, and compares slots, tokens, the bytes
@@ -190,6 +219,10 @@ public:
 		if (!(label.vaddr == vaddr && sizeof(T) <= label.size &&
 		      static_cast<T>(label.value) == value &&
 		      label.generation == LibKernel::Memory::GuestRemapGeneration())) {
+			if (LabelHitStatsEnabled()) {
+				NoteLabelCheck(label.vaddr == vaddr ? LabelCheck::Mismatch : LabelCheck::OtherAddress,
+				               label.source);
+			}
 			return false;
 		}
 		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::LabelPeek);
@@ -198,6 +231,10 @@ public:
 		                                                                  label.token, &stale);
 		// KYTY_FRAME_DIAG: label waits that collect because the label's token was voided
 		// (label_stale) or because the guest stored to the page (label_written).
+		if (LabelHitStatsEnabled()) {
+			NoteLabelCheck(untouched ? LabelCheck::Hit : stale ? LabelCheck::Stale : LabelCheck::Written,
+			               label.source);
+		}
 		if (!untouched) {
 			Common::FrameDiag::Add(stale ? Common::FrameDiag::Counter::LabelStale
 			                             : Common::FrameDiag::Counter::LabelWritten);
@@ -207,7 +244,8 @@ public:
 	void VerifyAsyncWrites(const std::vector<std::pair<uint64_t, uint64_t>>& written,
 	                       bool before_handling);
 	void VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
-	                    uint32_t stride, bool invalidate, uint64_t token, uint64_t invalidated);
+	                    uint32_t stride, bool invalidate, uint64_t token, uint64_t invalidated,
+	                    uint32_t source, uint64_t generation);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -242,11 +280,13 @@ private:
 	struct CpLabel {
 		uint64_t vaddr      = 0;
 		uint64_t value      = 0;
-		uint64_t size       = 0;
+		uint32_t size       = 0;
+		uint32_t source     = 0; // KYTY_LABEL_HIT_STATS: the WRITE_DATA packet's dwords, 0 other
 		uint64_t generation = 0;
 		uint64_t token      = 0; // LibKernel::Memory::ProtectAsyncGuestPage
 	};
 	std::array<CpLabel, 1024> m_cp_labels {};
+	LibKernel::Memory::LabelMemo m_label_memo; // GPU thread only (StoreCpLabels)
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
