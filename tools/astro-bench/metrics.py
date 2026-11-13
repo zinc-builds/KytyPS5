@@ -168,17 +168,23 @@ def short(r):
 
 
 def level_base(log):
-    """garden.sh's start line and base frame: the StartLevel line, then the first PERF frames=."""
-    start = None
+    """garden.sh's start line and base frame: the StartLevel line, then the first PERF frames=.
+    As garden.sh: the first StartLevel (a -lvl run starts the level it asked for first), but
+    StartLevel aerial_garden when the log has one (the menu route may start the world map first).
+    Before, only aerial_garden counted, so on any other level the windows of framediag.py and
+    framemodel.py were absolute flip counts (~480 frames before garden.sh's)."""
     with open(log, errors="replace") as f:
-        for n, line in enumerate(f, 1):
-            if start is None:
-                if "StartLevel aerial_garden" in line:
-                    start = n
-            elif line.startswith("PERF "):
-                m = re.search(r"frames=(\d+)", line)
-                if m:
-                    return start, int(m.group(1))
+        lines = f.read().splitlines()
+    starts = [n for n, line in enumerate(lines, 1) if "StartLevel " in line]
+    garden = [n for n in starts if "StartLevel aerial_garden" in lines[n - 1]]
+    if not starts:
+        return None, None
+    start = (garden or starts)[0]
+    for line in lines[start:]:
+        if line.startswith("PERF "):
+            m = re.search(r"frames=(\d+)", line)
+            if m:
+                return start, int(m.group(1))
     return None, None
 
 
