@@ -8,6 +8,7 @@
 #include "common/gpuWaitDiag.h"
 #include "common/stallDiag.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/passDiag.h"
 #include "graphics/host_gpu/renderer/decodeHandoff.h"
 #include "graphics/host_gpu/renderer/deferredRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
@@ -410,6 +411,9 @@ public:
 		m_prepare_stat.drains++;
 		Common::BenchMetrics::Add(Common::BenchMetrics::Counter::Drains);
 		m_drain_reason = reason < DrainReasons ? reason : DrainDirectDraw;
+		if (PassDiag::Enabled()) {
+			PassDiag::OnDrain(m_drain_reason);
+		}
 		m_draining     = true;
 		while (QueuedCount() != 0) {
 			FinishQueuedDraw(buffer);

@@ -895,6 +895,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	auto&      executor      = m_renderer.GetRenderExecutor();
 	const auto packet_header = view.header;
 	const auto opcode        = view.opcode;
+	if (PassDiag::Enabled()) {
+		PassDiag::OnPacket(opcode);
+	}
 	if (executor.HasQueuedDraw() &&
 	    (!KeepsQueuedDraw(packet_header) ||
 	     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
@@ -1128,6 +1131,9 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	    SkipOcclusionProxy()) {
 		return;
 	}
+	if (PassDiag::Enabled()) {
+		PassDiag::OnDraw(CurrentBuffer().GetRegisters(), CurrentBuffer().GetShaders(), 0);
+	}
 	executor.QueueDrawIndex(CurrentBuffer(), args);
 }
 
@@ -1222,6 +1228,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
 	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
+	if (PassDiag::Enabled()) {
+		PassDiag::OnDraw(CurrentBuffer().GetRegisters(), CurrentBuffer().GetShaders(), 2);
+	}
 	if (IndirectDrawOffsets(registers, records.offsets)) {
 		if (!indexed && executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
 			return;
@@ -1323,6 +1332,9 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (m_synthetic_occlusion_open != 0 && RenderExecutor::ProxySkipMode() != 0 &&
 	    SkipOcclusionProxy()) {
 		return;
+	}
+	if (PassDiag::Enabled()) {
+		PassDiag::OnDraw(CurrentBuffer().GetRegisters(), CurrentBuffer().GetShaders(), 1);
 	}
 	executor.QueueDrawAuto(CurrentBuffer(), args);
 }
@@ -1432,6 +1444,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		     event_type, event_index, event_address);
 	}
 
+	if (PassDiag::Enabled()) {
+		PassDiag::OnEvent(event_type);
+	}
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
 	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
 	// barriers already order.
@@ -1541,6 +1556,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	}
 	if (Common::FrameDiag::Enabled()) {
 		Common::FrameDiag::OnGuestFlip(PerformanceOverlayFlipCount());
+	}
+	if (PassDiag::Enabled()) {
+		PassDiag::OnGuestFlip(PerformanceOverlayFlipCount());
 	}
 }
 

@@ -1177,6 +1177,9 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	if (PassDiag::Enabled()) {
+		PassDiag::PopMarker();
+	}
 
 	return dw_num + 1;
 }
@@ -1185,6 +1188,9 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	if (PassDiag::Enabled()) {
+		PassDiag::PushMarker(buffer, std::min(dw_num + 1u, dw > 0 ? dw - 1u : 0u));
+	}
 
 	return dw_num + 1;
 }
@@ -1788,6 +1794,10 @@ static constexpr auto MakeContextIndirectTable() {
 	                             Pm4::PA_SC_SHADER_CONTROL}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
+	table[Pm4::DB_COUNT_CONTROL] = [](KYTY_HW_REG_ARGS) {
+		(void)cp;
+		PassDiag::SetCountControl(value);
+	};
 	table[Pm4::PA_CL_VS_OUT_CNTL]  = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetClVsOutCntl(value); };
 	table[Pm4::GE_NGG_SUBGRP_CNTL] = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetNggSubgrpCntl(value); };
 	table[Pm4::GE_MAX_OUTPUT_PER_SUBGROUP] = [](KYTY_HW_REG_ARGS) {

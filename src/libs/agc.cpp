@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/guest_gpu/passDiag.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -4133,6 +4134,9 @@ static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	Common::FrameDiag::OnGuestSubmit(true);
+	if (Graphics::PassDiag::Enabled()) {
+		Graphics::PassDiag::OnSubmit();
+	}
 
 	LibKernel::PthreadNoteGraphicsSubmitter();
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
