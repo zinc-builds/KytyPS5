@@ -1,28 +1,27 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/memDiag.h"
+#include "shader_store/shaderStoreKey.h"
 
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/regionDefinitions.h"
+#include "kernel/memory.h"
 #include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
 #include <xxhash.h>
 #include <zstd.h>
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
 
 // The shader store: a header, then zstd-compressed records of everything a run created first.
 // Records are only appended, so a store cut short by a crash keeps every complete record.
@@ -43,37 +42,55 @@ struct Frame {
 	uint64_t checksum        = 0; // XXH3 of the compressed bytes.
 };
 
-// Changes with every build, so records never meet code that encodes them differently. Zero when
-// the executable cannot be found.
-uint64_t BuildStamp() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::array<wchar_t, 32768> name {};
-	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
-	const std::filesystem::path path = name.data();
-#elif defined(__APPLE__)
-	std::array<char, 4096> name {};
-	auto size = static_cast<uint32_t>(name.size());
-	_NSGetExecutablePath(name.data(), &size);
-	const std::filesystem::path path = name.data();
-#else
-	const std::filesystem::path path = "/proc/self/exe";
-#endif
-	std::error_code error;
-	const auto      time = std::filesystem::last_write_time(path, error).time_since_epoch().count();
-	return error ? 0 : static_cast<uint64_t>(time);
+// Bump to discard every existing store by hand (a change the source hash cannot see).
+constexpr uint32_t kShaderStoreFormat = 1;
+
+// KYTY_SHADER_CACHE_STAMP=N (N > 0) replaces the source hash with N: a manual key, to keep a store
+// across a source change known not to alter what it records, or to discard one by changing N.
+// Change N whenever the shader recompiler changes, or the stored programs no longer match the code.
+uint64_t ManualStamp() {
+	static const uint64_t stamp = [] {
+		const char* env = std::getenv("KYTY_SHADER_CACHE_STAMP");
+		if (env == nullptr || env[0] < '1' || env[0] > '9') {
+			return uint64_t {0};
+		}
+		// A whole positive decimal number only; anything else is ignored.
+		char*      end   = nullptr;
+		errno            = 0;
+		const auto value = std::strtoull(env, &end, 10);
+		return errno == 0 && end != nullptr && *end == '\0' ? static_cast<uint64_t>(value) : uint64_t {0};
+	}();
+	return stamp;
 }
 
-// What every record depends on besides its own fields; empty when the build is unknown.
+// What every record depends on besides its own fields. A store is reused only when all of it
+// matches, so a rebuild that leaves these alone keeps the store:
+//  - KYTY_SHADER_STORE_SOURCE_HASH: the sources that turn guest code into the stored modules and
+//    keys (CMakeLists.txt lists them: the recompiler, its IR and serialization, the guest format
+//    and register definitions, the pipeline cache and this file), or KYTY_SHADER_CACHE_STAMP;
+//  - sizeof(GraphicsPipelineKey): pipeline records are its raw bytes;
+//  - the device and the switches that change generated code: the SPIR-V profile, the shared
+//    memory limit, the host subgroup sizes, the buffer cache's page table geometry and the DMA
+//    address translation constants, masked selects
+//    and KYTY_BDA_STATS=access (instrumented DMA shaders).
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
-	const auto stamp = BuildStamp();
-	if (stamp == 0) {
-		return {};
-	}
-	Writer header;
-	// KYTY_BDA_STATS=access instruments DMA shaders: their modules must not meet other runs.
-	const uint32_t bda_access = MemDiag::BdaStatsMode() == 2 ? 1u : 0u;
-	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize, bda_access);
+	Writer      header;
+	const auto& properties = graphics.GetPhysicalDeviceProperties();
+	const uint32_t bda_access     = MemDiag::BdaStatsMode() == 2 ? 1u : 0u;
+	const uint32_t masked_selects = ShaderRecompiler::MaskedSelectsEnabled() ? 1u : 0u;
+	const uint32_t wave64         = graphics.SupportsComputeWave64() ? 1u : 0u;
+	const uint32_t manual         = ManualStamp() != 0 ? 1u : 0u;
+	const uint64_t source_hash    = manual != 0 ? ManualStamp() : KYTY_SHADER_STORE_SOURCE_HASH;
+	const uint64_t key_size       = sizeof(GraphicsPipelineKey);
+	const uint32_t page_bits      = BufferCache::CACHING_PAGEBITS;
+	const uint64_t page_count     = BufferCache::CACHING_NUMPAGES;
+	// The DMA shaders' address translation (spirvEmitterMemory.cpp).
+	const uint64_t extended_base  = LibKernel::Memory::kExtendedMemoryBase;
+	const uint64_t lower_size     = LOWER_ADDRESS_SIZE;
+	IoAll(header, kShaderStoreFormat, manual, source_hash, key_size, properties.vendorID,
+	      properties.deviceID, SpirvProfile(graphics), properties.limits.maxComputeSharedMemorySize,
+	      graphics.subgroup_size, wave64, page_bits, page_count, extended_base, lower_size,
+	      masked_selects, bda_access);
 	return std::move(header.bytes);
 }
 
@@ -147,9 +164,6 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		return;
 	}
 	const auto header = StoreHeader(m_graphics);
-	if (header.empty()) {
-		return;
-	}
 	const auto           start = std::chrono::steady_clock::now();
 	std::vector<uint8_t> bytes;
 	if (Common::File file;

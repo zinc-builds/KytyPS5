@@ -587,6 +587,14 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 
 } // namespace
 
+bool MaskedSelectsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MASKED_SELECTS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Compute: return "CS";
@@ -862,11 +870,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
-	// KYTY_MASKED_SELECTS=0 keeps them (A/B only: shader stores don't record the setting).
-	static const bool masked_selects = [] {
-		const char* value = std::getenv("KYTY_MASKED_SELECTS");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	const bool masked_selects = MaskedSelectsEnabled();
 	// The analysis is per guest lane (compute runs two lanes per invocation, but each IR value is
 	// still one lane's). Tessellation, geometry and mesh stages are left out: not measured.
 	const bool masked_stage =

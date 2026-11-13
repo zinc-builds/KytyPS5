@@ -69,6 +69,9 @@ struct ShaderSource {
 };
 
 [[nodiscard]] const char* StageName(ShaderType stage);
+// Whether EXEC selects whose skipped lanes nothing reads are dropped (KYTY_MASKED_SELECTS=0 keeps
+// them). It changes the generated code, so the shader store's header records it.
+[[nodiscard]] bool MaskedSelectsEnabled();
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
