@@ -13,8 +13,9 @@
 # It runs the newest PGO build of dev under ~/.cache/kyty-builds that has the recorder, with the
 # bench's flags (run.sh: --amd-cpu, the warm shader store, Mailbox presentation at 60 Hz vblanks,
 # 1920x1080) and the default thread placement, so what is played is what the bench measures.
-# It refuses to start while a benchmark holds the bench lock or another emulator runs, and holds
-# the lock itself for the session, so no agent benchmark runs while you play.
+# It refuses to start while a benchmark holds the bench lock or another emulator runs, waits for
+# builds (queued at priority 1), and holds the lock for the session, so no agent benchmark runs
+# while you play.
 # Options:
 #   --install DIR  another install dir (or a build key under ~/.cache/kyty-builds)
 #   --dir DIR      session directory (default ~/.cache/kyty-playtest/<timestamp>)
@@ -71,14 +72,15 @@ for p in $(pgrep -x kyty_emulator); do
 done
 if [ "$lock" = 1 ]; then
 	. "$here/astro-bench/benchlock.sh"
-	st=$("$here/astro-bench/benchlock.sh" status)
+	st=$("$here/astro-bench/benchlock.sh" status | head -1)
 	case "$st" in exclusive*)
 		echo "playtest.sh: an agent benchmark is running (${st#exclusive: }); try again in a few minutes" >&2
 		exit 1 ;;
 	esac
 	# Builds hold it shared: wait for them (a few minutes at most), then hold it for the session.
 	[ "$st" = free ] || echo "playtest.sh: waiting for agent builds to finish..." >&2
-	KYTY_BENCH_LOCK_TIMEOUT=900 benchlock_acquire x "playtest.sh (the user is playing)" 2>/dev/null ||
+	# Priority 1: a person is waiting (ahead of every queued agent job).
+	KYTY_BENCH_PRIO=1 KYTY_BENCH_LOCK_TIMEOUT=900 benchlock_acquire x "playtest.sh (the user is playing)" 2>/dev/null ||
 		{ echo "playtest.sh: could not take the bench lock" >&2; exit 1; }
 fi
 dir=${dir:-$HOME/.cache/kyty-playtest/$(date +%Y%m%d-%H%M%S)}
