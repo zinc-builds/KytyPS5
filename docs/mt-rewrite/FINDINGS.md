@@ -1845,9 +1845,45 @@ How it was measured:
 - Pirate Island's +1.9 ms/frame over Sky Garden is mostly label stores (+1.4 ms), from the per-frame transparent queries.
 - `QueueDrawIndex`'s self time includes a `pause` spin waiting for a prepared draw, 64-bit `div`s for ring indices, the adoption check over the worker's read log, and 64-byte record copies.
 
+**Reference per-draw map of the command thread** (Pirate Island normal frames).
+
+How it was measured:
+- A debug-info twin of the shipped build: same commit (2a926892) and profile, built with `-gline-tables-only` and not stripped.
+- One cmdsplit run, symbolized with inlined frames (llvm-symbolizer, return address − 1 for call sites).
+- The twin's inlining is lighter, but its total is 3,276 ns/draw against 3,230 shipped (+1.4%), so the proportions carry over.
+
+Map, ns/draw:
+- Committing prepared draws (`FinishQueuedDraw`, through `QueueDrawIndex` → `PostQueuedDraw`): 1,977 (60%).
+  - `ExecutePreparedDraw`: ~1,240.
+    - `PrepareBindings`: ~330. `ResolveStageTexture` is 198 of it, NativeSampler 41, CanReuseBindings 30.
+    - `PrepareGraphicsBindings`: ~330.
+      - `RebindBuffers` 162 (of which `ObtainBuffer` 114).
+      - `RebindImages` 130 (of which `FindTexture` 104: FindView 61, AcquireTexture 42).
+      - `PrepareBda` 39.
+      - `FindBuffers` 28.
+    - `CommitBindings`: ~260. Descriptor writes and pushes ~130, image barriers 49, PushConstants 37.
+    - Dynamic state 64, vertex buffers 64, `AcquireRenderTargets` 63, `GetGraphicsPipeline` 34, libc 79.
+  - `PrepareDrawRenderState`: ~280.
+    - `AdoptPrograms` ~115, of which ~90 is the walk over the worker's read-log ranges.
+    - Colour and depth target resolution ~115.
+    - `GetGraphicsPrograms` 55.
+  - `Pool::Wait`'s `Done()` spin: 184.
+- `QueueDrawIndex`'s own posting: Post 34, register snapshot 12.
+
+What the map says:
+- **The prepare-wait spin is counted twice.** `Pool::Wait` busy-waits, so its time shows as CPU, and `Wait()` returns the same interval as `wait_prep`. Command-thread "CPU per frame" therefore overstates real work by ~0.9 ms on the heavy levels.
+- **The read-log hazard walk** costs ~90 ns/draw and almost never finds anything (`rej_f` 0.0005 per frame). It is the one cheap candidate (B4).
+- **The `div`s for ring indices** run only inside the spin. Not worth a change.
+- **Bindings, split by which plan targets them:**
+  - textures ~300 ns (resident textures);
+  - buffers ~190 ns (stage 2);
+  - descriptor building and pushing ~130 ns;
+  - push constants ~37 ns.
+- **Resident textures: target ~300, delivered ~35.** Stage 1b gave −1.2% on Sky Garden and was slower on Pirate Island. The implementation adds back most of what it removes, so don't read the 300 as available.
+
 **Stage 2 (buffers by address) stays on hold.**
 - It would delete the PrepareBda syncs plus buffer obtain/sync/stream: 2.1 ms/frame on Pirate Island, 2.6 ms/frame on Sky Garden, plus the buffer half of the bindings bucket.
-- At stage 1b's ratio (35 ns delivered of 140–160 ns found), that is ~0.5–0.8 ms/frame, for 2–3 weeks of medium-risk work.
+- At stage 1b's ratio (35 ns delivered of 140–160 ns found), that is ~0.5–0.8 ms/frame, for 2–3 weeks of medium-risk work. By the per-draw map, the buffer work stage 2 targets is ~190 of 3,276 ns. At that ratio, ~50 ns/draw is realistic.
 
 **Resident textures on Pirate Island: slower, cause not measured.** Same binary, normal-frame ns/draw:
 
