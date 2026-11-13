@@ -1030,7 +1030,7 @@ bool CommandProcessor::SkipOcclusionProxy() {
 	auto& executor = m_renderer.GetRenderExecutor();
 	auto& stat     = executor.m_proxy_stat;
 	stat.in_query++;
-	if (!RenderExecutor::ProxyRegisters(m_ctx)) {
+	if (!RenderExecutor::ProxyRegisters(m_ctx, m_ucfg)) {
 		stat.renders++;
 		return false;
 	}

@@ -1317,7 +1317,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (ProxySkipMode() != 0 && ProxyRegisters(buffer.GetRegisters()) &&
+	if (ProxySkipMode() != 0 && ProxyRegisters(buffer.GetRegisters(), buffer.GetUserConfig()) &&
 	    !m_context.GetOcclusionQueries().Enabled()) {
 		// KYTY_OCCLUSION_PROXY_SKIP: a draw that may stand in for an occlusion proxy: learn
 		// whether its shaders write anything (storage buffers or images, raw addresses, DMA,
@@ -1335,6 +1335,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			}
 		}
 		const auto key  = ProxyShaderKey(buffer.GetRegisters(), buffer.GetShaders());
+		ProxyShadersCurrent();
 		auto [it, added] = m_proxy_shaders.try_emplace(key, !writes);
 		if (!added && it->second && writes) {
 			// The same combination wrote this time (another stage set under one key): never
@@ -1774,7 +1775,19 @@ int RenderExecutor::ProxySkipMode() {
 	return mode;
 }
 
-bool RenderExecutor::ProxyRegisters(const HW::Context& ctx) {
+void RenderExecutor::ProxyShadersCurrent() {
+	if (const auto generation = ShaderMapGeneration(); generation != m_proxy_shader_generation) {
+		m_proxy_shaders.clear();
+		m_proxy_shader_generation = generation;
+	}
+}
+
+bool RenderExecutor::ProxyRegisters(const HW::Context& ctx, const HW::UserConfig& ucfg) {
+	// Tessellation runs other stages than the key names (LS/HS/ES), and object/primitive-ID output
+	// writes attachment 7 whatever the target mask (PipelineCache::PixelOutputs): not proxies.
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch || ctx.HasObjectPrimitiveIdOutput()) {
+		return false;
+	}
 	const auto  mode     = ctx.GetColorControl().mode;
 	const auto& override = ctx.GetDepthRenderOverride();
 	const auto& render   = ctx.GetRenderControl();
@@ -1796,7 +1809,9 @@ bool RenderExecutor::ProxyRegisters(const HW::Context& ctx) {
 uint64_t RenderExecutor::ProxyShaderKey(const HW::Context& ctx, const HW::Shader& sh) {
 	const bool  ps_active = PipelineCache::PixelOutputs(ctx, sh).active;
 	const auto& vs        = sh.GetVs();
+	// The stage selection (merged ES/GS, NGG, wave size) comes from VGT_SHADER_STAGES_EN.
 	return (ps_active ? sh.GetPs().ps_regs.data_addr : 1u) ^
+	       (static_cast<uint64_t>(ctx.GetShaderStages()) * 0x94d049bb133111ebull) ^
 	       (vs.gs_regs.data_addr * 0x9e3779b97f4a7c15ull) ^
 	       (vs.es_regs.data_addr * 0xc2b2ae3d27d4eb4full) ^
 	       (vs.ls_regs.data_addr * 0x165667b19e3779f9ull) ^

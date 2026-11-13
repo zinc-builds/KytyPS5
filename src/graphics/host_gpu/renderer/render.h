@@ -434,12 +434,14 @@ public:
 	[[nodiscard]] static int ProxySkipMode();
 	// The register part: no color, depth or stencil write, no clear, copy, resolve or metadata
 	// operation.
-	[[nodiscard]] static bool ProxyRegisters(const HW::Context& ctx);
+	[[nodiscard]] static bool ProxyRegisters(const HW::Context& ctx, const HW::UserConfig& ucfg);
 	// The shader combination the draw runs (pixel shader only if it runs).
 	[[nodiscard]] static uint64_t ProxyShaderKey(const HW::Context& ctx, const HW::Shader& sh);
 	enum class ProxyShaders : uint8_t { Unknown, Clean, Writes };
-	// What the commit found the combination's shaders to write (learnt from rendered draws).
-	[[nodiscard]] ProxyShaders ProxyShaderClass(uint64_t key) const {
+	// What the commit found the combination's shaders to write (learnt from rendered draws; forgotten
+	// whenever a shader binary is mapped, since the code at an address may then differ).
+	[[nodiscard]] ProxyShaders ProxyShaderClass(uint64_t key) {
+		ProxyShadersCurrent();
 		const auto it = m_proxy_shaders.find(key);
 		return it == m_proxy_shaders.end() ? ProxyShaders::Unknown
 		                                   : it->second ? ProxyShaders::Clean : ProxyShaders::Writes;
@@ -453,6 +455,7 @@ public:
 	};
 	ProxyStats m_proxy_stat; // GPU thread
 	void       PrintProxyStats();
+	void       ProxyShadersCurrent();
 
 private:
 	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,
@@ -864,6 +867,7 @@ private:
 	// KYTY_OCCLUSION_PROXY_SKIP: shader combinations rendered as possible proxies, and whether
 	// their shaders write nothing (GPU thread).
 	std::unordered_map<uint64_t, bool> m_proxy_shaders;
+	uint64_t                           m_proxy_shader_generation = 0;
 	uint64_t                           m_proxy_stat_ns = 0;
 	alignas(64) std::atomic<uint64_t> m_queued_released {0};
 	DecodeHandoff*                    m_decode_handoff = nullptr;
