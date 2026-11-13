@@ -119,7 +119,9 @@ if [ -n "$emu" ]; then
 	for _ in $(seq 300); do grep -q '"StartLevel"' "$dir/events.jsonl" 2>/dev/null && break; sleep 1; done
 	check "the level started" grep -q '"StartLevel"' "$dir/events.jsonl"
 	sleep "$play"
-	tr '\0' '\n' < "/proc/$emu/environ" 2>/dev/null | grep -qx "KYTY_PLAYTEST_DIR=$dir" && kill -TERM "$emu"
+	alive=0
+	tr '\0' '\n' < "/proc/$emu/environ" 2>/dev/null | grep -qx "KYTY_PLAYTEST_DIR=$dir" && kill -TERM "$emu" && alive=1
+	check "the emulator was still running after ${play}s of play and took SIGTERM" [ "$alive" = 1 ]
 fi
 for _ in $(seq 240); do [ -d "/proc/$launcher" ] || break; sleep 0.5; done
 if [ -d "/proc/$launcher" ]; then

@@ -109,8 +109,10 @@ def main():
     if have and have >= donor_size // 2:
         print(f'warm: the shader store has {mb(have)} for this build')
         return
-    # Seed only installs in the build cache (never a checkout's own install).
-    if donor and '--seed' in sys.argv and os.path.dirname(os.path.dirname(install)) == builds:
+    # Seed only a store with nothing for this build (never replace one the emulator would reuse: a
+    # donor run with other switches has another full header and would be rejected), and only in
+    # installs in the build cache (never a checkout's own install).
+    if donor and not have and '--seed' in sys.argv and os.path.dirname(os.path.dirname(install)) == builds:
         os.makedirs(os.path.dirname(mine), exist_ok=True)
         for ext in ('.shaders', '.bin'):
             src = os.path.join(donor, '_PipelineCache', title + ext)
@@ -120,6 +122,10 @@ def main():
                 os.replace(dst + '.seed', dst)
         print(f'seeded: the shader store had {mb(have)} for this build; copied {mb(donor_size)} from '
               f'{donor} (same store key), so the first load does not compile every shader')
+        return
+    if have:
+        print(f'partly warm: the shader store has {mb(have)} for this build ({donor} has {mb(donor_size)}): '
+              f'expect some shader-compile hitches on the first visit to new areas')
         return
     state = f'{mb(have)} for this build' if have else ('none' if not size(mine) else 'one from another build')
     hint = f'; {donor} has {mb(donor_size)} with the same key' if donor else ''
