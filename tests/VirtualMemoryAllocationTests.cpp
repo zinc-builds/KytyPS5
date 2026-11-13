@@ -5043,12 +5043,16 @@ void TestPackedReciprocalSquareRoot() {
 			input.fill(0x3f800000);
 		}
 	}
-	// An indirect branch prevents borrowing neighboring bytes for this four-byte site.
+	// An indirect branch prevents borrowing neighboring bytes for this four-byte site, and the
+	// direct jump just before it leaves no straight-line instruction to jump over instead.
 	Xbyak::CodeGenerator unsupported_code(code_size, reinterpret_cast<void*>(mapping));
 	Xbyak::Label continuation;
+	Xbyak::Label site;
 	unsupported_code.vmovups(unsupported_code.ymm1, unsupported_code.ptr[unsupported_code.rdi]);
 	unsupported_code.lea(unsupported_code.rax,
 	                     unsupported_code.ptr[unsupported_code.rip + continuation]);
+	unsupported_code.jmp(site);
+	unsupported_code.L(site);
 	const auto trap_offset = unsupported_code.getSize();
 	unsupported_code.vrsqrtps(unsupported_code.xmm1, unsupported_code.xmm1);
 	unsupported_code.jmp(unsupported_code.rax);

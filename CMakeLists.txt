@@ -757,7 +757,9 @@ if(BUILD_TESTING)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
 	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
-	add_test(NAME guest_instruction_patcher COMMAND $<TARGET_FILE:guest_instruction_patcher_tests>)
+	if(TARGET guest_instruction_patcher_tests)
+		add_test(NAME guest_instruction_patcher COMMAND $<TARGET_FILE:guest_instruction_patcher_tests>)
+	endif()
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -882,12 +884,14 @@ if(BUILD_TESTING)
 		jpeg_dec_tests
 		jpeg_enc_tests
 		occlusion_queries_tests
-		guest_instruction_patcher_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
 		rtc_tests
 	)
+	if(TARGET guest_instruction_patcher_tests)
+		add_dependencies(kyty_tests guest_instruction_patcher_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
