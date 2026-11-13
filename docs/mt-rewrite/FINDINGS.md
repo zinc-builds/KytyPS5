@@ -1895,6 +1895,42 @@ What the map says:
 - The store holds one file per title, and its header includes the switch, so every on/off toggle rebuilt it. Track U is fixing this.
 - The mode stays off and parked.
 
+**final_stage (the cutscene) is a different animal.**
+
+Record build a0e3fe50, frames 1000–3000:
+- 849 draws/frame at 13.0 µs/draw (user 10.8, sys 2.2).
+- The command thread is busy 10.8 ms/frame.
+- 2.2% of frames take two or more refreshes. Most slow frames are game-late (no guest work for more than 2 ms), not command-thread time.
+
+Per frame (debug twin, 462 draws/frame; 11.5 ms user + 2.7 ms kernel):
+
+| Item | ms/frame |
+|---|---|
+| Committing draws | 6.0 |
+| ↳ first-use texture uploads (`InitializeImage` → memcpy from guest sparse backing in `TryReadSparseBacking`) | 1.5 |
+| ↳ prepare-wait spin | 0.9 |
+| ↳ `GetGraphicsPrograms` (~1.2 µs/draw against ~55 ns in Pirate Island) | 0.56 |
+| ↳ `MaterializeColorClear` | 0.61 |
+| ↳ target resolution | 0.47 |
+| Compute dispatches | 1.9 |
+| Driver | 0.75 |
+| Readbacks | ~0.6 |
+| Kernel | 2.7 |
+
+**After the fixes (record build a0e3fe50).** The heavy levels have no frames with more than 1,000 drains. Pirate Island and Ninja Castle still show a 3-in-33 cadence at 29.5 and 32.2 ms. B4 profiled it:
+
+| Cost | Time |
+|---|---|
+| Indirect multi-draws of the `*_WithCulling` passes, run unprepared | ~10.5 ms |
+| WRITE_DATA | ~2.4–2.8 ms |
+| 0x39 dumps | ~1.8 ms |
+
+`KYTY_INDIRECT_QUEUE` is in proof for the indirect draws.
+
+Those frames also take ~450–640 command-thread minor faults against ~15 in other frames:
+- They are not the 0x39 result pages. Storing the dumps through the backing barely moved the count (636 → 588).
+- Their source is still open.
+
 **Classifier note.** cmdsplit's categories now match a function's own name, not its demangled parameter types. Before, `CommitBindings(…PipelineCache::Pipeline const*…)` counted as pipeline lookup.
 
 ### Commit-side prefetch: early hand-off lines don't buy cycles (Track R, 2026-11-12)
