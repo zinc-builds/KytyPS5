@@ -510,6 +510,16 @@ FINDINGS, "Frame pacing", has the tables. Judge pacing changes with `KYTY_FRAME_
 presented frame. A change to the game's core layout (Track B's stager) needs the no-guest-work
 share checked.
 
+## Playtests (Track L, 2026-11-13)
+
+The user plays by hand with `tools/playtest.sh [level]` (the newest PGO build of dev with the
+recorder, the bench's flags, bench lock held at priority 1). Each session lands in
+`~/.cache/kyty-playtest/<timestamp>/`; `tools/playtest-report.py <session>` is the page to read
+(incidents by cause with the targeted follow-up run for each, markers with screenshots, FPS and
+pacing distribution, memory growth, other processes on our cores). Hitches found there become
+targeted runs (`levels.sh` with the diagnostic the report names), never a request to the user to
+play again. Input is captured at the pad HLE read for replay (Track L, PR b).
+
 ## Status
 
 | Track | Current step | Notes |
