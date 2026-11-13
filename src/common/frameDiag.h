@@ -70,8 +70,33 @@ inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 	return counting;
 }
 
+// The counters the playtest recorder reads; the rest count only for KYTY_FRAME_DIAG (some sit on
+// per-packet paths, where a locked add would cost the recorder its budget).
+[[nodiscard]] constexpr bool RecorderReads(Counter counter) noexcept {
+	switch (counter) {
+		case Counter::MutexWaitNs:
+		case Counter::MutexWaits:
+		case Counter::GcRuns:
+		case Counter::GcNs:
+		case Counter::Collects:
+		case Counter::CollectNs:
+		case Counter::SubmitScans:
+		case Counter::SubmitScanNs:
+		case Counter::TextureCreates:
+		case Counter::BufferCreates:
+		case Counter::CmdGpuWaits:
+		case Counter::CmdGpuWaitNs:
+		case Counter::CmdIdles:
+		case Counter::CmdIdleNs:
+		case Counter::CmdBlocks:
+		case Counter::CmdBlockedNs:
+		case Counter::TextureFrees: return true;
+		default: return false;
+	}
+}
+
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
-	if (Counting()) {
+	if (RecorderReads(counter) ? Counting() : Enabled()) {
 		Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
 	}
 }
@@ -84,7 +109,7 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 class Scope {
 public:
 	Scope(Counter count, Counter ns) noexcept
-	    : m_count(count), m_ns(ns), m_start(Counting() ? NowNs() : 0) {}
+	    : m_count(count), m_ns(ns), m_start((RecorderReads(ns) ? Counting() : Enabled()) ? NowNs() : 0) {}
 	~Scope() {
 		if (m_start != 0) {
 			Add(m_count);
