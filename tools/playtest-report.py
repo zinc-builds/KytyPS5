@@ -233,7 +233,17 @@ def main():
         'rss_slope_mb_per_min': round(s * 60, 1) if s is not None else None,
         'vram_start_mb': vram[0] if vram else None, 'vram_end_mb': vram[-1] if vram else None,
         'vram_max_mb': max(vram) if vram else None,
+        'rss_peak_mb': round(max(r for _, r in rss_pts)) if rss_pts else None,
     }
+    emu_swap = [x['emu'].get('swap_mb', 0) for x in system if 'emu' in x]
+    sys_swap = [x['mem']['swap_used_mb'] for x in system if 'swap_used_mb' in x.get('mem', {})]
+    swapin = [x['mem']['pswpin'] for x in system if 'pswpin' in x.get('mem', {})]
+    memory.update({
+        'emu_swap_max_mb': round(max(emu_swap)) if emu_swap else None,
+        'system_swap_start_mb': sys_swap[0] if sys_swap else None, 'system_swap_end_mb': sys_swap[-1] if sys_swap else None,
+        'swapin_mb': round((swapin[-1] - swapin[0]) * 4096 / 1e6) if len(swapin) > 1 else None,
+        'major_faults_play': int(sum(f.get('majflt', 0) for f in play)),
+    })
     # System: who else ran on the emulator's cores, temperatures, clocks.
     intruders = defaultdict(lambda: [0.0, 0])
     temps_max = defaultdict(float)
@@ -244,11 +254,32 @@ def main():
         for k, v in x.get('temps', {}).items():
             temps_max[k] = max(temps_max[k], v)
     n_sys = max(1, len(system))
+    # Thermal throttling: samples with the CPU package at its critical temperature, and the clock of
+    # the emulator's cores then against the rest of the session. An outside cause (cooling).
+    limits = next((x['temp_limits'] for x in system if x.get('temp_limits')), None)
+    if limits is None:  # sessions from before the sampler read the limit: Intel's usual TjMax
+        limits = {k: 100.0 for x in system[:1] for k in x.get('temps', {}) if k.startswith('coretemp:Package')}
+    hot_t, mhz_hot, mhz_ok = [], [], []
+    for x in system:
+        cores = x.get('cores', {})
+        mhz = [cores[str(c)]['mhz'] for c in x.get('hot_cores', []) if cores.get(str(c), {}).get('mhz')]
+        at_limit = any(x.get('temps', {}).get(k, 0) >= lim - 1.0 for k, lim in limits.items())
+        if at_limit and 'start_mono_s' in start:
+            hot_t.append(x['t'] - start['start_mono_s'])
+        if mhz:
+            (mhz_hot if at_limit else mhz_ok).append(sum(mhz) / len(mhz))
+    thermal = None
+    if hot_t:
+        thermal = {'samples_at_limit': len(hot_t), 'samples': len(system), 'first_t': round(hot_t[0], 1),
+                   'limit_c': max(limits.values()),
+                   'core_mhz_at_limit': round(sum(mhz_hot) / len(mhz_hot)) if mhz_hot else None,
+                   'core_mhz_otherwise': round(sum(mhz_ok) / len(mhz_ok)) if mhz_ok else None}
     sys_info = {
         'samples': len(system),
         'intruders': sorted(({'comm': k, 'avg_pct': round(v[0] / n_sys, 2), 'seen': v[1]} for k, v in intruders.items()),
                             key=lambda d: -d['avg_pct'])[:5],
         'temps_max': {k: round(v, 1) for k, v in sorted(temps_max.items())},
+        'thermal_limit': thermal,
     }
     # Levels.
     levels = []
@@ -270,6 +301,36 @@ def main():
         if longs:
             return sum(max(0.0, f['ms'] - REFRESH_MS) for f in longs)
         return max(0.0, (rec.get('worst_ms') or 0) - REFRESH_MS)
+    # Memory pressure: a slow frame whose command thread spent its time in the kernel faulting pages
+    # in (thousands of faults: pages coming back from swap count as minor faults when they are still
+    # in the swap cache) while the system was swapping is not draw work.
+    by_g = {int(f['g']): f for f in frames if 'g' in f}
+    rel = start.get('start_mono_s')
+    pressure_t = []  # session times of system samples that show swapping
+    prev_mem = None
+    for x in system:
+        mem = x.get('mem') or {}
+        swapping = (prev_mem is not None and mem.get('pswpin', 0) > prev_mem.get('pswpin', 0)) or \
+            x.get('emu', {}).get('swap_mb', 0) > 0 or any(i['comm'] == 'kswapd0' for i in x.get('intruders', []))
+        if swapping and rel is not None:
+            pressure_t.append(x['t'] - rel)
+        prev_mem = mem
+    def memory_pressure(rec):
+        f = by_g.get(int(rec.get('worst_g') or -1))
+        if not f or rec.get('primary_cause') not in ('command thread CPU (draw work)', 'command thread off-CPU'):
+            return None
+        faults = f.get('minflt', 0) + f.get('majflt', 0)
+        sys_ms = f.get('sys_us', 0) / 1000
+        t = f.get('t', 0)  # the worst frame's time: a merged incident spans up to 30 s
+        if faults >= 2000 and sys_ms >= 5 and any(abs(p - t) <= 4 for p in pressure_t):
+            return f'memory pressure: page faults while the system swapped ({faults:.0f} faults, ' \
+                   f'{sys_ms:.0f} ms in the kernel)'
+        return None
+    for rec in incidents:
+        mp = memory_pressure(rec)
+        if mp:
+            rec['summary'] = f"{mp}; emulator side: {rec.get('summary', '')}"
+            rec['primary_cause'] = 'memory pressure (swapping)'
     groups = defaultdict(list)
     for rec in incidents:
         cause = rec.get('primary_cause', 'none')
@@ -314,6 +375,20 @@ def main():
         w = g['worst']
         top.append(f"{g['cause']}: {g['count']} incident(s), {g['lost_ms']:.0f} ms lost; worst {w['worst_ms']} ms "
                    f"at {fmt_t(w['t'] or 0)} ({w['file']}): {w['summary']}")
+    # Throttling keeps a top-three slot (after up to two others) when the clocks dropped with it.
+    # Outside causes the player can act on keep their top-three slots (after the others).
+    outside_top = []
+    if thermal and thermal['core_mhz_at_limit'] and thermal['core_mhz_otherwise'] and \
+            thermal['core_mhz_at_limit'] < 0.97 * thermal['core_mhz_otherwise']:
+        outside_top.append(f"not the emulator: the CPU package reached its thermal limit ({thermal['limit_c']:.0f} °C) in "
+                   f"{thermal['samples_at_limit']} of {thermal['samples']} system samples (first at "
+                   f"{fmt_t(thermal['first_t'])}), the emulator's cores at {thermal['core_mhz_at_limit']} MHz then vs "
+                   f"{thermal['core_mhz_otherwise']}; check the cooling (fan curve, dust, power profile)")
+    if (memory.get('emu_swap_max_mb') or 0) > 0:
+        outside_top.append(f"not the emulator: the system was swapping (the emulator had up to "
+                           f"{memory['emu_swap_max_mb']} MB swapped out); close other programs before playing")
+    del top[3 - len(outside_top):]
+    top.extend(outside_top)
     if len(top) < 3 and pres['two_refresh_pct'] > 1.0:
         top.append(f"pacing: {pres['two_refresh_pct']}% of presented frames took two refreshes outside loads "
                    f"(target < 1%)")
@@ -375,8 +450,17 @@ def main():
       f"{long_frames['over25']}, >33 ms: {long_frames['over33']}, >100 ms: {long_frames['over100']}")
     m = memory
     growth = f"{m['rss_slope_mb_per_min']} MB/min" if m['rss_slope_mb_per_min'] is not None else 'n/a, under 3 min of play'
-    p(f"memory: RSS {m['rss_start_mb']} -> {m['rss_end_mb']} MB (growth in play: {growth}); "
-      f"VRAM {m['vram_start_mb']} -> {m['vram_end_mb']} MB (max {m['vram_max_mb']})")
+    if (m['rss_slope_mb_per_min'] or 0) < 0:
+        growth = ('none; resident memory fell because the system swapped the emulator out' if m.get('emu_swap_max_mb')
+                  else 'none (resident memory fell)')
+    swap = (f"; system swap {m['system_swap_start_mb']} -> {m['system_swap_end_mb']} MB, {m['swapin_mb']} MB swapped in"
+            if m.get('system_swap_start_mb') is not None else '')
+    p(f"memory: RSS peak {m['rss_peak_mb']} MB ({m['rss_start_mb']} at start, {m['rss_end_mb']} at end; growth in play: "
+      f"{growth}); emulator swapped out up to {m['emu_swap_max_mb']} MB{swap}; major faults in play "
+      f"{m['major_faults_play']}; VRAM {m['vram_start_mb']} -> {m['vram_end_mb']} MB (max {m['vram_max_mb']})")
+    if m.get('emu_swap_max_mb') or (m.get('swapin_mb') or 0) > 100:
+        p(f"MEMORY PRESSURE: the system swapped during the session (the emulator had up to {m['emu_swap_max_mb']} MB "
+          f"swapped out): close other programs; frames that page faults slowed down are labelled 'memory pressure'")
     inc = report['incidents']
     p(f"incidents: {inc['total']} (play {inc['by_phase']['play']}, load {inc['by_phase']['load']}, "
       f"boot {inc['by_phase']['boot']}){', ' + str(inc['unwritten']) + ' past the cap' if inc['unwritten'] else ''}; "
@@ -402,6 +486,17 @@ def main():
         intr = ', '.join(f"{i['comm']} {i['avg_pct']}%" for i in sys_info['intruders']) or 'none'
         tm = ', '.join(f'{k} {v}' for k, v in sys_info['temps_max'].items())
         p(f"system ({sys_info['samples']} samples): other processes on the emulator's cores: {intr}; max temps: {tm}")
+        th = sys_info['thermal_limit']
+        if th:
+            clk = (f"; the emulator's cores ran at {th['core_mhz_at_limit']} MHz then vs {th['core_mhz_otherwise']} MHz "
+                   f"otherwise" if th['core_mhz_at_limit'] and th['core_mhz_otherwise'] else '')
+            measured = bool(th['core_mhz_at_limit'] and th['core_mhz_otherwise'])
+            dropped = measured and th['core_mhz_at_limit'] < 0.97 * th['core_mhz_otherwise']
+            p(f"THERMAL: CPU package at its limit ({th['limit_c']:.0f} °C) in {th['samples_at_limit']} of "
+              f"{th['samples']} samples, first at {fmt_t(th['first_t'])}{clk}: " +
+              ("the CPU throttles there, so slow frames in those seconds are partly the cooling's doing "
+               "(an outside cause)" if dropped else "no clock loss seen with it (no throttling cost)" if measured
+               else "no clock comparison (no readings away from the limit), so throttling is not measured"))
     if report['dropped']['events'] or report['dropped']['frames']:
         p(f"dropped: {report['dropped']['events']} events, {report['dropped']['frames']} frame records")
     p('top three things to fix:')

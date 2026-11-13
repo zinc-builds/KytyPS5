@@ -6,6 +6,8 @@ Every interval (default 2 s) one JSON line:
   t          CLOCK_MONOTONIC seconds (the emulator's frames.csv uses the same clock, from its start)
   cores      per CPU: busy % since the last sample, current MHz
   temps      hwmon temperatures (CPU package/cores, GPU if exposed), deg C
+  mem        system memory: available MB, swap used MB, pages swapped in / out since boot (/proc/vmstat)
+  temp_limits (first sample only) the CPU package's critical temperature (where it throttles), deg C
   emu        emulator RSS and VmSwap (MB), thread count, its named threads (KytyGpuCmd, KytyGpuPrep*,
              KytyGpuRec*, ...) with the CPU each ran on last and its CPU % since the last sample
   hot_cores  the CPUs those named threads ran on, plus their SMT siblings
@@ -93,6 +95,44 @@ def temps():
     return pkg
 
 
+def memory():
+    out = {}
+    info = {}
+    for line in (read('/proc/meminfo') or '').splitlines():
+        k, _, v = line.partition(':')
+        if v.strip():
+            info[k] = int(v.split()[0])
+    if 'MemAvailable' in info:
+        out['avail_mb'] = info['MemAvailable'] // 1024
+    if 'SwapTotal' in info and 'SwapFree' in info:
+        out['swap_used_mb'] = (info['SwapTotal'] - info['SwapFree']) // 1024
+    for line in (read('/proc/vmstat') or '').splitlines():
+        k, _, v = line.partition(' ')
+        if k in ('pswpin', 'pswpout'):
+            out[k] = int(v)
+    return out
+
+
+def temp_limits():
+    # The package sensor's critical temperature: Intel CPUs throttle there (TjMax).
+    out = {}
+    base = '/sys/class/hwmon'
+    try:
+        mons = os.listdir(base)
+    except OSError:
+        return out
+    for mon in mons:
+        if (read(f'{base}/{mon}/name') or '').strip() != 'coretemp':
+            continue
+        for f in os.listdir(f'{base}/{mon}'):
+            if f.startswith('temp') and f.endswith('_crit'):
+                label = (read(f'{base}/{mon}/{f[:-5]}_label') or '').strip()
+                v = read(f'{base}/{mon}/{f}')
+                if label.startswith('Package') and v:
+                    out[f'coretemp:{label}'] = int(v) / 1000.0
+    return out
+
+
 def proc_stat(path):
     text = read(path)
     if not text:
@@ -108,8 +148,9 @@ def gpu():
     try:
         r = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu,clocks.gr',
                             '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=5)
-        used, total, util, temp, clock = [x.strip() for x in r.stdout.strip().split('\n')[0].split(',')]
-        return {'vram_used_mb': int(used), 'vram_total_mb': int(total), 'util': int(util), 'temp': int(temp),
+        # Some drivers print the temperature with decimals ("57.82").
+        used, total, util, temp, clock = [float(x) for x in r.stdout.strip().split('\n')[0].split(',')]
+        return {'vram_used_mb': int(used), 'vram_total_mb': int(total), 'util': int(util), 'temp': round(temp, 1),
                 'clock_mhz': int(clock)}
     except Exception:
         return None
@@ -185,11 +226,13 @@ def main():
             prev_procs = cur_procs
             intruders.sort(key=lambda x: -x['pct'])
             rec = {
-                't': round(now, 3), 'cores': cores, 'temps': temps(),
+                't': round(now, 3), 'cores': cores, 'temps': temps(), 'mem': memory(),
                 'emu': {'rss_mb': round(mem.get('VmRSS', 0) / 1024, 1), 'swap_mb': round(mem.get('VmSwap', 0) / 1024, 1),
                         'threads': mem.get('Threads'), 'named': sorted(threads, key=lambda x: x['name'])},
                 'hot_cores': sorted(hot), 'intruders': intruders[:5],
             }
+            if n == 1:
+                rec['temp_limits'] = temp_limits()
             if n % 5 == 1:
                 g = gpu()
                 if g:
