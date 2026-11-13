@@ -929,7 +929,9 @@ bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t siz
 		return false;
 	}
 	if (invalidate) {
+		BufferCache::SetCollideLabelScope(true);
 		(void)InvalidateMemory(vaddr, size);
+		BufferCache::SetCollideLabelScope(false);
 	}
 	if (!FillsLabelSlots(source)) {
 		return true;
