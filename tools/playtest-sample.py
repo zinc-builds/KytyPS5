@@ -6,6 +6,7 @@ Every interval (default 2 s) one JSON line:
   t          CLOCK_MONOTONIC seconds (the emulator's frames.csv uses the same clock, from its start)
   cores      per CPU: busy % since the last sample, current MHz
   temps      hwmon temperatures (CPU package/cores, GPU if exposed), deg C
+  mem        system memory: available MB, swap used MB, pages swapped in / out since boot (/proc/vmstat)
   temp_limits (first sample only) the CPU package's critical temperature (where it throttles), deg C
   emu        emulator RSS and VmSwap (MB), thread count, its named threads (KytyGpuCmd, KytyGpuPrep*,
              KytyGpuRec*, ...) with the CPU each ran on last and its CPU % since the last sample
@@ -92,6 +93,24 @@ def temps():
     if cores:
         pkg['coretemp:hottest core'] = max(cores)
     return pkg
+
+
+def memory():
+    out = {}
+    info = {}
+    for line in (read('/proc/meminfo') or '').splitlines():
+        k, _, v = line.partition(':')
+        if v.strip():
+            info[k] = int(v.split()[0])
+    if 'MemAvailable' in info:
+        out['avail_mb'] = info['MemAvailable'] // 1024
+    if 'SwapTotal' in info and 'SwapFree' in info:
+        out['swap_used_mb'] = (info['SwapTotal'] - info['SwapFree']) // 1024
+    for line in (read('/proc/vmstat') or '').splitlines():
+        k, _, v = line.partition(' ')
+        if k in ('pswpin', 'pswpout'):
+            out[k] = int(v)
+    return out
 
 
 def temp_limits():
@@ -207,7 +226,7 @@ def main():
             prev_procs = cur_procs
             intruders.sort(key=lambda x: -x['pct'])
             rec = {
-                't': round(now, 3), 'cores': cores, 'temps': temps(),
+                't': round(now, 3), 'cores': cores, 'temps': temps(), 'mem': memory(),
                 'emu': {'rss_mb': round(mem.get('VmRSS', 0) / 1024, 1), 'swap_mb': round(mem.get('VmSwap', 0) / 1024, 1),
                         'threads': mem.get('Threads'), 'named': sorted(threads, key=lambda x: x['name'])},
                 'hot_cores': sorted(hot), 'intruders': intruders[:5],
