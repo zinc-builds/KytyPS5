@@ -38,7 +38,11 @@ for c in $cand; do
 	[[ "$seen" == *" $c "* ]] && continue
 	seen+="$c "
 	if [[ "$pinned" == *" $c "* ]]; then
-		continue # a pipeline thread's own CPU, not a candidate
+		# A pipeline thread's own CPU (the GPU thread's, the prepare workers' and the overflow
+		# worker's are always among the candidates). Say why when a setting took a sibling.
+		[[ " $(expand "${KYTY_RECORDER_CPU:-}") $(expand "${KYTY_DECODE_CPU:-}") " == *" $c "* ]] &&
+			echo "cpu $c: the run's own (KYTY_RECORDER_CPU/KYTY_DECODE_CPU)" >&2
+		continue
 	elif [[ "$threads" == *" $c "* ]]; then
 		echo "cpu $c: in an emulator thread's affinity" >&2
 		continue
