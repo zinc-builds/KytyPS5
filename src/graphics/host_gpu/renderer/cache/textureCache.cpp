@@ -20,6 +20,12 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -125,6 +131,38 @@ constexpr size_t MaxExactImages = 16384;
 
 } // namespace
 
+namespace {
+// KYTY_VRAM_DIAG=1 (diagnostic, not for merge): one VRAM line per garbage-collector tick (each
+// guest frame boundary) with the device memory in use, the collector's state, and the images it
+// evicted since the last line by mode, plus re-creations of images evicted earlier (same guest
+// address and size): count, MB, and age since the eviction (<1 s, <5 s, <30 s, >=30 s).
+// KYTY_VRAM_BUDGET_DELTA_MB=<signed MB> shifts the budget the thresholds come from.
+struct VramDiag {
+	bool                                   on = false;
+	uint64_t                               ev[3] {}; // normal, pressured, aggressive
+	uint64_t                               ev_b = 0, ev_dl = 0, recr = 0, recr_b = 0;
+	uint64_t                               recr_age[4] {};
+	std::unordered_map<uint64_t, uint64_t> evicted; // key -> ns
+};
+VramDiag& Vram() {
+	static VramDiag diag = [] {
+		VramDiag d;
+		const char* value = std::getenv("KYTY_VRAM_DIAG");
+		d.on              = value != nullptr && value[0] == '1';
+		return d;
+	}();
+	return diag;
+}
+uint64_t VramKey(uint64_t address, uint64_t size) {
+	return address ^ (size << 40u) ^ (size >> 24u);
+}
+uint64_t VramNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+} // namespace
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
@@ -135,14 +173,23 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+		const char* delta_mb = std::getenv("KYTY_VRAM_BUDGET_DELTA_MB");
+		const auto  budget =
+		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX)) +
+		    (delta_mb != nullptr ? std::strtoll(delta_mb, nullptr, 10) * 1024 * 1024 : 0);
 		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
 		m_pressure_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		if (Vram().on) {
+			std::printf("VRAMBUDGET reported_mb=%" PRIu64 " budget_mb=%" PRId64 " trigger_mb=%" PRIu64
+			            " pressure_mb=%" PRIu64 " critical_mb=%" PRIu64 "\n",
+			            m_graphics.GetTotalMemoryBudget() >> 20u, budget >> 20, m_trigger_gc_memory >> 20u,
+			            m_pressure_gc_memory >> 20u, m_critical_gc_memory >> 20u);
+			std::fflush(stdout);
+		}
 	}
 }
 
@@ -276,6 +323,16 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
+	if (auto& vram = Vram(); vram.on) {
+		const auto it = vram.evicted.find(VramKey(image.info.data.address, image.info.data.size));
+		if (it != vram.evicted.end()) {
+			const auto age = VramNowNs() - it->second;
+			vram.recr++;
+			vram.recr_b += image.AccountedSize();
+			vram.recr_age[age < 1'000'000'000ull ? 0 : age < 5'000'000'000ull ? 1 : age < 30'000'000'000ull ? 2 : 3]++;
+			vram.evicted.erase(it);
+		}
+	}
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -2396,6 +2453,20 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	if (auto& vram = Vram(); vram.on) {
+		const int state = m_total_used_memory < m_trigger_gc_memory    ? 0
+		                  : m_total_used_memory < m_pressure_gc_memory ? 1
+		                  : m_total_used_memory < m_critical_gc_memory ? 2
+		                                                               : 3;
+		std::printf("VRAM t=%" PRIu64 " used_mb=%" PRIu64 " state=%d ev=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+		            " ev_mb=%.1f ev_dl=%" PRIu64 " recr=%" PRIu64 " recr_mb=%.1f recr_age=%" PRIu64 "/%" PRIu64
+		            "/%" PRIu64 "/%" PRIu64 " evicted_known=%zu\n",
+		            VramNowNs(), m_total_used_memory >> 20u, state, vram.ev[0], vram.ev[1], vram.ev[2],
+		            static_cast<double>(vram.ev_b) / 1048576.0, vram.ev_dl, vram.recr,
+		            static_cast<double>(vram.recr_b) / 1048576.0, vram.recr_age[0], vram.recr_age[1],
+		            vram.recr_age[2], vram.recr_age[3], vram.evicted.size());
+		vram     = VramDiag {true, {}, 0, 0, 0, 0, {}, std::move(vram.evicted)};
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -2434,6 +2505,7 @@ void TextureCache::RunGarbageCollector() {
 				TouchImage(*owner);
 				continue;
 			}
+			bool downloaded = false;
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
@@ -2445,6 +2517,13 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !DownloadImageMemory(id)) {
 					continue;
 				}
+				downloaded = safe;
+			}
+			if (auto& vram = Vram(); vram.on) {
+				vram.ev[aggressive ? 2 : pressured ? 1 : 0]++;
+				vram.ev_b += owner->AccountedSize();
+				vram.ev_dl += downloaded ? 1 : 0;
+				vram.evicted[VramKey(owner->info.data.address, owner->info.data.size)] = VramNowNs();
 			}
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
