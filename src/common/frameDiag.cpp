@@ -259,7 +259,7 @@ void OnFlip(uint64_t frame, double interval_ms) noexcept {
 }
 
 namespace {
-void PrintFiberLine(uint64_t guest_frame);
+void PrintFiberLine(uint64_t guest_frame, bool print);
 } // namespace
 
 void OnGuestFlip(uint64_t frame) noexcept {
@@ -273,7 +273,11 @@ void OnGuestFlip(uint64_t frame) noexcept {
 		std::snprintf(head, sizeof(head), "GFRAME g=%" PRIu64 " f=%" PRIu64 " t=%" PRIu64 " ms=%.3f",
 		              g_guest.count, frame, now_ns, static_cast<double>(now_ns - g_guest.last_ns) / 1e6);
 		Print(head, now, g_guest.last);
-		PrintFiberLine(g_guest.count);
+		PrintFiberLine(g_guest.count, true);
+	} else {
+		// First flip: only take the baselines, so the first GFIBER covers the same interval as
+		// the first GFRAME.
+		PrintFiberLine(0, false);
 	}
 	g_guest.have    = true;
 	g_guest.last    = now;
@@ -336,8 +340,9 @@ GuestThread* Self() {
 	return t_guest;
 }
 
-// One GFIBER line: each guest thread's fiber transfers since the previous guest flip.
-void PrintFiberLine(uint64_t guest_frame) {
+// One GFIBER line: each guest thread's fiber transfers since the previous guest flip. With
+// print false, only moves the baselines.
+void PrintFiberLine(uint64_t guest_frame, bool print) {
 	char line[1024];
 	int  n = std::snprintf(line, sizeof(line), "GFIBER g=%" PRIu64, guest_frame);
 	bool any = false;
@@ -351,7 +356,7 @@ void PrintFiberLine(uint64_t guest_frame) {
 			any = true;
 		}
 	}
-	if (any) {
+	if (any && print) {
 		std::printf("%s\n", line);
 	}
 }
