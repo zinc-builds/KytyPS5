@@ -133,7 +133,7 @@ constexpr std::array OwnNames {"mutex_wait_ns", "mutex_waits", "gc", "gc_ns", "c
                                "cmd_blocked_ns", "wd", "wd_ns", "wd_dw", "label_stale",
                                "label_written", "wd_memo", "ind", "ind_queued", "ind_gpu_count",
                                "ind_patched", "ind_unqueued", "ind_predicated",
-                               "ind_verified", "tex_free", "own_takes", "own_uncertain", "collide_rb", "own_take_ns", "own_check_ns"};
+                               "ind_verified", "tex_free", "own_takes", "own_uncertain", "collide_rb", "own_take_ns", "own_check_ns", "collide_real"};
 static_assert(OwnNames.size() == static_cast<size_t>(Counter::Count));
 
 struct Totals {

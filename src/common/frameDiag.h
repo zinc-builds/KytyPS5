@@ -53,6 +53,7 @@ enum class Counter {
 	CollisionReadbacks, // GPU-thread synchronous merges: a written page found GPU-dirty
 	OwnershipTakeNs,    // time in RenderContext::TakeAsyncWrites
 	OwnershipCheckNs,   // time in the "already GPU-owned?" pre-check (1 in 16 timed, scaled)
+	CollisionRealMerges, // KYTY_OWNERSHIP_TAKE=verify: collection merges that were not no-ops
 	Count
 };
 

@@ -891,9 +891,12 @@ bool OwnershipTakeEnabled() {
 	}();
 	return on;
 }
-// KYTY_OWNERSHIP_TAKE=verify: the take stays on, and every synchronous merge left (a fallback)
-// first reads the whole page back from the GPU buffer and exits if any guest byte outside the
-// GPU-written bytes differs from it: the merge was not a no-op, a store the buffer lacked.
+// KYTY_OWNERSHIP_TAKE=verify: the take stays on, and every synchronous merge a write collection
+// (or a take) drives reads the page back from the GPU buffer first and compares it with the guest
+// bytes outside the GPU-written ones. Different bytes: the merge was real (GFRAME collide_real,
+// the first 20 printed as OWNERSHIPVERIFY). Not an error: a store between the take and GPU-dirty,
+// or on a page the take skipped, makes a real merge legitimately. The exiting checks for a
+// dropped store are KYTY_ASYNC_WP_VERIFY and KYTY_COLLECT_OBSERVE, which count takes.
 bool OwnershipTakeVerify() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_OWNERSHIP_TAKE");
@@ -1324,9 +1327,14 @@ void BufferCache::VerifyMergeIsNoOp(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	const uint8_t* gpu = readback.Mapped().data();
 	for (uint64_t i = 0; i < bytes; i++) {
 		if (skip[i] == 0 && gpu[i] != guest[i]) {
-			EXIT("KYTY_OWNERSHIP_TAKE=verify: a synchronous merge was not a no-op: guest 0x%016" PRIx64
-			     " holds 0x%02x, the GPU buffer 0x%02x (range 0x%016" PRIx64 "+0x%" PRIx64 ")\n",
-			     begin + i, guest[i], gpu[i], vaddr, size);
+			Common::FrameDiag::Add(Common::FrameDiag::Counter::CollisionRealMerges);
+			static std::atomic<uint32_t> printed {0};
+			if (printed.fetch_add(1, std::memory_order_relaxed) < 20) {
+				std::printf("OWNERSHIPVERIFY real merge: guest 0x%016" PRIx64 " holds 0x%02x, the GPU buffer "
+				            "0x%02x (range 0x%016" PRIx64 "+0x%" PRIx64 ")\n",
+				            begin + i, guest[i], gpu[i], vaddr, size);
+			}
+			return;
 		}
 	}
 }
@@ -1355,15 +1363,30 @@ void BufferCache::TakeOwnershipWrites(uint64_t vaddr, uint64_t size) {
 		if (m_memory_tracker.IsRegionFullyGpuModified(start, stop - start)) {
 			continue; // owned already: its marks were taken when it was acquired
 		}
-		Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipTakes);
-		const auto take_start = diag ? Common::GpuWaitDiag::NowNs() : 0;
-		if (locked || !m_scheduler.Context().TakeAsyncWrites(start, stop)) {
-			Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipUncertain);
-		}
-		if (diag) {
-			const auto ns = Common::GpuWaitDiag::NowNs() - take_start;
-			taken_ns += ns;
-			Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipTakeNs, ns);
+		// Only pages that are not GPU-dirty: invalidating a GPU-dirty page would merge it now
+		// (ReadMemory), and the merge's download window clears GPU ownership around it, including
+		// ranges earlier writable bindings of the draw being prepared have reserved. Marks left on
+		// GPU-dirty pages are for the next collection, outside binding preparation (fallback).
+		for (uint64_t run = start; run < stop;) {
+			if (m_memory_tracker.IsRegionGpuModified(run, TRACKER_PAGE_SIZE)) {
+				run += TRACKER_PAGE_SIZE;
+				continue;
+			}
+			uint64_t run_end = run + TRACKER_PAGE_SIZE;
+			while (run_end < stop && !m_memory_tracker.IsRegionGpuModified(run_end, TRACKER_PAGE_SIZE)) {
+				run_end += TRACKER_PAGE_SIZE;
+			}
+			Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipTakes);
+			const auto take_start = diag ? Common::GpuWaitDiag::NowNs() : 0;
+			if (locked || !m_scheduler.Context().TakeAsyncWrites(run, run_end)) {
+				Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipUncertain);
+			}
+			if (diag) {
+				const auto ns = Common::GpuWaitDiag::NowNs() - take_start;
+				taken_ns += ns;
+				Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipTakeNs, ns);
+			}
+			run = run_end;
 		}
 	}
 	if (timed_check) { // the pre-checks only: this call's takes are left out
