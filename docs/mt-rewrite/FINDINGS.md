@@ -1788,6 +1788,165 @@ How it was measured:
 | `hw_check` (per-draw register validation, reads the register copy) | 7.5 | 2.8 | to be skipped under B4's register change flags |
 | Recorder ring (Reserve, WaitDone) | 1.9 | 2.0 | |
 
+### Heavy levels: the occlusion-query burst, and where a normal frame's draw goes (Track B, 2026-11-13)
+
+**Setup.** dev 2a926892, PGO with its own profile, `--amd-cpu`. The reference numbers, log paths and commands are in `~/.cache/kyty-research/level-baselines.md`.
+
+**The heavy levels' draws are not dearer. They have a burst.**
+- Pirate Island, Ninja Castle and Clock Tower looked 1.5× dearer per draw than Sky Garden (4.2–4.6 vs 3.0 µs). Their normal frames cost the same: 3,119 / 3,065 / 2,713 ns/draw.
+- The whole excess is 3 consecutive guest frames every 33 (9% of frames), with these numbers:
+
+  | Level | draws/frame | drains/frame | cmd CPU | ns/draw |
+  |---|---|---|---|---|
+  | Pirate Island | 11.6k | 6.6k | 102 ms | 8.8k |
+  | Ninja Castle | 14.3k | 9.9k | 136 ms | 9.5k |
+
+- Sky Garden and Sky Aztec have none.
+- These are also the "100+ ms frames with prepare waits over 3 ms". With `--occlusion-queries` every frame becomes a burst frame (Ninja Castle 4.9 FPS), so real queries are not a route.
+
+**What the burst is.** It is the game's occlusion-culling pass, found with `KYTY_PASS_DIAG` (#132) and the research track's stream diagnostic.
+- It sits under the debug markers `…_WithCulling>OcclusionCullingQuery`, and in those frames the opaque passes switch to GPU-culled indirect draws.
+- Per object the game issues WRITE_DATA (zero 64 bytes at the result slot) → EVENT_WRITE 0x39 → a 36-vertex box (DrawIndexAuto) → EVENT_WRITE 0x39.
+- The boxes write no colour (CB_TARGET_MASK 0). Depth test is on, depth write and stencil are off, and they use 1–2 shader pairs.
+- Normal frames also carry ~95 transparent and decal queries.
+- Without the boxes, a burst frame would have fewer draws than a normal one (~4.4k vs ~5.7k).
+
+**Its cost is mostly WRITE_DATA, not drains.** In Ninja Castle's burst frames (user samples):
+
+| Where the time goes | Share |
+|---|---|
+| `CommandProcessor::WriteData` | 68% |
+| `FinishQueuedDraw` (drains) | 14% |
+| `Pool::Wait` | 8% |
+
+- WriteData stores one dword at a time through `StoreCpLabel`. Each store protects the page, writes the backing store and invalidates; the libc leaf is mostly rwlock/mutex calls. That makes 16 stores per box, ~0.6 µs each, ~9.7 µs per box.
+- Fixes:
+  - store the whole packet once (Track K);
+  - skip the boxes in always-visible mode while still writing the synthetic result (B4).
+
+**Normal frames, where a draw goes.** Command-thread user samples (cmdsplit, 997 Hz, frame-pointer stacks, normal frames only), ns/draw:
+
+| Bucket | Pirate Island | Sky Garden |
+|---|---|---|
+| total | **3,230 (17.2 ms/frame)** | **2,899 (15.3 ms/frame)** |
+| post/queue/adopt (mostly `QueueDrawIndex` self) | 781 | 920 |
+| bindings prepare/commit (textures and buffers) | 742 | 694 |
+| label stores (WRITE_DATA, RELEASE_MEM) | 338 | 70 |
+| PM4 decode/registers | 242 | 223 |
+| PrepareBda syncs | 208 | 293 |
+| buffer obtain/sync/stream | 192 | 197 |
+| pipeline/program lookup | 138 | 109 |
+| prepare/recorder waits | 122 | 78 |
+| texture resolve/find | 105 | 80 |
+| texture upload/create | 97 | 43 |
+| other | 265 | 192 |
+
+- Kernel time adds ~1.3 ms/frame.
+- Pirate Island's +1.9 ms/frame over Sky Garden is mostly label stores (+1.4 ms), from the per-frame transparent queries.
+- `QueueDrawIndex`'s self time includes a `pause` spin waiting for a prepared draw, 64-bit `div`s for ring indices, the adoption check over the worker's read log, and 64-byte record copies.
+
+**Reference per-draw map of the command thread** (Pirate Island normal frames).
+
+How it was measured:
+- A debug-info twin of the shipped build: same commit (2a926892) and profile, built with `-gline-tables-only` and not stripped.
+- One cmdsplit run, symbolized with inlined frames (llvm-symbolizer, return address − 1 for call sites).
+- The twin's inlining is lighter, but its total is 3,276 ns/draw against 3,230 shipped (+1.4%), so the proportions carry over.
+
+Map, ns/draw:
+- Committing prepared draws (`FinishQueuedDraw`, through `QueueDrawIndex` → `PostQueuedDraw`): 1,977 (60%).
+  - `ExecutePreparedDraw`: ~1,240.
+    - `PrepareBindings`: ~330. `ResolveStageTexture` is 198 of it, NativeSampler 41, CanReuseBindings 30.
+    - `PrepareGraphicsBindings`: ~330.
+      - `RebindBuffers` 162 (of which `ObtainBuffer` 114).
+      - `RebindImages` 130 (of which `FindTexture` 104: FindView 61, AcquireTexture 42).
+      - `PrepareBda` 39.
+      - `FindBuffers` 28.
+    - `CommitBindings`: ~260. Descriptor writes and pushes ~130, image barriers 49, PushConstants 37.
+    - Dynamic state 64, vertex buffers 64, `AcquireRenderTargets` 63, `GetGraphicsPipeline` 34, libc 79.
+  - `PrepareDrawRenderState`: ~280.
+    - `AdoptPrograms` ~115, of which ~90 is the walk over the worker's read-log ranges.
+    - Colour and depth target resolution ~115.
+    - `GetGraphicsPrograms` 55.
+  - `Pool::Wait`'s `Done()` spin: 184.
+- `QueueDrawIndex`'s own posting: Post 34, register snapshot 12.
+
+What the map says:
+- **The prepare-wait spin is counted twice.** `Pool::Wait` busy-waits, so its time shows as CPU, and `Wait()` returns the same interval as `wait_prep`. Command-thread "CPU per frame" therefore overstates real work by ~0.9 ms on the heavy levels.
+- **The read-log hazard walk** costs ~90 ns/draw and almost never finds anything (`rej_f` 0.0005 per frame). It is the one cheap candidate (B4).
+- **The `div`s for ring indices** run only inside the spin. Not worth a change.
+- **Bindings, split by which plan targets them:**
+  - textures ~300 ns (resident textures);
+  - buffers ~190 ns (stage 2);
+  - descriptor building and pushing ~130 ns;
+  - push constants ~37 ns.
+- **Resident textures: target ~300, delivered ~35.** Stage 1b gave −1.2% on Sky Garden and was slower on Pirate Island. Why so little arrived is not measured. Possible causes include the mode adding work of its own, coverage (stages it can't make resident), and the saving turning into prepare wait. Either way, don't read the 300 as available.
+
+**Stage 2 (buffers by address) stays on hold.**
+- It would delete the PrepareBda syncs plus buffer obtain/sync/stream: 2.1 ms/frame on Pirate Island, 2.6 ms/frame on Sky Garden.
+- At stage 1b's ratio (35 ns delivered of 140–160 ns found), that is ~0.5–0.8 ms/frame, for 2–3 weeks of medium-risk work. The two estimates use different scopes. Stage 2's whole target is the two buffer buckets above: PrepareBda syncs (208) and buffer obtain/sync/stream (192), ~400 ns/draw or 2.1 ms/frame. The ~190 ns of buffers in the per-draw map is only the part reached through the bindings (RebindBuffers, FindBuffers, the PrepareBda call there), and it is already inside those two buckets. At the stage 1b ratio, ~400 ns gives ~100 ns/draw (~0.5 ms/frame), the low end of the range above.
+
+**Resident textures on Pirate Island: slower, cause not measured.** Same binary, normal-frame ns/draw:
+
+| `KYTY_RESIDENT_TEXTURES` | run 1 | run 2 |
+|---|---|---|
+| off | 3,204 | 3,099 |
+| on | 3,944 (cold store: 1.86 s of pipeline compiles in one frame) | 3,394 |
+
+- The store holds one file per title, and its header includes the switch, so every on/off toggle rebuilt it. Track U is fixing this.
+- The mode stays off and parked.
+
+**final_stage (the cutscene) is a different animal.**
+
+Record build a0e3fe50, level frames 1000–3000:
+- 54.5 FPS, 849 draws/frame at 13.0 µs/draw (user 10.8, sys 2.2).
+- The command thread is busy 11.5 ms/frame.
+- 8.2% of frames take two or more refreshes. 11.3% of frames have no guest work for more than 2 ms: the game is late, not the command thread.
+
+**Its FPS numbers disagreed, but the cause was a harness bug** (#150), not real dropped frames:
+- framediag first reported 57.9 FPS against garden's 54.46.
+- `metrics.level_base()` only knew `StartLevel aerial_garden`, so on every other level framediag and framemodel measured absolute flips 1000–3000, about 480 frames earlier.
+- On garden's window, the guest frames sum to 36.69 s for 2,000 frames, which is 54.5 FPS. That matches the presented flips (1,977 in 36.30 s).
+- The player sees ~54.5.
+- Heavy-level framediag and framemodel numbers quoted before #150 used the shifted window. The burst and normal-frame splits here do not: they count from the level's StartLevel.
+
+Per frame (debug twin, 462 draws/frame; 11.5 ms user + 2.7 ms kernel):
+
+| Item | ms/frame |
+|---|---|
+| Committing draws | 6.0 |
+| ↳ first-use texture uploads (`InitializeImage` → memcpy from guest sparse backing in `TryReadSparseBacking`) | 1.5 |
+| ↳ prepare-wait spin | 0.9 |
+| ↳ `GetGraphicsPrograms` (~1.2 µs/draw against ~55 ns in Pirate Island) | 0.56 |
+| ↳ `MaterializeColorClear` | 0.61 |
+| ↳ target resolution | 0.47 |
+| Compute dispatches | 1.9 |
+| Driver | 0.75 |
+| Readbacks | ~0.6 |
+| Kernel | 2.7 |
+
+The kernel's 2.7 ms (19% of the thread's 14.2 ms) is not in the user-only samples, so they can't split it. Minor faults are only ~34 per frame, so the time is mostly syscalls. Candidates:
+- write-tracking protects and PAGEMAP_SCAN;
+- futex wakes from `Pool::Wait`'s `WakeAll`;
+- clock reads (the vDSO shows up at ~180 ns/draw on the user side).
+
+One `KYTY_KERNEL_STATS` run (`kstats.py`) would split it.
+
+**After the fixes (record build a0e3fe50).** The heavy levels have no frames with more than 1,000 drains. Pirate Island and Ninja Castle still show a 3-in-33 cadence at 29.5 and 32.2 ms. B4 profiled it:
+
+| Cost | Time |
+|---|---|
+| Indirect multi-draws of the `*_WithCulling` passes, run unprepared | ~10.5 ms |
+| WRITE_DATA | ~2.4–2.8 ms |
+| 0x39 dumps | ~1.8 ms |
+
+`KYTY_INDIRECT_QUEUE` is in proof for the indirect draws.
+
+Those frames also take ~450–640 command-thread minor faults against ~15 in other frames:
+- They are not the 0x39 result pages. Storing the dumps through the backing barely moved the count (636 → 588).
+- Their source is still open.
+
+**Classifier note.** cmdsplit's categories now match a function's own name, not its demangled parameter types. Before, `CommitBindings(…PipelineCache::Pipeline const*…)` counted as pipeline lookup.
+
 ### Commit-side prefetch: early hand-off lines don't buy cycles (Track R, 2026-11-12)
 
 The question was whether the command thread's cross-core hand-off loads cost cycles because they are late. The test: while committing queued draw N, the command thread prefetches what it will read for the draws behind it, one pointer level per draw of distance. Prototype on branch `trackR/commit-prefetch` (`KYTY_COMMIT_PREFETCH=1`, `KYTY_COMMIT_PREFETCH_LEVELS` bit mask), not merged. The levels:
