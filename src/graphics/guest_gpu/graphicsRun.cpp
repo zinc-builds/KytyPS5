@@ -1263,6 +1263,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 					executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainIndirectCount);
 					records.decoded_count = std::min(uint32_t {*count_addr}, max_count_or_count);
 				}
+				// A count of 0 leaves NUM_INSTANCES as it was: resolve a lazy value still pending
+				// (after a drain, as a draw reading it does) before the sentinel replaces it.
+				if (m_num_instances_addr != 0) {
+					executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainNumInstances);
+					(void)NumInstances();
+				}
 				m_num_instances_addr       = NumInstancesFromCount;
 				m_num_instances_count_addr = records.count_address;
 				m_num_instances_records    = args_addr;
