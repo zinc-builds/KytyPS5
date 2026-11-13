@@ -13,6 +13,14 @@
 #   --extra LINE    one more batch.sh line, run in the same lock hold (repeatable; gate.sh)
 #   --hitch A-B     one more run a side over level frames A-B with KYTY_FRAME_DIAG=1, in the same
 #                   lock hold: /tmp/bench-<label>-hitch-{ref,new}.log for hitches.py (gate.sh)
+#   --hitch-new-only  the hitch run on the new side only (gate.sh compares it with a stored baseline)
+#   --hitch-shot F  the hitch runs also save level frame F (gate.sh: instead of run 1 of a pair)
+#   --sequential    run one pair at a time and stop as soon as a decision metric (cmd_ns, cpd) is
+#                   a signal (>= 3 sd either way), else add a pair, up to -n
+#   --min-ref N     stored reference runs needed to reuse them (default 3)
+#   --flags "F"     emulator flags of every run (default --amd-cpu; plain words, no quotes: batch.sh
+#                   splits lines on whitespace). Stored references count only with the same flags.
+# The whole A/B (pairs, --extra lines, hitch runs) is one hold of the bench lock.
 # Window: 200-500 ends each run ~23 s sooner (~35 s instead of ~59 s) and gives the same verdicts
 # as 1000-1600 (PR #87); its FPS and CPU-ns noise is 2-3x larger, its cycles/draw noise the same.
 # Reuse: with >= 3 stored clean runs of the reference (same binary, window, env, flags) younger
@@ -29,6 +37,7 @@ label=$1
 [[ -n "$label" && "$label" != -* ]] || { sed -n '2,17p' "$0" >&2; exit 2; }
 shift
 n=2 pair=0 max_age=24 ref_sha= ref_install= new_install= env= ref_env= new_env= shot= hitch=
+hitch_new_only=0 hitch_shot= sequential=0 min_ref=3 flags=--amd-cpu
 extra=()
 window=${GARDEN_FRAMES:-$AB_WINDOW_DEFAULT}
 while [ $# -gt 0 ]; do
@@ -46,10 +55,16 @@ while [ $# -gt 0 ]; do
 	--shot) shot=$2; shift ;;
 	--extra) extra+=("$2"); shift ;;
 	--hitch) hitch=$2; shift ;;
+	--hitch-new-only) hitch_new_only=1 ;;
+	--hitch-shot) hitch_shot=$2; shift ;;
+	--sequential) sequential=1 ;;
+	--min-ref) min_ref=$2; shift ;;
+	--flags) flags=$2; shift ;;
 	*) echo "ab.sh: unknown option $1" >&2; exit 2 ;;
 	esac
 	shift
 done
+[[ "$flags" == *[\"\']* ]] && { echo "ab.sh: --flags takes plain words (no quotes)" >&2; exit 2; }
 [ "$KYTY_BENCH_LOCKED" = x ] && { echo "ab.sh: run it outside batch.sh (it builds and takes the lock itself)" >&2; exit 1; }
 if [ -z "$ref_install" ]; then
 	ref_sha=${ref_sha:-$(git -C "$repo" merge-base HEAD origin/dev)} || exit 1
@@ -84,50 +99,85 @@ exe_hash() { sha256sum "$1/kyty_emulator" | cut -c1-16; }
 ref_exe=$(exe_hash "$ref_install")
 reuse=0
 if [ "$pair" = 0 ] && [ -n "$ref_sha" ]; then
-	count=$(python3 -I "$dir/results.py" ref "$ref_sha" --window "$window" --env "$ref_key" --flags=--amd-cpu \
+	count=$(python3 -I "$dir/results.py" ref "$ref_sha" --window "$window" --env "$ref_key" --flags="$flags" \
 		--exe "$ref_exe" --route "${GARDEN_ROUTE:-lvl}" --max-age "$max_age" --count 2>/dev/null)
-	[ "${count:-0}" -ge 3 ] && reuse=1
+	[ "${count:-0}" -ge "$min_ref" ] && reuse=1
 fi
-lines=()
-for i in $(seq "$n"); do
-	s=; [ "$i" = 1 ] && [ -n "$shot" ] && s=GARDEN_SHOT=$shot
-	[ "$reuse" = 0 ] && lines+=("$label-ref$i KYTY_INSTALL=$ref_install GARDEN_FRAMES=$window $s $env $ref_env -- --amd-cpu")
-	lines+=("$label-new$i KYTY_INSTALL=$new_install GARDEN_FRAMES=$window $s $env $new_env -- --amd-cpu")
-done
-lines+=("${extra[@]}")
+pair_lines() { # pair_lines <i>: the batch lines of pair i
+	local s=
+	[ "$1" = 1 ] && [ -n "$shot" ] && s=GARDEN_SHOT=$shot
+	[ "$reuse" = 0 ] && echo "$label-ref$1 KYTY_INSTALL=$ref_install GARDEN_FRAMES=$window $s $env $ref_env -- $flags"
+	echo "$label-new$1 KYTY_INSTALL=$new_install GARDEN_FRAMES=$window $s $env $new_env -- $flags"
+}
+tail_lines=("${extra[@]}")
 if [ -n "$hitch" ]; then
-	lines+=("$label-hitch-ref KYTY_INSTALL=$ref_install KYTY_FRAME_DIAG=1 GARDEN_FRAMES=$hitch $env $ref_env -- --amd-cpu")
-	lines+=("$label-hitch-new KYTY_INSTALL=$new_install KYTY_FRAME_DIAG=1 GARDEN_FRAMES=$hitch $env $new_env -- --amd-cpu")
+	[ "$hitch_new_only" = 0 ] && tail_lines+=("$label-hitch-ref KYTY_INSTALL=$ref_install KYTY_FRAME_DIAG=1 GARDEN_FRAMES=$hitch ${hitch_shot:+GARDEN_SHOT=$hitch_shot} $env $ref_env -- $flags")
+	tail_lines+=("$label-hitch-new KYTY_INSTALL=$new_install KYTY_FRAME_DIAG=1 GARDEN_FRAMES=$hitch ${hitch_shot:+GARDEN_SHOT=$hitch_shot} $env $new_env -- $flags")
 fi
-# batch.sh warms up its first line's install only; a cold shader store (a new binary) compiles
-# during the first frames, so the other install gets its own short warm-up (not stored).
-if [ "$reuse" = 0 ]; then
-	lines=("${lines[0]}" "$label-new-warmup KYTY_INSTALL=$new_install GARDEN_FRAMES=0-150 $env $new_env -- --amd-cpu" "${lines[@]:1}")
-fi
-echo "ab.sh: ${#lines[@]} runs (window $window, reference ${ref_sha:0:12}$([ "$reuse" = 1 ] && echo ": stored runs reused"))" >&2
-for i in $(seq "$n"); do rm -f "/tmp/garden-$label-ref$i.json" "/tmp/garden-$label-new$i.json"; done
-printf '%s\n' "${lines[@]}" | "$dir/batch.sh" || exit 1
+for i in $(seq "$n"); do rm -f "/tmp/garden-$label-ref$i.json" "/tmp/garden-$label-new$i.json" "/tmp/garden-$label-ref$i.out" "/tmp/garden-$label-new$i.out"; done
+# One hold for everything below: pairs, extra lines, hitch runs (batch.sh nests in it).
+. "$dir/benchlock.sh"
+benchlock_acquire x "ab.sh $label" || exit 1
+# results <upto>: the verdict over pairs 1..upto (empty on a missing result)
 news=() refs=() failed=()
-for i in $(seq "$n"); do
-	for side in ref new; do
-		[ "$side" = ref ] && [ "$reuse" = 1 ] && continue
-		head -1 "/tmp/garden-$label-$side$i.out" >&2
-		if [ -f "/tmp/garden-$label-$side$i.json" ]; then
-			[ "$side" = ref ] && refs+=("/tmp/garden-$label-$side$i.json") || news+=("/tmp/garden-$label-$side$i.json")
-		else
-			failed+=("$label-$side$i")
-		fi
+collect() {
+	news=() refs=() failed=()
+	for i in $(seq "$1"); do
+		for side in ref new; do
+			[ "$side" = ref ] && [ "$reuse" = 1 ] && continue
+			if [ -f "/tmp/garden-$label-$side$i.json" ]; then
+				[ "$side" = ref ] && refs+=("/tmp/garden-$label-$side$i.json") || news+=("/tmp/garden-$label-$side$i.json")
+			else
+				failed+=("$label-$side$i")
+			fi
+		done
 	done
+}
+run_verdict() {
+	if [ "$reuse" = 1 ]; then
+		python3 -I "$dir/results.py" verdict --label "$label" --reused --new "${news[@]}" \
+			--ref-stored "$ref_sha" --window "$window" --env "$ref_key" --flags="$flags" --exe "$ref_exe" \
+			--route "${GARDEN_ROUTE:-lvl}" --max-age "$max_age"
+	else
+		python3 -I "$dir/results.py" verdict --label "$label" --ref "${refs[@]}" --new "${news[@]}"
+	fi
+}
+done_pairs=0
+step=$n
+[ "$sequential" = 1 ] && step=1
+while [ "$done_pairs" -lt "$n" ]; do
+	lines=()
+	upto=$((done_pairs + step))
+	((upto > n)) && upto=$n
+	for i in $(seq $((done_pairs + 1)) "$upto"); do mapfile -t -O "${#lines[@]}" lines < <(pair_lines "$i"); done
+	# batch.sh warms up its first line's install only; a cold shader store (a new binary)
+	# compiles during the first frames, so the other install gets its own short warm-up.
+	if [ "$done_pairs" = 0 ] && [ "$reuse" = 0 ]; then
+		lines=("${lines[0]}" "$label-new-warmup KYTY_INSTALL=$new_install GARDEN_FRAMES=0-150 $env $new_env -- $flags" "${lines[@]:1}")
+	fi
+	echo "ab.sh: pairs $((done_pairs + 1))-$upto: ${#lines[@]} runs (window $window, reference ${ref_sha:0:12}$([ "$reuse" = 1 ] && echo ": stored runs reused"))" >&2
+	printf '%s\n' "${lines[@]}" | BATCH_WARMUP=$([ "$done_pairs" = 0 ] && echo 1 || echo 0) "$dir/batch.sh" || exit 1
+	for i in $(seq $((done_pairs + 1)) "$upto"); do
+		for side in ref new; do [ "$side" = ref ] && [ "$reuse" = 1 ] && continue; head -1 "/tmp/garden-$label-$side$i.out" >&2; done
+	done
+	done_pairs=$upto
+	collect "$done_pairs"
+	[ ${#failed[@]} != 0 ] && break
+	if [ "$sequential" = 1 ] && [ "$done_pairs" -lt "$n" ]; then
+		v=$(run_verdict 2>/dev/null)
+		if grep -qE '(cmd_ns|cpd) [-+][0-9.]+%±[0-9.]+!' <<<"$v"; then
+			echo "ab.sh: a decision metric is a signal after $done_pairs pair(s); stopping (sequential)" >&2
+			break
+		fi
+	fi
 done
+if [ ${#tail_lines[@]} != 0 ]; then
+	printf '%s\n' "${tail_lines[@]}" | BATCH_WARMUP=0 "$dir/batch.sh"
+fi
 # A run that failed (or a binary without METRICS lines) leaves no JSON: no verdict on a partial batch.
 if [ ${#failed[@]} != 0 ]; then
 	echo "ab.sh: no result from ${failed[*]} (see /tmp/garden-<label>.out); no verdict" >&2
 	exit 1
 fi
-if [ "$reuse" = 1 ]; then
-	python3 -I "$dir/results.py" verdict --label "$label" --reused --new "${news[@]}" \
-		--ref-stored "$ref_sha" --window "$window" --env "$ref_key" --flags=--amd-cpu --exe "$ref_exe" \
-		--route "${GARDEN_ROUTE:-lvl}" --max-age "$max_age"
-else
-	python3 -I "$dir/results.py" verdict --label "$label" --ref "${refs[@]}" --new "${news[@]}"
-fi
+echo "AB_PAIRS=$done_pairs" >&2
+run_verdict
