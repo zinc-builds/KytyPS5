@@ -62,9 +62,13 @@ uint64_t NowNs() noexcept {
 
 template <typename T, uint32_t N>
 struct Ring {
+	// The payload is stored as atomic words: a reader racing the writer gets torn data, which the
+	// sequence check rejects, never a data race.
+	static_assert(sizeof(T) % sizeof(uint64_t) == 0);
+	static constexpr size_t Words = sizeof(T) / sizeof(uint64_t);
 	struct Slot {
 		std::atomic<uint64_t> seq {0};
-		T                     data {};
+		std::atomic<uint64_t> data[Words] {};
 	};
 	std::atomic<uint64_t> head {0};
 	Slot                  slots[N];
@@ -72,9 +76,13 @@ struct Ring {
 	void Push(const T& value) noexcept {
 		const uint64_t i    = head.load(std::memory_order_relaxed);
 		auto&          slot = slots[i % N];
+		uint64_t       words[Words];
+		std::memcpy(words, &value, sizeof(T));
 		slot.seq.store(2 * i + 1, std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_release);
-		std::memcpy(static_cast<void*>(&slot.data), &value, sizeof(T));
+		for (size_t w = 0; w < Words; w++) {
+			slot.data[w].store(words[w], std::memory_order_relaxed);
+		}
 		slot.seq.store(2 * i + 2, std::memory_order_release);
 		head.store(i + 1, std::memory_order_release);
 	}
@@ -84,9 +92,16 @@ struct Ring {
 		if (seq != 2 * i + 2) {
 			return false;
 		}
-		std::memcpy(static_cast<void*>(out), &slot.data, sizeof(T));
+		uint64_t words[Words];
+		for (size_t w = 0; w < Words; w++) {
+			words[w] = slot.data[w].load(std::memory_order_relaxed);
+		}
 		std::atomic_thread_fence(std::memory_order_acquire);
-		return slot.seq.load(std::memory_order_relaxed) == seq;
+		if (slot.seq.load(std::memory_order_relaxed) != seq) {
+			return false;
+		}
+		std::memcpy(static_cast<void*>(out), words, sizeof(T));
+		return true;
 	}
 };
 
@@ -191,6 +206,7 @@ std::atomic<bool>     g_started {false};
 std::atomic<bool>     g_fatal {false};
 std::atomic<bool>     g_stop {false};
 std::atomic<bool>     g_helper_done {false};
+char                  g_fatal_text[512] {}; // reason and detail, written before g_stop
 std::atomic<int>      g_helper_tid {0};
 char                  g_dir[512] {};
 uint64_t              g_start_ns = 0;
@@ -643,7 +659,7 @@ private:
 		WriteShots();
 		FinishMarkers(now, true);
 		if (g_fatal.load(std::memory_order_acquire)) {
-			Trigger(now, "fatal", m_fatal_detail);
+			Trigger(now, "fatal", g_fatal_text);
 		}
 		MaybeCloseIncident(now, true);
 		// Session summary.
@@ -1100,7 +1116,7 @@ private:
 		c.upload_copy = upload_copy_ms;
 		c.sys         = static_cast<double>(v[FSysUs]) / 1000.0;
 		const double cpu = Ms(v[FCpuNs]);
-		c.offcpu         = std::max(0.0, f.ms - cpu - c.no_work - c.gpu_wait - c.mutex);
+		c.offcpu         = std::max(0.0, f.ms - cpu - c.no_work - c.gpu_wait - c.mutex - c.prep - c.rec);
 		c.cpu_other =
 		    std::max(0.0, cpu - c.compile - c.pipeline - c.gc - c.collect - c.tex_upload - c.upload_copy);
 		return c;
@@ -1414,9 +1430,6 @@ private:
 			m_events_hist.pop_front();
 		}
 	}
-
-public:
-	std::string m_fatal_detail;
 
 private:
 	FILE*                         m_frames_csv  = nullptr;
@@ -1980,6 +1993,18 @@ void OnFatal(const char* reason, const char* detail) noexcept {
 	if (!Enabled() || !g_started.load(std::memory_order_acquire) || g_fatal.exchange(true)) {
 		return;
 	}
+	// First, without stdio or allocation: hand the helper its flush request (it polls every
+	// 50 ms), so it closes the open incident and flushes while this thread writes crash.json.
+	{
+		size_t n = 0;
+		for (const char* part: {reason, ": ", detail}) {
+			for (const char* c = part; c != nullptr && *c != '\0' && n + 1 < sizeof(g_fatal_text); c++) {
+				g_fatal_text[n++] = *c;
+			}
+		}
+		g_fatal_text[n] = '\0';
+		g_stop.store(true, std::memory_order_release);
+	}
 #if defined(__linux__)
 	char path[600];
 	std::snprintf(path, sizeof(path), "%s/crash.json", g_dir);
@@ -2052,16 +2077,17 @@ void OnFatal(const char* reason, const char* detail) noexcept {
 	if (w.fd >= 0) {
 		::close(w.fd);
 	}
-	std::printf("PLAYTEST fatal: %s (%s); crash.json written to %s\n", reason, detail != nullptr ? detail : "", g_dir);
-	std::fflush(stdout);
-#endif
-	// Let the helper close the open incident (as "fatal") and flush its files.
-	if (g_helper_obj != nullptr && !g_stop.load(std::memory_order_acquire)) {
-		std::string text = std::string(reason) + ": " + (detail != nullptr ? detail : "");
-		g_helper_obj->m_fatal_detail = text;
-		g_stop.store(true, std::memory_order_release); // the helper polls every 50 ms
-		WaitHelper(1500);
+	{
+		RawWriter out;
+		out.fd = 1;
+		out.Str("PLAYTEST fatal: crash.json written to ");
+		out.Str(g_dir);
+		out.Str("\n");
+		out.Flush();
 	}
+#endif
+	// Give the helper up to 1.5 s to close the open incident (as "fatal") and flush its files.
+	WaitHelper(1500);
 }
 
 } // namespace Common::Playtest

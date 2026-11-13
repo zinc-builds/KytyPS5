@@ -170,8 +170,24 @@ def main():
         per_sec[sec] += 1
         if f.get('load', 0):
             load_secs.add(sec)
-    secs = sorted(per_sec)
-    play_fps = [per_sec[s] for s in secs[1:-1] if s not in load_secs]
+    # Every whole second between the first and the last frame, frozen ones (no frame) included;
+    # a frameless second belongs to the phase of the frame that ends the gap.
+    play_fps = []
+    if frames:
+        first, last = int(frames[0]['t']), int(frames[-1]['t'])
+        next_load = {}
+        nxt = None
+        for f in reversed(frames):
+            nxt = f.get('load', 0)
+            next_load.setdefault(int(f['t']), nxt)
+        carry = 0
+        for sec in range(last, first - 1, -1):
+            carry = next_load.get(sec, carry)
+            next_load[sec] = carry
+        for sec in range(first + 1, last):
+            if sec in load_secs or (per_sec.get(sec, 0) == 0 and next_load.get(sec)):
+                continue
+            play_fps.append(per_sec.get(sec, 0))
     buckets = {'60+': 0, '57-59': 0, '50-56': 0, '40-49': 0, '<40': 0}
     for v in play_fps:
         key = '60+' if v >= 60 else '57-59' if v >= 57 else '50-56' if v >= 50 else '40-49' if v >= 40 else '<40'
@@ -249,6 +265,10 @@ def main():
             st['calls'] = calls.get(st['name'])
     # Incidents by cause.
     def frame_excess(rec):
+        # Every long frame of the incident (a merged stretch has many), else its worst one.
+        longs = rec.get('long_frames') or []
+        if longs:
+            return sum(max(0.0, f['ms'] - REFRESH_MS) for f in longs)
         return max(0.0, (rec.get('worst_ms') or 0) - REFRESH_MS)
     groups = defaultdict(list)
     for rec in incidents:

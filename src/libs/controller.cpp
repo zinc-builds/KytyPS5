@@ -1456,9 +1456,11 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
 	}
 	if (Common::Playtest::Enabled()) {
-		PadData seen = data[ret_num - 1]; // the newest state
-		seen.timestamp = 0;
-		Common::Playtest::OnPadRead(handle, &seen, sizeof(seen), ret_num);
+		for (int i = 0; i < ret_num; i++) { // every state the game received, in order
+			PadData seen   = data[i];
+			seen.timestamp = 0;
+			Common::Playtest::OnPadRead(handle, &seen, sizeof(seen), ret_num);
+		}
 	}
 
 	return ret_num;
