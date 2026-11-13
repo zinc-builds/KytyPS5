@@ -1897,10 +1897,17 @@ What the map says:
 
 **final_stage (the cutscene) is a different animal.**
 
-Record build a0e3fe50, frames 1000–3000:
-- 849 draws/frame at 13.0 µs/draw (user 10.8, sys 2.2).
-- The command thread is busy 10.8 ms/frame.
-- 2.2% of frames take two or more refreshes. Most slow frames are game-late (no guest work for more than 2 ms), not command-thread time.
+Record build a0e3fe50, level frames 1000–3000:
+- 54.5 FPS, 849 draws/frame at 13.0 µs/draw (user 10.8, sys 2.2).
+- The command thread is busy 11.5 ms/frame.
+- 8.2% of frames take two or more refreshes. 11.3% of frames have no guest work for more than 2 ms: the game is late, not the command thread.
+
+**Its FPS numbers disagreed, but the cause was a harness bug** (#150), not real dropped frames:
+- framediag first reported 57.9 FPS against garden's 54.46.
+- `metrics.level_base()` only knew `StartLevel aerial_garden`, so on every other level framediag and framemodel measured absolute flips 1000–3000, about 480 frames earlier.
+- On garden's window, the guest frames sum to 36.69 s for 2,000 frames, which is 54.5 FPS. That matches the presented flips (1,977 in 36.30 s).
+- The player sees ~54.5.
+- Heavy-level framediag and framemodel numbers quoted before #150 used the shifted window. The burst and normal-frame splits here do not: they count from the level's StartLevel.
 
 Per frame (debug twin, 462 draws/frame; 11.5 ms user + 2.7 ms kernel):
 
@@ -1916,6 +1923,13 @@ Per frame (debug twin, 462 draws/frame; 11.5 ms user + 2.7 ms kernel):
 | Driver | 0.75 |
 | Readbacks | ~0.6 |
 | Kernel | 2.7 |
+
+The kernel's 2.7 ms (22% of the thread) is not in the user-only samples, so they can't split it. Minor faults are only ~34 per frame, so the time is mostly syscalls. Candidates:
+- write-tracking protects and PAGEMAP_SCAN;
+- futex wakes from `Pool::Wait`'s `WakeAll`;
+- clock reads (the vDSO shows up at ~180 ns/draw on the user side).
+
+One `KYTY_KERNEL_STATS` run (`kstats.py`) would split it.
 
 **After the fixes (record build a0e3fe50).** The heavy levels have no frames with more than 1,000 drains. Pirate Island and Ninja Castle still show a 3-in-33 cadence at 29.5 and 32.2 ms. B4 profiled it:
 
