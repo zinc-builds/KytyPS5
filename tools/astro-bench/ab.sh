@@ -88,10 +88,12 @@ if [ "$(bm "$ref_install")" != "$(bm "$new_install")" ]; then
 	echo "ab.sh: build modes differ: ref '$(bm "$ref_install")' vs new '$(bm "$new_install")' (BUILD_MODE files)" >&2
 	exit 1
 fi
-# The env string garden.sh records: KYTY_* settings, sorted (minus the bench's own).
+# The env string garden.sh records: KYTY_* settings, sorted (minus the bench's own: lock and queue
+# settings, the gate's KYTY_REQUIRE_CHECKED, and KYTY_SHADER_STORE_DIR, where the shader store lives,
+# which changes no per-draw cost once warm; keep this list the same as garden.sh's kenv filter).
 # Later assignments win, as in `env A=1 A=0`.
 norm_env() {
-	tr ' ' '\n' <<<"$*" | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|BENCH_LOCK|BENCH_LOCK_TIMEOUT|BENCH_PRIO|BENCH_AGE|REQUIRE_CHECKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' |
+	tr ' ' '\n' <<<"$*" | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|BENCH_LOCK|BENCH_LOCK_TIMEOUT|BENCH_PRIO|BENCH_AGE|REQUIRE_CHECKED|SHADER_STORE_DIR|APP0_OVERLAY|INSTALL|SHOT_FILE)=' |
 		awk -F= '{v[$1] = $0} END {for (k in v) print v[k]}' | sort | tr '\n' ' ' | sed 's/ $//'
 }
 inherited=$(env | grep -E '^KYTY_' | tr '\n' ' ')

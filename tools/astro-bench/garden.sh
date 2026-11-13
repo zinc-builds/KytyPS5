@@ -182,7 +182,7 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	# fields appended to the summary line and as /tmp/garden-<label>.json.
 	rm -f "/tmp/garden-$label.json"
 	install=${KYTY_INSTALL:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/_Build/linux/install}
-	kenv=$(env | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|BENCH_LOCK|BENCH_LOCK_TIMEOUT|BENCH_PRIO|BENCH_AGE|REQUIRE_CHECKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' | sort | tr '\n' ' ')
+	kenv=$(env | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|BENCH_LOCK|BENCH_LOCK_TIMEOUT|BENCH_PRIO|BENCH_AGE|REQUIRE_CHECKED|SHADER_STORE_DIR|APP0_OVERLAY|INSTALL|SHOT_FILE)=' | sort | tr '\n' ' ')
 	# Build identity: the binary's hash, and the build mode and profile that refbuild.sh/build.sh
 	# record next to the install (plain when there is no BUILD_MODE file).
 	exe=$(sha256sum "$install/kyty_emulator" 2>/dev/null | cut -c1-16)
