@@ -2,7 +2,8 @@
 # test-benchlock.sh: tests benchlock.sh's queue with dummy commands on a private lock file (never
 # the real one): FIFO order, shared tickets going together, an exclusive ticket holding back later
 # shared ones, priorities, a killed waiter, a timeout, nested holds, and mutual exclusion against
-# old-style (flock-only) competitors. Takes about a minute. Exit status 0 when every case passes.
+# old-style (flock-only) competitors, a zombie waiter, a late higher-priority ticket. Takes about
+# 40 s. Exit status 0 when every case passes.
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d) || exit 1
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$tmp"' EXIT
@@ -12,7 +13,8 @@ fail=0
 check() { if eval "$1"; then echo "  ok: $2"; else echo "  FAILED: $2 ($1)"; fail=1; fi; }
 now() { date +%s%N; }
 
-# acq <log> <label> <x|s> <hold s> [env...]: a waiter in the background; logs "<label> start|end ns".
+# acq <log> <label> <x|s> <hold> [env...]: a waiter in the background; logs "<label> start|end ns".
+# <hold> is seconds, or a file path: hold until that file exists.
 acq() {
 	local log=$1 label=$2 mode=$3 hold=$4
 	shift 4
@@ -22,7 +24,11 @@ acq() {
 		. "$here/benchlock.sh"
 		if benchlock_acquire "$mode" "$label" 2>/dev/null; then
 			echo "$label start $(now)" >> "$log"
-			sleep "$hold"
+			if [[ "$hold" == /* ]]; then
+				while [ ! -e "$hold" ]; do sleep 0.05; done
+			else
+				sleep "$hold"
+			fi
 			echo "$label end $(now)" >> "$log"
 		else
 			echo "$label failed $(now)" >> "$log"
@@ -75,6 +81,34 @@ kill -9 "$w"
 wait
 check '[ -z "$(t $log W start)" ]' "W never ran"
 check '[ -n "$(t $log Z start)" ] && [ $(( ($(t $log Z start) - $(t $log H end)) / 1000000 )) -lt 3000 ]' "Z ran within 3 s of H"
+check drained "queue empty"
+
+echo "4b. a killed waiter its parent has not reaped (a zombie) does not block the queue"
+log=$tmp/4b.log
+acq "$log" H x 2; sleep 0.3
+# The waiter's parent execs sleep, which never reaps it: after kill -9 it stays a zombie.
+bash -c '( unset KYTY_BENCH_LOCKED; . "$1/benchlock.sh"; benchlock_acquire x W 2>/dev/null && echo "W start" >> "$2"; sleep 1 ) &
+	echo $! > "$3"; exec sleep 5' _ "$here" "$log" "$tmp/4b.pid" &
+sleep 0.3
+acq "$log" Z x 0.5; sleep 0.3
+w=$(cat "$tmp/4b.pid")
+kill -9 "$w"
+sleep 0.2
+check '[[ "$(cat /proc/$w/stat 2>/dev/null)" == *") Z "* ]]' "W is a zombie"
+wait
+check '[ -n "$(t $log Z start)" ] && [ $(( ($(t $log Z start) - $(t $log H end)) / 1000000 )) -lt 3000 ]' "Z ran within 3 s of H"
+check drained "queue empty"
+
+echo "4c. a higher-priority ticket arriving just before the holder lets go goes first (3 tries)"
+for i in 1 2 3; do
+	log=$tmp/4c.$i.log
+	acq "$log" H x "$tmp/4c.$i.release"; sleep 0.3
+	acq "$log" P9 x 0.3 KYTY_BENCH_PRIO=9; sleep 1.5 # P9 is at the head, polling
+	acq "$log" P1 x 0.3 KYTY_BENCH_PRIO=1; sleep 0.15
+	touch "$tmp/4c.$i.release"
+	wait
+	check '[ "$(t $log P1 start)" -lt "$(t $log P9 start)" ]' "P1 before P9 (try $i)"
+done
 check drained "queue empty"
 
 echo "5. a timeout removes the ticket"

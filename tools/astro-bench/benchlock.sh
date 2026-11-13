@@ -29,13 +29,15 @@ KYTY_BENCH_LOCK=${KYTY_BENCH_LOCK:-/tmp/kyty-bench.lock}
 benchlock_owner_file() { echo "$KYTY_BENCH_LOCK.owner"; }
 benchlock_queue_dir() { echo "$KYTY_BENCH_LOCK.queue"; }
 
-# The start time of process <pid> in clock ticks since boot ("" if it is gone): with the pid it
-# names one process, so a reused pid does not keep a dead waiter's ticket alive.
+# The start time of process <pid> in clock ticks since boot ("" if it is gone or a zombie): with
+# the pid it names one process, so a reused pid does not keep a dead waiter's ticket alive, nor
+# does a killed waiter whose parent has not reaped it yet.
 benchlock_starttime() {
 	local stat
 	{ read -r stat < "/proc/$1/stat"; } 2>/dev/null || return 0
 	stat=${stat##*) }
 	set -- $stat
+	case $1 in Z | X) return 0 ;; esac
 	echo "${20}"
 }
 
@@ -95,12 +97,17 @@ benchlock_acquire() {
 			}
 		fi
 		if benchlock_may_try "$name" "$mode"; then
-			# At the head: wait on the lock itself for a moment, then look at the queue again (a
-			# higher-priority ticket may have arrived).
-			if flock -w 1 "-$mode" 9; then
-				rm -f "$ticket"
-				break
+			# At the head: poll the lock without blocking (a waiter blocked inside flock would win
+			# against a higher-priority ticket arriving meanwhile), and once it is ours check the
+			# queue again: a ticket that arrived between the two goes first.
+			if flock -n "-$mode" 9; then
+				if benchlock_may_try "$name" "$mode"; then
+					rm -f "$ticket"
+					break
+				fi
+				flock -u 9
 			fi
+			sleep 0.2
 		else
 			sleep 1
 		fi
