@@ -1312,7 +1312,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
-	Common::WriteFpEnv(Common::GuestFpEnv);
+	Common::ApplyGuestFpEnv();
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}

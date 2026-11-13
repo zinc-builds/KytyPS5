@@ -38,6 +38,8 @@ enum class Counter {
 	WriteDataDwords,
 	LabelStale,   // IsCpLabel: the label matched but its token was voided (the wait collects)
 	LabelWritten, // IsCpLabel: the label matched but the guest stored to its page
+	FiberTransfers, // guest fiber switches, runs and returns (any thread)
+	FiberFpWrites,  // of those, the ones that loaded MXCSR or the x87 control word
 	Count
 };
 
@@ -128,6 +130,10 @@ private:
 	uint64_t  m_ident = 0;
 	GuestWait m_kind;
 };
+
+// A guest thread transfers to another fiber context (switch, run, return). Counted per guest
+// frame in GFRAME (fiber_sw, fiber_fp_w) and per thread in a GFIBER line after it.
+void OnFiberTransfer(bool fp_write) noexcept;
 
 // A guest thread submitted a command buffer; only graphics submissions mark the submitter.
 void OnGuestSubmit(bool graphics) noexcept;

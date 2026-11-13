@@ -130,7 +130,7 @@ constexpr std::array OwnNames {"mutex_wait_ns", "mutex_waits", "gc", "gc_ns", "c
                                "submit_scans", "submit_scan_ns", "tex_new", "buf_new", "cmd_gpu_waits",
                                "cmd_gpu_wait_ns", "cmd_idles", "cmd_idle_ns", "cmd_blocks",
                                "cmd_blocked_ns", "wd", "wd_ns", "wd_dw", "label_stale",
-                               "label_written"};
+                               "label_written", "fiber_sw", "fiber_fp_w"};
 static_assert(OwnNames.size() == static_cast<size_t>(Counter::Count));
 
 struct Totals {
@@ -258,6 +258,10 @@ void OnFlip(uint64_t frame, double interval_ms) noexcept {
 	g_presented.last = now;
 }
 
+namespace {
+void PrintFiberLine(uint64_t guest_frame);
+} // namespace
+
 void OnGuestFlip(uint64_t frame) noexcept {
 	if (!Enabled()) {
 		return;
@@ -269,6 +273,7 @@ void OnGuestFlip(uint64_t frame) noexcept {
 		std::snprintf(head, sizeof(head), "GFRAME g=%" PRIu64 " f=%" PRIu64 " t=%" PRIu64 " ms=%.3f",
 		              g_guest.count, frame, now_ns, static_cast<double>(now_ns - g_guest.last_ns) / 1e6);
 		Print(head, now, g_guest.last);
+		PrintFiberLine(g_guest.count);
 	}
 	g_guest.have    = true;
 	g_guest.last    = now;
@@ -297,6 +302,8 @@ struct GuestThread {
 	Entry                 ring[kRing];
 	std::atomic<uint64_t> short_ns[kKinds] {};
 	std::atomic<uint64_t> short_count[kKinds] {};
+	std::atomic<uint64_t> fiber_transfers {0};
+	uint64_t              fiber_printed = 0; // command thread only
 };
 
 std::mutex                                 g_threads_mutex;
@@ -329,7 +336,38 @@ GuestThread* Self() {
 	return t_guest;
 }
 
+// One GFIBER line: each guest thread's fiber transfers since the previous guest flip.
+void PrintFiberLine(uint64_t guest_frame) {
+	char line[1024];
+	int  n = std::snprintf(line, sizeof(line), "GFIBER g=%" PRIu64, guest_frame);
+	bool any = false;
+	std::lock_guard lock(g_threads_mutex);
+	for (auto& thread: g_threads) {
+		const auto total = thread->fiber_transfers.load(std::memory_order_relaxed);
+		const auto delta = total - thread->fiber_printed;
+		thread->fiber_printed = total;
+		if (delta != 0 && n < static_cast<int>(sizeof(line)) - 48) {
+			n += std::snprintf(line + n, sizeof(line) - n, " %s:%d=%" PRIu64, thread->name, thread->tid, delta);
+			any = true;
+		}
+	}
+	if (any) {
+		std::printf("%s\n", line);
+	}
+}
+
 } // namespace
+
+void OnFiberTransfer(bool fp_write) noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	Add(Counter::FiberTransfers);
+	if (fp_write) {
+		Add(Counter::FiberFpWrites);
+	}
+	Self()->fiber_transfers.fetch_add(1, std::memory_order_relaxed);
+}
 
 void GuestWaitScope::Begin() noexcept {
 	// Only the outermost wait of a thread counts (a timed wait may be built on another).

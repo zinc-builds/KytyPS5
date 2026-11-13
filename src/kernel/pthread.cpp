@@ -3277,7 +3277,7 @@ static void CleanupThread(void* arg) {
 }
 
 static void* RunThread(void* arg) {
-	Common::WriteFpEnv(Common::GuestFpEnv);
+	Common::ApplyGuestFpEnv();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {

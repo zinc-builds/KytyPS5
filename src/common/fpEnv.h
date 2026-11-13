@@ -3,6 +3,9 @@
 
 #include "common/common.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace Common {
 
 struct FpEnv {
@@ -20,6 +23,23 @@ inline FpEnv ReadFpEnv() {
 
 inline void WriteFpEnv(FpEnv env) {
 	asm volatile("ldmxcsr %0\n\tfldcw %1" : : "m"(env.mxcsr), "m"(env.control) : "memory");
+}
+
+// KYTY_GUEST_FP_ENV=0: guest threads and fibers keep the host's FP environment, as before
+// upstream f399d481 (fibers still carry their own across switches).
+[[nodiscard]] inline bool GuestFpEnvEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_FP_ENV");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Puts this thread in the console's FP environment, unless KYTY_GUEST_FP_ENV=0.
+inline void ApplyGuestFpEnv() {
+	if (GuestFpEnvEnabled()) {
+		WriteFpEnv(GuestFpEnv);
+	}
 }
 
 } // namespace Common

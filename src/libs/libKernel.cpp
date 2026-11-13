@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/fpEnv.h"
+#include "common/frameDiag.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -2533,16 +2534,29 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movq 40(%r10), %r13\n\t"
 	             "movq 48(%r10), %r14\n\t"
 	             "movq 56(%r10), %r15\n\t"
+	             // MXCSR and the x87 CW are loaded only when the target's differ from the current
+	             // ones (ldmxcsr and fldcw are the costly half): nearly every fiber of a game
+	             // shares one environment. MXCSR keeps the current exception flags (bits 0-5).
 	             "subq $8, %rsp\n\t"
 	             "stmxcsr (%rsp)\n\t"
 	             "movl (%rsp), %ecx\n\t"
-	             "andl $0x3f, %ecx\n\t"
-	             "movl 80(%r10), %edx\n\t"
-	             "andl $0xffffffc0, %edx\n\t"
-	             "orl %ecx, %edx\n\t"
-	             "movl %edx, (%rsp)\n\t"
+	             "movl %ecx, %edx\n\t"
+	             "andl $0x3f, %edx\n\t"
+	             "movl 80(%r10), %r8d\n\t"
+	             "andl $0xffffffc0, %r8d\n\t"
+	             "orl %edx, %r8d\n\t"
+	             "cmpl %ecx, %r8d\n\t"
+	             "je 1f\n\t"
+	             "movl %r8d, (%rsp)\n\t"
 	             "ldmxcsr (%rsp)\n\t"
+	             "1:\n\t"
+	             "fnstcw (%rsp)\n\t"
+	             "movzwl (%rsp), %ecx\n\t"
+	             "movzwl 84(%r10), %edx\n\t"
+	             "cmpl %ecx, %edx\n\t"
+	             "je 2f\n\t"
 	             "fldcw 84(%r10)\n\t"
+	             "2:\n\t"
 	             "movq 64(%r10), %rsp\n\t"
 	             "jmp *%r11\n");
 }
@@ -2559,6 +2573,17 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 }
 #endif
 
+// KYTY_FRAME_DIAG: counts a fiber transfer, and whether it will write MXCSR or the x87 CW.
+static void FiberNoteTransfer(const FiberCpuContext* to) {
+	if (!Common::FrameDiag::Enabled()) {
+		return;
+	}
+	const auto now = Common::ReadFpEnv();
+	const bool fp_write =
+	    ((now.mxcsr ^ to->fp_env.mxcsr) & ~0x3fu) != 0 || now.control != to->fp_env.control;
+	Common::FrameDiag::OnFiberTransfer(fp_write);
+}
+
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber);
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
@@ -2573,7 +2598,7 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
 	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
 	if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) {
-		Common::WriteFpEnv(Common::GuestFpEnv);
+		Common::ApplyGuestFpEnv();
 	}
 	ctx.fp_env = Common::ReadFpEnv();
 
@@ -2592,6 +2617,7 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	context->returned_fiber = fiber;
 	context->current_fiber = nullptr;
 
+	FiberNoteTransfer(&context->cpu_context);
 	FiberRestoreContext(&context->cpu_context, 1);
 }
 
@@ -2717,6 +2743,7 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 
 	if (FiberSaveContext(&context.cpu_context) == 0) {
 		if (fiber->context_valid) {
+			FiberNoteTransfer(&fiber->saved_context);
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
@@ -2762,6 +2789,7 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 		FiberSetContextValid(caller, true);
 		context->pending_idle_fiber = caller;
 		if (fiber->context_valid) {
+			FiberNoteTransfer(&fiber->saved_context);
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
@@ -2804,6 +2832,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 		FiberSetContextValid(fiber, true);
 		context->returned_fiber = fiber;
 		context->pending_idle_fiber = fiber;
+		FiberNoteTransfer(&context->cpu_context);
 		FiberRestoreContext(&context->cpu_context, 1);
 	}
 
