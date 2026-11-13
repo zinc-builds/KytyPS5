@@ -177,8 +177,9 @@ public:
 	bool StoreCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
 	                   uint32_t stride, bool invalidate);
 	// WriteData stores each page of its range with StoreCpLabels (KYTY_WRITE_DATA_RANGED=0: one
-	// StoreCpLabel per dword; =verify: also runs the per-dword store after each ranged one and
-	// compares token, label slots, bytes and invalidated bytes).
+	// StoreCpLabel per dword; =verify: after each ranged store, builds the label slots the
+	// per-dword path would write, without storing again, and compares slots, tokens, the bytes
+	// the guest reads back and the bytes invalidated: VerifyCpLabels).
 	[[nodiscard]] static bool WriteDataRanged() noexcept;
 	// Whether the value at vaddr is the processor's own label store, untouched by the guest: a
 	// wait it satisfies publishes no guest data, so needs no collection.
