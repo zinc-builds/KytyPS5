@@ -71,11 +71,15 @@ if [ -n "$hold" ]; then
 		KYTY_BENCH_PRIO=1 "$here/astro-bench/benchlock.sh" run bash -c "cd '$builds' && exec '$tmp/kyty_emulator' 45" 9>&- 8>&- &
 	fi
 	holder=$!
-	for _ in $(seq 600); do
-		case "$("$here/astro-bench/benchlock.sh" status | head -1)" in free) sleep 0.5 ;; *) break ;; esac
+	# Wait for the stand-in to hold the lock (behind whoever holds it now; at most 30 min).
+	owner=${KYTY_BENCH_LOCK:-/tmp/kyty-bench.lock}.owner
+	for _ in $(seq 3600); do
+		grep -q "pid=$holder " "$owner" 2>/dev/null && break
+		[ -d "/proc/$holder" ] || break
+		sleep 0.5
 	done
-	grep -q "pid=$holder " "$("$here/astro-bench/benchlock.sh" status >/dev/null; echo "${KYTY_BENCH_LOCK:-/tmp/kyty-bench.lock}.owner")" ||
-		{ echo "playtest-check.sh: the stand-in hold did not get the lock (queue busy?)" >&2; exit 1; }
+	grep -q "pid=$holder " "$owner" 2>/dev/null ||
+		{ echo "playtest-check.sh: the stand-in hold did not get the lock within 30 min" >&2; exit 1; }
 	echo "playtest-check.sh: lock held $hold by the stand-in (pid $holder)"
 fi
 
