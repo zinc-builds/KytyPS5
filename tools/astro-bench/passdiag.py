@@ -36,7 +36,8 @@ def main():
         elif l.startswith("PASSM "):
             kv = dict(KV.findall(l))
             markers[int(kv.get("g", kv["f"]))].append((kv["marker"], int(kv["draws"]), int(kv["drains"])))
-        elif a.frame is not None and l.startswith("PASST ") and dict(KV.findall(l)).get("g") == str(a.frame):
+        elif a.frame is not None and l.startswith("PASST ") and \
+                (lambda kv: kv.get("g", kv.get("f")))(dict(KV.findall(l))) == str(a.frame):
             print(l)
     if not frames:
         print("passdiag: no PASS lines (run with KYTY_PASS_DIAG=1)")
