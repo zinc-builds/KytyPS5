@@ -833,6 +833,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		env_switch_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

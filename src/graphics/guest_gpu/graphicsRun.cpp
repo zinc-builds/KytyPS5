@@ -1,7 +1,7 @@
-#if defined(__linux__)
-#include "common/hybridAffinity.h"
 #include "common/configReport.h"
 #include "common/envSwitch.h"
+#if defined(__linux__)
+#include "common/hybridAffinity.h"
 #include <pthread.h>
 #include <sys/resource.h>
 #endif

@@ -10,16 +10,16 @@ On/off switches read through `Common::EnvFlag` treat `0`, `false`, `off` and `no
 | Switch | Kind | Default | Values | Read | Where | What |
 |---|---|---|---|---|---|---|
 | `KYTY_AMD_CPU` | opt-in | see code | mode: 1, auto, on, true | startup | `src/main.cpp:124` | KYTY_AMD_CPU (used when neither --amd-cpu nor --no-amd-cpu is given): auto, 1/on/true or 0/off/false. Anything else is an error, not a silent default. |
-| `KYTY_AMD_SKIP_RSQRT` | opt-in | off | flag (0/false/off/no = off) | first use | `src/loader/guestInstructionPatcher.cpp:933` | Local knob: KYTY_AMD_SKIP_RSQRT=1 keeps VRSQRTPS on the host's precision, so --amd-cpu only removes the SSE4a/RDPID/CLWB traps (about 2-3% faster in Astro Bot's Sky Garden). |
+| `KYTY_AMD_SKIP_RSQRT` | opt-in | off | flag (0/false/off/no = off) | first use | `src/loader/guestInstructionPatcher.cpp:934` | Experiment knob: KYTY_AMD_SKIP_RSQRT=1 keeps VRSQRTPS on the host's precision (no traps, about 3% faster in Sky Garden), but on Intel it crashes Astro Bot's Sky Aztec (a null read in game code near level frame 400, 2... |
 | `KYTY_APP0_OVERLAY` | tool hook | unset | value | first use | `src/kernel/fileSystem.cpp:378` | KYTY_APP0_OVERLAY=<dir>: files in <dir> replace the game's /app0 files of the same relative path (e.g. a launch args.txt for benchmarks). Off unless set; only existing regular files. |
 | `KYTY_ASYNC_UPLOAD` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/cache/asyncUploader.cpp:27`<br>`src/graphics/host_gpu/renderer/cache/asyncUploader.cpp:35`<br>`src/graphics/presentation/window/vulkanWindow.cpp:187` | A transfer-only family (the copy engine), or -1 when there is none or KYTY_ASYNC_UPLOAD=0. |
 | `KYTY_ASYNC_UPLOAD_MIN` | tuning | see code | number | each call | `src/graphics/host_gpu/renderer/cache/asyncUploader.cpp:38` |  |
 | `KYTY_ASYNC_UPLOAD_VERIFY` | verify | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:285` |  |
-| `KYTY_ASYNC_WATCH_SCAN` | opt-in | off | 1 = on | first use | `src/kernel/memoryAddressSpace.inc:1414` | In an asynchronous chunk a page stays write-protected after its last watcher leaves: a store there costs no signal, and the protection keeps "not written since" provable (RenderContext::IsCpLabel). KYTY_ASYNC_WATCH_SC... |
-| `KYTY_ASYNC_WP_DRYRUN` | opt-in | off | flag (0/false/off/no = off) | first use | `src/kernel/memoryAddressSpace.inc:892`<br>`src/kernel/memoryAddressSpace.inc:916`<br>`src/kernel/memoryAddressSpace.inc:1103` (+2) | KYTY_ASYNC_WP_DRYRUN: track the chunk as if asynchronous but keep its views synchronous (to check KYTY_ASYNC_WP_VERIFY itself against the faulting path). |
+| `KYTY_ASYNC_WATCH_SCAN` | opt-in | off | 1 = on | first use | `src/kernel/memoryAddressSpace.inc:1419` | In an asynchronous chunk a page stays write-protected after its last watcher leaves: a store there costs no signal, and the protection keeps "not written since" provable (RenderContext::IsCpLabel). KYTY_ASYNC_WATCH_SC... |
+| `KYTY_ASYNC_WP_DRYRUN` | opt-in | off | flag (0/false/off/no = off) | first use | `src/kernel/memoryAddressSpace.inc:895`<br>`src/kernel/memoryAddressSpace.inc:919`<br>`src/kernel/memoryAddressSpace.inc:1108` (+2) | KYTY_ASYNC_WP_DRYRUN: track the chunk as if asynchronous but keep its views synchronous (to check KYTY_ASYNC_WP_VERIFY itself against the faulting path). |
 | `KYTY_ASYNC_WP_TRACE` | diagnostic | 0 | number | first use | `src/graphics/host_gpu/memDiag.h:113` | KYTY_ASYNC_WP_TRACE=<hex page>: print every tracking event that touches one page. |
 | `KYTY_ASYNC_WP_VERIFY` | verify | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/pageManager.cpp:105`<br>`src/graphics/host_gpu/renderer/renderContext.cpp:260`<br>`src/graphics/host_gpu/renderer/renderContext.cpp:333` (+2) | KYTY_ASYNC_WP_VERIFY: pages whose last write watcher left; their bytes may change legitimately. |
-| `KYTY_ASYNC_WP_VERIFY_DROP_KEPT` | verify | 0 | number | first use | `src/kernel/memoryAddressSpace.inc:1037` | KYTY_ASYNC_WP_VERIFY_DROP_KEPT=<n> (test only): silently drops every n-th kept write, to show the verifier reports such a loss. |
+| `KYTY_ASYNC_WP_VERIFY_DROP_KEPT` | verify | 0 | number | first use | `src/kernel/memoryAddressSpace.inc:1042` | KYTY_ASYNC_WP_VERIFY_DROP_KEPT=<n> (test only): silently drops every n-th kept write, to show the verifier reports such a loss. |
 | `KYTY_BDA_PRESTAGE` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/pageVersions.h:74` | Whether versions are kept at all (only the pre-stager reads them): KYTY_BDA_PRESTAGE not 0. |
 | `KYTY_BDA_STATS` | diagnostic | see code | mode: access | each call | `src/graphics/host_gpu/memDiag.h:148` | KYTY_BDA_STATS=1\|access: per-second BDASTATS lines about PrepareBda's uploads (what queued them, pages uploaded again within one frame, and for a 1/8 sample of pages how many bytes changed since their previous upload... |
 | `KYTY_BENCH_PERF` | diagnostic | on | on unless 0 | first use | `src/common/benchMetrics.cpp:91` |  |
@@ -28,41 +28,43 @@ On/off switches read through `Common::EnvFlag` treat `0`, `false`, `off` and `no
 | `KYTY_BINDING_REUSE_VERIFY` | verify | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/pipeline/descriptors.cpp:1234` | KYTY_BINDING_REUSE_VERIFY=1: every reused stage is resolved again from scratch and compared. |
 | `KYTY_BIND_DEDUPE` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/dynamicState.cpp:14` | KYTY_BIND_DEDUPE=0 records every bind and push again (for A/B comparisons). |
 | `KYTY_BORDERLESS` | opt-in | off | flag (0/false/off/no = off) | each call | `src/graphics/presentation/window/window.cpp:827` | macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed throwing NSExceptions under Rosetta during the first CATransaction commit. A borderless window skips that machinery entirely. |
+| `KYTY_COLLECT_OBSERVE` | opt-in | off | mode: count | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:618` | KYTY_COLLECT_OBSERVE (see renderContext.h). GPU thread only. |
+| `KYTY_COLLECT_OBSERVE_SKIPS` | opt-in | off | 1 = on | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:675` | A peek at every skip costs ~60 us each (~7.5k own-label waits a second in Sky Garden: half the command thread), so these statistics are opt-in: KYTY_COLLECT_OBSERVE_SKIPS=1. |
 | `KYTY_COLOR_CLEAR_MEMO` | kill switch + verify mode | on | mode: verify | first use | `src/graphics/host_gpu/renderer/cache/textureCache.cpp:1092` | KYTY_COLOR_CLEAR_MEMO: 0 off, 1 on (default), verify (runs anyway and checks a remembered "nothing to do"). |
-| `KYTY_CONTEXT_STATE_DRAIN` | opt-in | off | 1 = on | first use | `src/graphics/guest_gpu/graphicsRun.cpp:681` | Packets that read no guest data through the caches, so a requested collection of guest writes (RenderContext::RequestAsyncCollect) can wait past them. The emulator's context-state NOP (push, pop, clear of the context... |
+| `KYTY_CONTEXT_STATE_DRAIN` | opt-in | off | 1 = on | first use | `src/graphics/guest_gpu/graphicsRun.cpp:684` | Packets that read no guest data through the caches, so a requested collection of guest writes (RenderContext::RequestAsyncCollect) can wait past them. The emulator's context-state NOP (push, pop, clear of the context... |
 | `KYTY_DECODE_CPU` | tuning | automatic | CPU number | each call | `src/common/hybridAffinity.h:327` | Call from the decode thread (KYTY_DECODE_THREAD): KYTY_DECODE_CPU=<n>, else the emulator's |
-| `KYTY_DECODE_RUN_UNTIL_DRAW` | kill switch | on | on unless 0 | each call | `src/graphics/guest_gpu/graphicsRun.cpp:1686` | KYTY_DECODE_RUN_UNTIL_DRAW=0: hand every packet back to the decode thread after a sync. |
-| `KYTY_DECODE_SPIN_US` | tuning | see code | number | each call | `src/graphics/guest_gpu/graphicsRun.cpp:1675` |  |
-| `KYTY_DECODE_STATS` | diagnostic | off | flag (0/false/off/no = off) | each call | `src/graphics/guest_gpu/graphicsRun.cpp:1678` | KYTY_DECODE_STATS=1: DECODE lines (GPU thread prints). |
-| `KYTY_DECODE_THREAD` | opt-in + verify mode | see code | mode: 1, verify | first use | `src/graphics/guest_gpu/graphicsRun.cpp:1509` | KYTY_DECODE_THREAD: 0 (default) off, 1 on, verify: on with the shadow decode, the per-draw digest, the sync order and the ownership asserts. |
+| `KYTY_DECODE_RUN_UNTIL_DRAW` | kill switch | on | on unless 0 | each call | `src/graphics/guest_gpu/graphicsRun.cpp:1690` | KYTY_DECODE_RUN_UNTIL_DRAW=0: hand every packet back to the decode thread after a sync. |
+| `KYTY_DECODE_SPIN_US` | tuning | see code | number | each call | `src/graphics/guest_gpu/graphicsRun.cpp:1678` |  |
+| `KYTY_DECODE_STATS` | diagnostic | off | flag (0/false/off/no = off) | each call | `src/graphics/guest_gpu/graphicsRun.cpp:1681` | KYTY_DECODE_STATS=1: DECODE lines (GPU thread prints). |
+| `KYTY_DECODE_THREAD` | opt-in + verify mode | see code | mode: 1, verify | first use | `src/graphics/guest_gpu/graphicsRun.cpp:1512` | KYTY_DECODE_THREAD: 0 (default) off, 1 on, verify: on with the shadow decode, the per-draw digest, the sync order and the ownership asserts. |
 | `KYTY_DIRECT_RECORD` | opt-in | off | off unless 1 (inverted) | first use | `src/graphics/host_gpu/renderer/render.h:165` | KYTY_DIRECT_RECORD=1: the call sites converted to RecordQueued/RecordBinding record directly on the command thread again, after waiting for the recording thread (Handle()). |
 | `KYTY_DISPATCH_CHAIN` | kill switch | on | mode: stats | first use | `src/graphics/host_gpu/renderer/renderCompute.cpp:278` | KYTY_DISPATCH_CHAIN=0 records every dispatch's barriers; =stats also prints "DISPCHAIN" lines. |
-| `KYTY_DRAIN_STATS` | diagnostic | off | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1858` | KYTY_DRAIN_STATS: are the workers asleep when the first draw after a drain is posted? |
+| `KYTY_DRAIN_STATS` | diagnostic | off | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1859` | KYTY_DRAIN_STATS: are the workers asleep when the first draw after a drain is posted? |
 | `KYTY_DRIVER_STATS` | diagnostic | off | on unless 0 | first use | `src/common/gpuWaitDiag.cpp:409` |  |
 | `KYTY_DTC` | opt-in | unset | value | each call | `src/graphics/host_gpu/renderer/pipeline/drawStateCache.h:20` | draw. KYTY_DTC=0 turns them off. KYTY_DTC_VERIFY=1 also prepares every hit from scratch and |
 | `KYTY_DTC_STATS` | diagnostic | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/pipeline/drawStateCache.h:27` | exits unless both agree. KYTY_DTC_STATS=1 prints their hit rates once per second. |
 | `KYTY_DTC_VERIFY` | verify | off | 1 = on | first use | `src/graphics/host_gpu/renderer/pipeline/drawStateCache.h:17` | draw. KYTY_DTC=0 turns them off. KYTY_DTC_VERIFY=1 also prepares every hit from scratch and |
-| `KYTY_EARLY_SUBMIT` | tuning | 300 | number | each call | `src/graphics/host_gpu/renderer/commandScheduler.cpp:117` |  |
+| `KYTY_EARLY_SUBMIT` | kill switch | on | on unless 0 | each call | `src/graphics/host_gpu/renderer/commandScheduler.cpp:117` |  |
 | `KYTY_EARLY_SUBMIT_US` | tuning | 300 | number | each call | `src/graphics/host_gpu/renderer/commandScheduler.cpp:119` |  |
-| `KYTY_FAST_GUEST_READ` | kill switch + verify mode | on | mode: verify | first use | `src/kernel/memoryAddressSpace.inc:324` | KYTY_FAST_GUEST_READ=0 always takes the locks; =verify also checks each cached translation against a locked lookup. |
+| `KYTY_FAST_GUEST_READ` | kill switch + verify mode | on | mode: verify | first use | `src/kernel/memoryAddressSpace.inc:327` | KYTY_FAST_GUEST_READ=0 always takes the locks; =verify also checks each cached translation against a locked lookup. |
 | `KYTY_FAULT_DIAG` | diagnostic | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:64` | Local diagnostic (KYTY_FAULT_DIAG=1): remember recent GPU-written buffer ranges and their |
 | `KYTY_FILL_BACKING` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:1785` | Through the backing alias, then the invalidation the guest mapping's write faults would have done (KYTY_FILL_BACKING=0: through the guest mapping). |
 | `KYTY_FRAME_DIAG` | diagnostic | off | on unless 0 | each call | `src/common/frameDiag.cpp:241` |  |
 | `KYTY_FRAME_SKIP` | opt-in | see code | mode: auto, off | each call | `src/graphics/guest_gpu/frameSkip.cpp:385` | Command thread, every KYTY_FRAME_SKIP_DIAG report. |
-| `KYTY_FRAME_SKIP_DIAG` | diagnostic | see code | number | each call | `src/graphics/guest_gpu/frameSkip.cpp:402` | Command thread, every KYTY_FRAME_SKIP_DIAG report. |
+| `KYTY_FRAME_SKIP_DIAG` | diagnostic | unset | value | each call | `src/graphics/guest_gpu/frameSkip.cpp:402` | Command thread, every KYTY_FRAME_SKIP_DIAG report. |
 | `KYTY_FRAME_SKIP_KEEP` | tuning | see code | list | each call | `src/graphics/guest_gpu/frameSkip.cpp:398` |  |
-| `KYTY_FRAME_SKIP_LOG` | diagnostic | see code | number | each call | `src/graphics/guest_gpu/frameSkip.cpp:401` |  |
+| `KYTY_FRAME_SKIP_LOG` | diagnostic | off | 1 = on | each call | `src/graphics/guest_gpu/frameSkip.cpp:401` |  |
 | `KYTY_FRAME_SKIP_MAX` | tuning | see code | number | each call | `src/graphics/guest_gpu/frameSkip.cpp:406` |  |
-| `KYTY_FREE_LANES` | kill switch | on | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1845` |  |
-| `KYTY_FREE_PREPARE_SIBLINGS` | tuning | see code | list | each call | `src/common/hybridAffinity.h:199` | and off the overflow worker's CPU. KYTY_FREE_PREPARE_SIBLINGS=0\|1 overrides the first. |
-| `KYTY_GPU_TIME` | diagnostic | see code | mode: draws, passes, sites | first use | `src/graphics/host_gpu/vulkanDiagnostics.cpp:698`<br>`src/graphics/host_gpu/vulkanDiagnostics.cpp:864`<br>`src/graphics/host_gpu/vulkanDiagnostics.cpp:869` (+1) | KYTY_GPU_TIME=passes: timestamps around each render pass and dispatch, in a chunk of queries |
+| `KYTY_FREE_LANES` | kill switch | on | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1846` |  |
+| `KYTY_FREE_PREPARE_SIBLINGS` | opt-in | unset | value | each call | `src/common/hybridAffinity.h:199` | and off the overflow worker's CPU. KYTY_FREE_PREPARE_SIBLINGS=0\|1 overrides the first. |
+| `KYTY_GPU_TIME` | diagnostic | see code | mode: draws, passes | first use | `src/graphics/host_gpu/vulkanDiagnostics.cpp:698`<br>`src/graphics/host_gpu/vulkanDiagnostics.cpp:864`<br>`src/graphics/host_gpu/vulkanDiagnostics.cpp:869` (+1) | KYTY_GPU_TIME=passes: timestamps around each render pass and dispatch, in a chunk of queries |
 | `KYTY_GPU_WAIT_DIAG` | diagnostic | off | mode: trace | first use | `src/common/gpuWaitDiag.cpp:286` |  |
 | `KYTY_GPU_WAIT_TRACE` | diagnostic | unset | value | each call | `src/common/gpuWaitDiag.cpp:691` |  |
 | `KYTY_GUEST_PCORE_NAMES` | tuning | see code | list | first use | `src/common/hybridAffinity.h:450` | one of KYTY_GUEST_PCORE_NAMES=<name,...> (default DrawThread) also stay on the performance |
 | `KYTY_GUEST_PCORE_PRIORITY` | tuning | -1 | number | first use | `src/common/hybridAffinity.h:381`<br>`src/common/hybridAffinity.h:394` | The bar: -1 for none yet (or off). |
 | `KYTY_GUEST_THREAD_CPUS` | tuning | see code | list | each call | `src/common/hybridAffinity.h:346` | gained 3% (core layout, #46). KYTY_GUEST_THREAD_CPUS=<list> picks other CPUs, =none keeps every |
 | `KYTY_KERNEL_STATS` | diagnostic | off | on unless 0 | first use | `src/common/kernelStats.h:97` | KYTY_KERNEL_STATS=1: kernel time on the GPU command thread by user call site. Every system |
-| `KYTY_LABEL_SCAN_SKIP` | kill switch | on | on unless 0 | first use | `src/kernel/memoryAddressSpace.inc:950` | When the page still holds a current token, its marks were cleared when that token was made, so no scan: stores since then stay marked, the next peek sees them and collects (conservative), and the next scan reports the... |
+| `KYTY_LABEL_SCAN_SKIP` | kill switch | on | on unless 0 | first use | `src/kernel/memoryAddressSpace.inc:953` | When the page still holds a current token, its marks were cleared when that token was made, so no scan: stores since then stay marked, the next peek sees them and collects (conservative), and the next scan reports the... |
 | `KYTY_LRU_MIRROR` | kill switch | on | on unless 0 | first use | `src/common/lruCache.h:17` | KYTY_LRU_MIRROR=0: callers that mirror an item's tick (to skip touches within one tick, which LeastRecentlyUsedCache::Touch ignores) touch every time instead. |
 | `KYTY_MASKED_SELECTS` | kill switch | on | on unless 0 | first use | `src/graphics/shader/recompiler/ShaderRecompiler.cpp:867` | KYTY_MASKED_SELECTS=0 keeps them (A/B only: shader stores don't record the setting). |
 | `KYTY_MEM_DIAG` | diagnostic | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/memDiag.h:75` | Guest-memory traffic diagnostic (KYTY_MEM_DIAG=1): per-second MEMDIAG lines on stdout with |
@@ -71,33 +73,35 @@ On/off switches read through `Common::EnvFlag` treat `0`, `false`, `off` and `no
 | `KYTY_NO_PIN` | opt-in | off | flag (0/false/off/no = off) | first use | `src/common/hybridAffinity.h:120`<br>`src/common/hybridAffinity.h:121` | command thread's core both slowed the critical path. KYTY_NO_PIN=1 disables it. |
 | `KYTY_NO_SHADER_FASTREAD` | opt-in | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:67` |  |
 | `KYTY_NO_STREAM_REUSE` | opt-in | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:1680` |  |
+| `KYTY_OBSERVE_DROP` | tuning | 0 | number | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:865` | KYTY_OBSERVE_DROP=<n> (test only, with KYTY_COLLECT_OBSERVE): this collection leaves every n-th page a publication made visible stale, as a production bug would; observe must fail. |
 | `KYTY_OFFCPU_SAMPLE` | diagnostic | unset | value | each call | `src/common/gpuWaitDiag.cpp:240` |  |
 | `KYTY_OFFCPU_THREAD` | diagnostic | unset | value | first use | `src/common/gpuWaitDiag.cpp:232` |  |
 | `KYTY_OPENXR` | kill switch | on | on unless 0 | each call | `src/graphics/presentation/openxrHeadset.cpp:553` |  |
 | `KYTY_PERF_LOG` | diagnostic | off | flag (0/false/off/no = off) | first use | `src/common/benchMetrics.cpp:84`<br>`src/graphics/presentation/performanceOverlay.cpp:865` | Local benchmarking aid: one line per refresh on stdout when KYTY_PERF_LOG is set. |
-| `KYTY_PGO_DUMP` | tool hook | 10 | number | startup | `src/main.cpp:558` | KYTY_PGO_DUMP=<prefix> a thread writes them every KYTY_PGO_DUMP_INTERVAL seconds (default 10), |
+| `KYTY_PGO_DUMP` | tool hook | unset | value | startup | `src/main.cpp:558` | KYTY_PGO_DUMP=<prefix> a thread writes them every KYTY_PGO_DUMP_INTERVAL seconds (default 10), |
 | `KYTY_PGO_DUMP_INTERVAL` | tool hook | 10 | number | startup | `src/main.cpp:563` | KYTY_PGO_DUMP=<prefix> a thread writes them every KYTY_PGO_DUMP_INTERVAL seconds (default 10), |
 | `KYTY_PIPELINE_NICE` | tuning | 0 | number | first use | `src/common/hybridAffinity.h:232` | The GPU pipeline threads (command, prepare workers, recorder) run at this nice value (KYTY_PIPELINE_NICE, default 0 = unchanged), so other programs' threads on their cores yield to them. Lowering nice needs RLIMIT_NIC... |
 | `KYTY_PIPELINE_STATS` | diagnostic | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/vulkanDiagnostics.cpp:927` |  |
+| `KYTY_PREPARE_CHAOS` | tuning | 0 | number | each call | `src/graphics/host_gpu/renderer/drawPrepare.h:38` | KYTY_PREPARE_CHAOS=<seed> (non-zero): random short delays at the hand-off points of the prepare |
 | `KYTY_PREPARE_CPU` | tuning | automatic | CPU number | each call | `src/common/hybridAffinity.h:153`<br>`src/common/hybridAffinity.h:306` | itself; its SMT sibling stays with the emulator. KYTY_PREPARE_CPU=<n> (the first |
-| `KYTY_PREPARE_CPUS` | tuning | see code | number | each call | `src/common/hybridAffinity.h:148` | worker) or KYTY_PREPARE_CPUS=<list> (in worker order) pick other CPUs, which the |
-| `KYTY_PREPARE_DEPTH` | tuning | see code | number | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1848` | Deeper with free lanes: a worker past a slow draw can then run further ahead (with strict alternation the extra draws only queue behind it; either alone measured flat). |
-| `KYTY_PREPARE_OVERFLOW` | tuning | see code | list | first use | `src/common/hybridAffinity.h:172`<br>`src/common/hybridAffinity.h:285` | The overflow prepare worker: by default on the SMT sibling of the last prepare worker's core. KYTY_PREPARE_OVERFLOW_CPU=<n> picks another CPU, KYTY_PREPARE_OVERFLOW=0 turns it off. |
+| `KYTY_PREPARE_CPUS` | tuning | see code | list | each call | `src/common/hybridAffinity.h:148` | worker) or KYTY_PREPARE_CPUS=<list> (in worker order) pick other CPUs, which the |
+| `KYTY_PREPARE_DEPTH` | tuning | see code | number | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1849` | Deeper with free lanes: a worker past a slow draw can then run further ahead (with strict alternation the extra draws only queue behind it; either alone measured flat). |
+| `KYTY_PREPARE_OVERFLOW` | kill switch | on | on unless 0 | first use | `src/common/hybridAffinity.h:172`<br>`src/common/hybridAffinity.h:285` | The overflow prepare worker: by default on the SMT sibling of the last prepare worker's core. KYTY_PREPARE_OVERFLOW_CPU=<n> picks another CPU, KYTY_PREPARE_OVERFLOW=0 turns it off. |
 | `KYTY_PREPARE_OVERFLOW_CPU` | tuning | automatic | CPU number | each call | `src/common/hybridAffinity.h:173`<br>`src/common/hybridAffinity.h:289` | core. KYTY_PREPARE_OVERFLOW_CPU=<n> picks another CPU, KYTY_PREPARE_OVERFLOW=0 turns it off. |
-| `KYTY_PREPARE_OVERFLOW_K` | tuning | 0 | number | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1868` | sibling of the last worker's core) takes only draws at least KYTY_PREPARE_OVERFLOW_K |
-| `KYTY_PREPARE_OVERFLOW_SPIN_US` | tuning | 50 | number | first use | `src/graphics/host_gpu/renderer/drawPrepare.cpp:533` | (KYTY_PREPARE_OVERFLOW_SPIN_US, default 50), then sleeps until Post finds such a draw. |
-| `KYTY_PREPARE_SPIN_US` | tuning | 50 | number | first use | `src/graphics/host_gpu/renderer/drawPrepare.cpp:244` | How long an idle worker spins before it sleeps (KYTY_PREPARE_SPIN_US, default 50): draws arrive every few microseconds, and a sleeping worker's first draw after a pause waits for it to wake. |
-| `KYTY_PREPARE_STATS` | diagnostic | off | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1857` |  |
-| `KYTY_PREPARE_THREAD` | tuning | 2 | number | first use | `src/common/hybridAffinity.h:107`<br>`src/graphics/host_gpu/renderer/renderDraw.cpp:1838` | Draw prepare workers (KYTY_PREPARE_WORKERS, 1 to 4; 0 with KYTY_PREPARE_THREAD=0). |
-| `KYTY_PREPARE_VERIFY` | verify | off | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1856` |  |
+| `KYTY_PREPARE_OVERFLOW_K` | tuning | 0 | number | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1869` | sibling of the last worker's core) takes only draws at least KYTY_PREPARE_OVERFLOW_K |
+| `KYTY_PREPARE_OVERFLOW_SPIN_US` | tuning | 50 | number | first use | `src/graphics/host_gpu/renderer/drawPrepare.cpp:608` | (KYTY_PREPARE_OVERFLOW_SPIN_US, default 50), then sleeps until Post finds such a draw. |
+| `KYTY_PREPARE_SPIN_US` | tuning | 50 | number | first use | `src/graphics/host_gpu/renderer/drawPrepare.cpp:315` | How long an idle worker spins before it sleeps (KYTY_PREPARE_SPIN_US, default 50): draws arrive every few microseconds, and a sleeping worker's first draw after a pause waits for it to wake. |
+| `KYTY_PREPARE_STATS` | diagnostic | off | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1858` |  |
+| `KYTY_PREPARE_THREAD` | kill switch | on | on unless 0 | first use | `src/common/hybridAffinity.h:107`<br>`src/graphics/host_gpu/renderer/renderDraw.cpp:1839` | Draw prepare workers (KYTY_PREPARE_WORKERS, 1 to 4; 0 with KYTY_PREPARE_THREAD=0). |
+| `KYTY_PREPARE_VERIFY` | verify | off | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1857` |  |
 | `KYTY_PREPARE_WORKERS` | tuning | 2 | number | each call | `src/common/hybridAffinity.h:111` | Draw prepare workers (KYTY_PREPARE_WORKERS, 1 to 4; 0 with KYTY_PREPARE_THREAD=0). |
-| `KYTY_PRESTAGE_SELFTEST` | verify | off | 1 = on | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:667` | KYTY_PRESTAGE_SELFTEST=1 (test only, no stager): stage up to 16 pages of the first written run each collection, and unstage them all every 16th collection, to run the arm (including re-arms of staged pages), consumpti... |
+| `KYTY_PRESTAGE_SELFTEST` | verify | off | 1 = on | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:820` | KYTY_PRESTAGE_SELFTEST=1 (test only, no stager): stage up to 16 pages of the first written run each collection, and unstage them all every 16th collection, to run the arm (including re-arms of staged pages), consumpti... |
 | `KYTY_PRESTAGE_STATS` | diagnostic | off | 1 = on | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:585` | KYTY_PRESTAGE_STATS=1: a PRESTAGE line per second (BDA pre-staging arms, refusals, pre-arm stores kept, versions moved by consumed marks, staged pages, remap generation moves). |
-| `KYTY_RANGED_GPU_HAZARD` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/drawPrepare.cpp:178` |  |
+| `KYTY_RANGED_GPU_HAZARD` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/drawPrepare.cpp:249` |  |
 | `KYTY_READBACK_VERIFY` | verify | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:627` | KYTY_READBACK_VERIFY=1: when a read's pages are about to lose GPU ownership and nothing newer |
 | `KYTY_RECORDER_CPU` | tuning | automatic | CPU number | each call | `src/common/hybridAffinity.h:351`<br>`src/common/hybridAffinity.h:479` | Not the recording thread's CPU (see ApplyToRecorderThread). |
 | `KYTY_RECORD_THREAD` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/commandScheduler.cpp:88` |  |
-| `KYTY_REGISTER_SNAPSHOT` | kill switch + verify mode | on | mode: verify | first use | `src/graphics/host_gpu/renderer/renderDraw.cpp:1929` | KYTY_REGISTER_SNAPSHOT: 1 (default) share, 0 copy per draw, 2 verify. |
+| `KYTY_REGISTER_SNAPSHOT` | kill switch + verify mode | on | mode: verify | first use | `src/graphics/host_gpu/renderer/renderDraw.cpp:1931` | KYTY_REGISTER_SNAPSHOT: 1 (default) share, 0 copy per draw, 2 verify. |
 | `KYTY_RELAUNCHED` | tool hook | unset | value | each call | `src/common/logging/log.h:24` | Set by LoadExec for the program it starts, which continues the log file of the one it replaces instead of starting it over. |
 | `KYTY_RENDER_MUTEX_BIASED` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:128` |  |
 | `KYTY_RESERVE_CPUS` | tuning | see code | list | each call | `src/common/hybridAffinity.h:189` | KYTY_RESERVE_CPUS=<list>: also keep the emulator off these (for a thread pinned there). |
@@ -105,15 +109,15 @@ On/off switches read through `Common::EnvFlag` treat `0`, `false`, `off` and `no
 | `KYTY_RESIDENT_TEXTURES` | opt-in + verify mode | see code | mode: 1, shadow, verify | first use | `src/graphics/host_gpu/renderer/pipeline/residentStore.cpp:21`<br>`src/graphics/host_gpu/renderer/pipeline/residentTextures.cpp:40`<br>`src/graphics/presentation/window/vulkanWindow.cpp:82` | KYTY_RESIDENT_TEXTURES=1\|verify: whether the device has what resident textures rely on. Without it, draws keep their classic bindings (logged), whatever the setting. |
 | `KYTY_RESUME_SCAN` | opt-in + verify mode | off | mode: 1, verify | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:469` |  |
 | `KYTY_RETIRE_NOWAIT` | kill switch | on | on unless 0 | each call | `src/graphics/host_gpu/renderer/commandScheduler.cpp:105` |  |
-| `KYTY_SHARED_TEXTURE_MEMO` | kill switch | on | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1860` | KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo. |
+| `KYTY_SHARED_TEXTURE_MEMO` | kill switch | on | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/renderDraw.cpp:1861` | KYTY_SHARED_TEXTURE_MEMO=0: each worker keeps its own texture memo. |
 | `KYTY_SHOT_COUNT` | tool hook | see code | number | each call | `src/graphics/presentation/window/swapchain.cpp:307` | KYTY_SHOT_COUNT=<n>: also save the next n-1 presented frames, as <out>-<k>.ppm. |
-| `KYTY_SHOT_FILE` | tool hook | see code | number | each call | `src/graphics/presentation/window/swapchain.cpp:303` | KYTY_SHOT_FILE=<path>: bench screenshots (tools/astro-bench/gate.sh). The bench writes |
+| `KYTY_SHOT_FILE` | tool hook | unset | value | each call | `src/graphics/presentation/window/swapchain.cpp:303` | KYTY_SHOT_FILE=<path>: bench screenshots (tools/astro-bench/gate.sh). The bench writes |
 | `KYTY_SPV_DUMP` | diagnostic | unset | value | first use | `src/graphics/host_gpu/vulkanDiagnostics.cpp:982` |  |
 | `KYTY_STALL_DIAG` | diagnostic | off | on unless 0 | first use | `src/common/stallDiag.h:52` | KYTY_STALL_DIAG=1: where the GPU command thread, the draw-prepare worker and the recorder spend |
 | `KYTY_STENCIL_TARGET_FAST` | kill switch + verify mode | on | mode: verify | first use | `src/graphics/host_gpu/renderer/cache/textureCache.cpp:1766` | KYTY_STENCIL_TARGET_FAST: 0 off, 1 on (default), verify (re-checks the state under the lock). |
 | `KYTY_STREAM_VERIFY` | verify | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:291` | KYTY_STREAM_VERIFY=1: compare every reused stream copy against the guest bytes. |
 | `KYTY_SUBMIT_SCAN` | kill switch + verify mode | on | mode: stats, verify | first use | `src/graphics/host_gpu/renderer/renderContext.cpp:483` | KYTY_SUBMIT_SCAN=stats\|verify: submit-scan time by submitting thread. |
-| `KYTY_SUBMIT_SCAN_SERIAL` | opt-in | off | 1 = on | first use | `src/kernel/memoryAddressSpace.inc:1213` | KYTY_SUBMIT_SCAN_SERIAL=1: the earlier scheme (for A/B). |
+| `KYTY_SUBMIT_SCAN_SERIAL` | opt-in | off | 1 = on | first use | `src/kernel/memoryAddressSpace.inc:1218` | KYTY_SUBMIT_SCAN_SERIAL=1: the earlier scheme (for A/B). |
 | `KYTY_SUBMIT_THREAD` | kill switch | on | on unless 0 | each call | `src/graphics/host_gpu/renderer/commandScheduler.cpp:101` |  |
 | `KYTY_SYNC_READBACK` | opt-in | off | on unless 0 | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:620` |  |
 | `KYTY_TC_SETTLED_VERIFY` | verify | off | flag (0/false/off/no = off) | first use | `src/graphics/host_gpu/renderer/cache/textureCache.cpp:1677` | KYTY_TC_SETTLED_VERIFY=1: a lock-free lookup re-checks, under the lock, that the image is still settled for it or that something cleared the flag since. |
@@ -121,7 +125,7 @@ On/off switches read through `Common::EnvFlag` treat `0`, `false`, `off` and `no
 | `KYTY_TILER_VERIFY` | verify | off | flag (0/false/off/no = off) | each call | `src/graphics/host_gpu/renderer/image/tiler.cpp:87` | KYTY_TILER_VERIFY=1: also run the buffer path and compare its bytes ("TILERVERIFY" lines). |
 | `KYTY_TIME_DIAG` | diagnostic | see code | mode: dump | first use | `src/kernel/timeDiag.cpp:87`<br>`src/kernel/timeDiag.cpp:256` | KYTY_TIME_DIAG=dump: writes the guest code around a call site to /tmp/timediag-<module offset>.bin (1 KiB before the return address and 1 KiB after), for offline disassembly. |
 | `KYTY_UPLOAD_BATCH` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:2268` |  |
-| `KYTY_VK_COUNT` | diagnostic | see code | mode: draws, passes, sites | each call | `src/graphics/host_gpu/vulkanDiagnostics.cpp:697` | KYTY_VK_COUNT=sites: the recording site of a barrier (its caller and that one's caller) |
+| `KYTY_VK_COUNT` | diagnostic | see code | mode: passes, sites | each call | `src/graphics/host_gpu/vulkanDiagnostics.cpp:697` | KYTY_VK_COUNT=sites: the recording site of a barrier (its caller and that one's caller) |
 | `KYTY_WALKER_PAGE_LOG` | diagnostic | on | on unless 0 | first use | `src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp:1580` |  |
 | `KYTY_WORKER_BUFFERS` | kill switch + verify mode | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/cache/bufferCache.cpp:1243`<br>`src/graphics/host_gpu/renderer/cache/bufferCache.cpp:1252`<br>`src/graphics/host_gpu/renderer/cache/bufferCache.cpp:1262` | KYTY_WORKER_BUFFERS=verify: every speculated answer is checked against the full lookup. |
 | `KYTY_WORKER_PIPELINE_KEY` | kill switch | on | on unless 0 | first use | `src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp:1010`<br>`src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp:1028` |  |
@@ -139,11 +143,13 @@ lists them as such, not as unknown switches).
 
 | Variable | Used in |
 |---|---|
-| `KYTY_BENCH_LOCK` | `tools/astro-bench/benchlock.sh` |
-| `KYTY_BENCH_LOCKED` | `tools/astro-bench/ab.sh`, `tools/astro-bench/benchlock.sh`, `tools/astro-bench/build.sh`, `tools/astro-bench/pgo-train.sh`, `tools/astro-bench/refbuild.sh`, `tools/fast.sh` |
-| `KYTY_BENCH_LOCK_TIMEOUT` | `tools/astro-bench/benchlock.sh` |
+| `KYTY_BENCH_AGE` | `tools/astro-bench/benchlock.sh`, `tools/astro-bench/test-benchlock.sh` |
+| `KYTY_BENCH_LOCK` | `tools/astro-bench/benchlock.sh`, `tools/astro-bench/test-benchlock.sh` |
+| `KYTY_BENCH_LOCKED` | `tools/astro-bench/benchlock.sh`, `tools/astro-bench/build.sh`, `tools/astro-bench/pgo-train.sh`, `tools/astro-bench/refbuild.sh`, `tools/astro-bench/test-benchlock.sh`, `tools/fast.sh` |
+| `KYTY_BENCH_LOCK_TIMEOUT` | `tools/astro-bench/benchlock.sh`, `tools/astro-bench/test-benchlock.sh` |
+| `KYTY_BENCH_PRIO` | `tools/astro-bench/benchlock.sh`, `tools/astro-bench/test-benchlock.sh` |
 | `KYTY_BUILDS` | `tools/astro-bench/build.sh`, `tools/astro-bench/refbuild.sh` |
-| `KYTY_BUILD_MODE` | `tools/astro-bench/ab.sh`, `tools/astro-bench/build.sh`, `tools/astro-bench/buildmode.sh`, `tools/astro-bench/pgo-train.sh`, `tools/astro-bench/refbuild.sh` |
+| `KYTY_BUILD_MODE` | `tools/astro-bench/ab.sh`, `tools/astro-bench/build.sh`, `tools/astro-bench/buildmode.sh`, `tools/astro-bench/gate.sh`, `tools/astro-bench/pgo-train.sh`, `tools/astro-bench/refbuild.sh` |
 | `KYTY_CMAKE_ARGS` | `tools/astro-bench/build.sh` |
 | `KYTY_GAME` | `tools/astro-bench/run.sh` |
 | `KYTY_INSTALL` | `tools/astro-bench/ab.sh`, `tools/astro-bench/build.sh`, `tools/astro-bench/garden.sh`, `tools/astro-bench/gate.sh`, `tools/astro-bench/levels.sh`, `tools/astro-bench/pgo-train.sh`, `tools/astro-bench/refbuild.sh`, `tools/astro-bench/run.sh` |
@@ -152,9 +158,10 @@ lists them as such, not as unknown switches).
 | `KYTY_PGO_CURRENT` | `tools/astro-bench/pgo-train.sh` |
 | `KYTY_PGO_DIR` | `tools/astro-bench/buildmode.sh`, `tools/astro-bench/pgo-train.sh` |
 | `KYTY_PGO_LEVELS` | `tools/astro-bench/pgo-train.sh` |
-| `KYTY_PGO_PROFILE` | `tools/astro-bench/build.sh`, `tools/astro-bench/buildmode.sh`, `tools/astro-bench/refbuild.sh`, `tools/fast.sh` |
+| `KYTY_PGO_PROFILE` | `tools/astro-bench/build.sh`, `tools/astro-bench/buildmode.sh`, `tools/astro-bench/gate.sh`, `tools/astro-bench/refbuild.sh`, `tools/fast.sh` |
 | `KYTY_PGO_SET` | `tools/astro-bench/pgo-train.sh` |
+| `KYTY_REQUIRE_CHECKED` | `tools/astro-bench/gate.sh`, `tools/astro-bench/results.py` |
 | `KYTY_RESULTS` | `tools/astro-bench/results.py` |
 | `KYTY_SETUP_FROM` | `tools/astro-bench/buildmode.sh`, `tools/astro-bench/refbuild.sh` |
 
-Totals: diagnostic 29, kill switch 23, kill switch + verify mode 7, opt-in 16, opt-in + verify mode 3, tool hook 6, tuning 24, verify 14; 122 switches.
+Totals: diagnostic 29, kill switch 26, kill switch + verify mode 7, opt-in 19, opt-in + verify mode 3, tool hook 6, tuning 22, verify 14; 126 switches.

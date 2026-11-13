@@ -127,6 +127,37 @@ def classify(name, window, values):
     return parse, default, kind
 
 
+def read_window(lines, i, name):
+    """The code that parses this read of <name>, so a neighbouring switch's parse is never
+    borrowed. If the read is assigned to a variable: the lines (up to 8) that use it or a variable
+    derived from it (an assignment or constructor on a line using it). Otherwise: up to 8 lines,
+    cut at the next line naming another switch."""
+    var = re.search(r'(\w+)\s*=\s*(?:std::)?getenv\("%s"\)' % name, lines[i])
+    if not var:
+        window = [lines[i]]
+        for line in lines[i + 1: i + 8]:
+            if any(n != name for n in NAME.findall(line)):
+                break
+            window.append(line)
+        return window
+    tracked = {var.group(1)}
+    window = [lines[i]]
+    kept = True  # whether the line before was kept
+    for line in lines[i + 1: i + 8]:
+        uses = any(re.search(r"\b%s\b" % re.escape(t), line) for t in tracked)
+        # The branch body or continuation of a kept line (`if (value == nullptr) {` / `return 1;`,
+        # or a multi-line conditional) carries the default without naming the variable.
+        follows = kept and re.match(r"\s*(return\b|[:?}])", line)
+        kept = bool(uses or follows)
+        if not kept:
+            continue
+        window.append(line)
+        derived = re.match(r"\s*(?:[\w:<>]+\s+)+(\w+)\s*(?:=|\(|\{)", line)
+        if derived:
+            tracked.add(derived.group(1))
+    return window
+
+
 def when_read(lines, i, path):
     ctx = " ".join(lines[max(0, i - 3): i + 1])
     if path.endswith("main.cpp"):
@@ -145,7 +176,7 @@ def scan():
         for i, line in enumerate(lines):
             for m in NAME.finditer(line):
                 name = m.group(1)
-                window = lines[i: i + 8]
+                window = read_window(lines, i, name)
                 if not re.search(r"getenv|EnvFlag|EnvCpu|Env[A-Z][a-z]+\(", line + " ".join(lines[i - 1: i])):
                     # A name in another call (a table, a helper argument): still a site.
                     pass
@@ -188,6 +219,10 @@ def summarize(switches):
     return rows
 
 
+# Names in the scripts' usage text that stand for "a switch", not a variable of their own.
+PLACEHOLDERS = {"KYTY_X"}
+
+
 def script_variables(emulator_names):
     """KYTY_* names the bench and build scripts use that the emulator does not read."""
     found = {}
@@ -198,7 +233,7 @@ def script_variables(emulator_names):
                 continue
             with open(os.path.join(full, f), encoding="utf-8", errors="replace") as fh:
                 for name in re.findall(r"KYTY_[A-Z0-9_]+", fh.read()):
-                    if name not in emulator_names:
+                    if name not in emulator_names and name not in PLACEHOLDERS:
                         found.setdefault(name, []).append(f"{d}/{f}")
     return {k: sorted(set(v)) for k, v in sorted(found.items())}
 

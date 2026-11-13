@@ -45,26 +45,34 @@ const Known* Find(std::string_view name) {
 struct VerifyPair {
 	const char* verify;
 	const char* feature;
+	bool        exact_zero; // the feature is off only for exactly "0" (else: any value starting '0')
 };
 constexpr VerifyPair VERIFY_NEEDS[] = {
-    {"KYTY_BINDING_REUSE_VERIFY", "KYTY_BINDING_REUSE"},
-    {"KYTY_WORKER_TARGETS_VERIFY", "KYTY_WORKER_TARGETS"},
-    {"KYTY_WORKER_PIPELINE_KEY_VERIFY", "KYTY_WORKER_PIPELINE_KEY"},
-    {"KYTY_WORKER_TEXTURES_VERIFY", "KYTY_WORKER_TEXTURES"},
-    {"KYTY_PREPARE_VERIFY", "KYTY_PREPARE_THREAD"},
-    {"KYTY_TILER_VERIFY", "KYTY_TILER_DIRECT"},
+    // Each feature's own off test (descriptors.cpp, colorRenderTarget.cpp, pipelineCache.cpp,
+    // hybridAffinity.h: value[0] == '0'; tiler.cpp: strcmp(value, "0") == 0).
+    {"KYTY_BINDING_REUSE_VERIFY", "KYTY_BINDING_REUSE", false},
+    {"KYTY_WORKER_TARGETS_VERIFY", "KYTY_WORKER_TARGETS", false},
+    {"KYTY_WORKER_PIPELINE_KEY_VERIFY", "KYTY_WORKER_PIPELINE_KEY", false},
+    {"KYTY_WORKER_TEXTURES_VERIFY", "KYTY_WORKER_TEXTURES", false},
+    {"KYTY_PREPARE_VERIFY", "KYTY_PREPARE_THREAD", false},
+    {"KYTY_TILER_VERIFY", "KYTY_TILER_DIRECT", true},
 };
 
-// Pins that a disabled core layout (KYTY_NO_PIN) ignores.
-constexpr const char* PIN_SWITCHES[] = {"KYTY_PREPARE_CPU",  "KYTY_PREPARE_CPUS",  "KYTY_PREPARE_OVERFLOW_CPU",
-                                         "KYTY_DECODE_CPU",   "KYTY_RECORDER_CPU",  "KYTY_RESERVE_CPUS",
-                                         "KYTY_GUEST_THREAD_CPUS", "KYTY_GUEST_PCORE_NAMES"};
+// With KYTY_NO_PIN the automatic core layout is off (hybridAffinity.h GetPlan returns no plan):
+// these only feed that layout, so they are ignored ...
+constexpr const char* LAYOUT_ONLY[] = {"KYTY_PREPARE_CPUS", "KYTY_RESERVE_CPUS", "KYTY_GUEST_THREAD_CPUS",
+                                       "KYTY_GUEST_PCORE_NAMES"};
+// ... while these still pin their own thread (prepare worker 0, the overflow worker, the decode and
+// recording threads).
+constexpr const char* EXPLICIT_PINS[] = {"KYTY_PREPARE_CPU", "KYTY_PREPARE_OVERFLOW_CPU", "KYTY_DECODE_CPU",
+                                         "KYTY_RECORDER_CPU"};
 
-bool IsOffValue(const char* value) {
-	// The kill switches' "0"; EnvFlag's other off words count too.
-	if (value == nullptr) return false;
-	const std::string_view v(value);
-	return v == "0" || v == "off" || v == "false" || v == "no";
+bool FeatureOff(const VerifyPair& pair) {
+	const char* value = std::getenv(pair.feature);
+	if (value == nullptr) {
+		return false;
+	}
+	return pair.exact_zero ? std::strcmp(value, "0") == 0 : value[0] == '0';
 }
 
 std::mutex                         g_mutex;
@@ -100,12 +108,9 @@ void PrintStartup(const std::string& version) {
 		const std::string name  = entry.substr(0, eq);
 		const std::string value = eq == std::string::npos ? "" : entry.substr(eq + 1);
 		if (const auto* k = Find(name); k != nullptr) {
-			std::string line = "CONFIG switch " + name + "=" + value + " (" + k->kind + ", default " + k->def;
-			if (std::string_view(k->kind).find("kill switch") != std::string_view::npos ||
-			    std::string_view(k->def) == "on" || std::string_view(k->def) == "off") {
-				line += std::string(", now ") + (IsOffValue(value.c_str()) ? "off" : "on");
-			}
-			Emit(&g_startup, line + ")");
+			// The raw value with its kind and default: each switch parses its value its own way, so
+			// what it did is reported by the CONFIG feature lines, not guessed here.
+			Emit(&g_startup, "CONFIG switch " + name + "=" + value + " (" + k->kind + ", default " + k->def + ")");
 		} else {
 			unknown++;
 			Emit(&g_startup, "CONFIG warning: unknown switch " + name + "=" + value +
@@ -116,19 +121,26 @@ void PrintStartup(const std::string& version) {
 	if (set.empty()) {
 		Emit(&g_startup, "CONFIG switches: none set (all defaults)");
 	}
-	for (const auto& [verify, feature]: VERIFY_NEEDS) {
-		if (EnvFlag(verify) && IsOffValue(std::getenv(feature))) {
-			Emit(&g_startup, std::string("CONFIG warning: ") + verify + " checks nothing with " + feature +
-			                     "=0 (the feature it verifies is off)");
+	for (const auto& pair: VERIFY_NEEDS) {
+		if (EnvFlag(pair.verify) && FeatureOff(pair)) {
+			Emit(&g_startup, std::string("CONFIG warning: ") + pair.verify + " checks nothing with " + pair.feature +
+			                     "=" + std::getenv(pair.feature) + " (the feature it verifies is off)");
 		}
 	}
 	if (EnvFlag("KYTY_ASYNC_WP_VERIFY") && EnvFlag("KYTY_NO_ASYNC_WP")) {
 		Emit(&g_startup, "CONFIG warning: KYTY_ASYNC_WP_VERIFY checks nothing with KYTY_NO_ASYNC_WP");
 	}
 	if (EnvFlag("KYTY_NO_PIN")) {
-		for (const char* pin: PIN_SWITCHES) {
-			if (std::getenv(pin) != nullptr) {
-				Emit(&g_startup, std::string("CONFIG warning: ") + pin + " is ignored with KYTY_NO_PIN");
+		for (const char* name: LAYOUT_ONLY) {
+			if (std::getenv(name) != nullptr) {
+				Emit(&g_startup, std::string("CONFIG warning: ") + name +
+				                     " is ignored with KYTY_NO_PIN (the automatic core layout is off)");
+			}
+		}
+		for (const char* name: EXPLICIT_PINS) {
+			if (std::getenv(name) != nullptr) {
+				Emit(&g_startup, std::string("CONFIG note: ") + name +
+				                     " still pins its thread with KYTY_NO_PIN (only the automatic core layout is off)");
 			}
 		}
 	}

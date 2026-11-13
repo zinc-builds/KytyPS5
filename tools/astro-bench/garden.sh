@@ -117,6 +117,13 @@ for _ in $(seq 10); do [ -n "$(last_frames)" ] && break; wait_s 1; done
 base=$(perf_since_start | grep -m1 -o 'frames=[0-9]*' | cut -d= -f2)
 window=${GARDEN_FRAMES:-1000-1600}
 [ -n "$GARDEN_SHOT" ] && [ -n "$base" ] && printf '%s %s\n' "$((base + GARDEN_SHOT))" "/tmp/garden-$label-shot.ppm" > "$KYTY_SHOT_FILE"
+# The emulator's effective configuration (its "CONFIG summary" block: build mode, switches set,
+# features and fallbacks) goes with the run, in either window mode: /tmp/garden-<label>.config
+# (and, in the frame window, the JSON's "config").
+save_config() {
+	sed -n '/^CONFIG summary begin/,/^CONFIG summary end/p' "$log" > "/tmp/garden-$label.config"
+	[ -s "/tmp/garden-$label.config" ] || grep '^CONFIG' "$log" > "/tmp/garden-$label.config"
+}
 if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	f0=$((base + ${window%-*})) f1=$((base + ${window#*-}))
 	end=$((SECONDS + ${window#*-} / 5 + 30)) # even at 5 FPS
@@ -191,10 +198,7 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	extra=$(python3 -I "$(dirname "$0")/metrics.py" "$log" "$start" "$f0" "$f1" "/tmp/garden-$label.json" \
 		label="$label" window="$window" route="$route" install="$install" flags="$*" env="${kenv% }" \
 		time="$(date -Iseconds)" exe="$exe" build_mode="${mode:-plain}" profile="$profile" level="$level")
-	# The emulator's effective configuration (its "CONFIG summary" block: build mode, switches set,
-	# features and fallbacks) goes with the run: /tmp/garden-<label>.config and the JSON's "config".
-	sed -n '/^CONFIG summary begin/,/^CONFIG summary end/p' "$log" > "/tmp/garden-$label.config"
-	[ -s "/tmp/garden-$label.config" ] || grep '^CONFIG' "$log" > "/tmp/garden-$label.config"
+	save_config
 	if [ -s "/tmp/garden-$label.config" ] && [ -f "/tmp/garden-$label.json" ]; then
 		python3 -I -c 'import json,sys; p,c=sys.argv[1],sys.argv[2]; d=json.load(open(p)); d["config"]=open(c).read().splitlines(); json.dump(d,open(p,"w"),indent=1,sort_keys=True)' \
 			"/tmp/garden-$label.json" "/tmp/garden-$label.config"
@@ -218,6 +222,7 @@ else
 	to=$(wc -l < "$log")
 	sed -n "${from},${to}p" "$log" | grep '^PERF' | fields |
 		awk -v l="$label" -v fw="" -v note=" time window" "$summary"
+	save_config
 fi
 grep -E '^AMD CPU compatibility' "$log" | head -3
 if [ -n "$GARDEN_SHOT" ]; then
