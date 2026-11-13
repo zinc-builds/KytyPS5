@@ -130,7 +130,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache),
+      m_buffer_cache(buffer_cache), m_image_recycler(graphics),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -228,7 +228,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, &m_image_recycler);
 	Common::FrameDiag::Add(Common::FrameDiag::Counter::TextureCreates);
 	RegisterImage(id);
 	return id;

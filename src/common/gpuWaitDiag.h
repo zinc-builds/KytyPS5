@@ -83,11 +83,33 @@ enum class Driver : uint8_t {
 	BufferCreate,   // Buffer (vmaCreateBuffer)
 	BufferCreateDedicated,
 	BufferDelete,
+	ImageRecycled,  // TextureCache image taken from the recycler instead of created
+	ImageRetire,    // an image's Vulkan objects handed to the recycler or destroy thread
+	ImageViewCreate,
+	ImageFormatQuery,
 	Count
 };
 [[nodiscard]] bool DriverStats() noexcept;
 void NoteDriver(Driver kind, uint64_t ns) noexcept;
 void NoteDirectRecord(const std::source_location& site, uint64_t drain_ns) noexcept;
+// Host upload paths (KYTY_DRIVER_STATS; =touch also touches each destination page before the
+// copy so first-touch faults are timed apart from the copy). UPLOAD lines once per second.
+enum class UploadPath : uint8_t { RingFirstLap, Ring, Async, Temporary, Count };
+struct UploadSample {
+	uint64_t bytes      = 0;
+	uint64_t alloc_ns   = 0; // temporary buffer creation
+	uint64_t touch_ns   = 0; // =touch only
+	uint64_t copy_ns    = 0; // the write itself (includes first-touch faults unless =touch)
+	uint64_t flush_ns   = 0;
+	uint64_t touch_flt  = 0; // minor faults during the touch
+	uint64_t copy_flt   = 0; // minor faults during the write
+};
+[[nodiscard]] bool UploadTouch() noexcept;
+[[nodiscard]] uint64_t ThreadMinorFaults() noexcept;
+void NoteUpload(UploadPath path, const UploadSample& sample) noexcept;
+void NoteUploadDestroy(uint64_t ns) noexcept; // a temporary upload buffer's destruction
+// Image recycler state, sampled at report time.
+void NoteRecyclerState(uint64_t entries, uint64_t bytes, uint64_t evicted, uint64_t destroy_queue) noexcept;
 // Times its scope on the command thread when KYTY_DRIVER_STATS is on.
 class DriverScope final {
 public:

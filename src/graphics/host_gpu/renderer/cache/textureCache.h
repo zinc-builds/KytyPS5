@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageRecycler.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
@@ -243,6 +244,8 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	// Before m_slot_images: images retire into it when the slots are destroyed.
+	ImageRecycler                                     m_image_recycler;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	RegisteredPageCounts                              m_registered_pages;

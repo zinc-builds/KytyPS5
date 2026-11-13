@@ -19,6 +19,7 @@ namespace Libs::Graphics {
 
 class Buffer;
 class CommandScheduler;
+class ImageRecycler;
 class TileManager;
 struct ImageTestAccess;
 
@@ -46,7 +47,8 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      ImageRecycler* recycler = nullptr);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -252,6 +254,7 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
+	ImageRecycler*    m_recycler        = nullptr;
 	uint64_t          m_maybe_cpu_hash  = 0;
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;

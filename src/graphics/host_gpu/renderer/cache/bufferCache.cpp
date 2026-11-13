@@ -296,23 +296,79 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
 
+// KYTY_DRIVER_STATS: times a host upload's write into `mapped` (and, with =touch, a first pass
+// that touches each page) with the thread's minor faults.
+void TimedUploadWrite(Common::GpuWaitDiag::UploadSample& sample, uint8_t* mapped, uint64_t size,
+                      const auto& write) {
+	namespace Diag = Common::GpuWaitDiag;
+	sample.bytes = size;
+	if (Diag::UploadTouch()) {
+		const auto flt   = Diag::ThreadMinorFaults();
+		const auto start = Diag::NowNs();
+		auto*      bytes = reinterpret_cast<volatile uint8_t*>(mapped);
+		for (uint64_t at = 0; at < size; at += 4096 - ((reinterpret_cast<uintptr_t>(mapped) + at) & 4095u)) {
+			bytes[at] = bytes[at];
+		}
+		sample.touch_ns  = Diag::NowNs() - start;
+		sample.touch_flt = Diag::ThreadMinorFaults() - flt;
+	}
+	const auto flt   = Diag::ThreadMinorFaults();
+	const auto start = Diag::NowNs();
+	write();
+	sample.copy_ns  = Diag::NowNs() - start;
+	sample.copy_flt = Diag::ThreadMinorFaults() - flt;
+}
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
+	namespace Diag  = Common::GpuWaitDiag;
+	const bool diag = Diag::DriverStats();
+	const auto first_lap      = staging.Laps() == 0;
 	const auto [mapped, offset] = staging.Map(size, alignment);
 	if (mapped != nullptr) {
-		write(mapped, offset);
+		if (!diag) {
+			write(mapped, offset);
+			staging.Commit();
+			return {&staging, offset};
+		}
+		Diag::UploadSample sample;
+		TimedUploadWrite(sample, mapped, size, [&] { write(mapped, offset); });
+		const auto start = Diag::NowNs();
 		staging.Commit();
+		sample.flush_ns = Diag::NowNs() - start;
+		Diag::NoteUpload(first_lap && staging.Laps() == 0 ? Diag::UploadPath::RingFirstLap
+		                                                  : Diag::UploadPath::Ring,
+		                 sample);
 		return {&staging, offset};
 	}
 
 	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
-	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
-	                                         usage, size);
-	write(temporary->Mapped().data(), 0);
+	Diag::UploadSample sample;
+	auto               start     = diag ? Diag::NowNs() : 0;
+	auto               temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
+	                                                        usage, size);
+	if (diag) {
+		sample.alloc_ns = Diag::NowNs() - start;
+		TimedUploadWrite(sample, temporary->Mapped().data(), size,
+		                 [&] { write(temporary->Mapped().data(), 0); });
+		start = Diag::NowNs();
+	} else {
+		write(temporary->Mapped().data(), 0);
+	}
 	temporary->Flush(0, size);
+	if (diag) {
+		sample.flush_ns = Diag::NowNs() - start;
+		Diag::NoteUpload(Diag::UploadPath::Temporary, sample);
+	}
 	auto* buffer = temporary.get();
-	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	scheduler.DeferOperation([owner = std::move(temporary), diag]() mutable {
+		const auto start = diag ? Diag::NowNs() : 0;
+		owner.reset();
+		if (diag) {
+			Diag::NoteUploadDestroy(Diag::NowNs() - start);
+		}
+	});
 	return {buffer, 0};
 }
 
@@ -1149,7 +1205,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	m_last_upload_async    = false;
 	if (m_async_uploader.Enabled() && total_size >= m_async_uploader.MinSize()) {
 		std::tie(source, base_offset) = m_async_uploader.Upload(total_size, [&](uint8_t* mapped) {
-			write(mapped);
+			if (Common::GpuWaitDiag::DriverStats()) {
+				Common::GpuWaitDiag::UploadSample sample;
+				TimedUploadWrite(sample, mapped, total_size, [&] { write(mapped); });
+				Common::GpuWaitDiag::NoteUpload(Common::GpuWaitDiag::UploadPath::Async, sample);
+			} else {
+				write(mapped);
+			}
 			if (AsyncUploadVerifyEnabled()) {
 				m_async_verify_bytes.assign(mapped, mapped + total_size);
 			}
