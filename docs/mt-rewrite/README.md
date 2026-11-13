@@ -96,10 +96,11 @@ feature's state as `CONFIG summary begin` … `end` (the bench saves that block 
 `/tmp/garden-<label>.config` and in the run's JSON):
 
 - `CONFIG build` — the build mode and PGO profile hash (`plain`, `lto=thin pgo=use profile=…`).
-- `CONFIG switch KYTY_X=v (kind, default d, now on|off)` — every `KYTY_*` variable set, with its
-  kind and default from `SWITCHES.md`; `CONFIG warning:` for a name this build does not read (a
-  typo), a verify mode whose feature is turned off, pins ignored under `KYTY_NO_PIN`, and
-  `KYTY_STALL_DIAG` during a bench run.
+- `CONFIG switch KYTY_X=v (kind, default d)` — every `KYTY_*` variable set, as given, with its kind
+  and default from `SWITCHES.md` (each switch parses its value its own way; what it did is in the
+  `CONFIG feature` lines); `CONFIG warning:` for a name this build does not read (a typo), a verify
+  mode whose feature is turned off, layout settings ignored under `KYTY_NO_PIN` (a `CONFIG note:`
+  for explicit thread pins it still applies), and `KYTY_STALL_DIAG` during a bench run.
 - `CONFIG feature …` — what was chosen and what fell back, and why: `amd-cpu` (mode, the CPUID bits
   missing, per-module found/native/trapped/skipped), `write tracking` (asynchronous userfaultfd or
   the mprotect fallback), `core placement` and `core <thread>` (the CPUs of the GPU command thread,
