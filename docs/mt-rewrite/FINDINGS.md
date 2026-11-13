@@ -2238,8 +2238,8 @@ run the game or the neighbours, and can the emulator tolerate ordinary backgroun
 | the same × heavy | 1 | 51.9 | 18.39 | 0.26 | 1.48 / 0.21 | 0.50 | 15.6% |
 | core-scheduling cookie (`PR_SCHED_CORE`) × heavy | 1 | 33.6 | 22.50 | 5.15 | 9.22 / 1.53 | 0.06 | 66% |
 
-**Light load.** The single light-load run showed no measurable difference: every column is
-inside the quiet runs' spread.
+**Light load.** The single light-load run showed no observed degradation: the prepare wait was
+below the quiet-run range, and the other metrics were within it.
 
 **Heavy load.** The dominant measured cost is increased command-thread CPU time, consistent with
 SMT contention.
