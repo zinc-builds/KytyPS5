@@ -35,6 +35,11 @@ else
 	[[ "$name" =~ ^[0-9a-f]{40}-[A-Za-z0-9._-]+$ ]] || { echo "pgo-train: bad KYTY_PGO_SET" >&2; exit 1; }
 fi
 out=$dir/$name.profdata
+# A named set reused with other levels would silently return the old profile.
+if [ -f "$out.levels" ] && [ "$(cat "$out.levels")" != "$levels" ]; then
+	echo "pgo-train: $name was trained on \"$(cat "$out.levels")\", not \"$levels\"; pick another KYTY_PGO_SET" >&2
+	exit 1
+fi
 mkdir -p "$dir"
 log() { echo "pgo-train: $*" >&2; }
 

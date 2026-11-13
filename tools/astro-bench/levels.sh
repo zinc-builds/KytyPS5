@@ -10,7 +10,8 @@
 #   -e "K=V ..." extra env for every run (e.g. KYTY_INSTALL=<pgo install> KYTY_FRAME_DIAG=1)
 #   -t TAG      label prefix (default lv): runs are <TAG>-<mode>-<level>
 #   -l FILE     read the levels from FILE (one per line, # comments) as well
-#   -F "FLAGS"  emulator flags (default --amd-cpu; "" for the default --amd-cpu auto mode)
+#   -F "FLAGS"  emulator flags (default --amd-cpu; "" for the default --amd-cpu auto mode); plain
+#               words, no quotes (batch.sh splits lines on whitespace)
 # A level that does not reach "StartLevel <name>" within GARDEN_BOOT_TIMEOUT (default here 150 s)
 # is reported as not booting. A run that dies is reported with the cause garden.sh printed and the
 # last log lines; a verifier's exit shows up there as its EXIT message.
@@ -30,7 +31,7 @@ while [ $# -gt 0 ]; do
 	-s) shot=$2; shift ;;
 	-e) extra=$2; shift ;;
 	-t) tag=$2; shift ;;
-	-F) flags=$2; shift ;;
+	-F) flags=$2; [[ "$flags" == *[\"\']* ]] && { echo "levels.sh: -F takes plain words (no quotes)" >&2; exit 1; }; shift ;;
 	-l) while read -r l _ || [ -n "$l" ]; do [[ -n "$l" && "$l" != \#* ]] && levels+=("$l"); done < "$2"; shift ;;
 	-*) echo "levels.sh: unknown option $1" >&2; exit 1 ;;
 	*) levels+=("$1") ;;

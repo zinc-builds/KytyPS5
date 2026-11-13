@@ -30,7 +30,10 @@ inst=$bdir/install
 #                    the first run of a level).
 #   --present-mode Mailbox --vblank-frequency 60
 #                    what the numbers are measured with (Mailbox is also the default).
-FAST_FLAGS=(--amd-cpu --shader-cache --present-mode Mailbox --vblank-frequency 60)
+# The patcher mode, in one place: --amd-cpu (what every number of record uses), or "" for the
+# default auto (no VRSQRTPS rewrite, no traps; a behaviour check decides whether to move to it).
+FAST_AMD_CPU=--amd-cpu
+FAST_FLAGS=($FAST_AMD_CPU --shader-cache --present-mode Mailbox --vblank-frequency 60)
 
 cmd=${1:-}
 shift || true
@@ -56,7 +59,7 @@ build)
 	# systems; both binaries are installed by then.
 	cmake --install "$bdir" --prefix "$inst" >/dev/null || true
 	[ -x "$inst/kyty_emulator" ] || { echo "fast.sh: install failed ($inst)" >&2; exit 1; }
-	echo "fast.sh: installed $inst (run: tools/fast.sh run <game>; or $inst/launcher)" >&2
+	echo "fast.sh: installed $inst (run: tools/fast.sh run <game>; or $inst/kyty_launcher)" >&2
 	;;
 run)
 	game=${1:-}

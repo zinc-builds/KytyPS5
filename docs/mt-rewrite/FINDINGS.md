@@ -1815,6 +1815,28 @@ in the PR); all four verify modes
 `KYTY_WORKER_PIPELINE_KEY_VERIFY`) ran clean together to frame 1600 (11.8M reused stages, 22M
 target and 8M pipeline-key checks); the level renders the same as a plain build.
 
+### `--amd-cpu` modes and the trap cost (Track P, 2026-11-13)
+
+One PGO + ThinLTO binary (dev 2a926892 + the auto mode), frames 200–500, 2 runs each:
+
+| Mode | SIGILL/s | cmd ns/draw | FPS | eboot load |
+|---|---|---|---|---|
+| `--amd-cpu` (rewrites EXTRQ and VRSQRTPS; 1,088 VRSQRTPS sites trap) | 266k / 268k | 3011 / 2884 | 54.6 / 55.2 | 6.0 s |
+| auto (rewrites EXTRQ only) | 0 / 0 | 2877 / 2932 | 57.4 / 56.0 | 6.3 s |
+| `--no-amd-cpu` (EXTRQ traps) | 1.34M / 1.35M | 2791 / 2837 | 7.5 / 7.6 | 0.3 s |
+
+EXTRQ: native=97 in both auto and on. The command thread's cost per draw does not change, so the
+VRSQRTPS traps cost about 3% FPS on the game's side (low n). Auto changes float results (host
+VRSQRTPS precision) and draws per frame against the numbers of record, so the bench and
+`tools/fast.sh` keep `--amd-cpu` until a behaviour check (Track S) says otherwise.
+
+PGO training on several levels was ruled out the same day: on Sky Garden, profiles trained on Sky
+Garden, Pirate Island, or the three heavy levels merged were within ±2% per draw; on Pirate Island
+the merged profile was no better than the Sky Garden one (cycles/draw +3.7%, 2 runs each, within
+layout noise). The heavy levels' extra per-draw cost is an occlusion-query burst (Track B), not
+code the profile marks cold. `pgo-train.sh` keeps single-level training (~2 min of lock against ~5
+for three levels); `KYTY_PGO_LEVELS` trains on a set when needed.
+
 ### Tooling notes
 
 - `perf record -e sched:sched_switch` records, but `perf script` fails here with "broken or

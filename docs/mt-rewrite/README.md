@@ -59,7 +59,7 @@ tools/fast.sh run ~/Games/PS5/PPSA21567.zar --fullscreen --frame-skip auto
   (~5 minutes; it runs the Sky Garden bench, so not while playing). A profile from an older commit
   still works: code changed since then is compiled without counts.
 - **Settings (`tools/fast.sh flags`):** `--amd-cpu --shader-cache --present-mode Mailbox
-  --vblank-frequency 60`. The launcher's `_Build/linux-fast/install/launcher` works too; tick
+  --vblank-frequency 60`. The launcher's `_Build/linux-fast/install/kyty_launcher` works too; tick
   "AMD CPU" in the game's configuration to match.
 - **`--amd-cpu`.** The game is built for the PS5's AMD CPU and uses AMD-only instructions: SSE4a
   `EXTRQ`/`INSERTQ` in hot loops, and sometimes `RDPID` and `CLWB`. A host without them (any

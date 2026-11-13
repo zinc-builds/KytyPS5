@@ -125,7 +125,7 @@ static bool ParseAmdCpuEnv(Config::AmdCpuMode& out) {
 		return true;
 	}
 	const std::string_view value(env);
-	if (value == "auto" || value.empty()) {
+	if (value == "auto") {
 		out = Config::AmdCpuMode::Auto;
 	} else if (value == "1" || value == "on" || value == "true") {
 		out = Config::AmdCpuMode::On;
