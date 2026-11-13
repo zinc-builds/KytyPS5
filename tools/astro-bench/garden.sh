@@ -121,30 +121,19 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	f0=$((base + ${window%-*})) f1=$((base + ${window#*-}))
 	end=$((SECONDS + ${window#*-} / 5 + 30)) # even at 5 FPS
 	# Outside load (rule 7 of the bench procedure): over the window, idlemon.py samples the CPUs
-	# the core layout leaves idle: the SMT siblings of the GPU command thread's and the prepare
-	# workers' cores, plus KYTY_RESERVE_CPUS, minus every CPU the run itself may use (the "Hybrid
-	# CPU:" line, KYTY_RECORDER_CPU, KYTY_DECODE_CPU, and the affinity of every emulator thread,
-	# so KYTY_FREE_PREPARE_SIBLINGS=0 or KYTY_PREPARE_OVERFLOW=0 does not watch the game's own
-	# CPUs). The monitor runs on the emulator's own CPUs, never on the ones it watches. No hybrid
-	# layout, no monitor.
-	mon_cpus= mon_out=/tmp/garden-$label.idle
+	# the core layout leaves idle (idlecpus.sh: the SMT siblings of the GPU command thread's and
+	# the prepare workers' cores, plus KYTY_RESERVE_CPUS, minus every CPU the run itself may use).
+	# The monitor runs on the emulator's own CPUs, never on the ones it watches. A hybrid layout
+	# with nothing to watch says so on the summary line ("unchecked", with the reason); gate.sh
+	# fails such runs. No hybrid layout, no monitor (and no idle_busy field).
+	mon_cpus= mon_why= mon_out=/tmp/garden-$label.idle
 	rm -f "$mon_out"
 	hy=$(grep -m1 '^Hybrid CPU: emulator on' "$log")
 	if [ -n "$hy" ]; then
-		gpu=$(sed -n 's/.*GPU command thread on CPU \([0-9]*\).*/\1/p' <<<"$hy")
-		prep=$(sed -n 's/.*draw prepare workers on CPUs \([0-9,]*\).*/\1/p' <<<"$hy" | tr ',' ' ')
-		over=$(sed -n 's/.*overflow worker on CPU \(-\?[0-9]*\).*/\1/p' <<<"$hy")
 		emu_pid=$(pgrep -P "$run_pid" -x kyty_emulator | head -1)
-		used=" $gpu $prep $over ${KYTY_RECORDER_CPU:-} ${KYTY_DECODE_CPU:-} "
-		# Every CPU in any emulator thread's affinity list ("0-5,8,10-11").
-		for part in $(sed -n 's/^Cpus_allowed_list:\s*//p' /proc/"$emu_pid"/task/*/status 2>/dev/null | tr ',' ' '); do
-			[[ "$part" == *-* ]] && used+="$(seq -s ' ' "${part%-*}" "${part#*-}") " || used+="$part "
-		done
-		cand=$(echo "${KYTY_RESERVE_CPUS//,/ }"; for c in $gpu $prep; do
-			tr ',' '\n' < "/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list" 2>/dev/null; done)
-		for c in $cand; do
-			[[ "$c" =~ ^[0-9]+$ ]] && [[ "$used" != *" $c "* ]] && [[ ",$mon_cpus," != *",$c,"* ]] && mon_cpus+=${mon_cpus:+,}$c
-		done
+		mon_cpus=$(bash "$(dirname "$0")/idlecpus.sh" "$hy" "$emu_pid" 2>"$mon_out.why")
+		mon_why=$(tr '\n' ';' < "$mon_out.why" 2>/dev/null | sed 's/;$//')
+		rm -f "$mon_out.why"
 		# The emulator's own CPUs (its process mask) for the monitor itself.
 		mon_on=$(taskset -pc "$emu_pid" 2>/dev/null | sed -n 's/.*: //p')
 	fi
@@ -172,7 +161,9 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	fw=$(grep -m1 '^FRAMEFPS' "/tmp/garden-$label.window" | cut -d' ' -f2)
 	idle_note= void= suspect=
 	# A hybrid layout that leaves no CPU to watch says so, rather than passing unchecked.
-	[ -n "$hy" ] && [ -z "$mon_cpus" ] && idle_note=" idle_busy=unchecked(no idle CPUs)"
+	if [ -n "$hy" ] && [ -z "$mon_cpus" ]; then
+		idle_note=" idle_busy=unchecked(no idle CPUs${mon_why:+: $mon_why})"
+	fi
 	if [ -n "$mon_pid" ]; then
 		kill "$mon_pid" 2>/dev/null; wait "$mon_pid" 2>/dev/null; mon_pid=
 		read -r imean imax < <(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["mean"], d["max5s"])' "$mon_out" 2>/dev/null)
@@ -191,7 +182,7 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	# fields appended to the summary line and as /tmp/garden-<label>.json.
 	rm -f "/tmp/garden-$label.json"
 	install=${KYTY_INSTALL:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/_Build/linux/install}
-	kenv=$(env | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' | sort | tr '\n' ' ')
+	kenv=$(env | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|BENCH_LOCK|BENCH_LOCK_TIMEOUT|BENCH_PRIO|BENCH_AGE|REQUIRE_CHECKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' | sort | tr '\n' ' ')
 	# Build identity: the binary's hash, and the build mode and profile that refbuild.sh/build.sh
 	# record next to the install (plain when there is no BUILD_MODE file).
 	exe=$(sha256sum "$install/kyty_emulator" 2>/dev/null | cut -c1-16)

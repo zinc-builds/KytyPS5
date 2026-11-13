@@ -28,6 +28,16 @@ import time
 from datetime import datetime
 
 STORE = os.environ.get("KYTY_RESULTS", os.path.expanduser("~/.cache/kyty-builds/results.jsonl"))
+# KYTY_REQUIRE_CHECKED=1 (gate.sh sets it): reuse only runs and hitch baselines whose outside-load
+# check ran (garden.sh's idle_busy with a mean; add-hitch's checked=1).
+REQUIRE_CHECKED = os.environ.get("KYTY_REQUIRE_CHECKED", "") not in ("", "0")
+
+
+def checked(r):
+    if r.get("kind") == "hitch":
+        return r.get("checked") == "1"
+    ib = r.get("idle_busy")
+    return isinstance(ib, dict) and ib.get("mean") is not None
 
 # name, path in "metrics", format, per-run noise floor (sd %) for the (long, short) window, the
 # drift (sd %) between batches, added when the reference comes from another batch (None: the
@@ -156,6 +166,8 @@ def references(sha, window=None, env=None, flags=None, max_age=None, exe=None, m
             continue
         if max_age is not None and age_hours(r) > max_age:
             continue
+        if REQUIRE_CHECKED and not checked(r):
+            continue
         out.append(r)
     return out
 
@@ -227,7 +239,8 @@ def hitch_base(shas, mode=None, profile=None, flags=None, frames=None, shot_fram
                 and (profile is None or r.get("profile", "") == profile)
                 and (flags is None or r.get("flags", "") == flags)
                 and (frames is None or r.get("frames", "") == frames)
-                and (shot_frame is None or r.get("shot_frame", "") == shot_frame)]
+                and (shot_frame is None or r.get("shot_frame", "") == shot_frame)
+                and (not REQUIRE_CHECKED or checked(r))]
         if hits:
             return max(hits, key=lambda r: r.get("time", ""))
     return None
