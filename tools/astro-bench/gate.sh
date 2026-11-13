@@ -30,6 +30,10 @@
 #   --new-install D, and ab.sh's --ref, --ref-install, --env, --ref-env, --new-env, --flags (the
 #   emulator flags of every run, default --amd-cpu).
 #
+# It can run inside an exclusive hold of your own (benchlock.sh run <script> with the gate and
+# other runs, e.g. levels.sh), as long as the reference build exists: refbuild.sh <merge-base>
+# first, in the same KYTY_BUILD_MODE.
+#
 # gate.sh --baseline [<commit>] (default origin/dev): what the gate reads instead of re-running
 #   dev. For one dev commit, in the build mode KYTY_BUILD_MODE/KYTY_PGO_PROFILE select (as
 #   refbuild.sh): 2 per-draw runs (frames 200-500, into the result store) and one hitch run with
@@ -86,7 +90,7 @@ if [ "$1" = --baseline ]; then
 fi
 
 label=$1
-[[ -n "$label" && "$label" != -* ]] || { sed -n '2,36p' "$0" >&2; exit 2; }
+[[ -n "$label" && "$label" != -* ]] || { sed -n '2,40p' "$0" >&2; exit 2; }
 shift
 flags=--amd-cpu n=3 verify=1 hitch=1 accept_cost= verify_env= new_install= new_env= env= pass=() class= why= switch= diag_env= ref=
 while [ $# -gt 0 ]; do
