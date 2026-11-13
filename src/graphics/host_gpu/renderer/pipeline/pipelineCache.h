@@ -239,6 +239,11 @@ public:
 	void Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
 	// Whether the store is open.
 	explicit operator bool() const { return !m_file.IsInvalid(); }
+	// Takes the store's writer lock (<path>.lock, held until destruction): one emulator appends
+	// to a store at a time. False when another process holds it, or on failure; such a store is
+	// still read, just not written. Call before reading the store, so no other writer can append
+	// between the read and Open.
+	bool Lock(const std::filesystem::path& path);
 	// Compresses `record` and appends it on the store thread, in call order.
 	void Append(std::vector<uint8_t>&& record);
 	void Post(Common::UniqueFunction<void>&& job);
@@ -248,6 +253,15 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
+	struct WriterLock {
+		WriterLock() = default;
+		WriterLock(const WriterLock&)            = delete;
+		WriterLock& operator=(const WriterLock&) = delete;
+		~WriterLock();
+		int fd = -1;
+	};
+
+	WriterLock                               m_lock;
 	Common::File                             m_file;
 	std::mutex                               m_mutex;
 	std::condition_variable_any              m_ready;
@@ -446,7 +460,9 @@ private:
 	void WriteDriverCache() const;
 
 	// pipelineSerialization.cpp
-	void WarmUp(const std::filesystem::path& path);
+	// Loads the store at `path`; when it does not exist yet, first adopts the first of `adopt`
+	// whose header matches (a store an install kept in its own directory).
+	void WarmUp(const std::filesystem::path& path, std::span<const std::filesystem::path> adopt = {});
 	bool LoadRecord(std::span<const uint8_t>& records);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);
@@ -459,11 +475,32 @@ private:
 	                            const ModuleMap& modules);
 };
 
-// The shader store of the running title; empty unless --shader-cache is on in a Release build
-// without debug dumps, which change the SPIR-V.
+// Where the shader stores and the driver's pipeline cache live, shared by every build and install:
+// KYTY_SHADER_STORE_DIR if set, else the user's cache directory (Linux: $XDG_CACHE_HOME or
+// ~/.cache, then kyty-shaders; macOS: ~/Library/Caches/kyty-shaders; Windows:
+// %LOCALAPPDATA%\kyty-shaders), else the install's own _PipelineCache.
+std::filesystem::path ShaderStoreDir();
+// The install-local directory stores lived in before ShaderStoreDir, adopted from on first use.
+inline const std::filesystem::path& InstallStoreDir() {
+	static const std::filesystem::path dir("_PipelineCache");
+	return dir;
+}
+// The shader store of the running title (<dir>/<title>.shaders, before KeyedStorePath); empty
+// unless --shader-cache is on in a Release build without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();
-// `base` with a suffix for the device and code-changing switches: one store per combination.
-std::filesystem::path VariantStorePath(const GraphicContext& graphics, const std::filesystem::path& base);
+// `base` with a suffix for everything the store's header holds (the codegen source hash, the
+// device and the code-changing switches): <stem>.<16 hex digits><ext>. Builds and switch
+// combinations that would record different modules use different files, so none truncates
+// another's, and a rebuild that keeps the header finds its store warm.
+std::filesystem::path KeyedStorePath(const GraphicContext& graphics, const std::filesystem::path& base);
+// Copies the first of `candidates` whose first bytes equal `header` to `store` (through a temporary
+// file and a rename), unless `store` exists. Returns the adopted path, or empty.
+std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<const uint8_t> header,
+                                 std::span<const std::filesystem::path> candidates);
+// Removes stores of the same title (<title>.*<ext> beside `current`) not written for `max_age`,
+// and all but the `keep` most recently written, never `current` nor a store whose writer lock
+// another process holds. Returns how many it removed.
+size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chrono::hours max_age);
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 

@@ -50301,6 +50301,21 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   Require(name, "truncated record",
           run() == lost_pipeline && std::filesystem::file_size(store) == size,
           "a cut record was not dropped and appended again, or took earlier records along");
+#if !defined(_WIN32)
+  // While another emulator holds the store's writer lock, a run reads the store but neither
+  // truncates nor appends to it; once the lock is free, the next run appends again.
+  {
+    ShaderStoreWriter other;
+    const bool locked = other.Lock(store);
+    std::filesystem::resize_file(store, size - 3);
+    Require(name, "locked store",
+            locked && run() == lost_pipeline && std::filesystem::file_size(store) == size - 3,
+            "a store whose writer lock another emulator holds was truncated or appended to");
+  }
+  Require(name, "lock released",
+          run() == lost_pipeline && std::filesystem::file_size(store) == size,
+          "a store whose writer lock was released was not written again");
+#endif
   // Flips the top checksum byte, just before the last zstd frame's magic 0xfd2fb528.
   std::vector<uint8_t> bytes(size);
   Common::File(store, Common::File::Mode::Read).Read(bytes.data(), static_cast<u32>(size));
@@ -50372,6 +50387,95 @@ void CheckShaderStore(VulkanHarness &vulkan) {
           LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
               LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
           "output memory release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The shared store directory: KYTY_SHADER_STORE_DIR, adopting an install's own store whose
+// header matches, and pruning the stores of other builds.
+void CheckShaderStoreFiles() {
+  constexpr const char *name = "ShaderStoreFiles";
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_shader_store_files_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  std::filesystem::create_directories(dir / "install");
+  const auto write = [](const std::filesystem::path &path, std::vector<uint8_t> bytes) {
+    Common::File file;
+    file.Create(path);
+    file.Write(bytes.data(), static_cast<u32>(bytes.size()));
+  };
+  const auto read = [](const std::filesystem::path &path) {
+    std::vector<uint8_t> bytes(std::filesystem::file_size(path));
+    Common::File(path, Common::File::Mode::Read).Read(bytes.data(), static_cast<u32>(bytes.size()));
+    return bytes;
+  };
+#if !defined(_WIN32)
+  {
+    const char *saved = std::getenv("KYTY_SHADER_STORE_DIR");
+    const std::string previous = saved != nullptr ? saved : "";
+    setenv("KYTY_SHADER_STORE_DIR", dir.c_str(), 1);
+    const bool chosen = ShaderStoreDir() == dir;
+    setenv("KYTY_SHADER_STORE_DIR", "", 1);
+    const bool fallback = !ShaderStoreDir().empty() && ShaderStoreDir() != dir;
+    if (saved != nullptr) setenv("KYTY_SHADER_STORE_DIR", previous.c_str(), 1);
+    else unsetenv("KYTY_SHADER_STORE_DIR");
+    Require(name, "directory", chosen && fallback,
+            "KYTY_SHADER_STORE_DIR was not used, or an empty one was");
+  }
+#endif
+  const std::vector<uint8_t> header{1, 2, 3, 4};
+  const auto stale = dir / "install" / "TEST00000.shaders";
+  const auto local = dir / "install" / "TEST00000.00000000000000aa.shaders";
+  const auto store = dir / "TEST00000.00000000000000aa.shaders";
+  write(stale, {1, 2, 3, 5, 9});
+  write(local, {1, 2, 3, 4, 7, 7});
+  const std::array<std::filesystem::path, 3> candidates{dir / "install" / "missing.shaders", stale, local};
+  Require(name, "adopt",
+          AdoptStore(store, header, candidates) == local && read(store) == read(local),
+          "the install's matching store was not adopted, or a stale one was");
+  write(local, {1, 2, 3, 4, 8});
+  Require(name, "adopt once",
+          AdoptStore(store, header, candidates).empty() && read(store) == std::vector<uint8_t>{1, 2, 3, 4, 7, 7},
+          "an existing shared store was replaced by an install's");
+  const auto none = dir / "TEST00000.00000000000000bb.shaders";
+  const std::array<std::filesystem::path, 1> stale_only{stale};
+  Require(name, "no match", AdoptStore(none, header, stale_only).empty() && !std::filesystem::exists(none),
+          "a store with another header was adopted");
+
+  // Prune: `store` is current; five others of the title, newest first; another title and the
+  // title's driver cache stay.
+  const auto now = std::filesystem::file_time_type::clock::now();
+  std::vector<std::filesystem::path> others;
+  for (int i = 0; i < 5; i++) {
+    others.push_back(dir / fmt::format("TEST00000.{:016x}.shaders", 0x100 + i));
+    write(others.back(), header);
+    std::filesystem::last_write_time(others.back(), now - std::chrono::hours(1 + i));
+  }
+  // The second newest is old enough to go regardless of the count.
+  std::filesystem::last_write_time(others[1], now - std::chrono::hours(24 * 40));
+  const auto foreign = dir / "OTHER0000.0000000000000001.shaders";
+  const auto driver = dir / "TEST00000.0000000000000001.bin";
+  write(foreign, header);
+  write(driver, header);
+  std::filesystem::last_write_time(foreign, now - std::chrono::hours(24 * 400));
+  std::filesystem::last_write_time(driver, now - std::chrono::hours(24 * 400));
+#if !defined(_WIN32)
+  ShaderStoreWriter in_use;
+  const bool locked = in_use.Lock(others[4]); // the oldest, but another emulator writes it
+#else
+  const bool locked = true;
+#endif
+  const auto removed = PruneStores(store, 3, std::chrono::hours(24 * 30));
+  const auto exists = [](const auto &path) { return std::filesystem::exists(path); };
+  Require(name, "prune",
+          locked && exists(store) && exists(others[0]) && !exists(others[1]) && exists(others[2]) &&
+              !exists(others[3]) && exists(foreign) && exists(driver) &&
+#if !defined(_WIN32)
+              exists(others[4]) && removed == 2,
+#else
+              !exists(others[4]) && removed == 3,
+#endif
+          "PruneStores kept the wrong stores");
+  std::filesystem::remove_all(dir);
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -56651,6 +56755,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckShaderStore(vulkan);
     CheckShaderStoreCalls(vulkan);
+    CheckShaderStoreFiles();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
@@ -57949,6 +58054,7 @@ int main(int argc, char **argv) {
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
   CheckShaderStoreCalls(vulkan);
+  CheckShaderStoreFiles();
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();

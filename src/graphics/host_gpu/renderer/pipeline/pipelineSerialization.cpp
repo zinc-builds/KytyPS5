@@ -14,6 +14,11 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
 #include <algorithm>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -73,22 +78,10 @@ uint64_t ManualStamp() {
 //    memory limit, the host subgroup sizes, the buffer cache's page table geometry and the DMA
 //    address translation constants, masked selects
 //    and KYTY_BDA_STATS=access (instrumented DMA shaders).
-// The part of the header a player can change without rebuilding: the device and the switches
-// that change generated code. Each combination gets its own store file (VariantStorePath), so
-// turning KYTY_RESIDENT_TEXTURES (in the SPIR-V profile) or another switch on and off keeps a
-// warm store for each instead of discarding one store every time.
-std::vector<uint8_t> VariantKey(const GraphicContext& graphics) {
-	Writer         key;
-	const auto&    properties     = graphics.GetPhysicalDeviceProperties();
-	const uint32_t bda_access     = MemDiag::BdaStatsMode() == 2 ? 1u : 0u;
-	const uint32_t masked_selects = ShaderRecompiler::MaskedSelectsEnabled() ? 1u : 0u;
-	const uint32_t wave64         = graphics.SupportsComputeWave64() ? 1u : 0u;
-	IoAll(key, properties.vendorID, properties.deviceID, SpirvProfile(graphics),
-	      properties.limits.maxComputeSharedMemorySize, graphics.subgroup_size, wave64,
-	      masked_selects, bda_access);
-	return std::move(key.bytes);
-}
-
+// The store's file name carries a hash of all of it (KeyedStorePath), so every build and switch
+// combination that would record different modules has its own file in the shared directory:
+// turning KYTY_RESIDENT_TEXTURES on and off, or alternating two builds, keeps a warm store for
+// each instead of one truncating the other's.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	Writer      header;
 	const auto& properties = graphics.GetPhysicalDeviceProperties();
@@ -126,13 +119,161 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 
 } // namespace
 
-std::filesystem::path VariantStorePath(const GraphicContext& graphics,
-                                       const std::filesystem::path& base) {
-	const auto key = VariantKey(graphics);
-	auto       name = base.stem();
-	name += fmt::format(".{:016x}", XXH3_64bits(key.data(), key.size()));
+std::filesystem::path ShaderStoreDir() {
+	const auto env = [](const char* name) -> const char* {
+		const char* value = std::getenv(name);
+		return value != nullptr && value[0] != '\0' ? value : nullptr;
+	};
+	if (const char* dir = env("KYTY_SHADER_STORE_DIR")) {
+		return dir;
+	}
+#if defined(_WIN32)
+	if (const char* local = env("LOCALAPPDATA")) {
+		return std::filesystem::path(local) / "kyty-shaders";
+	}
+#elif defined(__APPLE__)
+	if (const char* home = env("HOME")) {
+		return std::filesystem::path(home) / "Library" / "Caches" / "kyty-shaders";
+	}
+#else
+	if (const char* xdg = env("XDG_CACHE_HOME"); xdg != nullptr && xdg[0] == '/') {
+		return std::filesystem::path(xdg) / "kyty-shaders";
+	}
+	if (const char* home = env("HOME")) {
+		return std::filesystem::path(home) / ".cache" / "kyty-shaders";
+	}
+#endif
+	return InstallStoreDir();
+}
+
+std::filesystem::path KeyedStorePath(const GraphicContext& graphics, const std::filesystem::path& base) {
+	const auto header = StoreHeader(graphics);
+	auto       name   = base.stem();
+	name += fmt::format(".{:016x}", XXH3_64bits(header.data(), header.size()));
 	name += base.extension();
 	return base.parent_path() / name;
+}
+
+std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<const uint8_t> header,
+                                 std::span<const std::filesystem::path> candidates) {
+	std::error_code error;
+	if (std::filesystem::exists(store, error)) {
+		return {};
+	}
+	for (const auto& candidate: candidates) {
+		if (candidate.empty() || candidate == store) {
+			continue;
+		}
+		std::vector<uint8_t> head(header.size());
+		uint32_t             read = 0;
+		if (Common::File file;
+		    Common::File::IsFileExisting(candidate) && file.Open(candidate, Common::File::Mode::Read)) {
+			file.Read(head.data(), static_cast<uint32_t>(head.size()), &read);
+		}
+		if (read != header.size() || !std::ranges::equal(head, header)) {
+			continue;
+		}
+		// A temporary name unique to this process, then a rename: a store appears whole or not.
+		auto temp = store;
+		temp += fmt::format(".{:x}.adopt", std::chrono::steady_clock::now().time_since_epoch().count());
+		Common::File::CreateDirectories(store.parent_path());
+		std::filesystem::copy_file(candidate, temp, std::filesystem::copy_options::overwrite_existing,
+		                           error);
+		if (!error) {
+			std::filesystem::rename(temp, store, error);
+		}
+		if (error) {
+			std::filesystem::remove(temp, error);
+			continue;
+		}
+		return candidate;
+	}
+	return {};
+}
+
+namespace {
+#if !defined(_WIN32)
+// The writer lock of `store`, or -1 when another process holds it (or it cannot be made).
+int TryLockStore(const std::filesystem::path& store) {
+	auto lock_path = store;
+	lock_path += ".lock";
+	const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		return -1;
+	}
+	if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+		::close(fd);
+		return -1;
+	}
+	return fd;
+}
+#endif
+} // namespace
+
+size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chrono::hours max_age) {
+	const auto dir    = current.parent_path().empty() ? std::filesystem::path(".") : current.parent_path();
+	const auto name   = current.filename().string();
+	const auto prefix = name.substr(0, name.find('.') + 1); // "<title>."
+	const auto ext    = current.extension().string();
+	if (prefix.size() < 2 || ext.empty()) {
+		return 0;
+	}
+	std::error_code error;
+	std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> stores;
+	for (const auto& entry: std::filesystem::directory_iterator(dir, error)) {
+		const auto file = entry.path().filename().string();
+		if (entry.is_regular_file(error) && file.starts_with(prefix) && file.ends_with(ext) &&
+		    file != name) {
+			stores.emplace_back(entry.last_write_time(error), entry.path());
+		}
+	}
+	std::ranges::sort(stores, std::greater {});
+	const auto now     = std::filesystem::file_time_type::clock::now();
+	size_t     removed = 0;
+	// `current` counts against `keep`.
+	for (size_t i = 0; i < stores.size(); i++) {
+		const auto& [time, path] = stores[i];
+		if (i + 1 < keep && now - time < max_age) {
+			continue;
+		}
+		auto lock_path = path;
+		lock_path += ".lock";
+#if !defined(_WIN32)
+		const int fd = TryLockStore(path);
+		if (fd < 0) {
+			continue; // in use
+		}
+#endif
+		if (std::filesystem::remove(path, error)) {
+			removed++;
+		}
+		std::filesystem::remove(lock_path, error);
+#if !defined(_WIN32)
+		::close(fd);
+#endif
+	}
+	return removed;
+}
+
+ShaderStoreWriter::WriterLock::~WriterLock() {
+#if !defined(_WIN32)
+	if (fd >= 0) {
+		::close(fd);
+	}
+#endif
+}
+
+bool ShaderStoreWriter::Lock(const std::filesystem::path& path) {
+#if defined(_WIN32)
+	(void)path;
+	return true; // no lock: one emulator at a time is assumed
+#else
+	Common::File::CreateDirectories(path.parent_path());
+	if (m_lock.fd < 0) {
+		m_lock.fd = TryLockStore(path);
+	}
+	return m_lock.fd >= 0;
+#endif
 }
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
@@ -185,12 +326,26 @@ void ShaderStoreWriter::Post(Common::UniqueFunction<void>&& job) {
 	m_ready.notify_one();
 }
 
-void PipelineCache::WarmUp(const std::filesystem::path& path) {
+void PipelineCache::WarmUp(const std::filesystem::path& path,
+                           std::span<const std::filesystem::path> adopt) {
 	if (path.empty()) {
 		return;
 	}
 	const auto header = StoreHeader(m_graphics);
 	const auto           start = std::chrono::steady_clock::now();
+	// Before reading: no other emulator appends between the read and Open's truncation.
+	const bool writer = m_store.Lock(path);
+	if (writer) {
+		if (const auto adopted = AdoptStore(path, header, adopt); !adopted.empty()) {
+			Log::WriteToConsoleAndLog(fmt::format("Shader cache: adopted {} as {}\n",
+			                                      Common::PathToString(adopted),
+			                                      Common::PathToString(path)));
+		}
+	} else {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader cache: {} is in use by another emulator; reading it, not adding to it\n",
+		    Common::PathToString(path)));
+	}
 	std::vector<uint8_t> bytes;
 	if (Common::File file;
 	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
@@ -212,7 +367,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		}
 	}
 	// A damaged record ends the store; the records before it stay.
-	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
+	if (writer) {
+		m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
+	}
 
 	const auto modules = MapModules();
 	std::vector<Common::UniqueFunction<void>> jobs;

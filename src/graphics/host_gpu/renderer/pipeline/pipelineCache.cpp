@@ -53,6 +53,10 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
+// Stores (and driver caches) of one title kept in the shared directory: the most recently written
+// ones, from the builds and switch combinations in use; others go after a month unused.
+constexpr size_t kKeptStores  = 8;
+constexpr auto   kStoreMaxAge = std::chrono::hours {24 * 30};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -283,7 +287,7 @@ std::filesystem::path ShaderStorePath() {
 	if (title_id.empty()) {
 		return {};
 	}
-	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+	return ShaderStoreDir() / (title_id + ".shaders");
 }
 
 bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
@@ -598,10 +602,22 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	// The title's own store is split by device and switches; a path given explicitly (tests) is
-	// used as is.
+	// The title's own store is keyed by its header (KeyedStorePath) in the shared directory, and
+	// adopts a matching store an install kept locally; a path given explicitly (tests) is used as is.
 	const bool title_store = !shader_store.empty() && shader_store == ShaderStorePath();
-	WarmUp(title_store ? VariantStorePath(m_graphics, shader_store) : shader_store);
+	if (!title_store) {
+		WarmUp(shader_store);
+		return;
+	}
+	const auto store = KeyedStorePath(m_graphics, shader_store);
+	const auto local = InstallStoreDir() / shader_store.filename();
+	const std::array<std::filesystem::path, 2> adopt {KeyedStorePath(m_graphics, local), local};
+	WarmUp(store, adopt);
+	// Stores of other builds and switch combinations: the most recent few stay.
+	if (const auto removed = PruneStores(store, kKeptStores, kStoreMaxAge); removed != 0) {
+		PipelineCacheLog("Shader cache: removed {} unused stores beside {}", removed,
+		                 Common::PathToString(store));
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -632,7 +648,20 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	// In the shared directory, keyed by the driver signature it is validated against; adopts the
+	// install's own <title>.bin the first time.
+	const auto signature_key = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	m_driver_cache_path = ShaderStoreDir() / fmt::format("{}.{:016x}.bin", title_id,
+	                                                     XXH3_64bits(signature_key.data(), signature_key.size()));
+	if (const auto local = InstallStoreDir() / (title_id + ".bin"); local != m_driver_cache_path) {
+		const std::array<std::filesystem::path, 1> adopt {local};
+		const auto signature_bytes = std::span(reinterpret_cast<const uint8_t*>(signature_key.data()),
+		                                       signature_key.size());
+		if (const auto adopted = AdoptStore(m_driver_cache_path, signature_bytes, adopt); !adopted.empty()) {
+			PipelineCacheLog("Vulkan pipeline cache: adopted {}", Common::PathToString(adopted));
+		}
+	}
+	PruneStores(m_driver_cache_path, kKeptStores, kStoreMaxAge);
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -750,8 +779,9 @@ void PipelineCache::WriteDriverCache() const {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return;
 	}
+	// Unique per process: two emulators saving at once never write into one temporary file.
 	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
+	temp_path += fmt::format(".{:x}.tmp", std::chrono::steady_clock::now().time_since_epoch().count());
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;

@@ -2122,8 +2122,27 @@ target and 8M pipeline-key checks); the level renders the same as a plain build.
 
 ### Tooling notes
 
-- **The shader store survives unrelated rebuilds** (`_PipelineCache/<title>.shaders` in the
-  install dir). Its header no longer holds the executable's build time.
+- **The shader store survives unrelated rebuilds and new install directories.** It lives in one
+  directory shared by every build: `KYTY_SHADER_STORE_DIR`, else `$XDG_CACHE_HOME` or
+  `~/.cache`, then `kyty-shaders/` (macOS `~/Library/Caches/kyty-shaders`, Windows
+  `%LOCALAPPDATA%\kyty-shaders`). Each file is `<title>.<16 hex digits>.shaders`, where the hex
+  digits hash the whole header (below). A build whose codegen sources, device and switches match
+  an existing store starts warm in any install directory. Builds and switch combinations that
+  record different modules use different files, so `KYTY_RESIDENT_TEXTURES` on and off, or two
+  builds run alternately, each keep their own warm store. The driver's pipeline cache sits
+  beside it as `<title>.<hash of the driver signature>.bin`.
+  - **Sharing:** one emulator at a time appends to a store (an `flock` on `<store>.lock`);
+    another one running meanwhile loads it but does not write. Records are checksummed zstd
+    frames, so a crash mid-write loses only the torn last record. A header mismatch starts a
+    store cold. The driver cache is written to a per-process temporary file and renamed.
+  - **Migration:** on first use, a missing shared store adopts the install's own
+    `_PipelineCache` store when its header matches. Stores written before this change do not
+    match, because the source hash changed with it.
+  - **Pruning:** of a title's other stores (and driver caches), the 7 most recently written stay
+    beside the current one. Those unused for 30 days go, unless another emulator holds their
+    lock.
+  - **For an isolated or cold run** (bench, A/B), set `KYTY_SHADER_STORE_DIR` to a directory of
+    its own; `KYTY_SHADER_CACHE_STAMP=N` gives a cold store without moving it.
   - **What the key holds:**
     - a manual format number;
     - a hash of the sources that decide what the store records: `src/graphics/shader`, the guest
