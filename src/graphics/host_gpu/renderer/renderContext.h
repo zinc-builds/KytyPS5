@@ -179,6 +179,14 @@ public:
 	// them again after the stores.
 	bool StoreCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
 	                   uint32_t stride, bool invalidate, uint32_t source = 0);
+	// Whether a label store from this source fills its label slots. A slot is a positive cache:
+	// IsCpLabel is true only for a slot that matches, so a slot never written (or overwritten)
+	// only makes the waiter collect. WRITE_DATA packets of more than kWriteDataLabelMaxDwords
+	// dwords leave the slots alone: no wait was seen on such a slot (KYTY_LABEL_HIT_STATS on Sky
+	// Garden and Ninja Castle), and their slots evicted labels waits did hit.
+	// KYTY_WRITE_DATA_LABELS=all fills them for every packet.
+	static constexpr uint32_t kWriteDataLabelMaxDwords = 16;
+	[[nodiscard]] static bool FillsLabelSlots(uint32_t source) noexcept;
 	// KYTY_LABEL_HIT_STATS=1 (off by default): per second, label checks (IsCpLabel) by outcome and
 	// by the size of the WRITE_DATA packet that wrote the slot, and slots written by size.
 	enum class LabelCheck { OtherAddress, Mismatch, Hit, Stale, Written };
@@ -231,7 +239,7 @@ public:
 	                       bool before_handling);
 	void VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
 	                    uint32_t stride, bool invalidate, uint64_t token, uint64_t invalidated,
-	                    uint32_t source);
+	                    uint32_t source, uint64_t generation);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

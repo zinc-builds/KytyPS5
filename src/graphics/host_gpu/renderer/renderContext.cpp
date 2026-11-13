@@ -931,6 +931,9 @@ bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t siz
 	if (invalidate) {
 		(void)InvalidateMemory(vaddr, size);
 	}
+	if (!FillsLabelSlots(source)) {
+		return true;
+	}
 	const auto bytes = static_cast<uint32_t>(size);
 	m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()] = {vaddr, stored, bytes, source, generation,
 	                                                   token};
@@ -979,6 +982,14 @@ WriteDataVerify g_wd_verify;
 
 } // namespace
 
+bool RenderContext::FillsLabelSlots(uint32_t source) noexcept {
+	static const bool all = [] {
+		const char* value = std::getenv("KYTY_WRITE_DATA_LABELS");
+		return value != nullptr && std::strcmp(value, "all") == 0;
+	}();
+	return all || source <= kWriteDataLabelMaxDwords;
+}
+
 bool RenderContext::WriteDataRanged() noexcept {
 	return GetWriteDataMode() != WriteDataMode::PerDword;
 }
@@ -1019,7 +1030,7 @@ bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t e
 		}
 	}
 	const auto* bytes = static_cast<const uint8_t*>(values);
-	for (uint32_t i = 0; i < count; i++) {
+	for (uint32_t i = 0; FillsLabelSlots(source) && i < count; i++) {
 		const uint64_t at     = vaddr + uint64_t {i} * stride;
 		uint64_t       stored = 0;
 		std::memcpy(&stored, bytes + uint64_t {i} * elem, elem);
@@ -1029,11 +1040,12 @@ bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t e
 			                                                       generation, token};
 		}
 	}
-	if (LabelHitStatsEnabled()) {
+	if (LabelHitStatsEnabled() && FillsLabelSlots(source)) {
 		NoteLabelStores(source, count * (elem / 4));
 	}
 	if (GetWriteDataMode() == WriteDataMode::Verify) {
-		VerifyCpLabels(vaddr, values, elem, count, stride, invalidate, token, invalidated, source);
+		VerifyCpLabels(vaddr, values, elem, count, stride, invalidate, token, invalidated, source,
+		               generation);
 	}
 	return true;
 }
@@ -1048,9 +1060,11 @@ bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t e
 // invalidated are the values' bytes. A remap since counts as raced.
 void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t elem,
                                    uint32_t count, uint32_t stride, bool invalidate,
-                                   uint64_t token, uint64_t invalidated, uint32_t source) {
+                                   uint64_t token, uint64_t invalidated, uint32_t source,
+                                   uint64_t generation) {
 	const auto  page       = vaddr & ~uint64_t {0xfff};
-	const auto  generation = m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()].generation;
+	// Packets that leave the label slots alone (FillsLabelSlots) leave them alone on both paths.
+	const bool  slots      = FillsLabelSlots(source);
 	const auto* bytes      = static_cast<const uint8_t*>(values);
 	auto&       v          = g_wd_verify;
 	v.runs++;
@@ -1096,10 +1110,10 @@ void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t 
 		const CpLabel dword_hi {at + 4, expected >> 32u, 4, source, generation, dword_token};
 		const auto&   ranged    = m_cp_labels[(at >> 2u) % m_cp_labels.size()];
 		const auto&   ranged_hi = m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()];
-		if (!same(ranged, dword)) {
+		if (slots && !same(ranged, dword)) {
 			fail("label slot", at, ranged, dword);
 		}
-		if (elem == 8 && !same(ranged_hi, dword_hi)) {
+		if (slots && elem == 8 && !same(ranged_hi, dword_hi)) {
 			fail("label slot, high dword", at + 4, ranged_hi, dword_hi);
 		}
 		uint64_t seen = 0;
