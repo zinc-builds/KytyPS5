@@ -292,8 +292,10 @@ size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chron
 		if (i + 1 < keep && now - time < max_age) {
 			continue;
 		}
-		// Only a store no emulator is writing; its lock file stays (StoreLock::Release).
-		if (const StoreLock lock(path); !lock.Held()) {
+		// Only a store no emulator is writing, locked until it is gone: no emulator opens it in
+		// between. Its lock file stays (StoreLock::Release).
+		const StoreLock lock(path);
+		if (!lock.Held()) {
 			continue;
 		}
 		std::error_code remove_error;
