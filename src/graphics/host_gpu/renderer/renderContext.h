@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/frameDiag.h"
 #include "common/kernelStats.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -168,6 +169,18 @@ public:
 	// False: store through the guest mapping instead (and the page's chunk is asked to become
 	// asynchronous).
 	bool StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size, bool invalidate);
+	// count values of elem bytes (4 or 8) at vaddr + i * stride, all in one page, stored as
+	// StoreCpLabel stores each one, in address order, with one protection (one token for all),
+	// one backing store and one invalidation of the bytes stored. False: nothing was stored
+	// (store them one at a time). values must not overlap the bytes stored: the label slots read
+	// them again after the stores.
+	bool StoreCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
+	                   uint32_t stride, bool invalidate);
+	// WriteData stores each page of its range with StoreCpLabels (KYTY_WRITE_DATA_RANGED=0: one
+	// StoreCpLabel per dword; =verify: after each ranged store, builds the label slots the
+	// per-dword path would write, without storing again, and compares slots, tokens, the bytes
+	// the guest reads back and the bytes invalidated: VerifyCpLabels).
+	[[nodiscard]] static bool WriteDataRanged() noexcept;
 	// Whether the value at vaddr is the processor's own label store, untouched by the guest: a
 	// wait it satisfies publishes no guest data, so needs no collection.
 	template <typename T>
@@ -180,10 +193,21 @@ public:
 			return false;
 		}
 		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::LabelPeek);
-		return LibKernel::Memory::AsyncGuestPageUntouched(vaddr & ~uint64_t {0xfff}, label.token);
+		bool       stale     = false;
+		const bool untouched = LibKernel::Memory::AsyncGuestPageUntouched(vaddr & ~uint64_t {0xfff},
+		                                                                  label.token, &stale);
+		// KYTY_FRAME_DIAG: label waits that collect because the label's token was voided
+		// (label_stale) or because the guest stored to the page (label_written).
+		if (!untouched) {
+			Common::FrameDiag::Add(stale ? Common::FrameDiag::Counter::LabelStale
+			                             : Common::FrameDiag::Counter::LabelWritten);
+		}
+		return untouched;
 	}
 	void VerifyAsyncWrites(const std::vector<std::pair<uint64_t, uint64_t>>& written,
 	                       bool before_handling);
+	void VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
+	                    uint32_t stride, bool invalidate, uint64_t token, uint64_t invalidated);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

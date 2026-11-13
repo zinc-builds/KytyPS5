@@ -326,18 +326,50 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 
 	MemDiag::NoteLabel();
+	const uint64_t diag_start = Common::FrameDiag::Enabled() ? Common::FrameDiag::NowNs() : 0;
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
 	auto& buffers = m_renderer.GetBufferCache();
-	for (uint32_t i = 0; i < dw_num; i++) {
-		const auto vaddr = reinterpret_cast<uint64_t>(output);
-		if (!GuestRange {vaddr, sizeof(uint32_t)}.Valid() ||
-		    buffers.HasGpuDirtyBytes(vaddr, sizeof(uint32_t)) ||
-		    !m_renderer.StoreCpLabel(vaddr, &src[i], sizeof(uint32_t), true)) {
-			*output = src[i];
-			m_renderer.NoteGpuWrite(vaddr, sizeof(uint32_t));
+	// Dwords [from, to) one at a time, each its own label store.
+	const auto per_dword = [&](uint32_t from, uint32_t to) {
+		auto* output = static_cast<volatile uint32_t*>(dst) + (write_one_address ? 0 : from);
+		for (uint32_t i = from; i < to; i++) {
+			const auto vaddr = reinterpret_cast<uint64_t>(output);
+			if (!GuestRange {vaddr, sizeof(uint32_t)}.Valid() ||
+			    buffers.HasGpuDirtyBytes(vaddr, sizeof(uint32_t)) ||
+			    !m_renderer.StoreCpLabel(vaddr, &src[i], sizeof(uint32_t), true)) {
+				*output = src[i];
+				m_renderer.NoteGpuWrite(vaddr, sizeof(uint32_t));
+			}
+			output += !write_one_address;
 		}
-		output += !write_one_address;
+	};
+	const auto base = reinterpret_cast<uint64_t>(dst);
+	// A destination overlapping the packet's own data: the per-dword loop reads each value after
+	// the stores before it, and labels what it stored; keep that.
+	const auto src_begin = reinterpret_cast<uint64_t>(src);
+	const bool overlaps  = src_begin < base + uint64_t {dw_num} * 4 && base < src_begin + uint64_t {dw_num} * 4;
+	if (write_one_address || overlaps || (base & 3u) != 0 || !RenderContext::WriteDataRanged()) {
+		per_dword(0, dw_num);
+	} else {
+		// Each page's dwords as one label store: the same stores in the same order as the
+		// per-dword loop, under one protection and one invalidation (StoreCpLabels). A page
+		// holding any byte the GPU dirtied, or one the ranged store refuses, goes per dword.
+		for (uint32_t i = 0; i < dw_num;) {
+			const uint64_t vaddr = base + uint64_t {i} * sizeof(uint32_t);
+			const auto     n     = static_cast<uint32_t>(std::min<uint64_t>(dw_num - i, (0x1000 - (vaddr & 0xfff)) / 4));
+			const uint64_t size  = uint64_t {n} * sizeof(uint32_t);
+			if (!GuestRange {vaddr, size}.Valid() || buffers.HasGpuDirtyBytes(vaddr, size) ||
+			    !m_renderer.StoreCpLabels(vaddr, &src[i], sizeof(uint32_t), n, sizeof(uint32_t), true)) {
+				per_dword(i, i + n);
+			}
+			i += n;
+		}
+	}
+	if (diag_start != 0) {
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::WriteDatas);
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::WriteDataDwords, dw_num);
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::WriteDataNs,
+		                       Common::FrameDiag::NowNs() - diag_start);
 	}
 }
 

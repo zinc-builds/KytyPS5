@@ -139,6 +139,11 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged = false);
 // One aligned 4- or 8-byte store through the backing (a label: never written twice).
 bool                   TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size);
+// count values of elem bytes (4 or 8) at vaddr + i * stride, stored in address order through the
+// backing, each as TryStoreLabelBacking would; one guest mapping must hold them all. One epoch
+// advance pair for the run.
+bool TryStoreLabelsBacking(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
+                           uint32_t stride);
 // Fills dword-aligned [vaddr, vaddr + size) with value through the backing alias: no write
 // faults, so the caller invalidates the range. False (nothing written) if it is not all backed.
 bool                   TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value);
@@ -199,7 +204,9 @@ void RequestAsyncWriteTracking(uint64_t vaddr) noexcept;
 // go to the next collection) and gives a token; false if the page is not one.
 // AsyncGuestPageUntouched: no guest view has stored to the page since the token was given.
 bool               ProtectAsyncGuestPage(uint64_t page, uint64_t& token);
-[[nodiscard]] bool AsyncGuestPageUntouched(uint64_t page, uint64_t token);
+// stale (optional): set when it is false because the token was voided (no longer the page's
+// current one), not because of a guest store.
+[[nodiscard]] bool AsyncGuestPageUntouched(uint64_t page, uint64_t token, bool* stale = nullptr);
 // Advances on remaps and zeroing: guest bytes that change without a store.
 [[nodiscard]] uint64_t GuestRemapGeneration() noexcept;
 // KYTY_ASYNC_WP_VERIFY: takes the ranges the emulator wrote through the backing alias.
