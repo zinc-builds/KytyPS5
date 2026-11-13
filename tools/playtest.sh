@@ -172,6 +172,12 @@ echo "playtest: session $dir"
 echo "playtest: marker = F9, or the PS / microphone button; F2 shows the performance overlay"
 echo "playtest: to finish, close the game window (or press Ctrl+C here); the report follows"
 start=$(date +%s)
+# Ctrl+C (or a hangup) in this terminal quits the game the way closing its window does: the
+# emulator runs in the background, where SIGINT is ignored, so pass it on as SIGTERM (SDL turns
+# that into a quit, and the recorder flushes the session). Set before the launch: a signal that
+# comes before the emulator's pid is known is passed on as soon as it is.
+emu= quit=0
+trap 'quit=1; [ -n "$emu" ] && kill -TERM "$emu" 2>/dev/null' INT TERM HUP
 (
 	cd "$install" || exit 1
 	# The emulator keeps the bench lock's descriptor (fd 9): the lock lasts as long as it runs.
@@ -179,6 +185,7 @@ start=$(date +%s)
 		${overlay:+KYTY_APP0_OVERLAY=$overlay} ./kyty_emulator "${flags[@]}" > "$dir/emulator.log" 2>&1
 ) &
 emu=$!
+[ "$quit" = 1 ] && kill -TERM "$emu" 2>/dev/null
 # Wait for the emulator process itself (the subshell execs into it), then sample it.
 sampler=
 for _ in $(seq 50); do [ -d "/proc/$emu" ] && [ "$(readlink "/proc/$emu/exe" 2>/dev/null)" = "$install/kyty_emulator" ] && break; sleep 0.1; done
@@ -186,10 +193,6 @@ if [ -d "/proc/$emu" ]; then
 	nice -n 19 python3 -I "$here/playtest-sample.py" "$emu" "$dir/system.jsonl" 2 9>&- 8>&- &
 	sampler=$!
 fi
-# Ctrl+C (or a hangup) in this terminal quits the game the way closing its window does: the
-# emulator runs in the background, where SIGINT is ignored, so pass it on as SIGTERM (SDL turns
-# that into a quit, and the recorder flushes the session).
-trap 'kill -TERM "$emu" 2>/dev/null' INT TERM HUP
 while :; do
 	wait "$emu"
 	status=$?

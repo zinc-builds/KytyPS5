@@ -321,7 +321,7 @@ def main():
             return None
         faults = f.get('minflt', 0) + f.get('majflt', 0)
         sys_ms = f.get('sys_us', 0) / 1000
-        t = rec.get('t') or 0
+        t = f.get('t', 0)  # the worst frame's time: a merged incident spans up to 30 s
         if faults >= 2000 and sys_ms >= 5 and any(abs(p - t) <= 4 for p in pressure_t):
             return f'memory pressure: page faults while the system swapped ({faults:.0f} faults, ' \
                    f'{sys_ms:.0f} ms in the kernel)'
@@ -376,16 +376,19 @@ def main():
         top.append(f"{g['cause']}: {g['count']} incident(s), {g['lost_ms']:.0f} ms lost; worst {w['worst_ms']} ms "
                    f"at {fmt_t(w['t'] or 0)} ({w['file']}): {w['summary']}")
     # Throttling keeps a top-three slot (after up to two others) when the clocks dropped with it.
+    # Outside causes the player can act on keep their top-three slots (after the others).
+    outside_top = []
     if thermal and thermal['core_mhz_at_limit'] and thermal['core_mhz_otherwise'] and \
             thermal['core_mhz_at_limit'] < 0.97 * thermal['core_mhz_otherwise']:
-        del top[2:]
-        top.append(f"not the emulator: the CPU package reached its thermal limit ({thermal['limit_c']:.0f} °C) in "
+        outside_top.append(f"not the emulator: the CPU package reached its thermal limit ({thermal['limit_c']:.0f} °C) in "
                    f"{thermal['samples_at_limit']} of {thermal['samples']} system samples (first at "
                    f"{fmt_t(thermal['first_t'])}), the emulator's cores at {thermal['core_mhz_at_limit']} MHz then vs "
                    f"{thermal['core_mhz_otherwise']}; check the cooling (fan curve, dust, power profile)")
-    if len(top) < 3 and (memory.get('emu_swap_max_mb') or 0) > 0:
-        top.append(f"not the emulator: the system was swapping (the emulator had up to {memory['emu_swap_max_mb']} MB "
-                   f"swapped out); close other programs before playing")
+    if (memory.get('emu_swap_max_mb') or 0) > 0:
+        outside_top.append(f"not the emulator: the system was swapping (the emulator had up to "
+                           f"{memory['emu_swap_max_mb']} MB swapped out); close other programs before playing")
+    del top[3 - len(outside_top):]
+    top.extend(outside_top)
     if len(top) < 3 and pres['two_refresh_pct'] > 1.0:
         top.append(f"pacing: {pres['two_refresh_pct']}% of presented frames took two refreshes outside loads "
                    f"(target < 1%)")
