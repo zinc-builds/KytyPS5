@@ -51,6 +51,8 @@ enum class Counter {
 	OwnershipTakes,     // KYTY_OWNERSHIP_TAKE: write collections limited to a range taking GPU ownership
 	OwnershipUncertain, // of which the take could not handle (the readback stays the fallback)
 	CollisionReadbacks, // GPU-thread synchronous merges: a written page found GPU-dirty
+	OwnershipTakeNs,    // time in RenderContext::TakeAsyncWrites
+	OwnershipCheckNs,   // time in the "already GPU-owned?" pre-check (1 in 16 timed, scaled)
 	Count
 };
 

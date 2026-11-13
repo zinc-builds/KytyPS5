@@ -1345,15 +1345,30 @@ void BufferCache::TakeOwnershipWrites(uint64_t vaddr, uint64_t size) {
 	const bool         locked = m_texture_cache.LockHeldByCurrentThread();
 	const uint64_t     begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const uint64_t     end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const bool         diag   = Common::FrameDiag::Enabled();
+	static thread_local uint32_t sample = 0;
+	const bool timed_check = diag && (++sample % 16) == 0;
+	const auto check_start = timed_check ? Common::GpuWaitDiag::NowNs() : 0;
+	uint64_t   taken_ns    = 0;
 	for (uint64_t start = begin; start < end; start += Chunk) {
 		const auto stop = std::min(end, start + Chunk);
 		if (m_memory_tracker.IsRegionFullyGpuModified(start, stop - start)) {
 			continue; // owned already: its marks were taken when it was acquired
 		}
 		Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipTakes);
+		const auto take_start = diag ? Common::GpuWaitDiag::NowNs() : 0;
 		if (locked || !m_scheduler.Context().TakeAsyncWrites(start, stop)) {
 			Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipUncertain);
 		}
+		if (diag) {
+			const auto ns = Common::GpuWaitDiag::NowNs() - take_start;
+			taken_ns += ns;
+			Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipTakeNs, ns);
+		}
+	}
+	if (timed_check) { // the pre-checks only: this call's takes are left out
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipCheckNs,
+		                       16 * (Common::GpuWaitDiag::NowNs() - check_start - taken_ns));
 	}
 }
 
