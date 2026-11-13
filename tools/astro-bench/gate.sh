@@ -236,6 +236,14 @@ if [ "$hitch" = 1 ]; then
 	echo "$href"
 	echo "$hnew"
 	echo '```'
+	# A baseline older than the merge-base predates these dev commits; one of them may have moved
+	# hitch counts (#128 moved them by ~10), so the reader can see what lies between.
+	if [ -n "$base_sha" ] && [ "$base_sha" != "$merge_base" ]; then
+		echo "Dev commits between the baseline and the merge-base:"
+		echo '```'
+		git -C "$repo" log --first-parent --oneline "$base_sha..$merge_base"
+		echo '```'
+	fi
 	[[ "$hverdict" == FAIL* ]] && python3 -I "$dir/hitches.py" "$label-hitch-new" --frames "$hframes" --list 2>&1 | tail -n +2 | head -20
 elif [ "$class" = diag ]; then
 	new_png=/tmp/garden-$label-diag-shot.png
