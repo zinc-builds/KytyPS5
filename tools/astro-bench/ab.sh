@@ -20,7 +20,9 @@
 #   --min-ref N     stored reference runs needed to reuse them (default 3)
 #   --flags "F"     emulator flags of every run (default --amd-cpu; plain words, no quotes: batch.sh
 #                   splits lines on whitespace). Stored references count only with the same flags.
-# The whole A/B (pairs, --extra lines, hitch runs) is one hold of the bench lock.
+# The whole A/B (pairs, --extra lines, hitch runs) is one hold of the bench lock. Inside a hold
+# that is already exclusive (benchlock.sh run <script>, so a gate and other runs share one hold)
+# it uses that one; the reference build must exist then (refbuild.sh refuses to build inside it).
 # Window: 200-500 ends each run ~23 s sooner (~35 s instead of ~59 s) and gives the same verdicts
 # as 1000-1600 (PR #87); its FPS and CPU-ns noise is 2-3x larger, its cycles/draw noise the same.
 # Reuse: with >= 3 stored clean runs of the reference (same binary, window, env, flags) younger
@@ -65,7 +67,6 @@ while [ $# -gt 0 ]; do
 	shift
 done
 [[ "$flags" == *[\"\']* ]] && { echo "ab.sh: --flags takes plain words (no quotes)" >&2; exit 2; }
-[ "$KYTY_BENCH_LOCKED" = x ] && { echo "ab.sh: run it outside batch.sh (it builds and takes the lock itself)" >&2; exit 1; }
 if [ -z "$ref_install" ]; then
 	ref_sha=${ref_sha:-$(git -C "$repo" merge-base HEAD origin/dev)} || exit 1
 	ref_sha=$(git -C "$repo" rev-parse --verify "$ref_sha^{commit}") || exit 1
