@@ -27,8 +27,12 @@
 #     compares it with the baseline's (or the reference arm's) by eye and ticks the line.
 # Options: -n N, --switch "K=V", --diag-env "K=V ...", --verify-env "K=V ..." (only verifiers that
 #   exit on a difference: EXITING_VERIFY), --no-verify, --no-hitch, --accept-cost "<reason>",
-#   --new-install D, and ab.sh's --ref, --ref-install, --env, --ref-env, --new-env, --flags (the
-#   emulator flags of every run, default --amd-cpu).
+#   --new-install D, --allow-unchecked (timed runs without the outside-load check pass; see
+#   below), and ab.sh's --ref, --ref-install, --env, --ref-env, --new-env, --flags (the emulator
+#   flags of every run, default --amd-cpu).
+#   Outside load: every timed run (A/B pairs, hitch runs) must have been checked by garden.sh's
+#   idle-CPU monitor (idle_busy=<mean>/<max>% on its summary line); an unchecked run fails the
+#   gate unless --allow-unchecked, and only checked stored references and baselines are reused.
 #
 # It can run inside an exclusive hold of your own (benchlock.sh run <script> with the gate and
 # other runs, e.g. levels.sh), as long as the reference build exists: refbuild.sh <merge-base>
@@ -53,12 +57,24 @@ bm() { # "<mode> [<profile hash>]" of an install; no BUILD_MODE file: plain
 	sed -n 's/.*\bmode=\([a-z]*\).*/\1/p; s/.*\bsha256=\([0-9a-f]*\).*/\1/p' "$1/../BUILD_MODE" | xargs
 }
 o100() { sed -n 's/.* over100=\([0-9]*\) .*/\1/p' <<<"$1"; }
+# Outside load must have been checked on every timed run (garden.sh's idle_busy=<mean>/<max>):
+# a run marked idle_busy=unchecked, or without the field (no hybrid layout), fails the gate unless
+# --allow-unchecked. Stored references and hitch baselines are reused only if they were checked.
+allow_unchecked=0
+args=()
+for a in "$@"; do [ "$a" = --allow-unchecked ] && allow_unchecked=1 || args+=("$a"); done
+set -- "${args[@]}"
+[ "$allow_unchecked" = 1 ] || export KYTY_REQUIRE_CHECKED=1
+checked() { [[ "$(head -1 "/tmp/garden-$1.out" 2>/dev/null)" =~ \ idle_busy=[0-9] ]]; }
 # ran <label> [timed]: the run reached its last frame; with "timed", also not VOID (outside load
-# makes timings, not correctness, worthless: verify and diagnostic runs accept a VOID).
+# makes timings, not correctness, worthless: verify and diagnostic runs accept a VOID) and checked
+# for outside load (unless --allow-unchecked).
 ran() {
 	local v
 	v=$(head -1 "/tmp/garden-$1.out" 2>/dev/null)
-	[[ "$v" == "$1: fps="* ]] && { [ "$2" != timed ] || [[ "$v" != *" VOID "* ]]; }
+	[[ "$v" == "$1: fps="* ]] || return 1
+	[ "$2" = timed ] || return 0
+	[[ "$v" != *" VOID "* ]] && { [ "$allow_unchecked" = 1 ] || checked "$1"; }
 }
 
 if [ "$1" = --baseline ]; then
@@ -74,9 +90,9 @@ if [ "$1" = --baseline ]; then
 	for r in perf1 perf2 hitch; do head -1 "/tmp/garden-$b-$r.out"; done
 	for r in perf1 perf2; do # garden.sh stored these in the result store (references for gates)
 		ran "$b-$r" timed && [ -f "/tmp/garden-$b-$r.json" ] ||
-			{ echo "gate.sh: $b-$r failed or was void (no per-draw result); baseline not stored" >&2; exit 1; }
+			{ echo "gate.sh: $b-$r failed, was void or was not checked for outside load (no per-draw result); baseline not stored" >&2; exit 1; }
 	done
-	ran "$b-hitch" timed || { echo "gate.sh: the hitch run failed or was void; baseline not stored" >&2; exit 1; }
+	ran "$b-hitch" timed || { echo "gate.sh: the hitch run failed, was void or was not checked for outside load; baseline not stored" >&2; exit 1; }
 	h=$(python3 -I "$dir/hitches.py" "$b-hitch" --frames "$hframes" 2>&1)
 	[ -n "$(o100 "$h")" ] || { echo "gate.sh: no hitch result: $h" >&2; exit 1; }
 	keep=$HOME/.cache/kyty-builds/baselines
@@ -84,13 +100,14 @@ if [ "$1" = --baseline ]; then
 	png=
 	[ -f "/tmp/garden-$b-hitch-shot.png" ] && png=$keep/$b-shot$shot.png && cp "/tmp/garden-$b-hitch-shot.png" "$png"
 	python3 -I "$dir/results.py" add-hitch "$h" rev="$sha" exe="$(sha256sum "$inst/kyty_emulator" | cut -c1-16)" \
-		build_mode="$mode" profile="$profile" frames="$hframes" flags=--amd-cpu shot="$png" shot_frame="$shot" || exit 1
+		build_mode="$mode" profile="$profile" frames="$hframes" flags=--amd-cpu shot="$png" shot_frame="$shot" \
+		checked="$(checked "$b-hitch" && checked "$b-perf1" && checked "$b-perf2" && echo 1 || echo 0)" || exit 1
 	echo "gate.sh: baseline of ${sha:0:12} ($mode${profile:+ $profile}) stored: $h${png:+; screenshot $png}"
 	exit 0
 fi
 
 label=$1
-[[ -n "$label" && "$label" != -* ]] || { sed -n '2,40p' "$0" >&2; exit 2; }
+[[ -n "$label" && "$label" != -* ]] || { sed -n '2,44p' "$0" >&2; exit 2; }
 shift
 flags=--amd-cpu n=3 verify=1 hitch=1 accept_cost= verify_env= new_install= new_env= env= pass=() class= why= switch= diag_env= ref=
 while [ $# -gt 0 ]; do
@@ -182,6 +199,21 @@ elif ! grep -q '^AB ' <<<"$verdict"; then
 else
 	echo "**Perf direction:** PASS (no decision metric worse by >= 3 sd)"
 fi
+# Outside load on the A/B's runs (stored references were only reused if checked).
+unchecked=()
+for i in $(seq "$maxn"); do
+	for side in ref new; do
+		[ -f "/tmp/garden-$label-$side$i.out" ] && ! checked "$label-$side$i" && unchecked+=("$label-$side$i")
+	done
+done
+if [ ${#unchecked[@]} = 0 ]; then
+	echo "**Outside load:** checked on every A/B run (idle_busy on each line above)"
+elif [ "$allow_unchecked" = 1 ]; then
+	echo "**Outside load:** NOT checked on ${unchecked[*]} (allowed: --allow-unchecked)"
+else
+	status=FAIL
+	echo "**Outside load:** FAIL, not checked on ${unchecked[*]} (see idle_busy=unchecked(...); --allow-unchecked to accept)"
+fi
 for run in $([ "$verify" = 1 ] && [ "$class" != diag ] && echo verify) $([ "$class" = diag ] && echo diag); do
 	v=$(head -1 "/tmp/garden-$label-$run.out" 2>/dev/null)
 	what=$([ "$run" = verify ] && echo "$VERIFY_ENV${verify_env:+ $verify_env}" || echo "$diag_env$([ "$verify" = 1 ] && echo " $VERIFY_ENV${verify_env:+ $verify_env}")")
@@ -219,7 +251,7 @@ if [ "$hitch" = 1 ]; then
 	fi
 	if [ "$done_ref" = 0 ] || [ "$done_new" = 0 ]; then
 		status=FAIL
-		hverdict="FAIL: a hitch run did not complete or was void (ref $done_ref, new $done_new; see /tmp/garden-$label-hitch-*.out)"
+		hverdict="FAIL: a hitch run did not complete, was void or was not checked for outside load (ref $done_ref, new $done_new; see /tmp/garden-$label-hitch-*.out)"
 	elif [ -z "$r" ] || [ -z "$w" ]; then
 		status=FAIL
 		hverdict="FAIL (no result)"

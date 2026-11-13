@@ -382,7 +382,11 @@ The rule, in any build mode:
   outside load; kept)`. Track R's provisional thresholds: quiet runs read ~5.5%; a harmless
   ~0.5-CPU load 16% (worst 5 s 19%, no measurable cost); a 4.8-CPU load 60-63% (cmd_ns +28%);
   nothing measured in between. `GARDEN_VOID_MEAN`, `GARDEN_VOID_MAX5`, `GARDEN_FLAG_MEAN` override
-  them. `idle_busy=mean/max5s%` is on every summary line.
+  them. `idle_busy=mean/max5s%` is on every summary line; `idle_busy=unchecked(...)` means nothing
+  was watched (with the reason), and `gate.sh` fails such runs unless `--allow-unchecked`.
+  `idlecpus.sh` computes the watched set and `test-idlecpus.sh` checks it is not empty on this
+  machine. (Until #PR it always was: sysfs writes a core's siblings as `10-11`, which the first
+  version did not parse, so no run from #135 to #PR was checked for outside load.)
 
 **Where the command thread's cycles go (2026-11-12, `KYTY_BENCH_PMU=1`).** That diagnostic mode adds
 user-mode PMU events for the command thread and the prepare workers, multiplexed by the kernel, plus

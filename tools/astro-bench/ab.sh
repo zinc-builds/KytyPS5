@@ -91,7 +91,7 @@ fi
 # The env string garden.sh records: KYTY_* settings, sorted (minus the bench's own).
 # Later assignments win, as in `env A=1 A=0`.
 norm_env() {
-	tr ' ' '\n' <<<"$*" | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' |
+	tr ' ' '\n' <<<"$*" | grep -E '^KYTY_' | grep -vE '^KYTY_(BENCH_LOCKED|BENCH_LOCK|BENCH_LOCK_TIMEOUT|BENCH_PRIO|BENCH_AGE|REQUIRE_CHECKED|APP0_OVERLAY|INSTALL|SHOT_FILE)=' |
 		awk -F= '{v[$1] = $0} END {for (k in v) print v[k]}' | sort | tr '\n' ' ' | sed 's/ $//'
 }
 inherited=$(env | grep -E '^KYTY_' | tr '\n' ' ')
