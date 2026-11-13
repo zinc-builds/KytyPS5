@@ -756,6 +756,14 @@ static uint32_t ReciprocalSquareRoot(uint32_t bits) {
 	return std::bit_cast<uint32_t>(_mm_cvtss_f32(_mm_cvtsd_ss(_mm_setzero_ps(), result)));
 }
 
+uint32_t ReciprocalSquareRootLane(uint32_t bits) {
+	const uint32_t mxcsr = _mm_getcsr();
+	_mm_setcsr(0x1f80u);
+	const uint32_t result = ReciprocalSquareRoot(bits);
+	_mm_setcsr(mxcsr);
+	return result;
+}
+
 static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	const auto* rip            = reinterpret_cast<const uint8_t*>(context.Rip());
 	size_t      prefix_size    = 0;

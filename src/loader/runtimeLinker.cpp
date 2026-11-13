@@ -24,6 +24,7 @@
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
+#include "loader/trapDiag.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
@@ -35,7 +36,10 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <string_view>
 #include <vector>
+#include <cinttypes>
+#include <immintrin.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
@@ -651,10 +655,20 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
-	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
-	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
-		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
-		return true;
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction) {
+		const bool     diag      = Loader::TrapDiag::Enabled();
+		const uint64_t start_tsc = diag ? __rdtsc() : 0;
+		uint32_t       bytes     = 0;
+		if (diag) {
+			std::memcpy(&bytes, reinterpret_cast<const void*>(info->exception_address), sizeof(bytes));
+		}
+		if (Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
+			if (diag) {
+				Loader::TrapDiag::Note(info->exception_address, bytes, start_tsc);
+			}
+			return true;
+		}
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
@@ -1759,6 +1773,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		LOGF("tls_handler_size       = 0x%016" PRIx64 "\n", tls_handler_size);
 	}
 
+	Loader::TrapDiag::Init();
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
@@ -1837,6 +1852,14 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		                                &function_starts) &&
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
+		if (Loader::TrapDiag::Enabled()) {
+			for (const auto& [segment_addr, segment_size]: executable_segments) {
+				std::printf("TRAPDIAG module name=%s base=0x%" PRIx64 " segment=0x%" PRIx64
+				            "+0x%" PRIx64 "\n",
+				            module_name.c_str(), static_cast<uint64_t>(program->base_vaddr),
+				            static_cast<uint64_t>(segment_addr), static_cast<uint64_t>(segment_size));
+			}
+		}
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
@@ -1848,6 +1871,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
 			    GetGuestInstructionHostFeatures(), tsc_multiplier);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
+			totals.reciprocal_sqrt_preceding_jump += result.reciprocal_sqrt_preceding_jump;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
 			totals.rdpid += result.rdpid;
@@ -1883,6 +1907,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				if (!details.empty()) details += "; ";
 				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
 				                       counts.trapped, counts.Skipped());
+				if (std::string_view {name} == "VRSQRTPS" && totals.reciprocal_sqrt_preceding_jump != 0) {
+					details += fmt::format(" (preceding-jump={})", totals.reciprocal_sqrt_preceding_jump);
+				}
 			}
 			const auto  found   = combined.found;
 			const auto  skipped = combined.Skipped();

@@ -590,6 +590,25 @@ add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
 target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
 
+# Linux and macOS: the test traps SIGILL itself.
+if(NOT WIN32)
+add_executable(guest_instruction_patcher_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestInstructionPatcherTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
+	"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp")
+target_link_libraries(guest_instruction_patcher_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
+target_include_directories(guest_instruction_patcher_tests PRIVATE ${inc_headers})
+endif()
+
+# tools/re/patchstats.cpp: the guest instruction patcher run offline on an eboot image.
+if(NOT WIN32)
+add_executable(patch_stats EXCLUDE_FROM_ALL
+	"${KYTY_SOURCE_DIR}/../tools/re/patchstats.cpp"
+	"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp")
+target_link_libraries(patch_stats common fmt::fmt Zydis::Zydis xbyak::xbyak)
+target_include_directories(patch_stats PRIVATE ${inc_headers})
+endif()
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -738,6 +757,7 @@ if(BUILD_TESTING)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
 	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
+	add_test(NAME guest_instruction_patcher COMMAND $<TARGET_FILE:guest_instruction_patcher_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -862,6 +882,7 @@ if(BUILD_TESTING)
 		jpeg_dec_tests
 		jpeg_enc_tests
 		occlusion_queries_tests
+		guest_instruction_patcher_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests

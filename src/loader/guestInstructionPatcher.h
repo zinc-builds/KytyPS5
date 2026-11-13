@@ -46,6 +46,9 @@ struct GuestInstructionPatchResult {
 	uint64_t               unrelocatable_memory_instruction_count   = 0;
 	uint64_t               indirect_red_zone_function_count         = 0;
 	InstructionPatchCounts reciprocal_sqrt;
+	// VRSQRTPS sites made native by a jump over a preceding instruction (in functions with
+	// unresolved indirect branches); counted in reciprocal_sqrt.native too.
+	uint64_t               reciprocal_sqrt_preceding_jump = 0;
 	InstructionPatchCounts extrq;
 	InstructionPatchCounts insertq;
 	InstructionPatchCounts rdpid;
@@ -64,6 +67,18 @@ GuestInstructionPatchResult PatchGuestInstructions(
     bool protect_memory, bool emulate_amd,
     GuestInstructionHostFeatures host_features  = GetGuestInstructionHostFeatures(),
     uint64_t                     tsc_multiplier = 0);
+
+// Diagnostic (tools/re/patchstats.cpp): called for each instruction left to trap, while patching.
+struct TrappedSiteInfo {
+	uintptr_t                  site               = 0;
+	uintptr_t                  function_start     = 0;
+	uintptr_t                  function_end       = 0;
+	bool                       indirect_function  = false; // unresolved indirect branches
+	bool                       reciprocal_sqrt    = false;
+	std::span<const uintptr_t> unresolved_indirect_branches;
+};
+using TrappedSiteObserver = void (*)(const TrappedSiteInfo& info);
+void SetTrappedSiteObserver(TrappedSiteObserver observer);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);
