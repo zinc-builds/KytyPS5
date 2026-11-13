@@ -1879,11 +1879,11 @@ What the map says:
   - buffers ~190 ns (stage 2);
   - descriptor building and pushing ~130 ns;
   - push constants ~37 ns.
-- **Resident textures: target ~300, delivered ~35.** Stage 1b gave −1.2% on Sky Garden and was slower on Pirate Island. The implementation adds back most of what it removes, so don't read the 300 as available.
+- **Resident textures: target ~300, delivered ~35.** Stage 1b gave −1.2% on Sky Garden and was slower on Pirate Island. Why so little arrived is not measured. Possible causes include the mode adding work of its own, coverage (stages it can't make resident), and the saving turning into prepare wait. Either way, don't read the 300 as available.
 
 **Stage 2 (buffers by address) stays on hold.**
 - It would delete the PrepareBda syncs plus buffer obtain/sync/stream: 2.1 ms/frame on Pirate Island, 2.6 ms/frame on Sky Garden, plus the buffer half of the bindings bucket.
-- At stage 1b's ratio (35 ns delivered of 140–160 ns found), that is ~0.5–0.8 ms/frame, for 2–3 weeks of medium-risk work. By the per-draw map, the buffer work stage 2 targets is ~190 of 3,276 ns. At that ratio, ~50 ns/draw is realistic.
+- At stage 1b's ratio (35 ns delivered of 140–160 ns found), that is ~0.5–0.8 ms/frame, for 2–3 weeks of medium-risk work. The two estimates use different scopes. Stage 2's whole target is the two buffer buckets above: PrepareBda syncs (208) and buffer obtain/sync/stream (192), ~400 ns/draw or 2.1 ms/frame. The ~190 ns of buffers in the per-draw map is only the part reached through the bindings (RebindBuffers, FindBuffers, the PrepareBda call there), and it is already inside those two buckets. At the stage 1b ratio, ~400 ns gives ~100 ns/draw (~0.5 ms/frame), the low end of the range above.
 
 **Resident textures on Pirate Island: slower, cause not measured.** Same binary, normal-frame ns/draw:
 
@@ -1924,7 +1924,7 @@ Per frame (debug twin, 462 draws/frame; 11.5 ms user + 2.7 ms kernel):
 | Readbacks | ~0.6 |
 | Kernel | 2.7 |
 
-The kernel's 2.7 ms (22% of the thread) is not in the user-only samples, so they can't split it. Minor faults are only ~34 per frame, so the time is mostly syscalls. Candidates:
+The kernel's 2.7 ms (19% of the thread's 14.2 ms) is not in the user-only samples, so they can't split it. Minor faults are only ~34 per frame, so the time is mostly syscalls. Candidates:
 - write-tracking protects and PAGEMAP_SCAN;
 - futex wakes from `Pool::Wait`'s `WakeAll`;
 - clock reads (the vDSO shows up at ~180 ns/draw on the user side).
