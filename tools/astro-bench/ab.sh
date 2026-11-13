@@ -118,7 +118,7 @@ fi
 for i in $(seq "$n"); do rm -f "/tmp/garden-$label-ref$i.json" "/tmp/garden-$label-new$i.json" "/tmp/garden-$label-ref$i.out" "/tmp/garden-$label-new$i.out"; done
 # One hold for everything below: pairs, extra lines, hitch runs (batch.sh nests in it).
 . "$dir/benchlock.sh"
-benchlock_acquire x "ab.sh $label" || exit 1
+benchlock_acquire x "ab.sh $label" || exit $?
 # results <upto>: the verdict over pairs 1..upto (empty on a missing result)
 news=() refs=() failed=()
 collect() {
