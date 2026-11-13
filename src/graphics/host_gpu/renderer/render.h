@@ -58,9 +58,15 @@ enum class DrawOffsetSource : uint8_t {
 // Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
 	uint64_t              address = 0;
-	uint32_t              count   = 0;
+	uint32_t              count   = 0; // the record count; with count_address, its bound
 	uint32_t              stride  = 0;
 	ShaderIndirectOffsets offsets;
+	// KYTY_INDIRECT_QUEUE: the guest address of the record count the GPU reads at draw time
+	// (vkCmdDraw[Indexed]IndirectCount); 0 when `count` is the count.
+	uint64_t count_address = 0;
+	// KYTY_INDIRECT_QUEUE=verify: the count the command processor read when it decoded the
+	// packet (as without the queue).
+	uint32_t decoded_count = 0;
 };
 
 struct DrawIndexArgs {
@@ -402,6 +408,7 @@ public:
 		DrainAsyncCollect  = 258, // async writes collected before a kept packet
 		DrainNumInstances  = 259, // a draw reads NUM_INSTANCES from guest memory
 		DrainDirectDraw    = 260, // a draw that cannot be queued
+		DrainIndirectCount = 263, // a multi-draw indirect drawn at once (count read on the CPU)
 		DrainReasons       = 768,
 	};
 	void FinishQueuedDraws(CommandBuffer& buffer, uint32_t reason = DrainDirectDraw) {
@@ -431,6 +438,19 @@ public:
 		return m_queued_posted.load(std::memory_order_acquire) - m_queued_taken;
 	}
 	[[nodiscard]] bool HasQueuedDraw() const { return QueuedCount() != 0; }
+
+	// KYTY_INDIRECT_QUEUE: 1 (default) indirect draws are queued and prepared like direct ones,
+	// with a record count read from memory read by the GPU at draw time; 0 drains and draws them
+	// at once with the count read when the packet is decoded, as before; verify also reads the
+	// count then and checks it against the GPU's (exits on a difference). Off without the device's
+	// drawIndirectCount.
+	[[nodiscard]] int IndirectQueueMode();
+	// Whether a draw with these registers can read its indirect records on the GPU: false where
+	// the draw path would need the CPU to read them (tessellation, legacy quad lists, a mesh
+	// program without room for the task payload; ResolveDrawEmit, PipelineCache).
+	[[nodiscard]] bool IndirectRecordsOnGpu(const HW::Context& ctx, const HW::UserConfig& ucfg,
+	                                        const HW::Shader& shaders) const;
+	std::atomic<int> m_indirect_queue_mode {-1}; // resolved on first use (decode thread)
 
 	// KYTY_OCCLUSION_PROXY_SKIP: 1 (default) a draw inside an always-visible occlusion query that
 	// can only change the query's count is not rendered; 0 renders it, as before; verify renders

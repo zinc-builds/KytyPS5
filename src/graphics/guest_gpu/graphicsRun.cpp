@@ -876,6 +876,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			if (opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI) {
+				Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectPredicated);
+			}
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
 			cursor.offset_dw += packet_dw;
@@ -899,11 +902,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	if (PassDiag::Enabled()) {
 		PassDiag::OnPacket(opcode);
 	}
+	// A multi-draw indirect keeps the queue too while it is queued itself (KYTY_INDIRECT_QUEUE);
+	// one drawn at once drains in DrawIndirectMulti.
+	const bool keeps = KeepsQueuedDraw(packet_header) ||
+	                   ((opcode == Pm4::IT_DRAW_INDIRECT_MULTI ||
+	                     opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI) &&
+	                    executor.IndirectQueueMode() != 0);
 	if (executor.HasQueuedDraw() &&
-	    (!KeepsQueuedDraw(packet_header) ||
-	     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
+	    (!keeps || (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
 		uint32_t reason = RenderExecutor::DrainAsyncCollect;
-		if (!KeepsQueuedDraw(packet_header)) {
+		if (!keeps) {
 			reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
 		}
 		executor.FinishQueuedDraws(CurrentBuffer(), reason);
@@ -1011,6 +1019,15 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 }
 
 uint32_t CommandProcessor::NumInstances() {
+	if (m_num_instances_addr == NumInstancesFromCount) {
+		// The last record of the multi-draw (none drawn: NUM_INSTANCES unchanged).
+		const auto count = std::min(uint32_t {*reinterpret_cast<const volatile uint32_t*>(m_num_instances_count_addr)},
+		                            m_num_instances_max);
+		m_num_instances_addr = count == 0 ? 0
+		                                  : m_num_instances_records +
+		                                        static_cast<uint64_t>(count - 1) * m_num_instances_stride +
+		                                        offsetof(vk::DrawIndirectCommand, instanceCount);
+	}
 	if (m_num_instances_addr != 0) {
 		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
 		m_num_instances_addr = 0;
@@ -1210,6 +1227,64 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
+	auto&      executor = m_renderer.GetRenderExecutor();
+	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+	Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectDraws);
+	// KYTY_INDIRECT_QUEUE: queued and prepared like a direct draw, the record count (if it is in
+	// memory) read by the GPU when it draws: by construction the value the GPU work before it
+	// wrote. The packet kept the queue (RunPrologue). With the decode thread the packet is a sync
+	// on the GPU thread (not KeepsQueuedDraw), drawn at once as before.
+	if (const int mode = executor.IndirectQueueMode();
+	    mode != 0 && !FrameSkip::Active() && m_decode == nullptr) {
+		DrawIndirectArgs records {args_addr, max_count_or_count, stride_in_bytes};
+		const auto&      graphics = m_renderer.GetGraphics();
+		const bool       offsets  = IndirectDrawOffsets(registers, records.offsets);
+		auto&            buffer   = CurrentBuffer();
+		const bool       fits     = max_count_or_count <= graphics.max_draw_indirect_count &&
+		                     (!indexed || m_index_buffer_size != 0) &&
+		                     executor.IndirectRecordsOnGpu(buffer.GetRegisters(), buffer.GetUserConfig(),
+		                                                   buffer.GetShaders());
+		if (offsets && fits) {
+			if (max_count_or_count == 0) {
+				return;
+			}
+			if (count_addr != nullptr) {
+				records.count_address = reinterpret_cast<uint64_t>(count_addr);
+				if (mode == 2) {
+					// What the decode-time read gives (as without the queue), for the commit's check.
+					executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainIndirectCount);
+					records.decoded_count = std::min(uint32_t {*count_addr}, max_count_or_count);
+				}
+				m_num_instances_addr       = NumInstancesFromCount;
+				m_num_instances_count_addr = records.count_address;
+				m_num_instances_records    = args_addr;
+				m_num_instances_stride     = stride_in_bytes;
+				m_num_instances_max        = max_count_or_count;
+				Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectGpuCount);
+			} else {
+				m_num_instances_addr = args_addr +
+				                       static_cast<uint64_t>(max_count_or_count - 1) * stride_in_bytes +
+				                       offsetof(vk::DrawIndirectCommand, instanceCount);
+			}
+			Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectQueued);
+			if (indexed) {
+				executor.QueueDrawIndex(CurrentBuffer(), {.index_count         = m_index_buffer_size,
+				                                          .index_addr          = IndexAddress(0),
+				                                          .index_type_and_size = m_index_type_and_size,
+				                                          .indirect            = records});
+			} else {
+				executor.QueueDrawAuto(CurrentBuffer(), {.indirect = records});
+			}
+			return;
+		}
+		Common::FrameDiag::Add(offsets ? Common::FrameDiag::Counter::IndirectUnqueued
+		                               : Common::FrameDiag::Counter::IndirectPatched);
+	} else {
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectUnqueued);
+	}
+	// Drawn at once with the count read here: the draws queued before it go first.
+	executor.FinishQueuedDraws(CurrentBuffer(), RenderExecutor::DrainIndirectCount);
+
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
 	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
@@ -1218,8 +1293,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
-	auto&      executor  = m_renderer.GetRenderExecutor();
-	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
@@ -2031,6 +2104,9 @@ bool DecodeThread::RunUntilDraw() {
 			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 		if ((packet_header & 1u) != 0 && m_cp.ShouldSkipPredicatedPackets()) {
+			if (opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI) {
+				Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectPredicated);
+			}
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
 			cursor.offset_dw += packet_dw;
@@ -2339,6 +2415,9 @@ void CommandProcessor::ProcessPm4Decode(Pm4Execution& execution) {
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			if (opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI) {
+				Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectPredicated);
+			}
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
 			cursor.offset_dw += packet_dw;

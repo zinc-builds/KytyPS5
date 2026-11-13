@@ -510,6 +510,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
 	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
+	features12.drawIndirectCount        = supported12.drawIndirectCount;
+	graphics.draw_indirect_count_enabled = supported12.drawIndirectCount != VK_FALSE;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -536,6 +538,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.physical_device_properties = properties2.properties;
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
+	graphics.max_draw_indirect_count    = properties2.properties.limits.maxDrawIndirectCount;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
 
 	const auto subgroup_stages = subgroup_control.requiredSubgroupSizeStages;

@@ -39,6 +39,14 @@ enum class Counter {
 	LabelStale,   // IsCpLabel: the label matched but its token was voided (the wait collects)
 	LabelWritten, // IsCpLabel: the label matched but the guest stored to its page
 	WriteDataMemoHits, // StoreCpLabels through the page's memo (KYTY_WRITE_DATA_MEMO)
+	IndirectDraws,      // indirect draw packets, single and multi (KYTY_INDIRECT_QUEUE)
+	IndirectQueued,     // of those, queued and prepared
+	IndirectGpuCount,   // of those, with the record count read by the GPU
+	IndirectPatched,    // drawn at once: the shaders need per-record offsets patched
+	IndirectUnqueued,   // drawn at once: switch off, frame skip, decode thread, over the device
+	                    // bound, no index buffer, records needed on the CPU (tess, quad list, mesh)
+	IndirectPredicated, // multi-draw indirect packets skipped by predication
+	IndirectVerified,   // queued draws whose GPU count was checked (KYTY_INDIRECT_QUEUE=verify)
 	Count
 };
 

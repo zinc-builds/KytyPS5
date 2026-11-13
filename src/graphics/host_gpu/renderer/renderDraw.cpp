@@ -1152,16 +1152,44 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 }
 
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                         DrawRenderState& state, const DrawEmitInfo& emit,
+                                         DrawRenderState& state, const DrawEmitInfo& emit_in,
                                          const DrawIndexBufferSource& index_source) {
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;
+	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
+	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
+	DrawEmitInfo emit = emit_in;
+	if (emit.indirect.count_address != 0) {
+		// KYTY_INDIRECT_QUEUE: the record count is in guest memory, written by earlier GPU work.
+		const bool verify = IndirectQueueMode() == 2;
+		if (verify || mesh_active || mesh_task) {
+			// The count as the GPU will read it: earlier work finished, its bytes downloaded.
+			m_context.GetBufferCache().ReadMemory(emit.indirect.count_address, sizeof(uint32_t));
+			const uint32_t count =
+			    std::min(uint32_t {*reinterpret_cast<const volatile uint32_t*>(emit.indirect.count_address)},
+			             emit.indirect.count);
+			if (verify) {
+				Common::FrameDiag::Add(Common::FrameDiag::Counter::IndirectVerified);
+				if (count != emit.indirect.decoded_count) {
+					EXIT("KYTY_INDIRECT_QUEUE=verify: indirect draw count at 0x%016" PRIx64
+					     " is %u at commit, %u when decoded\n",
+					     emit.indirect.count_address, count, emit.indirect.decoded_count);
+				}
+			}
+			if (mesh_active || mesh_task) {
+				// Mesh draws launch their groups from the count on the CPU, as before.
+				emit.indirect.count         = count;
+				emit.indirect.count_address = 0;
+				if (count == 0) {
+					return;
+				}
+			}
+		}
+	}
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
 	const auto  vertex_stages = state.VertexStages();
-	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
-	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
 	const auto& mesh          = state.vertex_info[0].mesh;
 	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
 	uint32_t    mesh_groups   = 0;
@@ -1239,6 +1267,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                                : sizeof(vk::DrawIndirectCommand));
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
+	}
+	std::pair<Buffer*, uint64_t> count_buffer {};
+	if (emit.indirect.count_address != 0) {
+		count_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.count_address,
+		                                                       sizeof(uint32_t), false);
+		EXIT_IF((count_buffer.second & 3u) != 0);
 	}
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_adopted_pipeline_key);
@@ -1429,6 +1463,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			                       ? uint64_t {draw.index_count} * index_source.guest_element_size
 			                       : index_source.size);
 		}
+		if (count_buffer.first != nullptr) {
+			plain.emplace_back(emit.indirect.count_address, sizeof(uint32_t));
+		}
 		if (args_buffer.first != nullptr) {
 			plain.emplace_back(emit.indirect.address,
 			                   static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
@@ -1502,6 +1539,19 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, buffer, draw, emit);
+	} else if (count_buffer.first != nullptr) {
+		// The GPU reads the record count (bounded by the packet's maximum) when it draws.
+		buffer.Record([indexed = draw.indexed, handle = args_buffer.first->Handle(),
+		               offset = args_buffer.second, count_handle = count_buffer.first->Handle(),
+		               count_offset = count_buffer.second, max_count = emit.indirect.count,
+		               stride = emit.indirect.stride](vk::CommandBuffer cb) {
+			if (indexed) {
+				cb.drawIndexedIndirectCount(handle, offset, count_handle, count_offset, max_count,
+				                            stride);
+			} else {
+				cb.drawIndirectCount(handle, offset, count_handle, count_offset, max_count, stride);
+			}
+		});
 	} else {
 		buffer.Record([indexed = draw.indexed, handle = args_buffer.first->Handle(),
 		               offset = args_buffer.second, count = emit.indirect.count,
@@ -1675,6 +1725,8 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args,
 	                     args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  args.base_vertex, args.first_instance, args.indirect);
+	// IndirectRecordsOnGpu kept the draws that would need the CPU's records out of the queue.
+	EXIT_IF(!emit && queued != nullptr && args.indirect.address != 0);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, index_source);
 	}
@@ -1759,11 +1811,54 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args,
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
 	                                  args.indirect);
+	// IndirectRecordsOnGpu kept the draws that would need the CPU's records out of the queue.
+	EXIT_IF(!emit && queued != nullptr && args.indirect.address != 0);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, {});
 	}
 	ResetBindings();
 	return emit.has_value();
+}
+
+int RenderExecutor::IndirectQueueMode() {
+	if (const int mode = m_indirect_queue_mode.load(std::memory_order_relaxed); mode >= 0) {
+		return mode;
+	}
+	{
+		const char* value = std::getenv("KYTY_INDIRECT_QUEUE");
+		const int   asked = value == nullptr                       ? 1
+		                    : std::string_view(value) == "0"        ? 0
+		                    : std::string_view(value) == "verify"   ? 2
+		                                                            : 1;
+		const bool supported = m_context.GetGraphics().draw_indirect_count_enabled;
+		const int  mode      = supported ? asked : 0;
+		int        unset     = -1;
+		if (m_indirect_queue_mode.compare_exchange_strong(unset, mode, std::memory_order_relaxed)) {
+			std::printf("Config: KYTY_INDIRECT_QUEUE=%s%s\n",
+			            mode == 0 ? "0" : mode == 2 ? "verify" : "1",
+			            asked != 0 && !supported ? " (off: the device lacks drawIndirectCount)" : "");
+		}
+		return mode;
+	}
+}
+
+bool RenderExecutor::IndirectRecordsOnGpu(const HW::Context& ctx, const HW::UserConfig& ucfg,
+                                          const HW::Shader& shaders) const {
+	const auto prim = ucfg.GetPrimType();
+	if (prim == Prospero::PrimitiveType::kPatch || prim == Prospero::PrimitiveType::kQuadListLegacy) {
+		return false;
+	}
+	// A possible mesh program (merged or NGG: ShaderGetInputInfoVS) needs room for the payload.
+	const auto& vs  = shaders.GetVs();
+	const uint32_t lds = static_cast<uint32_t>(vs.gs_regs.rsrc2.lds_size) * 128u;
+	if ((ctx.GetShaderStages() & 0x20u) == 0 && lds == 0) {
+		return true;
+	}
+	const auto& graphics = m_context.GetGraphics();
+	return (lds + 2u + ctx.GetShaderRegisters().m_geMaxOutputPerSubgroup +
+	        ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) *
+	           sizeof(uint32_t) <=
+	       graphics.mesh_shader_properties.maxMeshPayloadAndSharedMemorySize;
 }
 
 int RenderExecutor::ProxySkipMode() {
@@ -2153,7 +2248,9 @@ void RenderExecutor::PostQueuedDraw(const LiveRegisters& live, QueuedDraw& queue
 
 void RenderExecutor::QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	const LiveRegisters live {buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders()};
-	auto* queued = args.indirect.address == 0 && args.index_count != 0 && args.instance_count != 0
+	auto* queued = args.index_count != 0 &&
+	                       (args.indirect.address != 0 ? IndirectQueueMode() != 0
+	                                                   : args.instance_count != 0)
 	                   ? NextQueuedDraw(live)
 	                   : nullptr;
 	if (queued == nullptr) {
@@ -2169,7 +2266,8 @@ void RenderExecutor::QueueDrawIndex(CommandBuffer& buffer, const DrawIndexArgs& 
 
 void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	const LiveRegisters live {buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders()};
-	auto* queued = args.indirect.address == 0 && args.vertex_count != 0 && args.instance_count != 0
+	auto* queued = (args.indirect.address != 0 ? IndirectQueueMode() != 0
+	                                           : args.vertex_count != 0 && args.instance_count != 0)
 	                   ? NextQueuedDraw(live)
 	                   : nullptr;
 	if (queued == nullptr) {
@@ -2184,7 +2282,9 @@ void RenderExecutor::QueueDrawAuto(CommandBuffer& buffer, const DrawAutoArgs& ar
 }
 
 bool RenderExecutor::TryQueueDrawIndex(const LiveRegisters& live, const DrawIndexArgs& args) {
-	auto* queued = args.indirect.address == 0 && args.index_count != 0 && args.instance_count != 0
+	auto* queued = args.index_count != 0 &&
+	                       (args.indirect.address != 0 ? IndirectQueueMode() != 0
+	                                                   : args.instance_count != 0)
 	                   ? NextQueuedDraw(live)
 	                   : nullptr;
 	if (queued == nullptr) {
@@ -2197,7 +2297,8 @@ bool RenderExecutor::TryQueueDrawIndex(const LiveRegisters& live, const DrawInde
 }
 
 bool RenderExecutor::TryQueueDrawAuto(const LiveRegisters& live, const DrawAutoArgs& args) {
-	auto* queued = args.indirect.address == 0 && args.vertex_count != 0 && args.instance_count != 0
+	auto* queued = (args.indirect.address != 0 ? IndirectQueueMode() != 0
+	                                           : args.vertex_count != 0 && args.instance_count != 0)
 	                   ? NextQueuedDraw(live)
 	                   : nullptr;
 	if (queued == nullptr) {
@@ -2251,6 +2352,10 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	DrawPrepare::SetLog(&queued.log);
 	std::destroy_at(&queued.state);
 	std::construct_at(&queued.state);
+	// An indirect draw's programs read their offsets from the records (as DrawIndex sets them).
+	const auto& indirect = queued.indexed ? queued.index_args.indirect : queued.auto_args.indirect;
+	queued.state.indirect_offsets = indirect.offsets;
+	queued.state.indirect_draw    = indirect.address != 0;
 	self.m_context.GetPipelineCache().GetGraphicsPrograms(
 	    *queued.registers, queued.user_config, queued.shaders, queued.state, queued.resources);
 	DrawPrepare::SetLog(nullptr);
