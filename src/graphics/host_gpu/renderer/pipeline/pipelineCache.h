@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <initializer_list>
@@ -232,6 +233,26 @@ struct DrawRenderState {
 };
 
 // Writes the shader store on its own thread, running jobs in the order they were posted.
+// An exclusive lock on <path>.lock (flock, or LockFileEx on Windows), tried once without waiting
+// and held until destruction: one emulator writes a store or driver cache at a time, and pruning
+// removes only files nobody holds. The lock file itself is never removed.
+class StoreLock {
+public:
+	StoreLock() = default;
+	explicit StoreLock(const std::filesystem::path& path);
+	StoreLock(StoreLock&& other) noexcept: m_handle(other.m_handle) { other.m_handle = kNone; }
+	StoreLock& operator=(StoreLock&& other) noexcept;
+	StoreLock(const StoreLock&)            = delete;
+	StoreLock& operator=(const StoreLock&) = delete;
+	~StoreLock() { Release(); }
+	[[nodiscard]] bool Held() const { return m_handle != kNone; }
+
+private:
+	static constexpr intptr_t kNone = -1; // also INVALID_HANDLE_VALUE
+	void                      Release();
+	intptr_t                  m_handle = kNone;
+};
+
 class ShaderStoreWriter {
 public:
 	ShaderStoreWriter();
@@ -253,15 +274,7 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
-	struct WriterLock {
-		WriterLock() = default;
-		WriterLock(const WriterLock&)            = delete;
-		WriterLock& operator=(const WriterLock&) = delete;
-		~WriterLock();
-		int fd = -1;
-	};
-
-	WriterLock                               m_lock;
+	StoreLock                                m_lock;
 	Common::File                             m_file;
 	std::mutex                               m_mutex;
 	std::condition_variable_any              m_ready;
@@ -415,6 +428,9 @@ private:
 	StageResources                         m_compute_resources;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	// Held while this emulator may write the driver cache; taken again at a save if another
+	// emulator held it at start.
+	mutable StoreLock             m_driver_lock;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash,
@@ -493,13 +509,16 @@ std::filesystem::path ShaderStorePath();
 // combinations that would record different modules use different files, so none truncates
 // another's, and a rebuild that keeps the header finds its store warm.
 std::filesystem::path KeyedStorePath(const GraphicContext& graphics, const std::filesystem::path& base);
+// `path` with a suffix unique to this process and call, for a file written and then renamed.
+std::filesystem::path TempPathFor(const std::filesystem::path& path);
 // Copies the first of `candidates` whose first bytes equal `header` to `store` (through a temporary
-// file and a rename), unless `store` exists. Returns the adopted path, or empty.
+// file and a rename), unless `store` exists. Returns the adopted path, or empty. The caller holds
+// the store's StoreLock, so no other emulator creates `store` meanwhile.
 std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<const uint8_t> header,
                                  std::span<const std::filesystem::path> candidates);
 // Removes stores of the same title (<title>.*<ext> beside `current`) not written for `max_age`,
-// and all but the `keep` most recently written, never `current` nor a store whose writer lock
-// another process holds. Returns how many it removed.
+// and all but the `keep` most recently written, never `current` nor a store whose StoreLock
+// another emulator holds. Returns how many it removed.
 size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chrono::hours max_age);
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);

@@ -14,11 +14,14 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
 #include <algorithm>
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h> // IWYU pragma: keep
+#else
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
 #endif
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -154,10 +157,22 @@ std::filesystem::path KeyedStorePath(const GraphicContext& graphics, const std::
 	return base.parent_path() / name;
 }
 
+std::filesystem::path TempPathFor(const std::filesystem::path& path) {
+	static std::atomic<uint32_t> counter {0};
+#if defined(_WIN32)
+	const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
+#else
+	const auto pid = static_cast<uint64_t>(::getpid());
+#endif
+	auto temp = path;
+	temp += fmt::format(".{}.{}.tmp", pid, counter.fetch_add(1, std::memory_order_relaxed));
+	return temp;
+}
+
 std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<const uint8_t> header,
                                  std::span<const std::filesystem::path> candidates) {
 	std::error_code error;
-	if (std::filesystem::exists(store, error)) {
+	if (std::filesystem::exists(store, error) || error) {
 		return {};
 	}
 	for (const auto& candidate: candidates) {
@@ -173,9 +188,8 @@ std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<c
 		if (read != header.size() || !std::ranges::equal(head, header)) {
 			continue;
 		}
-		// A temporary name unique to this process, then a rename: a store appears whole or not.
-		auto temp = store;
-		temp += fmt::format(".{:x}.adopt", std::chrono::steady_clock::now().time_since_epoch().count());
+		// A copy under a name of this process's, then a rename: a store appears whole or not.
+		const auto temp = TempPathFor(store);
 		Common::File::CreateDirectories(store.parent_path());
 		std::filesystem::copy_file(candidate, temp, std::filesystem::copy_options::overwrite_existing,
 		                           error);
@@ -191,24 +205,59 @@ std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<c
 	return {};
 }
 
-namespace {
-#if !defined(_WIN32)
-// The writer lock of `store`, or -1 when another process holds it (or it cannot be made).
-int TryLockStore(const std::filesystem::path& store) {
-	auto lock_path = store;
+StoreLock::StoreLock(const std::filesystem::path& path) {
+	auto lock_path = path;
 	lock_path += ".lock";
+	Common::File::CreateDirectories(path.parent_path());
+#if defined(_WIN32)
+	HANDLE handle = ::CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+	                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+	                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	OVERLAPPED overlapped {};
+	if (::LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0,
+	                 &overlapped) == 0) {
+		::CloseHandle(handle);
+		return;
+	}
+	m_handle = reinterpret_cast<intptr_t>(handle);
+#else
 	const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
 	if (fd < 0) {
-		return -1;
+		return;
 	}
 	if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
 		::close(fd);
-		return -1;
+		return;
 	}
-	return fd;
-}
+	m_handle = fd;
 #endif
-} // namespace
+}
+
+void StoreLock::Release() {
+	if (m_handle == kNone) {
+		return;
+	}
+	// Closing releases the lock. The lock file stays: unlinking it would let a process that opened
+	// it before the unlink and one that creates it again afterwards both hold "the" lock.
+#if defined(_WIN32)
+	::CloseHandle(reinterpret_cast<HANDLE>(m_handle));
+#else
+	::close(static_cast<int>(m_handle));
+#endif
+	m_handle = kNone;
+}
+
+StoreLock& StoreLock::operator=(StoreLock&& other) noexcept {
+	if (this != &other) {
+		Release();
+		m_handle       = other.m_handle;
+		other.m_handle = kNone;
+	}
+	return *this;
+}
 
 size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chrono::hours max_age) {
 	const auto dir    = current.parent_path().empty() ? std::filesystem::path(".") : current.parent_path();
@@ -218,13 +267,20 @@ size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chron
 	if (prefix.size() < 2 || ext.empty()) {
 		return 0;
 	}
-	std::error_code error;
 	std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> stores;
-	for (const auto& entry: std::filesystem::directory_iterator(dir, error)) {
-		const auto file = entry.path().filename().string();
-		if (entry.is_regular_file(error) && file.starts_with(prefix) && file.ends_with(ext) &&
-		    file != name) {
-			stores.emplace_back(entry.last_write_time(error), entry.path());
+	std::error_code                       error;
+	std::filesystem::directory_iterator it(dir, error);
+	for (const std::filesystem::directory_iterator end; !error && it != end; it.increment(error)) {
+		const auto&     entry = *it;
+		const auto      file  = entry.path().filename().string();
+		std::error_code entry_error;
+		if (!file.starts_with(prefix) || !file.ends_with(ext) || file == name ||
+		    !entry.is_regular_file(entry_error) || entry_error) {
+			continue;
+		}
+		const auto time = entry.last_write_time(entry_error);
+		if (!entry_error) {
+			stores.emplace_back(time, entry.path());
 		}
 	}
 	std::ranges::sort(stores, std::greater {});
@@ -236,44 +292,23 @@ size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chron
 		if (i + 1 < keep && now - time < max_age) {
 			continue;
 		}
-		auto lock_path = path;
-		lock_path += ".lock";
-#if !defined(_WIN32)
-		const int fd = TryLockStore(path);
-		if (fd < 0) {
-			continue; // in use
+		// Only a store no emulator is writing; its lock file stays (StoreLock::Release).
+		if (const StoreLock lock(path); !lock.Held()) {
+			continue;
 		}
-#endif
-		if (std::filesystem::remove(path, error)) {
+		std::error_code remove_error;
+		if (std::filesystem::remove(path, remove_error)) {
 			removed++;
 		}
-		std::filesystem::remove(lock_path, error);
-#if !defined(_WIN32)
-		::close(fd);
-#endif
 	}
 	return removed;
 }
 
-ShaderStoreWriter::WriterLock::~WriterLock() {
-#if !defined(_WIN32)
-	if (fd >= 0) {
-		::close(fd);
-	}
-#endif
-}
-
 bool ShaderStoreWriter::Lock(const std::filesystem::path& path) {
-#if defined(_WIN32)
-	(void)path;
-	return true; // no lock: one emulator at a time is assumed
-#else
-	Common::File::CreateDirectories(path.parent_path());
-	if (m_lock.fd < 0) {
-		m_lock.fd = TryLockStore(path);
+	if (!m_lock.Held()) {
+		m_lock = StoreLock(path);
 	}
-	return m_lock.fd >= 0;
-#endif
+	return m_lock.Held();
 }
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,

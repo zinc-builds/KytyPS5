@@ -653,7 +653,9 @@ void PipelineCache::InitializeDriverCache() {
 	const auto signature_key = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	m_driver_cache_path = ShaderStoreDir() / fmt::format("{}.{:016x}.bin", title_id,
 	                                                     XXH3_64bits(signature_key.data(), signature_key.size()));
-	if (const auto local = InstallStoreDir() / (title_id + ".bin"); local != m_driver_cache_path) {
+	m_driver_lock = StoreLock(m_driver_cache_path);
+	if (const auto local = InstallStoreDir() / (title_id + ".bin");
+	    m_driver_lock.Held() && local != m_driver_cache_path) {
 		const std::array<std::filesystem::path, 1> adopt {local};
 		const auto signature_bytes = std::span(reinterpret_cast<const uint8_t*>(signature_key.data()),
 		                                       signature_key.size());
@@ -779,9 +781,16 @@ void PipelineCache::WriteDriverCache() const {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return;
 	}
-	// Unique per process: two emulators saving at once never write into one temporary file.
-	auto temp_path = m_driver_cache_path;
-	temp_path += fmt::format(".{:x}.tmp", std::chrono::steady_clock::now().time_since_epoch().count());
+	// One emulator writes a driver cache at a time; another keeps what it loaded.
+	if (!m_driver_lock.Held()) {
+		m_driver_lock = StoreLock(m_driver_cache_path);
+		if (!m_driver_lock.Held()) {
+			PipelineCacheLog("Vulkan pipeline cache: {} is in use by another emulator; not saved",
+			                 Common::PathToString(m_driver_cache_path));
+			return;
+		}
+	}
+	const auto temp_path = TempPathFor(m_driver_cache_path);
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;

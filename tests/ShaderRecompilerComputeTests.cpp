@@ -50301,7 +50301,6 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   Require(name, "truncated record",
           run() == lost_pipeline && std::filesystem::file_size(store) == size,
           "a cut record was not dropped and appended again, or took earlier records along");
-#if !defined(_WIN32)
   // While another emulator holds the store's writer lock, a run reads the store but neither
   // truncates nor appends to it; once the lock is free, the next run appends again.
   {
@@ -50315,7 +50314,6 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   Require(name, "lock released",
           run() == lost_pipeline && std::filesystem::file_size(store) == size,
           "a store whose writer lock was released was not written again");
-#endif
   // Flips the top checksum byte, just before the last zstd frame's magic 0xfd2fb528.
   std::vector<uint8_t> bytes(size);
   Common::File(store, Common::File::Mode::Read).Read(bytes.data(), static_cast<u32>(size));
@@ -50381,6 +50379,8 @@ void CheckShaderStore(VulkanHarness &vulkan) {
     cache.Save();
     Require(name, "driver cache at exit", std::filesystem::exists(driver_cache),
             "Save() returned before the changed driver cache was written");
+    Require(name, "driver cache lock", !StoreLock(driver_cache).Held(),
+            "a second emulator could take the lock of a driver cache this one writes");
   }
   std::filesystem::remove_all(store.parent_path());
   Require(name, "release",
@@ -50458,23 +50458,20 @@ void CheckShaderStoreFiles() {
   write(driver, header);
   std::filesystem::last_write_time(foreign, now - std::chrono::hours(24 * 400));
   std::filesystem::last_write_time(driver, now - std::chrono::hours(24 * 400));
-#if !defined(_WIN32)
-  ShaderStoreWriter in_use;
-  const bool locked = in_use.Lock(others[4]); // the oldest, but another emulator writes it
-#else
-  const bool locked = true;
-#endif
+  const StoreLock in_use(others[4]); // the oldest, but another emulator writes it
+  const bool locked = in_use.Held();
   const auto removed = PruneStores(store, 3, std::chrono::hours(24 * 30));
   const auto exists = [](const auto &path) { return std::filesystem::exists(path); };
   Require(name, "prune",
           locked && exists(store) && exists(others[0]) && !exists(others[1]) && exists(others[2]) &&
-              !exists(others[3]) && exists(foreign) && exists(driver) &&
-#if !defined(_WIN32)
-              exists(others[4]) && removed == 2,
-#else
-              !exists(others[4]) && removed == 3,
-#endif
+              !exists(others[3]) && exists(foreign) && exists(driver) && exists(others[4]) &&
+              removed == 2,
           "PruneStores kept the wrong stores");
+  // A pruned store's lock file stays, so a later writer and anyone still holding it agree.
+  auto pruned_lock = others[3];
+  pruned_lock += ".lock";
+  Require(name, "lock files stay", exists(pruned_lock) && !StoreLock(others[4]).Held(),
+          "pruning removed a lock file, or a held lock was taken twice");
   std::filesystem::remove_all(dir);
   std::printf("[gpu]     %-32s ok\n", name);
 }

@@ -2131,10 +2131,13 @@ target and 8M pipeline-key checks); the level renders the same as a plain build.
   record different modules use different files, so `KYTY_RESIDENT_TEXTURES` on and off, or two
   builds run alternately, each keep their own warm store. The driver's pipeline cache sits
   beside it as `<title>.<hash of the driver signature>.bin`.
-  - **Sharing:** one emulator at a time appends to a store (an `flock` on `<store>.lock`);
-    another one running meanwhile loads it but does not write. Records are checksummed zstd
-    frames, so a crash mid-write loses only the torn last record. A header mismatch starts a
-    store cold. The driver cache is written to a per-process temporary file and renamed.
+  - **Sharing:** one emulator at a time writes a store or driver cache: an exclusive,
+    non-waiting lock on `<file>.lock` (`flock`; `LockFileEx` on Windows), taken before the store
+    is read. Another emulator running meanwhile loads it but does not write. Lock files are never
+    deleted (pruning removes only the store), so two processes can never hold different lock
+    files for one store. Records are checksummed zstd frames, so a crash mid-write loses only the
+    torn last record. A header mismatch starts a store cold. The driver cache is written to a
+    per-process temporary file and renamed.
   - **Migration:** on first use, a missing shared store adopts the install's own
     `_PipelineCache` store when its header matches. Stores written before this change do not
     match, because the source hash changed with it.
