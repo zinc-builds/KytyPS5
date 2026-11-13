@@ -1018,6 +1018,52 @@ public:
 		TakeKeptWrites(written);
 	}
 
+	// ScanAsyncWrites limited to [begin, end) (page-aligned): the written marks of the range's
+	// asynchronous pages are taken and the pages re-protected, then the kept writes overlapping the
+	// range are taken (an entry that straddles an edge keeps its part outside). Marks and kept
+	// writes outside the range stay for the next collection. Consumed marks move staged pages'
+	// versions, as in a collection.
+	void ScanAsyncWritesIn(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>& written) {
+		{
+			std::shared_lock lock(m_mutex);
+			ForEachAsyncChunk(begin, end - begin, [&](uint64_t start, uint64_t bytes) {
+				m_write_protection.Scan(
+				    start, bytes,
+				    [&](uint64_t written_begin, uint64_t written_end) {
+					    StagedConsumed(written_begin, written_end);
+					    if (!written.empty() && written.back().second == written_begin) {
+						    written.back().second = written_end;
+					    } else {
+						    written.emplace_back(written_begin, written_end);
+					    }
+				    },
+				    true);
+			});
+		}
+		WaitSerialSubmitScan();
+		std::lock_guard kept_lock(m_kept_mutex);
+		static thread_local std::vector<std::pair<uint64_t, uint64_t>> rest;
+		rest.clear();
+		for (const auto& entry: m_kept_writes) {
+			if (entry.second <= begin || entry.first >= end) {
+				rest.push_back(entry);
+				continue;
+			}
+			const std::pair<uint64_t, uint64_t> taken {std::max(entry.first, begin), std::min(entry.second, end)};
+			written.push_back(taken);
+			if (g_log_alias_writes) {
+				g_verify_kept_taken.push_back(taken);
+			}
+			if (entry.first < begin) {
+				rest.emplace_back(entry.first, begin);
+			}
+			if (entry.second > end) {
+				rest.emplace_back(end, entry.second);
+			}
+		}
+		m_kept_writes.swap(rest);
+	}
+
 	// Appends the kept writes (re-protections and submit scans).
 	void TakeKeptWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
 		WaitSerialSubmitScan();

@@ -175,6 +175,10 @@ enum class GpuFaultCause { Protection, WriteProtect };
 // wanted: whether any page of [begin, end) has a write watcher (chunks without are not scanned).
 void CollectAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written,
                              bool (*wanted)(uint64_t begin, uint64_t end) = nullptr);
+// CollectAsyncGuestWrites limited to the page-aligned [begin, end) (GPU thread): appends the
+// written runs of the range (page-table marks, re-protecting the pages, and the kept writes that
+// overlap it); the rest stays for the next collection. False if asynchronous protection is off.
+bool CollectAsyncGuestWritesIn(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>& written);
 // The [begin, end) ranges under asynchronous write protection (for KYTY_ASYNC_WP_VERIFY).
 void AsyncGuestRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 // KYTY_SUBMIT_SCAN: a submitting guest thread's scan of the asynchronous ranges; what it finds is
