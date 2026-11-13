@@ -883,6 +883,26 @@ bool WindowsOverlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
 }
 } // namespace
 
+namespace {
+bool OwnershipTakeEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_OWNERSHIP_TAKE");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+// KYTY_OWNERSHIP_TAKE=verify: the take stays on, and every synchronous merge left (a fallback)
+// first reads the whole page back from the GPU buffer and exits if any guest byte outside the
+// GPU-written bytes differs from it: the merge was not a no-op, a store the buffer lacked.
+bool OwnershipTakeVerify() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_OWNERSHIP_TAKE");
+		return v != nullptr && std::strcmp(v, "verify") == 0;
+	}();
+	return on;
+}
+} // namespace
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -914,6 +934,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				}
 				if (is_write && GuestGpu::IsGpuThread()) {
 					Common::FrameDiag::Add(Common::FrameDiag::Counter::CollisionReadbacks);
+					if (OwnershipTakeVerify()) {
+						VerifyMergeIsNoOp(buffer, vaddr, size);
+					}
 				}
 				downloaded              = true;
 				const auto [start, len] = DownloadWindow(buffer, vaddr, size);
@@ -1252,15 +1275,61 @@ void NoteStaged(uint64_t vaddr, const uint8_t* staged, uint64_t size);
 } // namespace
 } // namespace BdaStats
 
-namespace {
-bool OwnershipTakeEnabled() {
-	static const bool on = [] {
-		const char* v = std::getenv("KYTY_OWNERSHIP_TAKE");
-		return v == nullptr || v[0] != '0';
-	}();
-	return on;
+
+void BufferCache::VerifyMergeIsNoOp(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const uint64_t begin = std::max(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), buffer.CpuAddress());
+	const uint64_t end   = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE),
+	                                buffer.CpuAddress() + buffer.Size());
+	if (end <= begin) {
+		return;
+	}
+	const uint64_t bytes = end - begin;
+	Buffer         readback(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                        vk::BufferUsageFlagBits::eTransferDst, bytes);
+	auto&          command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 0, nullptr, 1, &before, 0, nullptr);
+	const vk::BufferCopy region {begin - buffer.CpuAddress(), 0, bytes};
+	native.copyBuffer(buffer.Handle(), readback.Handle(), 1, &region);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = readback.Handle();
+	after.offset        = 0;
+	after.size          = bytes;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+	                       nullptr, 1, &after, 0, nullptr);
+	m_scheduler.Finish();
+	readback.Invalidate(0, bytes);
+	std::vector<uint8_t> guest(bytes);
+	if (!LibKernel::Memory::CopySparseMemory(begin, guest.data(), bytes)) {
+		return;
+	}
+	std::vector<uint8_t> skip(bytes, 0); // bytes the GPU owns: stale in guest memory by design
+	for (const auto* set: {&m_gpu_modified_ranges, &m_inflight_ranges}) {
+		set->ForEachInRange(begin, bytes, [&](uint64_t s, uint64_t e) {
+			std::fill(skip.begin() + static_cast<ptrdiff_t>(s - begin), skip.begin() + static_cast<ptrdiff_t>(e - begin), 1);
+		});
+	}
+	const uint8_t* gpu = readback.Mapped().data();
+	for (uint64_t i = 0; i < bytes; i++) {
+		if (skip[i] == 0 && gpu[i] != guest[i]) {
+			EXIT("KYTY_OWNERSHIP_TAKE=verify: a synchronous merge was not a no-op: guest 0x%016" PRIx64
+			     " holds 0x%02x, the GPU buffer 0x%02x (range 0x%016" PRIx64 "+0x%" PRIx64 ")\n",
+			     begin + i, guest[i], gpu[i], vaddr, size);
+		}
+	}
 }
-} // namespace
 
 // The ownership transaction (KYTY_OWNERSHIP_TAKE): before a sync takes GPU ownership of pages
 // that are not GPU-dirty yet, collect their pending write marks now, so every store already made
@@ -1271,6 +1340,9 @@ bool OwnershipTakeEnabled() {
 // leaves a new mark: the next collection merges as today. A store after GPU-dirty faults.
 void BufferCache::TakeOwnershipWrites(uint64_t vaddr, uint64_t size) {
 	constexpr uint64_t Chunk = 64 * TRACKER_PAGE_SIZE;
+	// The take invalidates through the texture cache: not while this thread holds its lock
+	// (ObtainBuffer from inside the texture cache). The readback stays the fallback there.
+	const bool         locked = m_texture_cache.LockHeldByCurrentThread();
 	const uint64_t     begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const uint64_t     end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	for (uint64_t start = begin; start < end; start += Chunk) {
@@ -1279,7 +1351,7 @@ void BufferCache::TakeOwnershipWrites(uint64_t vaddr, uint64_t size) {
 			continue; // owned already: its marks were taken when it was acquired
 		}
 		Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipTakes);
-		if (!m_scheduler.Context().TakeAsyncWrites(start, stop)) {
+		if (locked || !m_scheduler.Context().TakeAsyncWrites(start, stop)) {
 			Common::FrameDiag::Add(Common::FrameDiag::Counter::OwnershipUncertain);
 		}
 	}

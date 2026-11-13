@@ -983,13 +983,6 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool r
 	}
 }
 
-bool RenderContext::TakeAsyncWrites(uint64_t begin, uint64_t end) {
-	// Stub until Track K's implementation: nothing taken, so the synchronous readback remains.
-	(void)begin;
-	(void)end;
-	return false;
-}
-
 bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t size,
                                  bool invalidate, uint32_t source) {
 	EXIT_IF(g_on_decode_thread); // GPU thread only (sync packets)
