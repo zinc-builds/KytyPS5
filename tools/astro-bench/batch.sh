@@ -6,7 +6,8 @@
 # The first measured run of a batch tends to be slow (cold file cache and clocks), so the batch
 # starts with a short, unreported warm-up run of its first line. BATCH_WARMUP=0 skips it.
 # A run that garden.sh marks VOID (outside load on the CPUs the layout leaves idle) is repeated
-# once; the void one is kept as /tmp/garden-<label>.void.out.
+# once; the void one is kept as /tmp/garden-<label>.void.out (and .void.json). A second VOID
+# leaves no /tmp/garden-<label>.json: callers treat it as a failed run.
 . "$(dirname "$0")/benchlock.sh"
 benchlock_acquire x "batch.sh" || exit 1
 run_line() { # run_line <line> [extra env]: runs one configuration, prints garden.sh's summary line
@@ -20,6 +21,7 @@ run_line() { # run_line <line> [extra env]: runs one configuration, prints garde
 	if head -1 "/tmp/garden-$label.out" | grep -q ' VOID '; then
 		echo "batch.sh: $label void (outside load), running it again: $(grep -o 'idle_busy=[^ ]*' "/tmp/garden-$label.out" | head -1)" >&2
 		cp "/tmp/garden-$label.out" "/tmp/garden-$label.void.out"
+		rm -f "/tmp/garden-$label.json"
 		sleep 10
 		# shellcheck disable=SC2086
 		env $envs $2 bash "$(dirname "$0")/garden.sh" "$label" $flags > "/tmp/garden-$label.out" 2>&1

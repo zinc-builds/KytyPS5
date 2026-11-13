@@ -9,7 +9,7 @@
                                               one A/B verdict line (SEL: json file or label glob)
   results.py add-hitch "<HITCH line>" key=value...
                                               store a hitch baseline (gate.sh --baseline)
-  results.py hitch-base <sha>... [--mode M] [--profile P]
+  results.py hitch-base <sha>... [--mode M] [--profile P] [--flags F] [--frames A-B] [--shot-frame N]
                                               the newest hitch baseline of the first <sha> that has
                                               one (JSON on stdout; exit 1 if none)
 
@@ -219,13 +219,15 @@ def add_hitch(line, fields):
     return 0
 
 
-def hitch_base(shas, mode=None, profile=None, flags=None):
+def hitch_base(shas, mode=None, profile=None, flags=None, frames=None, shot_frame=None):
     stored = [r for r in load() if r.get("kind") == "hitch"]
     for sha in shas:
         hits = [r for r in stored if str(r.get("rev", "")).startswith(sha)
                 and (mode is None or r.get("build_mode", "plain") == mode)
                 and (profile is None or r.get("profile", "") == profile)
-                and (flags is None or r.get("flags", "") == flags)]
+                and (flags is None or r.get("flags", "") == flags)
+                and (frames is None or r.get("frames", "") == frames)
+                and (shot_frame is None or r.get("shot_frame", "") == shot_frame)]
         if hits:
             return max(hits, key=lambda r: r.get("time", ""))
     return None
@@ -276,8 +278,10 @@ def main():
         p.add_argument("--mode", default=None)
         p.add_argument("--profile", default=None)
         p.add_argument("--flags", default=None)
+        p.add_argument("--frames", default=None)
+        p.add_argument("--shot-frame", default=None)
         a = p.parse_args(args)
-        r = hitch_base(a.sha, a.mode, a.profile, a.flags)
+        r = hitch_base(a.sha, a.mode, a.profile, a.flags, a.frames, a.shot_frame)
         if r is None:
             return 1
         print(json.dumps(r, sort_keys=True))

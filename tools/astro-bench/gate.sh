@@ -49,19 +49,30 @@ bm() { # "<mode> [<profile hash>]" of an install; no BUILD_MODE file: plain
 	sed -n 's/.*\bmode=\([a-z]*\).*/\1/p; s/.*\bsha256=\([0-9a-f]*\).*/\1/p' "$1/../BUILD_MODE" | xargs
 }
 o100() { sed -n 's/.* over100=\([0-9]*\) .*/\1/p' <<<"$1"; }
+# ran <label> [timed]: the run reached its last frame; with "timed", also not VOID (outside load
+# makes timings, not correctness, worthless: verify and diagnostic runs accept a VOID).
+ran() {
+	local v
+	v=$(head -1 "/tmp/garden-$1.out" 2>/dev/null)
+	[[ "$v" == "$1: fps="* ]] && { [ "$2" != timed ] || [[ "$v" != *" VOID "* ]]; }
+}
 
 if [ "$1" = --baseline ]; then
 	sha=$(git -C "$repo" rev-parse --verify "${2:-origin/dev}^{commit}") || exit 1
 	inst=$("$dir/refbuild.sh" "$sha") || { echo "gate.sh: refbuild.sh $sha failed" >&2; exit 1; }
 	read -r mode profile <<<"$(bm "$inst")"
 	b=base-${sha:0:8}-$mode${profile:+-$profile}
-	rm -f "/tmp/garden-$b-hitch-shot.png" "/tmp/bench-$b-hitch.log"
+	rm -f "/tmp/garden-$b-hitch-shot.png" "/tmp/bench-$b-hitch.log" /tmp/garden-"$b"-{perf1,perf2,hitch}.{out,json}
 	printf '%s\n' "$b-perf1 KYTY_INSTALL=$inst GARDEN_FRAMES=200-500 -- --amd-cpu" \
 		"$b-perf2 KYTY_INSTALL=$inst GARDEN_FRAMES=200-500 -- --amd-cpu" \
 		"$b-hitch KYTY_INSTALL=$inst KYTY_FRAME_DIAG=1 GARDEN_FRAMES=$hframes GARDEN_SHOT=$shot -- --amd-cpu" |
 		"$dir/batch.sh" || exit 1
 	for r in perf1 perf2 hitch; do head -1 "/tmp/garden-$b-$r.out"; done
-	[[ "$(head -1 "/tmp/garden-$b-hitch.out")" == "$b-hitch: fps="* ]] || { echo "gate.sh: the hitch run failed" >&2; exit 1; }
+	for r in perf1 perf2; do # garden.sh stored these in the result store (references for gates)
+		ran "$b-$r" timed && [ -f "/tmp/garden-$b-$r.json" ] ||
+			{ echo "gate.sh: $b-$r failed or was void (no per-draw result); baseline not stored" >&2; exit 1; }
+	done
+	ran "$b-hitch" timed || { echo "gate.sh: the hitch run failed or was void; baseline not stored" >&2; exit 1; }
 	h=$(python3 -I "$dir/hitches.py" "$b-hitch" --frames "$hframes" 2>&1)
 	[ -n "$(o100 "$h")" ] || { echo "gate.sh: no hitch result: $h" >&2; exit 1; }
 	keep=$HOME/.cache/kyty-builds/baselines
@@ -120,7 +131,7 @@ merge_base=$(git -C "$repo" rev-parse --verify "${ref:-$(git -C "$repo" merge-ba
 base_json= base_sha=
 if [ "$hitch" = 1 ]; then
 	base_json=$(python3 -I "$dir/results.py" hitch-base $(git -C "$repo" rev-list --first-parent -n 11 "$merge_base") \
-		--mode "$mode" --profile "${profile:-}" --flags="$flags" 2>/dev/null)
+		--mode "$mode" --profile "${profile:-}" --flags="$flags" --frames "$hframes" --shot-frame "$shot" 2>/dev/null)
 	base_sha=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["rev"])' "$base_json" 2>/dev/null)
 fi
 extra=()
@@ -170,7 +181,7 @@ fi
 for run in $([ "$verify" = 1 ] && [ "$class" != diag ] && echo verify) $([ "$class" = diag ] && echo diag); do
 	v=$(head -1 "/tmp/garden-$label-$run.out" 2>/dev/null)
 	what=$([ "$run" = verify ] && echo "$VERIFY_ENV${verify_env:+ $verify_env}" || echo "$diag_env$([ "$verify" = 1 ] && echo " $VERIFY_ENV${verify_env:+ $verify_env}")")
-	if [[ "$v" == "$label-$run: fps="* ]]; then
+	if ran "$label-$run"; then
 		echo "**${run^}:** PASS, frames 0-$([ "$run" = verify ] && echo "$vframes" || echo $((shot + 100))) clean with $what"
 	else
 		status=FAIL
@@ -187,7 +198,7 @@ if [ "$hitch" = 1 ]; then
 	w=$(o100 "$hnew")
 	new_png=/tmp/garden-$label-hitch-new-shot.png
 	done_new=0
-	[[ "$(head -1 "/tmp/garden-$label-hitch-new.out" 2>/dev/null)" == "$label-hitch-new: fps="* ]] && done_new=1
+	ran "$label-hitch-new" timed && done_new=1
 	if [ -n "$base_sha" ]; then
 		href=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["line"])' "$base_json")
 		r=$(o100 "$href")
@@ -200,11 +211,11 @@ if [ "$hitch" = 1 ]; then
 		ref_png=/tmp/garden-$label-hitch-ref-shot.png
 		from="the reference arm (no stored baseline within 10 dev commits; gate.sh --baseline stores one)"
 		done_ref=0
-		[[ "$(head -1 "/tmp/garden-$label-hitch-ref.out" 2>/dev/null)" == "$label-hitch-ref: fps="* ]] && done_ref=1
+		ran "$label-hitch-ref" timed && done_ref=1
 	fi
 	if [ "$done_ref" = 0 ] || [ "$done_new" = 0 ]; then
 		status=FAIL
-		hverdict="FAIL: a hitch run did not complete (ref $done_ref, new $done_new; see /tmp/garden-$label-hitch-*.out)"
+		hverdict="FAIL: a hitch run did not complete or was void (ref $done_ref, new $done_new; see /tmp/garden-$label-hitch-*.out)"
 	elif [ -z "$r" ] || [ -z "$w" ]; then
 		status=FAIL
 		hverdict="FAIL (no result)"
@@ -225,7 +236,7 @@ if [ "$hitch" = 1 ]; then
 elif [ "$class" = diag ]; then
 	new_png=/tmp/garden-$label-diag-shot.png
 	ref_png=$(python3 -I "$dir/results.py" hitch-base $(git -C "$repo" rev-list --first-parent -n 11 "$merge_base") \
-		--mode "$mode" --profile "${profile:-}" --flags="$flags" 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("shot", ""))' 2>/dev/null)
+		--mode "$mode" --profile "${profile:-}" --flags="$flags" --shot-frame "$shot" 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("shot", ""))' 2>/dev/null)
 fi
 # Near-black or near-uniform frames fail (a blank capture passed by existence once).
 stats=$(magick "$new_png" -colorspace gray -format '%[fx:mean] %[fx:standard_deviation]' info: 2>/dev/null)

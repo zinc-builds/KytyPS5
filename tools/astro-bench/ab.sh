@@ -171,13 +171,14 @@ while [ "$done_pairs" -lt "$n" ]; do
 		fi
 	fi
 done
-if [ ${#tail_lines[@]} != 0 ]; then
-	printf '%s\n' "${tail_lines[@]}" | BATCH_WARMUP=0 "$dir/batch.sh"
-fi
-# A run that failed (or a binary without METRICS lines) leaves no JSON: no verdict on a partial batch.
+# A run that failed, was void twice, or a binary without METRICS lines leaves no JSON: no verdict
+# on a partial batch, and no verify or hitch runs for a gate that has already failed.
 if [ ${#failed[@]} != 0 ]; then
 	echo "ab.sh: no result from ${failed[*]} (see /tmp/garden-<label>.out); no verdict" >&2
 	exit 1
+fi
+if [ ${#tail_lines[@]} != 0 ]; then
+	printf '%s\n' "${tail_lines[@]}" | BATCH_WARMUP=0 "$dir/batch.sh"
 fi
 echo "AB_PAIRS=$done_pairs" >&2
 run_verdict
