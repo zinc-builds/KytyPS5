@@ -483,10 +483,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		const auto function_code = cached.FunctionCode();
 		bool       planned       = false;
 		for (auto& stored: cached.modules) {
-			if (!planned && std::ranges::equal(stored.function_code, function_code) &&
-			    ShaderRecompiler::IR::LoadResourcePlan(stored.stored_call_plan, cached.resource_plan)) {
-				cached.resource_plan.source_reads = cached.call_source->reads;
-				planned                           = true;
+			if (!planned && std::ranges::equal(stored.function_code, function_code)) {
+				// LoadResourcePlan appends: load into a fresh plan, not over the first record's.
+				ShaderRecompiler::IR::ResourcePlan plan;
+				if (ShaderRecompiler::IR::LoadResourcePlan(stored.stored_call_plan, plan)) {
+					cached.resource_plan              = std::move(plan);
+					cached.resource_plan.source_reads = cached.call_source->reads;
+					planned                           = true;
+				}
 			}
 			stored.stored_call_plan = {};
 		}
