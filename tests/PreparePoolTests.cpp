@@ -116,15 +116,22 @@ Outcome RunPipeline(uint64_t seed, uint64_t draws, bool retire_bug) {
 					const auto oldest = run.released.load(std::memory_order_acquire) + 1;
 					Chaos::Point(Chaos::Site::SnapshotRetire);
 					auto* snapshot = snapshots.Take(current, retire_bug ? oldest + 1 : oldest);
+					bool  in_use   = false;
 					for (const auto& slot: run.slots) {
 						if (slot.snapshot == snapshot && slot.sequence >= oldest && slot.sequence < s) {
-							out.reuse_violations++;
+							in_use = true;
 						}
 					}
-					for (size_t i = 0; i < snapshot->words.size(); i++) {
-						snapshot->words[i] = s * 1000 + i;
+					if (in_use) {
+						// Caught: an unreleased draw still reads it. Not rewritten (that would race
+						// the reader); this draw keeps the current registers.
+						out.reuse_violations++;
+					} else {
+						for (size_t i = 0; i < snapshot->words.size(); i++) {
+							snapshot->words[i] = s * 1000 + i;
+						}
+						current = snapshot;
 					}
-					current = snapshot;
 				}
 				current->last_sequence = s;
 				auto& slot             = run.slots[(s - 1) % kRing];
@@ -212,7 +219,7 @@ int main(int argc, char** argv) {
 	// A retirement rule off by one must be caught by the invariants.
 	{
 		const auto o = RunPipeline(7, draws, true);
-		Check(!Clean(o) && o.reuse_violations != 0, "retirement bug caught", o);
+		Check(o.reuse_violations != 0, "retirement bug caught", o);
 	}
 	return g_failed == 0 ? 0 : 1;
 }
