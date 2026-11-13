@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/envSwitch.h"
 #include "common/file.h"
 #include "common/kernelStats.h"
 #include "common/logging/log.h"
@@ -1017,8 +1018,7 @@ namespace {
 
 bool WorkerPipelineKeyVerify() {
 	static const bool verify = [] {
-		const char* value = std::getenv("KYTY_WORKER_PIPELINE_KEY_VERIFY");
-		return value != nullptr && value[0] != '0';
+		return Common::EnvFlag("KYTY_WORKER_PIPELINE_KEY_VERIFY");
 	}();
 	return verify;
 }

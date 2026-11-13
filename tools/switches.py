@@ -32,6 +32,8 @@ TOOL_HOOKS = {"KYTY_RELAUNCHED", "KYTY_APP0_OVERLAY", "KYTY_SHOT_FILE", "KYTY_SH
 
 NAME = re.compile(r'"(KYTY_[A-Z0-9_]+)"')
 CHAR_VALUE = re.compile(r"\[0\]\s*==\s*'([1-9a-z])'")
+# strcmp(x, "v") / x == "v" / string_view(x) == "v", with x captured.
+COMPARE = re.compile(r'(?:strcmp\(\s*(\w+)\s*,\s*|\b(\w+)\s*==\s*|string_view\(\s*(\w+)\s*\)\s*==\s*)"([a-z0-9_]+)"')
 VALUE_STR = re.compile(r'(?:strcmp\([^,]+,\s*|==\s*|string_view\([^)]*\)\s*==\s*)"([a-z0-9_]+)"')
 
 
@@ -78,6 +80,8 @@ def classify(name, window, values):
     m = re.search(r'EnvFlag\("%s",\s*(true|false)\)' % n, w)
     if m:
         parse, default = "flag (0/false/off/no = off)", "on" if m.group(1) == "true" else "off"
+    elif re.search(r'!= nullptr && !\s*(?:Common::)?EnvFlag\("%s"\)' % n, w):
+        parse, default = "flag (0/false/off/no = off)", "on"  # set and off: the feature is off
     elif re.search(r'EnvFlag\("%s"\)' % n, w):
         parse, default = "flag (0/false/off/no = off)", "off"
     elif re.search(r'EnvCpu\("%s"\)' % n, w):
@@ -139,7 +143,7 @@ def read_window(lines, i, name):
             if any(n != name for n in NAME.findall(line)):
                 break
             window.append(line)
-        return window
+        return window, None
     tracked = {var.group(1)}
     window = [lines[i]]
     kept = True  # whether the line before was kept
@@ -155,7 +159,7 @@ def read_window(lines, i, name):
         derived = re.match(r"\s*(?:[\w:<>]+\s+)+(\w+)\s*(?:=|\(|\{)", line)
         if derived:
             tracked.add(derived.group(1))
-    return window
+    return window, tracked
 
 
 def when_read(lines, i, path):
@@ -176,13 +180,18 @@ def scan():
         for i, line in enumerate(lines):
             for m in NAME.finditer(line):
                 name = m.group(1)
-                window = read_window(lines, i, name)
+                window, tracked = read_window(lines, i, name)
                 if not re.search(r"getenv|EnvFlag|EnvCpu|Env[A-Z][a-z]+\(", line + " ".join(lines[i - 1: i])):
                     # A name in another call (a table, a helper argument): still a site.
                     pass
                 joined = " ".join(window)
-                values = [v for v in VALUE_STR.findall(joined) + CHAR_VALUE.findall(joined) if v != "0"]
-                if not VALUE_STR.findall(joined):
+                strs = VALUE_STR.findall(joined)
+                if tracked:
+                    # Only comparisons of this read's own variable (a line can test another).
+                    strs = [m.group(4) for m in COMPARE.finditer(joined)
+                            if (m.group(1) or m.group(2) or m.group(3)) in tracked]
+                values = [v for v in strs + CHAR_VALUE.findall(joined) if v != "0"]
+                if not strs:
                     values = []  # a single char test is a flag, not a mode
                 s = switches.setdefault(name, {"sites": [], "parses": [], "comment": ""})
                 s["sites"].append(f"{rel}:{i + 1}")

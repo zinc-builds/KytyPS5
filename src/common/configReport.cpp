@@ -42,20 +42,22 @@ const Known* Find(std::string_view name) {
 }
 
 // A verify mode only checks its feature: with the feature turned off it checks nothing.
+// How a feature's switch turns it off (each as in its own code).
+enum class Off { PrefixZero, ExactZero, Flag };
 struct VerifyPair {
-	const char* verify;
+	const char* verify; // read with Common::EnvFlag (all of them)
 	const char* feature;
-	bool        exact_zero; // the feature is off only for exactly "0" (else: any value starting '0')
+	Off         off;
 };
 constexpr VerifyPair VERIFY_NEEDS[] = {
-    // Each feature's own off test (descriptors.cpp, colorRenderTarget.cpp, pipelineCache.cpp,
-    // hybridAffinity.h: value[0] == '0'; tiler.cpp: strcmp(value, "0") == 0).
-    {"KYTY_BINDING_REUSE_VERIFY", "KYTY_BINDING_REUSE", false},
-    {"KYTY_WORKER_TARGETS_VERIFY", "KYTY_WORKER_TARGETS", false},
-    {"KYTY_WORKER_PIPELINE_KEY_VERIFY", "KYTY_WORKER_PIPELINE_KEY", false},
-    {"KYTY_WORKER_TEXTURES_VERIFY", "KYTY_WORKER_TEXTURES", false},
-    {"KYTY_PREPARE_VERIFY", "KYTY_PREPARE_THREAD", false},
-    {"KYTY_TILER_VERIFY", "KYTY_TILER_DIRECT", true},
+    // descriptors.cpp, colorRenderTarget.cpp, pipelineCache.cpp: value[0] == '0'; tiler.cpp:
+    // strcmp(value, "0") == 0; renderDraw.cpp and hybridAffinity.h: EnvFlag.
+    {"KYTY_BINDING_REUSE_VERIFY", "KYTY_BINDING_REUSE", Off::PrefixZero},
+    {"KYTY_WORKER_TARGETS_VERIFY", "KYTY_WORKER_TARGETS", Off::PrefixZero},
+    {"KYTY_WORKER_PIPELINE_KEY_VERIFY", "KYTY_WORKER_PIPELINE_KEY", Off::PrefixZero},
+    {"KYTY_WORKER_TEXTURES_VERIFY", "KYTY_WORKER_TEXTURES", Off::PrefixZero},
+    {"KYTY_PREPARE_VERIFY", "KYTY_PREPARE_THREAD", Off::Flag},
+    {"KYTY_TILER_VERIFY", "KYTY_TILER_DIRECT", Off::ExactZero},
 };
 
 // With KYTY_NO_PIN the automatic core layout is off (hybridAffinity.h GetPlan returns no plan):
@@ -72,7 +74,12 @@ bool FeatureOff(const VerifyPair& pair) {
 	if (value == nullptr) {
 		return false;
 	}
-	return pair.exact_zero ? std::strcmp(value, "0") == 0 : value[0] == '0';
+	switch (pair.off) {
+		case Off::PrefixZero: return value[0] == '0';
+		case Off::ExactZero: return std::strcmp(value, "0") == 0;
+		case Off::Flag: return !EnvFlag(pair.feature);
+	}
+	return false;
 }
 
 std::mutex                         g_mutex;

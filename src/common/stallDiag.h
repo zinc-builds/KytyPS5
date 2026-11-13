@@ -1,6 +1,8 @@
 #ifndef KYTY_COMMON_STALL_DIAG_H_
 #define KYTY_COMMON_STALL_DIAG_H_
 
+#include "common/envSwitch.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -49,8 +51,7 @@ inline thread_local bool     t_in_command = false;
 
 [[nodiscard]] inline bool Enabled() noexcept {
 	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_STALL_DIAG");
-		return value != nullptr && value[0] != '0';
+		return Common::EnvFlag("KYTY_STALL_DIAG");
 	}();
 	return enabled;
 }

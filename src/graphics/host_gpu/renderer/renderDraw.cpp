@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/envSwitch.h"
 #include "common/hybridAffinity.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -1740,9 +1741,9 @@ uint64_t PrepareNowNs() {
 	                                 .count());
 }
 
+// Unset: fallback; set: Common::EnvFlag's rule (0, false, off, no = off).
 bool EnvFlag(const char* name, bool fallback) {
-	const char* value = std::getenv(name);
-	return value == nullptr ? fallback : value[0] != '0';
+	return std::getenv(name) == nullptr ? fallback : Common::EnvFlag(name);
 }
 
 // A fresh state for a program lookup, keeping what the draw path set before it.

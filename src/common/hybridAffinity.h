@@ -105,7 +105,7 @@ inline int EnvCpu(const char* name) {
 inline uint32_t PrepareWorkerCount() {
 	static const uint32_t count = [] {
 		const char* thread = std::getenv("KYTY_PREPARE_THREAD");
-		if (thread != nullptr && thread[0] == '0') {
+		if (thread != nullptr && !Common::EnvFlag("KYTY_PREPARE_THREAD")) {
 			return 0u;
 		}
 		const char* value = std::getenv("KYTY_PREPARE_WORKERS");
