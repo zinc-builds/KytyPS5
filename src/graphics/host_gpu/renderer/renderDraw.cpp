@@ -1317,6 +1317,40 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
+	if (ProxySkipMode() != 0 && ProxyRegisters(buffer.GetRegisters(), buffer.GetUserConfig()) &&
+	    !m_context.GetOcclusionQueries().Enabled()) {
+		// KYTY_OCCLUSION_PROXY_SKIP: a draw that may stand in for an occlusion proxy: learn
+		// whether its shaders write anything (storage buffers or images, raw addresses, DMA,
+		// GDS), from the stages that run.
+		bool writes = false;
+		for (const auto* stage: stages) {
+			const auto& program = stage->runtime->module->info;
+			writes = writes || program.has_address_writes || program.info.uses_dma ||
+			         program.info.uses_gds;
+			for (const auto& image: program.info.images) {
+				writes = writes || image.written || image.atomic;
+			}
+			for (const auto& meta: program.info.buffers) {
+				writes = writes || meta.written || meta.atomic;
+			}
+		}
+		const auto key  = ProxyShaderKey(buffer.GetRegisters(), buffer.GetShaders());
+		ProxyShadersCurrent();
+		auto [it, added] = m_proxy_shaders.try_emplace(key, !writes);
+		if (!added && it->second && writes) {
+			// The same combination wrote this time (another stage set under one key): never
+			// again; under verify, a draw it would have skipped did write.
+			if (ProxySkipMode() == 2) {
+				EXIT("KYTY_OCCLUSION_PROXY_SKIP=verify: a skippable shader combination writes "
+				     "memory (key 0x%016" PRIx64 ")\n",
+				     key);
+			}
+			it->second = false;
+		}
+		if (!added && ProxySkipMode() == 2) {
+			m_proxy_stat.verified++;
+		}
+	}
 	if (FrameSkip::Active()) {
 		// Frame skipping keeps draws whose shaders write memory, and drops a shader combination
 		// only once it was inspected here.
@@ -1730,6 +1764,79 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args,
 	}
 	ResetBindings();
 	return emit.has_value();
+}
+
+int RenderExecutor::ProxySkipMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_OCCLUSION_PROXY_SKIP");
+		if (value == nullptr) return 1;
+		return std::string_view(value) == "0" ? 0 : std::string_view(value) == "verify" ? 2 : 1;
+	}();
+	return mode;
+}
+
+void RenderExecutor::ProxyShadersCurrent() {
+	if (const auto generation = ShaderMapGeneration(); generation != m_proxy_shader_generation) {
+		m_proxy_shaders.clear();
+		m_proxy_shader_generation = generation;
+	}
+}
+
+bool RenderExecutor::ProxyRegisters(const HW::Context& ctx, const HW::UserConfig& ucfg) {
+	// Tessellation runs other stages than the key names (LS/HS/ES), and object/primitive-ID output
+	// writes attachment 7 whatever the target mask (PipelineCache::PixelOutputs): not proxies.
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch || ctx.HasObjectPrimitiveIdOutput()) {
+		return false;
+	}
+	const auto  mode     = ctx.GetColorControl().mode;
+	const auto& override = ctx.GetDepthRenderOverride();
+	const auto& render   = ctx.GetRenderControl();
+	const auto& depth    = ctx.GetDepthControl();
+	// Color: an ordinary draw with every target's write mask 0, or color disabled; no fast-clear
+	// elimination, decompression or resolve (those modes write without a mask).
+	if (!((mode == static_cast<uint8_t>(CbColorMode::Normal) && ctx.GetRenderTargetMask() == 0) ||
+	      mode == static_cast<uint8_t>(CbColorMode::Disable))) {
+		return false;
+	}
+	// Depth and stencil: no write, no stencil test (its ops may write), no clear, copy or forced
+	// metadata state.
+	return !depth.z_write_enable && !depth.stencil_enable && !render.depth_clear_enable &&
+	       !render.stencil_clear_enable && !render.copy_depth_to_color &&
+	       !render.copy_stencil_to_color && !render.resummarize_enable && !override.force_z_dirty &&
+	       !override.force_stencil_dirty && !override.force_z_valid && !override.force_stencil_valid;
+}
+
+uint64_t RenderExecutor::ProxyShaderKey(const HW::Context& ctx, const HW::Shader& sh) {
+	const bool  ps_active = PipelineCache::PixelOutputs(ctx, sh).active;
+	const auto& vs        = sh.GetVs();
+	// The stage selection (merged ES/GS, NGG, wave size) comes from VGT_SHADER_STAGES_EN.
+	return (ps_active ? sh.GetPs().ps_regs.data_addr : 1u) ^
+	       (static_cast<uint64_t>(ctx.GetShaderStages()) * 0x94d049bb133111ebull) ^
+	       (vs.gs_regs.data_addr * 0x9e3779b97f4a7c15ull) ^
+	       (vs.es_regs.data_addr * 0xc2b2ae3d27d4eb4full) ^
+	       (vs.ls_regs.data_addr * 0x165667b19e3779f9ull) ^
+	       (vs.hs_regs.data_addr * 0x27d4eb2f165667c5ull);
+}
+
+void RenderExecutor::PrintProxyStats() {
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                            std::chrono::steady_clock::now().time_since_epoch())
+	                                            .count());
+	if (m_proxy_stat_ns == 0) {
+		m_proxy_stat_ns = now;
+		return;
+	}
+	if (now - m_proxy_stat_ns < 5'000'000'000ull) {
+		return;
+	}
+	m_proxy_stat_ns = now;
+	const auto& s   = m_proxy_stat;
+	std::printf("PROXY_SKIP in_query=%" PRIu64 " renders=%" PRIu64 " proxies=%" PRIu64
+	            " skipped=%" PRIu64 " refused_unknown=%" PRIu64 " refused_writes=%" PRIu64
+	            " verified=%" PRIu64 " combos=%zu\n",
+	            s.in_query, s.renders, s.skipped + s.refused_unknown + s.refused_writes, s.skipped,
+	            s.refused_unknown, s.refused_writes, s.verified, m_proxy_shaders.size());
+	std::fflush(stdout);
 }
 
 namespace {

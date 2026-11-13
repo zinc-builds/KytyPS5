@@ -428,6 +428,35 @@ public:
 	}
 	[[nodiscard]] bool HasQueuedDraw() const { return QueuedCount() != 0; }
 
+	// KYTY_OCCLUSION_PROXY_SKIP: 1 (default) a draw inside an always-visible occlusion query that
+	// can only change the query's count is not rendered; 0 renders it, as before; verify renders
+	// it and checks at commit that its shaders write nothing.
+	[[nodiscard]] static int ProxySkipMode();
+	// The register part: no color, depth or stencil write, no clear, copy, resolve or metadata
+	// operation.
+	[[nodiscard]] static bool ProxyRegisters(const HW::Context& ctx, const HW::UserConfig& ucfg);
+	// The shader combination the draw runs (pixel shader only if it runs).
+	[[nodiscard]] static uint64_t ProxyShaderKey(const HW::Context& ctx, const HW::Shader& sh);
+	enum class ProxyShaders : uint8_t { Unknown, Clean, Writes };
+	// What the commit found the combination's shaders to write (learnt from rendered draws; forgotten
+	// whenever a shader binary is mapped, since the code at an address may then differ).
+	[[nodiscard]] ProxyShaders ProxyShaderClass(uint64_t key) {
+		ProxyShadersCurrent();
+		const auto it = m_proxy_shaders.find(key);
+		return it == m_proxy_shaders.end() ? ProxyShaders::Unknown
+		                                   : it->second ? ProxyShaders::Clean : ProxyShaders::Writes;
+	}
+	// Draws inside an open synthetic query: those that render (they write a target), and those
+	// shaped like a proxy (only the count changes), skipped or refused (shaders not yet seen, or
+	// seen to write memory).
+	struct ProxyStats {
+		uint64_t in_query = 0, renders = 0, skipped = 0, refused_unknown = 0, refused_writes = 0,
+		         verified = 0;
+	};
+	ProxyStats m_proxy_stat; // GPU thread
+	void       PrintProxyStats();
+	void       ProxyShadersCurrent();
+
 private:
 	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,
 	                                         const PreparedBindings& bindings, uint32_t mode);
@@ -835,6 +864,11 @@ private:
 	// free again).
 	alignas(64) std::atomic<uint64_t> m_queued_posted {0};
 	alignas(64) uint64_t              m_queued_taken = 0;
+	// KYTY_OCCLUSION_PROXY_SKIP: shader combinations rendered as possible proxies, and whether
+	// their shaders write nothing (GPU thread).
+	std::unordered_map<uint64_t, bool> m_proxy_shaders;
+	uint64_t                           m_proxy_shader_generation = 0;
+	uint64_t                           m_proxy_stat_ns = 0;
 	alignas(64) std::atomic<uint64_t> m_queued_released {0};
 	DecodeHandoff*                    m_decode_handoff = nullptr;
 	// Register snapshots taken (the poster writes, the GPU thread reports).

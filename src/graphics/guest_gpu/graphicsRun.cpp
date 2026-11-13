@@ -1026,6 +1026,28 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 
 // Frame skipping (frameSkip.h): classifies the draw, and drops it in a skipped frame. A dropped
 // draw inside an open occlusion query counts as visible.
+bool CommandProcessor::SkipOcclusionProxy() {
+	auto& executor = m_renderer.GetRenderExecutor();
+	auto& stat     = executor.m_proxy_stat;
+	stat.in_query++;
+	if (!RenderExecutor::ProxyRegisters(m_ctx, m_ucfg)) {
+		stat.renders++;
+		return false;
+	}
+	switch (executor.ProxyShaderClass(RenderExecutor::ProxyShaderKey(m_ctx, m_sh_ctx))) {
+		case RenderExecutor::ProxyShaders::Unknown: stat.refused_unknown++; return false;
+		case RenderExecutor::ProxyShaders::Writes: stat.refused_writes++; return false;
+		case RenderExecutor::ProxyShaders::Clean: break;
+	}
+	if (RenderExecutor::ProxySkipMode() == 2) {
+		return false; // rendered; the commit checks the shaders again
+	}
+	// The draw's only effect would be the query's count, which is synthetic (always visible):
+	// nothing to render. Its registers stay as the packets left them.
+	stat.skipped++;
+	return true;
+}
+
 bool CommandProcessor::SkipDraw(bool indirect, bool indirect_count) {
 	if (!FrameSkip::OnDraw(m_ctx, m_sh_ctx, indirect, indirect_count)) {
 		return false;
@@ -1046,8 +1068,10 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	}
 	if (OnDecodeThread()) {
 		// A draw reading its instance count from memory, frame skipping (its tables are the GPU
-		// thread's) and one that cannot be queued run on the GPU thread.
-		if ((args.instance_count == 0 && m_num_instances_addr != 0) || FrameSkip::Active()) {
+		// thread's), a possible occlusion proxy (likewise) and one that cannot be queued run on
+		// the GPU thread.
+		if ((args.instance_count == 0 && m_num_instances_addr != 0) || FrameSkip::Active() ||
+		    (m_synthetic_occlusion_open != 0 && RenderExecutor::ProxySkipMode() != 0)) {
 			m_decode_bail = true;
 			return;
 		}
@@ -1066,6 +1090,10 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	}
 	// After the instance count: a dropped draw leaves the same register state behind.
 	if (FrameSkip::Active() && SkipDraw(false, false)) {
+		return;
+	}
+	if (m_synthetic_occlusion_open != 0 && RenderExecutor::ProxySkipMode() != 0 &&
+	    SkipOcclusionProxy()) {
 		return;
 	}
 	executor.QueueDrawIndex(CurrentBuffer(), args);
@@ -1240,7 +1268,8 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		return;
 	}
 	if (OnDecodeThread()) {
-		if ((args.instance_count == 0 && m_num_instances_addr != 0) || FrameSkip::Active()) {
+		if ((args.instance_count == 0 && m_num_instances_addr != 0) || FrameSkip::Active() ||
+		    (m_synthetic_occlusion_open != 0 && RenderExecutor::ProxySkipMode() != 0)) {
 			m_decode_bail = true;
 			return;
 		}
@@ -1257,6 +1286,10 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		args.instance_count = NumInstances();
 	}
 	if (FrameSkip::Active() && SkipDraw(false, false)) {
+		return;
+	}
+	if (m_synthetic_occlusion_open != 0 && RenderExecutor::ProxySkipMode() != 0 &&
+	    SkipOcclusionProxy()) {
 		return;
 	}
 	executor.QueueDrawAuto(CurrentBuffer(), args);
@@ -1418,6 +1451,12 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				            "may be lower.\n");
 			});
 
+			// Begins dump to the results, ends 8 bytes into them (OcclusionQueries::Dump).
+			if ((event_address & 8u) == 0) {
+				m_synthetic_occlusion_open++;
+			} else if (m_synthetic_occlusion_open != 0) {
+				m_synthetic_occlusion_open--;
+			}
 			// Without host occlusion queries, publish an always-visible result. The PS5 layout
 			// contains one interleaved begin/end pair per DB, and bit 63 marks a result ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
@@ -1439,6 +1478,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
+	}
+	if (m_renderer.GetRenderExecutor().m_proxy_stat.in_query != 0) {
+		m_renderer.GetRenderExecutor().PrintProxyStats();
 	}
 	m_renderer.GetOcclusionQueries().Publish();
 	if (MemDiag::BdaStatsMode() != 0) {

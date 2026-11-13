@@ -100,6 +100,9 @@ public:
 	                uint32_t interrupt_context_id);
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	bool SkipDraw(bool indirect, bool indirect_count);
+	// KYTY_OCCLUSION_PROXY_SKIP: a draw inside an always-visible occlusion query whose only effect
+	// would be the query's count (RenderExecutor::ProxyRegisters, shaders known to write nothing).
+	bool SkipOcclusionProxy();
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
@@ -204,6 +207,8 @@ private:
 
 	const int m_interrupt_event_id;
 	uint64_t  m_synthetic_occlusion_counter = 0;
+	// Always-visible occlusion queries begun and not yet ended (begin dumps minus end dumps).
+	uint32_t  m_synthetic_occlusion_open    = 0;
 	bool      m_predicate_skip              = false;
 };
 
