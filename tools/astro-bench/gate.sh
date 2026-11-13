@@ -23,7 +23,7 @@
 #   a difference, so that reaching the last frame means clean: see EXITING_VERIFY), --no-verify,
 #   --no-hitch, --accept-cost "<reason>", and ab.sh's --ref,
 #   --ref-install, --new-install, --env, --ref-env, --new-env. Takes ~9 min (7 runs + 2 warm-ups).
-VERIFY_ENV="KYTY_PREPARE_VERIFY=1 KYTY_BINDING_REUSE_VERIFY=1 KYTY_WORKER_TARGETS_VERIFY=1 KYTY_WORKER_PIPELINE_KEY_VERIFY=1"
+VERIFY_ENV="KYTY_PREPARE_VERIFY=1 KYTY_BINDING_REUSE_VERIFY=1 KYTY_WORKER_TARGETS_VERIFY=1 KYTY_WORKER_PIPELINE_KEY_VERIFY=1 KYTY_COLLECT_OBSERVE=1"
 # Verifiers that exit on a difference. Others (KYTY_STREAM_VERIFY, KYTY_TILER_VERIFY, ...) only
 # print, so a run that reaches its last frame proves nothing for them: run those by hand.
 EXITING_VERIFY="$VERIFY_ENV KYTY_WORKER_BUFFERS=verify KYTY_COLOR_CLEAR_MEMO=verify KYTY_STENCIL_TARGET_FAST=verify KYTY_DECODE_THREAD=verify"

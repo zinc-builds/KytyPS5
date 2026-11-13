@@ -495,6 +495,12 @@ bool PageManager::HasWriteWatched(uint64_t begin, uint64_t end) const noexcept {
 	return false;
 }
 
+bool PageManager::HasWriteWatchedPage(uint64_t page) const {
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	AppendWriteWatched(page, page + PAGE_SIZE, runs);
+	return !runs.empty();
+}
+
 void PageManager::AppendWriteWatched(uint64_t begin, uint64_t end,
                                      std::vector<std::pair<uint64_t, uint64_t>>& runs) const {
 	begin = Common::AlignDown(begin, PAGE_SIZE);

@@ -165,7 +165,10 @@ public:
 	// with protect, write-protects them again in the same step. With protect, ranges outside the
 	// asynchronous context are skipped by the kernel.
 	template <typename Found>
-	void Scan(uint64_t vaddr, uint64_t size, Found&& found, bool protect = true) const {
+	// wp_only (without protect): only pages a protecting scan could match (PAGE_IS_WPALLOWED: in a
+	// view registered for write protection); others read as written whenever populated.
+	void Scan(uint64_t vaddr, uint64_t size, Found&& found, bool protect = true,
+	          bool wp_only = false) const {
 #if defined(PAGEMAP_SCAN)
 		std::array<page_region, 512> regions {};
 		auto                         start = vaddr;
@@ -178,7 +181,7 @@ public:
 			arg.end           = end;
 			arg.vec           = reinterpret_cast<uint64_t>(regions.data());
 			arg.vec_len       = regions.size();
-			arg.category_mask = PAGE_IS_WRITTEN;
+			arg.category_mask = PAGE_IS_WRITTEN | (wp_only ? PAGE_IS_WPALLOWED : 0);
 			arg.return_mask   = PAGE_IS_WRITTEN;
 			const auto count  = [&] {
 				Common::KernelStats::Syscall kernel(Common::KernelStats::Kind::Scan);
@@ -972,12 +975,14 @@ public:
 	}
 
 	// KYTY_ASYNC_WP_VERIFY: pages written since the last ScanAsyncWrites, without consuming them.
-	void PeekAsyncWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
+	// wp_only: only what a collection's protecting scan can report (KYTY_COLLECT_OBSERVE).
+	void PeekAsyncWrites(std::vector<std::pair<uint64_t, uint64_t>>& written, bool wp_only = false) {
 		std::shared_lock lock(m_mutex);
 		for (const auto chunk: m_async_list) {
 			m_write_protection.Scan(
 			    chunk << ASYNC_CHUNK_BITS, ASYNC_CHUNK_SIZE,
-			    [&](uint64_t begin, uint64_t end) { written.emplace_back(begin, end); }, false);
+			    [&](uint64_t begin, uint64_t end) { written.emplace_back(begin, end); }, false,
+			    wp_only);
 		}
 		// Kept writes are pending report too: the next collection takes them. (A submit scan
 		// clears marks and keeps them in one hold of m_kept_mutex.)
