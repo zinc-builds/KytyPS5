@@ -967,8 +967,7 @@ struct WriteDataVerify {
 	uint64_t voided      = 0; // the per-dword store got a newer token: the ranged one was voided
 	                          // meanwhile (another page took its token slot, or a collection
 	                          // raised the floor); a voided token only fails IsCpLabel
-	uint64_t ranged_inv  = 0; // bytes the ranged store invalidated
-	uint64_t dword_inv   = 0; // bytes the per-element stores invalidate
+	uint64_t ranged_inv  = 0; // bytes the ranged stores invalidated
 	uint64_t last_report = 0;
 };
 WriteDataVerify g_wd_verify;
@@ -1031,70 +1030,88 @@ bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t e
 	return true;
 }
 
-// KYTY_WRITE_DATA_RANGED=verify, after StoreCpLabels stored [vaddr, ...): runs StoreCpLabel for
-// each value as the per-dword path would have, then checks that it left the label slots as the
-// ranged store did (address, value, size, remap generation, token), that the guest reads the
-// values back, and that both invalidated the same bytes. When the guest stored to the page
-// meanwhile, or remapped, (a race the guest owns) nothing is compared or stored again (so as not
-// to overwrite the guest's store): counted apart, not a failure.
+// KYTY_WRITE_DATA_RANGED=verify, after StoreCpLabels stored [vaddr, ...): what the per-dword path
+// would have done, without storing anything again (so a guest store since is never overwritten).
+// For each value it takes the token StoreCpLabel would take (ProtectAsyncGuestPage, as that path
+// calls it) and checks the ranged label slots against the slots StoreCpLabel would write: same
+// address, value, size and remap generation, and the same token or an older one (the ranged token
+// voided since: waiters on it collect, more conservative, never less). It checks that the guest
+// reads each value back unless the guest stored to the page since (raced), and that the bytes
+// invalidated are the values' bytes. A remap since counts as raced.
 void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t elem,
                                    uint32_t count, uint32_t stride, bool invalidate,
                                    uint64_t token, uint64_t invalidated) {
-	static const bool scan_skip = [] {
-		const char* value = std::getenv("KYTY_LABEL_SCAN_SKIP");
-		return value == nullptr || value[0] != '0';
-	}();
-	const auto page      = vaddr & ~uint64_t {0xfff};
+	const auto  page       = vaddr & ~uint64_t {0xfff};
 	const auto  generation = m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()].generation;
-	const bool  untouched  = LibKernel::Memory::AsyncGuestPageUntouched(page, token) &&
-	                       LibKernel::Memory::GuestRemapGeneration() == generation;
 	const auto* bytes      = static_cast<const uint8_t*>(values);
 	auto&       v          = g_wd_verify;
 	v.runs++;
 	v.elems += count;
-	v.raced += untouched ? 0 : 1;
-	for (uint32_t i = 0; untouched && i < count; i++) {
+	if (LibKernel::Memory::GuestRemapGeneration() != generation) {
+		v.raced++;
+		return;
+	}
+	const auto fail = [&](const char* what, uint64_t at, const CpLabel& ranged, const CpLabel& dword) {
+		EXIT("WDVERIFY FAIL (%s): 0x%016" PRIx64 " ranged label {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64
+		     " gen %" PRIu64 " token %" PRIu64 "}, per-dword {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64
+		     " gen %" PRIu64 " token %" PRIu64 "}\n",
+		     what, at, ranged.vaddr, ranged.value, ranged.size, ranged.generation, ranged.token,
+		     dword.vaddr, dword.value, dword.size, dword.generation, dword.token);
+	};
+	// The ranged token, or one it was voided for.
+	const auto same = [&](const CpLabel& ranged, const CpLabel& dword) {
+		if (ranged.vaddr != dword.vaddr || ranged.value != dword.value || ranged.size != dword.size ||
+		    ranged.generation != dword.generation || dword.token < ranged.token) {
+			return false;
+		}
+		v.voided += dword.token > ranged.token ? 1 : 0;
+		return true;
+	};
+	bool raced = false;
+	for (uint32_t i = 0; i < count; i++) {
+		if (LibKernel::Memory::GuestRemapGeneration() != generation) {
+			raced = true; // the per-dword path would label the rest with the new generation
+			break;
+		}
 		const uint64_t at       = vaddr + uint64_t {i} * stride;
-		const auto     ranged   = m_cp_labels[(at >> 2u) % m_cp_labels.size()];
-		const auto     ranged_hi = m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()];
 		uint64_t       expected = 0;
 		std::memcpy(&expected, bytes + uint64_t {i} * elem, elem);
+		uint64_t dword_token = 0;
+		if (!LibKernel::Memory::ProtectAsyncGuestPage(page, dword_token)) {
+			if (LibKernel::Memory::GuestRemapGeneration() != generation) {
+				raced = true;
+				break;
+			}
+			fail("the per-dword protection fails", at, {}, {});
+		}
+		const CpLabel dword {at, expected, elem, generation, dword_token};
+		const CpLabel dword_hi {at + 4, expected >> 32u, 4, generation, dword_token};
+		const auto&   ranged    = m_cp_labels[(at >> 2u) % m_cp_labels.size()];
+		const auto&   ranged_hi = m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()];
+		if (!same(ranged, dword)) {
+			fail("label slot", at, ranged, dword);
+		}
+		if (elem == 8 && !same(ranged_hi, dword_hi)) {
+			fail("label slot, high dword", at + 4, ranged_hi, dword_hi);
+		}
 		uint64_t seen = 0;
 		std::memcpy(&seen, reinterpret_cast<const void*>(at), elem);
-		if (!StoreCpLabel(at, bytes + uint64_t {i} * elem, elem, invalidate)) {
-			EXIT("WDVERIFY FAIL: the per-dword store of 0x%016" PRIx64 " failed after the ranged one\n", at);
-		}
-		v.dword_inv += invalidate ? elem : 0;
-		const auto dword    = m_cp_labels[(at >> 2u) % m_cp_labels.size()];
-		const auto dword_hi = m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()];
-		// Tokens: equal, or the per-dword one newer (the ranged token voided since, which only
-		// makes waiters on it collect). KYTY_LABEL_SCAN_SKIP=0 makes a new token per protection.
-		const auto same = [&](const CpLabel& a, const CpLabel& b) {
-			if (a.vaddr != b.vaddr || a.value != b.value || a.size != b.size || a.generation != b.generation) {
-				return false;
+		if (seen != expected) {
+			if (!LibKernel::Memory::AsyncGuestPageUntouched(page, token)) {
+				raced = true; // the guest stored to the page since
+				continue;
 			}
-			if (a.token != b.token && scan_skip) {
-				v.voided += b.token > a.token ? 1 : 0;
-				return b.token > a.token;
-			}
-			return true;
-		};
-		if (seen != expected || !same(ranged, dword) || (elem == 8 && !same(ranged_hi, dword_hi))) {
-			EXIT("WDVERIFY FAIL: 0x%016" PRIx64 " guest reads 0x%" PRIx64 " (stored 0x%" PRIx64
-			     "), ranged label {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64 " gen %" PRIu64 " token %" PRIu64
-			     "}, per-dword {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64 " gen %" PRIu64 " token %" PRIu64
-			     "}, page untouched %d\n",
-			     at, seen, expected, ranged.vaddr, ranged.value, ranged.size, ranged.generation,
-			     ranged.token, dword.vaddr, dword.value, dword.size, dword.generation, dword.token,
-			     untouched ? 1 : 0);
+			EXIT("WDVERIFY FAIL: 0x%016" PRIx64 " guest reads 0x%" PRIx64 ", stored 0x%" PRIx64
+			     " with the page untouched since\n",
+			     at, seen, expected);
 		}
 	}
-	if (untouched) {
-		v.ranged_inv += invalidated;
-	}
-	if (v.ranged_inv != v.dword_inv) {
-		EXIT("WDVERIFY FAIL: the ranged stores invalidated %" PRIu64 " bytes, per-dword %" PRIu64 "\n",
-		     v.ranged_inv, v.dword_inv);
+	v.raced += raced ? 1 : 0;
+	const uint64_t dword_inv = invalidate ? uint64_t {count} * elem : 0;
+	v.ranged_inv += invalidated;
+	if (invalidated != dword_inv) {
+		EXIT("WDVERIFY FAIL: the ranged store invalidated %" PRIu64 " bytes, per-dword %" PRIu64 "\n",
+		     invalidated, dword_inv);
 	}
 	const auto now = Common::FrameDiag::NowNs();
 	if (now - v.last_report >= 1'000'000'000ull) {

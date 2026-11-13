@@ -344,7 +344,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		}
 	};
 	const auto base = reinterpret_cast<uint64_t>(dst);
-	if (write_one_address || (base & 3u) != 0 || !RenderContext::WriteDataRanged()) {
+	// A destination overlapping the packet's own data: the per-dword loop reads each value after
+	// the stores before it, and labels what it stored; keep that.
+	const auto src_begin = reinterpret_cast<uint64_t>(src);
+	const bool overlaps  = src_begin < base + uint64_t {dw_num} * 4 && base < src_begin + uint64_t {dw_num} * 4;
+	if (write_one_address || overlaps || (base & 3u) != 0 || !RenderContext::WriteDataRanged()) {
 		per_dword(0, dw_num);
 	} else {
 		// Each page's dwords as one label store: the same stores in the same order as the

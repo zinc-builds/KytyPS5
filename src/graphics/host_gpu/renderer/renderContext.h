@@ -172,7 +172,8 @@ public:
 	// count values of elem bytes (4 or 8) at vaddr + i * stride, all in one page, stored as
 	// StoreCpLabel stores each one, in address order, with one protection (one token for all),
 	// one backing store and one invalidation of the bytes stored. False: nothing was stored
-	// (store them one at a time).
+	// (store them one at a time). values must not overlap the bytes stored: the label slots read
+	// them again after the stores.
 	bool StoreCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
 	                   uint32_t stride, bool invalidate);
 	// WriteData stores each page of its range with StoreCpLabels (KYTY_WRITE_DATA_RANGED=0: one
