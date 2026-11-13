@@ -211,6 +211,12 @@ step 1 comes first.
   (run `setup-install.sh` once per build dir). Never build, install or benchmark in another track's
   checkout or in the user's `~/AI/emu/KytyPS5`. One `vpad.py` serves everyone: start it only if
   `/tmp/vpad.fifo` is missing.
+- **Shader stores: bench and play apart.** Bench runs (run.sh, so garden.sh, ab.sh, batch.sh,
+  gate.sh, levels.sh) use `~/.cache/kyty-shaders-bench`, shared by every track and install; the
+  user's `~/.cache/kyty-shaders` is written only by builds they run (`tools/playtest.sh`, plain
+  launches), so a branch's bug outside the hashed codegen sources can never put a bad record in
+  front of the user. A same-binary switch pair shares a store; two binaries with different codegen
+  get different files by construction. For an isolated store, set `KYTY_SHADER_STORE_DIR`.
 - **A/B with `ab.sh`, judged on the command thread's time per draw.** `dev` moves under you:
   compare against your merge-base (`ab.sh` builds it with `refbuild.sh`). Decide on `cmd_ns`
   (CPU ns per draw, user + sys) and `cpd` (cycles per draw), not on instructions or FPS: see
