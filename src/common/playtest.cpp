@@ -33,6 +33,7 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <dirent.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -510,6 +511,10 @@ struct PendingMarker {
 	std::string shot;
 };
 
+// A reserved-idle CPU this busy (percent of a 100 ms sample) during a slow frame marks it as
+// outside load. Quiet: ~5%; the fan daemon's 47 ms poll reads ~47%.
+constexpr double OutsideBusy = 25.0;
+
 const char* FieldName(uint32_t i) {
 	return kFieldNames[i];
 }
@@ -585,6 +590,10 @@ private:
 		m_present_csv = Create("present.csv");
 		m_events      = Create("events.jsonl", "a");
 		m_input       = Create("input.jsonl", "a");
+		m_reserved    = Create("reserved_cpus.csv");
+		if (m_reserved != nullptr) {
+			std::fprintf(m_reserved, "t,cpus,mean_busy,max_busy\n");
+		}
 		if (m_frames_csv != nullptr) {
 			std::fprintf(m_frames_csv, "t,g,presented,ms,load,flip_queue,rss_mb");
 			for (uint32_t i = 0; i < FFieldCount; i++) {
@@ -604,6 +613,7 @@ private:
 		DrainEvents();
 		DrainInput();
 		SampleRss(now);
+		SampleReserved(now);
 		CheckFreeze(now);
 		WriteShots();
 		RequestQueuedMarkerShot();
@@ -622,6 +632,218 @@ private:
 		if (m_input != nullptr) {
 			std::fflush(m_input);
 		}
+		if (m_reserved != nullptr) {
+			std::fflush(m_reserved);
+		}
+	}
+
+	// --- outside load ------------------------------------------------------------------------
+	// The CPUs the layout leaves idle on purpose (the SMT siblings of the command thread's and the
+	// prepare workers' CPUs, and KYTY_RESERVE_CPUS, that no pinned emulator thread runs on). Host work
+	// landing there slows the command thread or a worker (FINDINGS, "outside load"); a spike there
+	// during a slow frame is the incident's cause, not the emulator.
+	static std::vector<int> ParseCpuList(const char* text) {
+		std::vector<int> out;
+		const char*      p = text;
+		while (p != nullptr && *p != '\0' && *p != '\n') {
+			char*      end = nullptr;
+			const long lo  = std::strtol(p, &end, 10);
+			if (end == p) {
+				break;
+			}
+			long hi = lo;
+			p       = end;
+			if (*p == '-') {
+				hi = std::strtol(p + 1, &end, 10);
+				p  = end;
+			}
+			for (long c = lo; c <= hi && c < 4096; c++) {
+				out.push_back(static_cast<int>(c));
+			}
+			if (*p == ',') {
+				p++;
+			}
+		}
+		return out;
+	}
+
+	void FindReservedCpus() {
+#if defined(__linux__)
+		std::vector<int> hot, allowed;
+		if (const char* reserve = std::getenv("KYTY_RESERVE_CPUS"); reserve != nullptr) {
+			for (const int c: ParseCpuList(reserve)) {
+				hot.push_back(c);
+			}
+		}
+		if (auto* dir = opendir("/proc/self/task"); dir != nullptr) {
+			while (const auto* entry = readdir(dir)) {
+				if (entry->d_name[0] == '.') {
+					continue;
+				}
+				const auto base = fmt::format("/proc/self/task/{}/", entry->d_name);
+				char       comm[32] {};
+				if (FILE* f = std::fopen((base + "comm").c_str(), "r"); f != nullptr) {
+					if (std::fgets(comm, sizeof(comm), f) == nullptr) {
+						comm[0] = '\0';
+					}
+					std::fclose(f);
+				}
+				if (std::strncmp(comm, "KytyGpuCmd", 10) == 0 || std::strncmp(comm, "KytyGpuPrep", 11) == 0) {
+					if (FILE* f = std::fopen((base + "stat").c_str(), "r"); f != nullptr) {
+						char buf[1024] {};
+						const auto n = std::fread(buf, 1, sizeof(buf) - 1, f);
+						std::fclose(f);
+						buf[n]           = '\0';
+						const char* rest = std::strrchr(buf, ')');
+						int         cpu  = -1;
+						// processor is field 39; the space after ")" starts field 3 (state).
+						for (int field = 2; rest != nullptr && *rest != '\0'; rest++) {
+							if (*rest == ' ') {
+								field++;
+								if (field == 39) {
+									cpu = std::atoi(rest + 1);
+									break;
+								}
+							}
+						}
+						if (cpu >= 0) {
+							if (FILE* s = std::fopen(fmt::format("/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list", cpu).c_str(), "r");
+							    s != nullptr) {
+								char list[64] {};
+								if (std::fgets(list, sizeof(list), s) != nullptr) {
+									for (const int c: ParseCpuList(list)) {
+										hot.push_back(c);
+									}
+								}
+								std::fclose(s);
+							}
+						}
+					}
+				}
+				if (FILE* f = std::fopen((base + "status").c_str(), "r"); f != nullptr) {
+					char line[512];
+					while (std::fgets(line, sizeof(line), f) != nullptr) {
+						if (std::strncmp(line, "Cpus_allowed_list:", 18) == 0) {
+							const char* p = line + 18;
+							while (*p == ' ' || *p == '\t') {
+								p++;
+							}
+							// Only pinned threads (one CPU) occupy a CPU: unpinned emulator threads
+							// (the main thread, SDL's, ...) may list every CPU but rarely run.
+							if (const auto list = ParseCpuList(p); list.size() == 1) {
+								allowed.push_back(list[0]);
+							}
+						}
+					}
+					std::fclose(f);
+				}
+			}
+			closedir(dir);
+		}
+		std::vector<int> watch;
+		for (const int c: hot) {
+			if (std::find(allowed.begin(), allowed.end(), c) == allowed.end() &&
+			    std::find(watch.begin(), watch.end(), c) == watch.end()) {
+				watch.push_back(c);
+			}
+		}
+		std::sort(watch.begin(), watch.end());
+		if (watch != m_reserved_cpus) {
+			m_reserved_cpus = watch;
+			m_cpu_prev.clear();
+			std::string list;
+			for (const int c: watch) {
+				list += fmt::format("{}{}", list.empty() ? "" : " ", c);
+			}
+			m_reserved_list = list.empty() ? "none" : list;
+			std::printf("PLAYTEST reserved-idle CPUs watched for outside load: %s\n", m_reserved_list.c_str());
+			std::fflush(stdout);
+		}
+#endif
+	}
+
+	// Every 100 ms: the busy share of each reserved CPU (/proc/stat).
+	void SampleReserved(uint64_t now) {
+		if (now - m_last_layout_ns >= (now - g_start_ns < 60'000'000'000ull ? 5'000'000'000ull : 30'000'000'000ull)) {
+			m_last_layout_ns = now;
+			FindReservedCpus();
+		}
+		if (m_reserved_cpus.empty() || now - m_last_reserved_ns < 100'000'000ull) {
+			return;
+		}
+		const uint64_t sample_start = m_last_reserved_ns;
+		m_last_reserved_ns          = now;
+		FILE* f            = std::fopen("/proc/stat", "r");
+		if (f == nullptr) {
+			return;
+		}
+		char   line[512];
+		double sum = 0, max = 0;
+		int    n   = 0;
+		while (std::fgets(line, sizeof(line), f) != nullptr) {
+			if (std::strncmp(line, "cpu", 3) != 0 || line[3] < '0' || line[3] > '9') {
+				continue;
+			}
+			const int cpu = std::atoi(line + 3);
+			if (std::find(m_reserved_cpus.begin(), m_reserved_cpus.end(), cpu) == m_reserved_cpus.end()) {
+				continue;
+			}
+			unsigned long long v[10] {};
+			const char*        p = std::strchr(line, ' ');
+			for (int i = 0; i < 10 && p != nullptr; i++) {
+				char* end = nullptr;
+				v[i]      = std::strtoull(p, &end, 10);
+				p         = end;
+			}
+			uint64_t total = 0;
+			for (const auto x: v) {
+				total += x;
+			}
+			const uint64_t idle = v[3] + v[4];
+			auto&          prev = m_cpu_prev[cpu];
+			if (prev.first != 0 && total > prev.first) {
+				const double busy = 100.0 * (1.0 - static_cast<double>(idle - prev.second) / static_cast<double>(total - prev.first));
+				sum += busy;
+				max = std::max(max, busy);
+				n++;
+			}
+			prev = {total, idle};
+		}
+		std::fclose(f);
+		if (n == 0) {
+			return;
+		}
+		m_reserved_samples.push_back({sample_start, now, sum / n, max});
+		if (m_reserved != nullptr) {
+			std::fprintf(m_reserved, "%.3f,%s,%.1f,%.1f\n", RelS(now), m_reserved_list.c_str(), sum / n, max);
+		}
+	}
+
+	// A slow frame is outside load when a reserved CPU spiked during it and the emulator's own top
+	// cause is only what contention on the SMT siblings looks like from inside (slower CPU work,
+	// off-CPU time, waits on the workers or the recorder, or nothing). A compile, an upload, a GC,
+	// a GPU wait, a collection or the mutex explains the frame by itself.
+	static bool OutsideLoad(double busy, const std::vector<Cause>& causes) {
+		if (busy < OutsideBusy) {
+			return false;
+		}
+		if (causes.empty() || causes[0].excess < 1.0) {
+			return true;
+		}
+		const auto& top = causes[0].key;
+		return top == "command thread CPU (draw work)" || top == "command thread off-CPU" ||
+		       top == "prepare-worker wait" || top == "recorder wait";
+	}
+
+	// The busiest reserved CPU over the samples that overlap (from, to], or -1 with no samples.
+	[[nodiscard]] double ReservedBusy(uint64_t from, uint64_t to) const {
+		double best = -1;
+		for (const auto& s: m_reserved_samples) {
+			if (s.t_ns > from && s.start_ns < to) {
+				best = std::max(best, s.max);
+			}
+		}
+		return best;
 	}
 
 	// Pad records: the PadData bytes as hex, and its first fields decoded (buttons, sticks,
@@ -680,12 +902,12 @@ private:
 			std::fclose(f);
 		}
 		DrainInput();
-		for (FILE* f: {m_frames_csv, m_present_csv, m_events, m_input}) {
+		for (FILE* f: {m_frames_csv, m_present_csv, m_events, m_input, m_reserved}) {
 			if (f != nullptr) {
 				std::fclose(f);
 			}
 		}
-		m_frames_csv = m_present_csv = m_events = m_input = nullptr;
+		m_frames_csv = m_present_csv = m_events = m_input = m_reserved = nullptr;
 	}
 
 	static std::string WallNow() {
@@ -1297,6 +1519,15 @@ private:
 			}
 			std::sort(uploads.begin(), uploads.end(), [](const auto* x, const auto* y) { return x->a > y->a; });
 			summary = fmt::format("{:.0f} ms frame", worst->ms);
+			const double busy    = ReservedBusy(worst->d.t_ns - static_cast<uint64_t>(worst->ms * 1e6), worst->d.t_ns);
+			const bool   outside = OutsideLoad(busy, causes);
+			out += fmt::format(",\"reserved_cpus\":\"{}\",\"reserved_busy\":{:.1f},\"outside_load\":{}", m_reserved_list,
+			                   busy, outside ? "true" : "false");
+			if (outside) {
+				summary += fmt::format(": outside load (host task on a reserved core: CPUs {} up to {:.0f}% busy during the "
+				                       "frame); emulator side",
+				                       m_reserved_list, busy);
+			}
 			int shown = 0;
 			for (const auto& cause: causes) {
 				if (cause.excess < 1.0 || shown == 3) {
@@ -1337,16 +1568,42 @@ private:
 				if (listed == 30) {
 					continue;
 				}
-				const auto fc  = Attribute(window, *f, from);
-				const auto top = fc.empty() || fc[0].excess < 1.0 ? std::string("none") : fc[0].key;
-				out += fmt::format("{}{{\"g\":{},\"ms\":{:.2f},\"cause\":\"{}\",\"excess_ms\":{:.2f}}}",
-				                   listed == 0 ? "" : ",", f->d.g, f->ms, Escape(top), fc.empty() ? 0.0 : fc[0].excess);
+				const auto fc   = Attribute(window, *f, from);
+				const auto fbusy = ReservedBusy(f->d.t_ns - static_cast<uint64_t>(f->ms * 1e6), f->d.t_ns);
+				const auto top  = OutsideLoad(fbusy, fc) ? std::string("outside load (host task on a reserved core)")
+				                  : fc.empty() || fc[0].excess < 1.0 ? std::string("none")
+				                                                    : fc[0].key;
+				out += fmt::format("{}{{\"g\":{},\"t\":{:.4f},\"ms\":{:.2f},\"cause\":\"{}\",\"excess_ms\":{:.2f}}}",
+				                   listed == 0 ? "" : ",", f->d.g, RelS(f->d.t_ns), f->ms, Escape(top),
+				                   fc.empty() ? 0.0 : fc[0].excess);
 				if (f != worst && listed < 30) {
 					others += fmt::format("{}{:.0f} ms {}", others.empty() ? "" : ", ", f->ms, top);
 				}
 				listed++;
 			}
 			out += fmt::format("],\"lost_ms\":{:.2f}", lost);
+			// Session times of every frame over 25 ms in the incident that reads as outside load
+			// (the report counts their period and matches host processes to them).
+			out += ",\"outside_frames\":[";
+			{
+				int      tagged = 0;
+				uint64_t prev2  = 0;
+				for (const auto* f: window) {
+					const auto from2 = prev2;
+					prev2            = f->d.t_ns;
+					if (f->ms <= 25.0 || tagged == 200 ||
+					    f->d.t_ns < open_ns - std::min<uint64_t>(open_ns, 1'000'000'000ull) ||
+					    f->d.t_ns > last_ns + 100'000'000ull) {
+						continue;
+					}
+					const auto fbusy = ReservedBusy(f->d.t_ns - static_cast<uint64_t>(f->ms * 1e6), f->d.t_ns);
+					if (fbusy >= OutsideBusy && OutsideLoad(fbusy, Attribute(window, *f, from2))) {
+						out += fmt::format("{}{:.4f}", tagged == 0 ? "" : ",", RelS(f->d.t_ns));
+						tagged++;
+					}
+				}
+			}
+			out += "]";
 			if (!others.empty()) {
 				summary += "; other long frames: " + others;
 			}
@@ -1356,7 +1613,10 @@ private:
 				summary = fmt::format("{}; new unresolved import: {}", summary, detail);
 			}
 			out += fmt::format(",\"primary_cause\":\"{}\",\"summary\":\"{}\",\"causes\":[",
-			                   causes.empty() || causes[0].excess < 1.0 ? "none" : Escape(causes[0].key), Escape(summary));
+			                   outside ? "outside load (host task on a reserved core)"
+			                   : causes.empty() || causes[0].excess < 1.0 ? "none"
+			                                                              : Escape(causes[0].key),
+			                   Escape(summary));
 			for (size_t i = 0; i < causes.size(); i++) {
 				out += fmt::format("{}{{\"cause\":\"{}\",\"ms\":{:.2f},\"excess_ms\":{:.2f},\"detail\":\"{}\"}}",
 				                   i == 0 ? "" : ",", Escape(causes[i].key), causes[i].ms, causes[i].excess,
@@ -1434,6 +1694,9 @@ private:
 		while (!m_events_hist.empty() && old(m_events_hist.front().t_ns)) {
 			m_events_hist.pop_front();
 		}
+		while (!m_reserved_samples.empty() && old(m_reserved_samples.front().t_ns)) {
+			m_reserved_samples.pop_front();
+		}
 	}
 
 private:
@@ -1441,6 +1704,18 @@ private:
 	FILE*                         m_present_csv = nullptr;
 	FILE*                         m_events      = nullptr;
 	FILE*                         m_input       = nullptr;
+	FILE*                         m_reserved    = nullptr;
+	struct ReservedSample {
+		uint64_t start_ns = 0; // the previous /proc/stat read: the busy share covers [start, t]
+		uint64_t t_ns     = 0;
+		double   mean = 0, max = 0;
+	};
+	std::deque<ReservedSample>    m_reserved_samples;
+	std::vector<int>              m_reserved_cpus;
+	std::string                   m_reserved_list = "none";
+	std::map<int, std::pair<uint64_t, uint64_t>> m_cpu_prev;
+	uint64_t                      m_last_layout_ns   = 0;
+	uint64_t                      m_last_reserved_ns = 0;
 	uint64_t                      m_frame_cursor   = 0;
 	uint64_t                      m_present_cursor = 0;
 	std::vector<uint64_t>         m_event_cursors;
