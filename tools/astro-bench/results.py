@@ -7,6 +7,11 @@
   results.py table <json|label-glob>...       median and spread of runs (files or stored labels)
   results.py verdict --ref SEL... --new SEL... [--reused]
                                               one A/B verdict line (SEL: json file or label glob)
+  results.py add-hitch "<HITCH line>" key=value...
+                                              store a hitch baseline (gate.sh --baseline)
+  results.py hitch-base <sha>... [--mode M] [--profile P] [--flags F] [--frames A-B] [--shot-frame N]
+                                              the newest hitch baseline of the first <sha> that has
+                                              one (JSON on stdout; exit 1 if none)
 
 The store is ~/.cache/kyty-builds/results.jsonl (KYTY_RESULTS overrides): one JSON object per
 garden.sh run with its identity (rev, exe hash, build mode, install, window, flags, KYTY_* env,
@@ -135,7 +140,7 @@ def references(sha, window=None, env=None, flags=None, max_age=None, exe=None, m
     """Stored clean runs of commit <sha>: no -dirty build, same window, env, flags, build mode."""
     out = []
     for r in load():
-        if is_warmup(r) or not str(r.get("rev", "")).startswith(sha) or "dirty" in str(r.get("build_hash", "")):
+        if r.get("kind") or is_warmup(r) or not str(r.get("rev", "")).startswith(sha) or "dirty" in str(r.get("build_hash", "")):
             continue
         if window is not None and r.get("window") != window:
             continue
@@ -194,6 +199,40 @@ def verdict(refs, news, reused=False, label=""):
     return head + " ".join(parts) + tail
 
 
+def add_hitch(line, fields):
+    """A hitch baseline: hitches.py's HITCH line for one KYTY_FRAME_DIAG run of a dev commit."""
+    import re
+    m = re.search(r"frames=(\d+) over50=(\d+) over100=(\d+) worst=([\d.]+)", line)
+    if not m:
+        print(f"add-hitch: not a HITCH line: {line}", file=sys.stderr)
+        return 1
+    entry = {"kind": "hitch", "frames_counted": int(m.group(1)), "over50": int(m.group(2)),
+             "over100": int(m.group(3)), "worst_ms": float(m.group(4)), "line": line.strip(),
+             "time": datetime.now().astimezone().isoformat(timespec="seconds")}
+    for kv in fields:
+        k, _, v = kv.partition("=")
+        entry[k] = v
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    with open(STORE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+    return 0
+
+
+def hitch_base(shas, mode=None, profile=None, flags=None, frames=None, shot_frame=None):
+    stored = [r for r in load() if r.get("kind") == "hitch"]
+    for sha in shas:
+        hits = [r for r in stored if str(r.get("rev", "")).startswith(sha)
+                and (mode is None or r.get("build_mode", "plain") == mode)
+                and (profile is None or r.get("profile", "") == profile)
+                and (flags is None or r.get("flags", "") == flags)
+                and (frames is None or r.get("frames", "") == frames)
+                and (shot_frame is None or r.get("shot_frame", "") == shot_frame)]
+        if hits:
+            return max(hits, key=lambda r: r.get("time", ""))
+    return None
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -230,6 +269,22 @@ def main():
             print(f"== {a.sha[:12]} window {w}: {len(group)} runs, newest {youngest:.1f} h old, "
                   f"env '{group[0].get('env', '')}' flags '{group[0].get('flags', '')}'")
             table(group)
+    elif cmd == "add-hitch":
+        return add_hitch(args[0], args[1:])
+    elif cmd == "hitch-base":
+        import argparse
+        p = argparse.ArgumentParser(prog="results.py hitch-base")
+        p.add_argument("sha", nargs="+")
+        p.add_argument("--mode", default=None)
+        p.add_argument("--profile", default=None)
+        p.add_argument("--flags", default=None)
+        p.add_argument("--frames", default=None)
+        p.add_argument("--shot-frame", default=None)
+        a = p.parse_args(args)
+        r = hitch_base(a.sha, a.mode, a.profile, a.flags, a.frames, a.shot_frame)
+        if r is None:
+            return 1
+        print(json.dumps(r, sort_keys=True))
     elif cmd == "verdict":
         import argparse
         p = argparse.ArgumentParser(prog="results.py verdict")

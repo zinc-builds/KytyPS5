@@ -6,7 +6,9 @@ Reads the GFRAME lines (one per guest flip, its wall time in ms=) of the level: 
 the first PERF frame after the StartLevel line, as in garden.sh's window. Level-load frames, those
 before level frame --load-before (default 150) that uploaded at least --load-mb (default 1024) of
 textures and buffers (tex_up_b + buf_up_b), are listed apart and not counted; a streaming burst
-later in the level counts however large. Prints one line:
+later in the level counts however large. Frames around a bench screenshot (SHOT lines: the capture
+waits for its frame's GPU work once) are left out too, so a hitch run can also take the screenshot.
+Prints one line:
 
   HITCH <label>: frames=<n> over50=<n> over100=<n> worst=<ms> (f=<level frame>) load=<ms@f,...>
 
@@ -50,6 +52,7 @@ def main():
     started = False
     base = None
     rows = []
+    shots = []
     with open(log, errors='replace') as f:
         for line in f:
             if not started:
@@ -59,6 +62,10 @@ def main():
                 m = re.search(r'\bframes=(\d+)', line)
                 if m:
                     base = int(m.group(1))
+            if line.startswith('SHOT flip='):
+                m = re.match(r'SHOT flip=(\d+)', line)
+                if m:
+                    shots.append(int(m.group(1)))
             if line.startswith('GFRAME '):
                 rows.append(dict(re.findall(r'(\w+)=([^\s]+)', line)))
     if not started or base is None:
@@ -70,6 +77,8 @@ def main():
     for d in rows:
         lf = int(d['f']) - base
         if lf < frames[0] or lf > frames[1]:
+            continue
+        if any(s - 1 <= int(d['f']) <= s + 2 for s in shots):
             continue
         ms = float(d['ms'])
         up = (float(d.get('tex_up_b', 0)) + float(d.get('buf_up_b', 0))) / 1048576.0
@@ -87,7 +96,8 @@ def main():
     worst = max(counted, key=lambda c: c[1])
     load = ','.join(f'{ms:.0f}@{lf}' for lf, ms in loads) or 'none'
     print(f'HITCH {label}: frames={len(counted)} over50={len(over50)} over100={len(over100)} '
-          f'worst={worst[1]:.1f} (f={worst[0]}) load={load}')
+          f'worst={worst[1]:.1f} (f={worst[0]}) load={load}'
+          + (f' shot_frames_skipped={",".join(str(s - base) for s in shots)}' if shots else ''))
     if show:
         ms = lambda d, k: float(d.get(k, 0)) / 1e6
         for lf, wall, d in over50:

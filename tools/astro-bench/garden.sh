@@ -67,6 +67,7 @@ fi
 # Kill only this run's emulator (a child of run.sh): a pattern kill could hit the emulator of
 # whoever takes the lock next.
 cleanup() {
+	[ -n "$mon_pid" ] && kill "$mon_pid" 2>/dev/null
 	[ -n "$overlay" ] && rm -rf "$overlay"
 	[ -n "$KYTY_SHOT_FILE" ] && rm -f "$KYTY_SHOT_FILE" "/tmp/garden-$label-shot.ppm"
 	[ -n "$run_pid" ] || return
@@ -119,6 +120,44 @@ window=${GARDEN_FRAMES:-1000-1600}
 if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	f0=$((base + ${window%-*})) f1=$((base + ${window#*-}))
 	end=$((SECONDS + ${window#*-} / 5 + 30)) # even at 5 FPS
+	# Outside load (rule 7 of the bench procedure): over the window, idlemon.py samples the CPUs
+	# the core layout leaves idle: the SMT siblings of the GPU command thread's and the prepare
+	# workers' cores, plus KYTY_RESERVE_CPUS, minus every CPU the run itself may use (the "Hybrid
+	# CPU:" line, KYTY_RECORDER_CPU, KYTY_DECODE_CPU, and the affinity of every emulator thread,
+	# so KYTY_FREE_PREPARE_SIBLINGS=0 or KYTY_PREPARE_OVERFLOW=0 does not watch the game's own
+	# CPUs). The monitor runs on the emulator's own CPUs, never on the ones it watches. No hybrid
+	# layout, no monitor.
+	mon_cpus= mon_out=/tmp/garden-$label.idle
+	rm -f "$mon_out"
+	hy=$(grep -m1 '^Hybrid CPU: emulator on' "$log")
+	if [ -n "$hy" ]; then
+		gpu=$(sed -n 's/.*GPU command thread on CPU \([0-9]*\).*/\1/p' <<<"$hy")
+		prep=$(sed -n 's/.*draw prepare workers on CPUs \([0-9,]*\).*/\1/p' <<<"$hy" | tr ',' ' ')
+		over=$(sed -n 's/.*overflow worker on CPU \(-\?[0-9]*\).*/\1/p' <<<"$hy")
+		emu_pid=$(pgrep -P "$run_pid" -x kyty_emulator | head -1)
+		used=" $gpu $prep $over ${KYTY_RECORDER_CPU:-} ${KYTY_DECODE_CPU:-} "
+		# Every CPU in any emulator thread's affinity list ("0-5,8,10-11").
+		for part in $(sed -n 's/^Cpus_allowed_list:\s*//p' /proc/"$emu_pid"/task/*/status 2>/dev/null | tr ',' ' '); do
+			[[ "$part" == *-* ]] && used+="$(seq -s ' ' "${part%-*}" "${part#*-}") " || used+="$part "
+		done
+		cand=$(echo "${KYTY_RESERVE_CPUS//,/ }"; for c in $gpu $prep; do
+			tr ',' '\n' < "/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list" 2>/dev/null; done)
+		for c in $cand; do
+			[[ "$c" =~ ^[0-9]+$ ]] && [[ "$used" != *" $c "* ]] && [[ ",$mon_cpus," != *",$c,"* ]] && mon_cpus+=${mon_cpus:+,}$c
+		done
+		# The emulator's own CPUs (its process mask) for the monitor itself.
+		mon_on=$(taskset -pc "$emu_pid" 2>/dev/null | sed -n 's/.*: //p')
+	fi
+	until [ "$(last_frames)" -ge "$f0" ] 2>/dev/null; do
+		((SECONDS > end)) && break
+		pgrep -f '^\./kyty_emulator --game' >/dev/null || break
+		wait_s 1
+	done
+	if [ -n "$mon_cpus" ]; then
+		# 9>&- etc.: a monitor must never hold the bench lock.
+		nice -n 19 taskset -c "${mon_on:-0}" python3 -I "$(dirname "$0")/idlemon.py" "$mon_cpus" "$mon_out" 9>&- 8>&- 7>&- &
+		mon_pid=$!
+	fi
 	until [ "$(last_frames)" -ge "$f1" ] 2>/dev/null; do
 		((SECONDS > end)) && { echo "timeout waiting for frame $f1" >&2; exit 1; }
 		pgrep -f '^\./kyty_emulator --game' >/dev/null || { echo "emulator exited ($(tail -1 "$log"))" >&2; exit 1; }
@@ -131,6 +170,19 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 		inwin { print }
 		fr >= f1 { printf "FRAMEFPS %.4f\n", (fr - a) / (t - ta); exit }' > "/tmp/garden-$label.window"
 	fw=$(grep -m1 '^FRAMEFPS' "/tmp/garden-$label.window" | cut -d' ' -f2)
+	idle_note= void=
+	# A hybrid layout that leaves no CPU to watch says so, rather than passing unchecked.
+	[ -n "$hy" ] && [ -z "$mon_cpus" ] && idle_note=" idle_busy=unchecked(no idle CPUs)"
+	if [ -n "$mon_pid" ]; then
+		kill "$mon_pid" 2>/dev/null; wait "$mon_pid" 2>/dev/null; mon_pid=
+		read -r imean imax < <(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["mean"], d["max5s"])' "$mon_out" 2>/dev/null)
+		if [ -n "$imean" ] && [ "$imean" != None ]; then
+			idle_note=" idle_busy=$imean/$imax%(cpus $mon_cpus)"
+			# Provisional thresholds (Track R): mean over 15%, or any 5 s over 40%.
+			awk -v m="$imean" -v x="$imax" -v tm="${GARDEN_VOID_MEAN:-15}" -v tx="${GARDEN_VOID_MAX5:-40}" \
+				'BEGIN { exit !(m > tm || x > tx) }' && void=1
+		fi
+	fi
 	# Per-draw costs over the same window (metrics.py; needs a binary with METRICS lines), as
 	# fields appended to the summary line and as /tmp/garden-<label>.json.
 	rm -f "/tmp/garden-$label.json"
@@ -144,10 +196,18 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	extra=$(python3 -I "$(dirname "$0")/metrics.py" "$log" "$start" "$f0" "$f1" "/tmp/garden-$label.json" \
 		label="$label" window="$window" route="$route" install="$install" flags="$*" env="${kenv% }" \
 		time="$(date -Iseconds)" exe="$exe" build_mode="${mode:-plain}" profile="$profile" level="$level")
+	rm -f "/tmp/garden-$label.void.json"
+	if [ -f "/tmp/garden-$label.json" ] && [ -s "$mon_out" ]; then
+		python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["idle_busy"]=json.load(open(sys.argv[2])); d["void"]=sys.argv[3]=="1"; json.dump(d,open(p,"w"),indent=1,sort_keys=True)' \
+			"/tmp/garden-$label.json" "$mon_out" "${void:-0}"
+		# A void run is not a result: its JSON is kept apart, so nothing reads it as one.
+		[ -n "$void" ] && mv -f "/tmp/garden-$label.json" "/tmp/garden-$label.void.json"
+	fi
 	# Every measured run goes into the shared result store (results.sh), so references are reused.
-	case "$label" in *-warmup) ;; *) [ "$level" = aerial_garden ] && [ -f "/tmp/garden-$label.json" ] && python3 -I "$(dirname "$0")/results.py" add "/tmp/garden-$label.json" ;; esac
+	# A void run (outside load) is not data: it stays out of the store.
+	case "$label" in *-warmup) ;; *) [ -z "$void" ] && [ "$level" = aerial_garden ] && [ -f "/tmp/garden-$label.json" ] && python3 -I "$(dirname "$0")/results.py" add "/tmp/garden-$label.json" ;; esac
 	grep '^PERF' "/tmp/garden-$label.window" | fields |
-		awk -v l="$label" -v fw="$fw" -v note=" frames=$window$extra" "$summary"
+		awk -v l="$label" -v fw="$fw" -v note=" frames=$window$extra$idle_note${void:+ VOID (outside load)}" "$summary"
 else
 	wait_s "${GARDEN_SETTLE:-25}"       # opening flight / shader warm-up
 	from=$(wc -l < "$log")

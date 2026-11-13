@@ -215,7 +215,8 @@ step 1 comes first.
   compare against your merge-base (`ab.sh` builds it with `refbuild.sh`). Decide on `cmd_ns`
   (CPU ns per draw, user + sys) and `cpd` (cycles per draw), not on instructions or FPS: see
   "Bench metrics and A/B" below.
-  An FPS claim of record needs a same-batch pair in frames 1000–1600 (`gate.sh` runs it).
+  An FPS claim of record needs a same-batch pair in frames 1000–1600 on a quiet machine (the lead
+  takes those; `gate.sh` no longer judges FPS).
 - **Correctness first:** `gate.sh` before merging (screenshots against the merge-base, the verify
   modes), the touched unit tests (one suite at a time, under `MemoryMax=10G`), and a verify mode
   for any cache. After any change to pipeline layouts or to the order of warm-up and context
@@ -355,12 +356,30 @@ The rule, in any build mode:
   - For a kill switch on one binary (no layout term):
     `ab.sh <label> --ref-install D --new-install D --new-env KYTY_X=0`.
 - `results.sh ref <sha> [--window W]`: stored numbers of a commit (median, spread).
-- `gate.sh <label>` (~7 min, one lock hold) prints a pass/fail block for the PR:
-  - a same-batch pair in 1000–1600 (2 + 2 runs, the FPS of record);
-  - one run with `KYTY_PREPARE_VERIFY`, `KYTY_BINDING_REUSE_VERIFY`,
-    `KYTY_WORKER_TARGETS_VERIFY` and `KYTY_WORKER_PIPELINE_KEY_VERIFY` (`--verify-env` adds more);
-  - screenshots of level frame 600 from both sides (`GARDEN_SHOT`, saved in-emulator through
-    `KYTY_SHOT_FILE`: the guest image, no desktop capture).
+- `gate.sh <label> --class diag|switch|full --why "<reason>"` (one lock hold) prints a pass/fail
+  block for the PR. The class is declared, and printed with its reason for review:
+  - `diag` (diagnostic code, off by default, `--diag-env "KYTY_X=1"`): a screening A/B against
+    stored references of the merge-base, and one run with the diagnostic on, the verify modes and
+    the screenshot. ~2–4 runs.
+  - `switch` (behind a kill switch, `--switch "KYTY_X=0"`, the value that turns the change off):
+    the same binary with the switch off as the reference arm, a verify run, and one hitch run with
+    the screenshot on the new arm. ~4–8 runs.
+  - `full`: the A/B against the merge-base (stored references when there are), verify, hitch.
+  - Every A/B is sequential in frames 200–500: one pair, stop when `cmd_ns` or `cpd` is a signal,
+    else another pair, up to `-n` (3). It fails on `cmd_ns` or `cpd` worse by ≥3 sd (unless
+    `--accept-cost`); FPS is printed, not judged (FPS of record is the lead's, on a quiet machine).
+  - Hitches are compared with the stored hitch baseline of the merge-base or the nearest of the 10
+    dev commits before it (same build mode and profile); without one, the reference arm runs a
+    hitch run too. The hitch run also takes the screenshot (level frame 600; `hitches.py` leaves
+    the capture's frames out).
+- `gate.sh --baseline [<commit>]` (default `origin/dev`): whoever merges to `dev` runs it once
+  (~4 min): 2 per-draw runs into the result store and one hitch run with the screenshot, stored as
+  the commit's hitch baseline. Gates then read `dev` instead of re-running it.
+- **Void runs.** `garden.sh` samples the CPUs the core layout leaves idle (the SMT siblings of the
+  command thread's and prepare workers' cores) over the measured window: a mean over 15% busy or
+  any 5 s over 40% (Track R's provisional thresholds; ~5.5% quiet, ~60% under a 4.8-CPU outside
+  load) marks the run `VOID (outside load)`, keeps it out of the store, and `batch.sh` runs it once
+  more. `idle_busy=mean/max5s%` is on every summary line.
 
 **Where the command thread's cycles go (2026-11-12, `KYTY_BENCH_PMU=1`).** That diagnostic mode adds
 user-mode PMU events for the command thread and the prepare workers, multiplexed by the kernel, plus
