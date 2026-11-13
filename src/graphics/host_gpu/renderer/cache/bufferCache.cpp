@@ -1885,29 +1885,33 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return DirtyInAnyView(m_gpu_modified_ranges, m_inflight_ranges, vaddr, size);
+	// Bytes of a read in flight are not in the backing store yet.
+	if (m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	    (!m_inflight_ranges.Empty() && m_inflight_ranges.Intersects(vaddr, size))) {
+		return true;
+	}
+	return LibKernel::Memory::AnyGuestAliases() &&
+	       DirtyThroughAlias(m_gpu_modified_ranges, m_inflight_ranges, vaddr, size);
 }
 
 bool BufferCache::DirtyInAnyView(const RangeSet& modified, const RangeSet& inflight,
                                  uint64_t vaddr, uint64_t size) {
-	// Bytes of a read in flight are not in the backing store yet.
-	const auto dirty = [&](uint64_t address, uint64_t bytes) {
-		return modified.Intersects(address, bytes) ||
-		       (!inflight.Empty() && inflight.Intersects(address, bytes));
-	};
-	if (dirty(vaddr, size)) {
+	if (modified.Intersects(vaddr, size) || (!inflight.Empty() && inflight.Intersects(vaddr, size))) {
 		return true;
 	}
-	if (!LibKernel::Memory::AnyGuestAliases()) {
-		return false;
-	}
-	// The ranges are kept by guest address: the GPU may have written these bytes through
-	// another guest view of them.
+	return LibKernel::Memory::AnyGuestAliases() && DirtyThroughAlias(modified, inflight, vaddr, size);
+}
+
+// The ranges are kept by guest address: the GPU may have written these bytes through another
+// guest view of them.
+bool BufferCache::DirtyThroughAlias(const RangeSet& modified, const RangeSet& inflight,
+                                    uint64_t vaddr, uint64_t size) {
 	thread_local std::vector<std::pair<uint64_t, uint64_t>> aliases;
 	aliases.clear();
 	LibKernel::Memory::GuestAliasesOf(vaddr, size, aliases);
 	const bool hit = std::ranges::any_of(aliases, [&](const auto& alias) {
-		return dirty(alias.first, alias.second);
+		return modified.Intersects(alias.first, alias.second) ||
+		       (!inflight.Empty() && inflight.Intersects(alias.first, alias.second));
 	});
 	DrawPrepare::AliasStats::Note(DrawPrepare::AliasStats::DirtyCheck, !aliases.empty(), hit);
 	return hit;

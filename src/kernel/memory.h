@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <atomic>
 #include <utility>
 #include <optional>
 #include <vector>
@@ -212,7 +213,10 @@ bool               ProtectAsyncGuestPage(uint64_t page, uint64_t& token);
 // Guest views that share backing bytes with another view (direct memory mapped twice). Checks
 // that compare guest virtual addresses must also look at a range's other views. Any thread; no
 // alias anywhere costs one atomic load.
-[[nodiscard]] bool AnyGuestAliases() noexcept;
+inline std::atomic<bool> g_any_guest_aliases {false}; // GuestBackingStore keeps it
+[[nodiscard]] inline bool AnyGuestAliases() noexcept {
+	return g_any_guest_aliases.load(std::memory_order_acquire);
+}
 [[nodiscard]] bool GuestRangeAliased(uint64_t vaddr, uint64_t size);
 // Appends the other guest views of the bytes behind [vaddr, vaddr + size) as {vaddr, size}.
 void GuestAliasesOf(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& out);

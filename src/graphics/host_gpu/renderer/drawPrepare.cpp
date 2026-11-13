@@ -274,10 +274,6 @@ void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-bool AnyAliases() noexcept {
-	return LibKernel::Memory::AnyGuestAliases();
-}
-
 uint64_t GpuWriteSequence() noexcept {
 	return g_gpu_written.Sequence();
 }
@@ -293,13 +289,8 @@ std::array<std::atomic<uint64_t>, Kinds> g_hit {};
 std::atomic<uint64_t>                    g_last_report_ns {0};
 } // namespace
 
-bool Enabled() noexcept {
-	static const bool enabled = std::getenv("KYTY_ALIAS_STATS") != nullptr;
-	return enabled;
-}
-
-void Note(Kind kind, bool aliased, bool hit) noexcept {
-	if (!Enabled() || !aliased) {
+void NoteAliased(Kind kind, bool hit) noexcept {
+	if (!Enabled()) {
 		return;
 	}
 	g_aliased[kind].fetch_add(1, std::memory_order_relaxed);

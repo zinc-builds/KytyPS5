@@ -202,6 +202,8 @@ static std::atomic<uint64_t> g_test_free_range_visits {0};
 static bool                  g_test_fail_next_write_protect_register = false;
 #endif
 
+static bool AliasHazardChecks() noexcept;
+
 #include "memoryAddressSpace.inc"
 
 enum class VirtualRangeType {
@@ -897,8 +899,6 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
-static bool AliasHazardChecks() noexcept;
-
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged) {
 	// Emulator stores into guest memory (downloads, labels) change bytes without a guest write.
 	// Advance on both sides so no reader pairs the old bytes with the new epoch, or the reverse.
@@ -909,7 +909,7 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool range
 	    ranged_store ? Graphics::GuestSyncEpoch::AdvanceRanged : Graphics::GuestSyncEpoch::Advance;
 	advance();
 	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size,
-	                                                            ranged_store && AliasHazardChecks());
+	                                                            ranged_store && AnyGuestAliases());
 	advance();
 	return written;
 }
@@ -925,7 +925,7 @@ bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 	};
 	advance();
 	const bool written = g_guest_address_space->TryStoreLabelBacking(vaddr, value, size,
-	                                                                 ranged && AliasHazardChecks());
+	                                                                 ranged && AnyGuestAliases());
 	advance();
 	return written;
 }
@@ -1283,11 +1283,6 @@ static bool AliasHazardChecks() noexcept {
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
-}
-
-bool AnyGuestAliases() noexcept {
-	return AliasHazardChecks() && g_guest_address_space != nullptr &&
-	       g_guest_address_space->Store().AnyAliases();
 }
 
 bool GuestRangeAliased(uint64_t vaddr, uint64_t size) {

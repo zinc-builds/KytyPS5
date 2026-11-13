@@ -88,6 +88,10 @@ public:
 	// of the same bytes (direct memory mapped twice), intersects `modified` or `inflight`.
 	[[nodiscard]] static bool DirtyInAnyView(const RangeSet& modified, const RangeSet& inflight,
 	                                         uint64_t vaddr, uint64_t size);
+	// The aliased part of DirtyInAnyView (only while guest aliases exist).
+	[[gnu::noinline, gnu::cold]] static bool DirtyThroughAlias(const RangeSet& modified,
+	                                                          const RangeSet& inflight,
+	                                                          uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so

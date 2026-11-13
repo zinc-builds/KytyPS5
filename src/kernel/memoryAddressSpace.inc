@@ -1498,6 +1498,9 @@ private:
 		std::ranges::sort(m_aliased);
 		std::ranges::sort(m_alias_entries, {}, &MapEntry::backing_offset);
 		m_alias_count.store(m_aliased.size(), std::memory_order_release);
+		// The hazard checks' fast test (KYTY_ALIAS_HAZARD=0 keeps it false).
+		g_any_guest_aliases.store(!m_aliased.empty() && AliasHazardChecks(),
+		                          std::memory_order_release);
 		static const bool stats = std::getenv("KYTY_ALIAS_STATS") != nullptr;
 		if (stats && previous != m_aliased) {
 			uint64_t bytes = 0;

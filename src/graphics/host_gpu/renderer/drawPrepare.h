@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/guestSyncEpoch.h"
+#include "kernel/memory.h"
 
 #include <atomic>
 #include <cstdint>
@@ -168,8 +169,10 @@ enum class Verdict : uint8_t {
 	Stored,     // an emulator store (a readback publication) overlapped its reads
 	GpuDirty,   // bytes it read are GPU-dirty now: the command thread would have waited
 };
-// Whether any guest bytes are mapped at two guest addresses (LibKernel::Memory::AnyGuestAliases).
-[[nodiscard]] bool AnyAliases() noexcept;
+// Whether any guest bytes are mapped at two guest addresses (one load).
+[[nodiscard]] inline bool AnyAliases() noexcept {
+	return LibKernel::Memory::AnyGuestAliases();
+}
 // `has_gpu_dirty_bytes(vaddr, size)`: BufferCache::HasGpuDirtyBytes.
 template <typename HasGpuDirtyBytes>
 [[nodiscard]] Verdict Adoption(const Stamps& stamps, const Log& log,
@@ -266,8 +269,17 @@ enum Kind : uint32_t {
 	PreparedRead, // a prepared draw's logged read of an aliased range, at adoption
 	Kinds,
 };
-[[nodiscard]] bool Enabled() noexcept;
-void               Note(Kind kind, bool aliased, bool hit = false) noexcept;
+[[nodiscard]] inline bool Enabled() noexcept {
+	static const bool enabled = std::getenv("KYTY_ALIAS_STATS") != nullptr;
+	return enabled;
+}
+void NoteAliased(Kind kind, bool hit) noexcept;
+// Inline so the hot paths pay one test while nothing is aliased.
+inline void Note(Kind kind, bool aliased, bool hit = false) noexcept {
+	if (aliased) [[unlikely]] {
+		NoteAliased(kind, hit);
+	}
+}
 // At most every five seconds: prints the counts, and whether any alias exists at all.
 void Report();
 } // namespace AliasStats
