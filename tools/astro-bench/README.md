@@ -58,6 +58,9 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   `KYTY_BENCH_LOCK_TIMEOUT` (4 h, longer than a priority-9 ticket takes to age to 1) prints "timed out waiting for the bench lock" and the script
   exits 75. `benchlock.sh status` shows the holder and the queue with aged priorities;
   `test-benchlock.sh` tests the queue on a private lock file.
+- `idlecpus.sh` — the CPUs garden.sh's outside-load monitor (`idlemon.py`) watches for a run's
+  "Hybrid CPU:" line; `test-idlecpus.sh` fails if this machine's default layout leaves none (then
+  every run reads `idle_busy=unchecked` and gates fail).
 - `batch.sh` — runs `<label> [ENV=VAL…] -- [flags…]` lines back to back, after a short unreported
   warm-up run of the first line (the first run of a batch reads slow; `BATCH_WARMUP=0` skips it).
 - `refbuild.sh <commit>` — prints the install dir of a Release build of that commit, building it
