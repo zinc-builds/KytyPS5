@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "common/envSwitch.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -337,7 +338,7 @@ static bool WorkerTargetsEnabled() {
 
 // KYTY_WORKER_TARGETS_VERIFY=1: every adopted target is resolved again from the registers.
 static bool WorkerTargetsVerify() {
-	static const bool verify = std::getenv("KYTY_WORKER_TARGETS_VERIFY") != nullptr;
+	static const bool verify = Common::EnvFlag("KYTY_WORKER_TARGETS_VERIFY");
 	return verify;
 }
 

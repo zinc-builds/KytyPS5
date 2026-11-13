@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/configReport.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -80,6 +81,10 @@ static bool ResidentTexturesSupported(const vk::PhysicalDeviceFeatures&         
                                       const vk::PhysicalDeviceVulkan12Properties& limits) {
 	const char* value = std::getenv("KYTY_RESIDENT_TEXTURES");
 	if (value == nullptr || (strcmp(value, "1") != 0 && strcmp(value, "verify") != 0)) {
+		Common::ConfigReport::Feature("resident textures",
+		                              value != nullptr && strcmp(value, "shadow") == 0
+		                                  ? "shadow (bookkeeping only; draws keep classic bindings)"
+		                                  : "off (default): classic bindings");
 		return false;
 	}
 	const char* missing = nullptr;
@@ -100,9 +105,13 @@ static bool ResidentTexturesSupported(const vk::PhysicalDeviceFeatures&         
 	if (missing != nullptr) {
 		Log::WriteToConsoleAndLog(std::string("Resident textures unavailable (") + missing +
 		                          "); draws keep classic bindings\n");
+		Common::ConfigReport::Feature("resident textures", std::string("requested, unavailable (") +
+		                                                       missing + "): classic bindings");
 		return false;
 	}
 	LOGF("Resident textures: on\n");
+	Common::ConfigReport::Feature("resident textures",
+	                              strcmp(value, "verify") == 0 ? "on, verify" : "on");
 	return true;
 }
 

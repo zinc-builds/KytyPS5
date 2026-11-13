@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRAWSTATECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRAWSTATECACHE_H_
 
+#include "common/envSwitch.h"
+
 #include <cstdlib>
 
 namespace Libs::Graphics {
@@ -22,7 +24,7 @@ inline DrawStateCacheMode GetDrawStateCacheMode() {
 }
 
 inline bool DrawStateCacheStats() {
-	static const bool enabled = std::getenv("KYTY_DTC_STATS") != nullptr;
+	static const bool enabled = Common::EnvFlag("KYTY_DTC_STATS");
 	return enabled;
 }
 

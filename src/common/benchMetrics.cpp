@@ -1,4 +1,5 @@
 #include "common/benchMetrics.h"
+#include "common/envSwitch.h"
 
 #include "kytyGitVersion.h"
 
@@ -80,7 +81,7 @@ std::atomic<const std::atomic<uint64_t>*> g_worker_busy[MaxWorkers] {};
 std::atomic<const std::atomic<uint64_t>*> g_worker_done[MaxWorkers] {};
 
 bool PerfLogEnabled() {
-	static const bool enabled = std::getenv("KYTY_PERF_LOG") != nullptr;
+	static const bool enabled = Common::EnvFlag("KYTY_PERF_LOG");
 	return enabled;
 }
 

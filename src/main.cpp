@@ -1,6 +1,7 @@
 #include "common/hybridAffinity.h"
 #include "common/archive.h"
 #include "common/common.h"
+#include "common/configReport.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -507,6 +508,8 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	Common::ConfigReport::PrintStartup(std::string(KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release") +
+	                                   " " KYTY_TOOLCHAIN " " KYTY_VERSION " git " KYTY_GIT_VERSION);
 	Run(options);
 
 	return 0;

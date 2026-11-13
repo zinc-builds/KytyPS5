@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "common/envSwitch.h"
 #include "graphics/host_gpu/renderer/pipeline/drawStateCache.h"
 
 #include "common/alignment.h"
@@ -816,7 +817,7 @@ static bool WorkerTexturesEnabled() {
 
 // KYTY_WORKER_TEXTURES_VERIFY=1: every adopted proposal is resolved again from scratch.
 static bool WorkerTexturesVerify() {
-	static const bool verify = std::getenv("KYTY_WORKER_TEXTURES_VERIFY") != nullptr;
+	static const bool verify = Common::EnvFlag("KYTY_WORKER_TEXTURES_VERIFY");
 	return verify;
 }
 
@@ -1230,7 +1231,7 @@ static bool BindingReuseEnabled() {
 
 // KYTY_BINDING_REUSE_VERIFY=1: every reused stage is resolved again from scratch and compared.
 bool RenderExecutor::BindingReuseVerify() {
-	static const bool verify = std::getenv("KYTY_BINDING_REUSE_VERIFY") != nullptr;
+	static const bool verify = Common::EnvFlag("KYTY_BINDING_REUSE_VERIFY");
 	return verify;
 }
 
@@ -2091,7 +2092,7 @@ void RenderExecutor::EndResidentCommit(std::span<PreparedBindings* const> stages
 
 // KYTY_RESIDENT_STATS=1: the stage counts of the RESIDENT lines (push data, spills, index words).
 bool RenderExecutor::ResidentStatsEnabled() {
-	static const bool enabled = std::getenv("KYTY_RESIDENT_STATS") != nullptr;
+	static const bool enabled = Common::EnvFlag("KYTY_RESIDENT_STATS");
 	return enabled;
 }
 

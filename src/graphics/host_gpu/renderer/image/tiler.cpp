@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "common/envSwitch.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -83,7 +84,7 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 	// KYTY_TILER_VERIFY=1: also run the buffer path and compare its bytes ("TILERVERIFY" lines).
 	const char* direct = std::getenv("KYTY_TILER_DIRECT");
 	m_direct_image     = direct == nullptr || std::strcmp(direct, "0") != 0;
-	m_verify           = m_direct_image && std::getenv("KYTY_TILER_VERIFY") != nullptr;
+	m_verify           = m_direct_image && Common::EnvFlag("KYTY_TILER_VERIFY");
 
 	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
 	descriptor_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;

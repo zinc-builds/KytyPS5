@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "common/envSwitch.h"
 #include "common/frameDiag.h"
 
 #include "common/alignment.h"
@@ -1673,7 +1674,7 @@ void TextureCache::Settle(Image& image) {
 // KYTY_TC_SETTLED_VERIFY=1: a lock-free lookup re-checks, under the lock, that the image is still
 // settled for it or that something cleared the flag since.
 void TextureCache::VerifySettled(const Image& image, uint8_t need) {
-	static const bool verify = std::getenv("KYTY_TC_SETTLED_VERIFY") != nullptr;
+	static const bool verify = Common::EnvFlag("KYTY_TC_SETTLED_VERIFY");
 	if (!verify) {
 		return;
 	}
@@ -2339,7 +2340,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	// m_surface_metas belongs to the GPU thread (this one, per draw): unmaps run on it too
 	// (RenderContext::UnmapMemory), and MaterializeColorClear and FindDepthTarget already use it
 	// unlocked. KYTY_META_LOCK=1 takes the lock anyway.
-	static const bool locked = std::getenv("KYTY_META_LOCK") != nullptr;
+	static const bool locked = Common::EnvFlag("KYTY_META_LOCK");
 	std::unique_lock  lock {m_lock, std::defer_lock};
 	if (locked) {
 		lock.lock();

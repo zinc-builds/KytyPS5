@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/configReport.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -1737,6 +1738,7 @@ const AmdPatchPlan& GetAmdPatchPlan() {
 				break;
 		}
 		Log::WriteToConsoleAndLog(fmt::format("AMD CPU compatibility: mode {}\n", text));
+		Common::ConfigReport::Feature("amd-cpu", text);
 		return result;
 	}();
 	return plan;
@@ -1955,6 +1957,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			    std::chrono::duration_cast<std::chrono::milliseconds>(
 			        std::chrono::steady_clock::now() - load_start)
 			        .count()));
+			if (found != 0) {
+				Common::ConfigReport::Feature("amd-cpu " + module_name, std::string(status) + " (" + details + ")");
+			}
 		}
 	}
 

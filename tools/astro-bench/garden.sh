@@ -191,6 +191,14 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	extra=$(python3 -I "$(dirname "$0")/metrics.py" "$log" "$start" "$f0" "$f1" "/tmp/garden-$label.json" \
 		label="$label" window="$window" route="$route" install="$install" flags="$*" env="${kenv% }" \
 		time="$(date -Iseconds)" exe="$exe" build_mode="${mode:-plain}" profile="$profile" level="$level")
+	# The emulator's effective configuration (its "CONFIG summary" block: build mode, switches set,
+	# features and fallbacks) goes with the run: /tmp/garden-<label>.config and the JSON's "config".
+	sed -n '/^CONFIG summary begin/,/^CONFIG summary end/p' "$log" > "/tmp/garden-$label.config"
+	[ -s "/tmp/garden-$label.config" ] || grep '^CONFIG' "$log" > "/tmp/garden-$label.config"
+	if [ -s "/tmp/garden-$label.config" ] && [ -f "/tmp/garden-$label.json" ]; then
+		python3 -I -c 'import json,sys; p,c=sys.argv[1],sys.argv[2]; d=json.load(open(p)); d["config"]=open(c).read().splitlines(); json.dump(d,open(p,"w"),indent=1,sort_keys=True)' \
+			"/tmp/garden-$label.json" "/tmp/garden-$label.config"
+	fi
 	rm -f "/tmp/garden-$label.void.json"
 	if [ -f "/tmp/garden-$label.json" ] && [ -s "$mon_out" ]; then
 		python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["idle_busy"]=json.load(open(sys.argv[2])); d["void"]=sys.argv[3]=="1"; d["suspect"]=sys.argv[4]=="1"; json.dump(d,open(p,"w"),indent=1,sort_keys=True)' \

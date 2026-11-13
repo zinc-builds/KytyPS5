@@ -5,6 +5,8 @@
 // stream copies, buffer uploads by caller, write-watch changes and write faults by thread kind.
 // Relaxed atomics; costs one predictable branch per event when off.
 
+#include "common/envSwitch.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -70,7 +72,7 @@ inline std::atomic<uint64_t> g_label_epoch {0};
 inline std::atomic<uint64_t> g_submit_epoch {0};
 
 [[nodiscard]] inline bool Enabled() noexcept {
-	static const bool on = std::getenv("KYTY_MEM_DIAG") != nullptr;
+	static const bool on = Common::EnvFlag("KYTY_MEM_DIAG");
 	return on;
 }
 

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/asyncUploader.h"
+#include "common/configReport.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -23,6 +24,12 @@ AsyncUploader::AsyncUploader(GraphicContext& graphics, CommandScheduler& schedul
                              uint64_t ring_size)
     : m_graphics(graphics), m_scheduler(scheduler), m_ring_size(Common::AlignUp(ring_size, RingAlign)) {
 	if (graphics.transfer_queue == nullptr) {
+		const char* env = std::getenv("KYTY_ASYNC_UPLOAD");
+		Common::ConfigReport::Feature(
+		    "transfer uploads", env != nullptr && std::strcmp(env, "0") == 0
+		                            ? "off (KYTY_ASYNC_UPLOAD=0): large uploads on the graphics queue"
+		                            : "off (the GPU has no transfer-only queue): large uploads on the "
+		                              "graphics queue");
 		return;
 	}
 	if (const char* env = std::getenv("KYTY_ASYNC_UPLOAD"); env != nullptr) {
@@ -56,6 +63,10 @@ AsyncUploader::AsyncUploader(GraphicContext& graphics, CommandScheduler& schedul
 	SetVulkanObjectNameF(graphics.device, m_host->Handle(), "Kyty.AsyncUploadHost");
 	SetVulkanObjectNameF(graphics.device, m_device->Handle(), "Kyty.AsyncUploadDevice");
 	m_enabled = true;
+	Common::ConfigReport::Feature("transfer uploads",
+	                              "copy engine (queue family " +
+	                                  std::to_string(graphics.transfer_queue_family) + ") for uploads >= " +
+	                                  std::to_string(m_min_size) + " bytes");
 	std::printf("AsyncUploader: transfer queue family %u, uploads >= %llu bytes\n",
 	            graphics.transfer_queue_family, static_cast<unsigned long long>(m_min_size));
 }

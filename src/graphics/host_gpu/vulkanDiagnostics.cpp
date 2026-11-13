@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanDiagnostics.h"
+#include "common/envSwitch.h"
 
 #include <algorithm>
 #include <array>
@@ -860,7 +861,7 @@ void BeginCommandBuffer(vk::Device device, float timestamp_period, vk::CommandBu
 	std::lock_guard lock(timer.mutex);
 	if (!timer.initialized) {
 		timer.initialized = true;
-		if (std::getenv("KYTY_GPU_TIME") != nullptr) {
+		if (Common::EnvFlag("KYTY_GPU_TIME")) {
 			vk::QueryPoolCreateInfo info {};
 			info.queryType  = vk::QueryType::eTimestamp;
 			info.queryCount = static_cast<uint32_t>(timer.pending.size() * 2);
@@ -923,7 +924,7 @@ void TagDispatch(vk::CommandBuffer buffer, uint64_t module_id) {
 }
 
 bool PipelineStatsRequested() {
-	static const bool requested = std::getenv("KYTY_PIPELINE_STATS") != nullptr;
+	static const bool requested = Common::EnvFlag("KYTY_PIPELINE_STATS");
 	return requested;
 }
 

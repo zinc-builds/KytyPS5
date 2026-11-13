@@ -1,5 +1,7 @@
 #if defined(__linux__)
 #include "common/hybridAffinity.h"
+#include "common/configReport.h"
+#include "common/envSwitch.h"
 #include <pthread.h>
 #include <sys/resource.h>
 #endif
@@ -1508,9 +1510,14 @@ static uint64_t DecodeNowNs() {
 static int DecodeThreadMode() {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_DECODE_THREAD");
-		if (value == nullptr) return 0;
-		if (std::string_view(value) == "verify") return 2;
-		return value[0] == '1' ? 1 : 0;
+		const int   m     = value == nullptr                     ? 0
+		                    : std::string_view(value) == "verify" ? 2
+		                    : value[0] == '1'                     ? 1
+		                                                          : 0;
+		if (m == 0) {
+			Common::ConfigReport::Feature("decode thread", "off (default; KYTY_DECODE_THREAD=1 turns it on)");
+		}
+		return m;
 	}();
 	return mode;
 }
@@ -1671,7 +1678,7 @@ public:
 		if (const char* spin = std::getenv("KYTY_DECODE_SPIN_US"); spin != nullptr) {
 			handoff.spin_ns = std::strtoull(spin, nullptr, 10) * 1000;
 		}
-		m_stats_enabled = std::getenv("KYTY_DECODE_STATS") != nullptr;
+		m_stats_enabled = Common::EnvFlag("KYTY_DECODE_STATS");
 		verify          = DecodeThreadMode() == 2;
 		handoff.verify  = verify;
 		handoff.asserts = verify || DrawPrepare::Chaos::Enabled();
@@ -1682,6 +1689,8 @@ public:
 		// KYTY_DECODE_RUN_UNTIL_DRAW=0: hand every packet back to the decode thread after a sync.
 		const char* until = std::getenv("KYTY_DECODE_RUN_UNTIL_DRAW");
 		m_run_until_draw  = until == nullptr || until[0] != '0';
+		Common::ConfigReport::Feature("decode thread", verify ? "on, verify (KYTY_DECODE_THREAD=verify)"
+		                                                      : "on (KYTY_DECODE_THREAD=1)");
 		m_thread        = std::thread([this] { Loop(); });
 	}
 	~DecodeThread() {
@@ -2169,6 +2178,11 @@ void CommandProcessor::DecodeThreadDeleter::operator()(DecodeThread* decode) con
 void CommandProcessor::RunPacketLoop(Pm4Execution& execution) {
 	// Not with frame skipping: its draw classification is the GPU thread's, so every draw would be
 	// a sync (stage 1).
+	if (static bool noted = false; !noted && DecodeThreadMode() != 0 && FrameSkip::Active()) {
+		noted = true; // the GPU thread only
+		Common::ConfigReport::Feature("decode thread",
+		                              "requested, not used: frame skipping is on (stage 1 limit)");
+	}
 	if (DecodeThreadMode() != 0 && !IsAsyncComputeQueue() && g_gpu_state != nullptr &&
 	    !FrameSkip::Active() && m_renderer.GetRenderExecutor().EnsurePrepareLanes()) {
 		if (m_decode == nullptr) {

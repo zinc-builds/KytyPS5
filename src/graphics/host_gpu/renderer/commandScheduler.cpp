@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/configReport.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -105,6 +106,13 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 		m_retire_nowait = false;
 	}
 	if (record_thread) {
+		Common::ConfigReport::Feature(
+		    "recorder thread", m_recorder != nullptr ? "on (Vulkan commands recorded off the GPU thread)"
+		                                             : "off (KYTY_RECORD_THREAD=0): the GPU thread records");
+		Common::ConfigReport::Feature(
+		    "submit thread", m_queued_submit ? "on (queue submits on the recorder thread)"
+		                                     : m_recorder == nullptr ? "off (no recorder thread)"
+		                                                             : "off (KYTY_SUBMIT_THREAD=0)");
 		m_master.EnableWaitDiag();
 		const char* early = std::getenv("KYTY_EARLY_SUBMIT");
 		if (early == nullptr || early[0] != '0') {

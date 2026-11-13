@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/envSwitch.h"
 #include "common/frameDiag.h"
 #include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
@@ -63,7 +64,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 			DrawPrepare::NoteRead(vaddr, size);
 			return LibKernel::Memory::CopySparseMemory(vaddr, dst, size);
 		}
-		static const bool disabled = std::getenv("KYTY_NO_SHADER_FASTREAD") != nullptr;
+		static const bool disabled = Common::EnvFlag("KYTY_NO_SHADER_FASTREAD");
 		if (disabled || context == nullptr || !GuestGpu::IsGpuThread() ||
 		    context->GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
 			return false; // read in place: GPU-written bytes must be synchronized first
@@ -256,7 +257,7 @@ void NoteVerifyInvalidated(uint64_t vaddr, uint64_t size) {
 	if (MemDiag::Traced(vaddr, size)) {
 		MemDiag::Trace("invalidate", vaddr, size);
 	}
-	static const bool verify = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+	static const bool verify = Common::EnvFlag("KYTY_ASYNC_WP_VERIFY");
 	if (verify) {
 		std::lock_guard lock(g_verify_mutex);
 		g_verify_invalidated.emplace_back(vaddr, vaddr + size);
@@ -329,7 +330,7 @@ void RenderContext::VerifyNoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	if (MemDiag::Traced(vaddr, size)) {
 		MemDiag::Trace("gpu-thread-store", vaddr, size);
 	}
-	static const bool enabled = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+	static const bool enabled = Common::EnvFlag("KYTY_ASYNC_WP_VERIFY");
 	if (enabled && size != 0) {
 		for (auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < vaddr + size; page += TRACKER_PAGE_SIZE) {
 			g_verify_gpu_writes[page]++;
@@ -339,7 +340,7 @@ void RenderContext::VerifyNoteGpuWrite(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::VerifyAsyncWrites(const std::vector<std::pair<uint64_t, uint64_t>>& written,
                                       bool before_handling) {
-	static const bool enabled = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+	static const bool enabled = Common::EnvFlag("KYTY_ASYNC_WP_VERIFY");
 	if (!enabled) {
 		return;
 	}

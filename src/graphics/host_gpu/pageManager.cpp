@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "common/envSwitch.h"
 
 #include "common/alignment.h"
 #include "common/kernelStats.h"
@@ -101,7 +102,7 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 namespace {
 // KYTY_ASYNC_WP_VERIFY: pages whose last write watcher left; their bytes may change legitimately.
-const bool                 g_verify_unwatch = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+const bool                 g_verify_unwatch = Common::EnvFlag("KYTY_ASYNC_WP_VERIFY");
 std::mutex                 g_unwatch_mutex;
 std::vector<uint64_t>      g_unwatched;
 

@@ -229,6 +229,10 @@ step 1 comes first.
   its cache lookup around preparation.
 - **Record progress.** Add a row to the FINDINGS.md progress table for every merged gain (on a
   conflict, rebase and keep both rows). Update your track's status line below.
+- **Switches.** A new `KYTY_*` switch reads through `Common::EnvFlag` (on/off; `=0` is off) or
+  parses its value so that `0` means off, and `tools/switches.py` regenerates
+  `docs/mt-rewrite/SWITCHES.md` (its `--check` fails when the table is stale). A new optional
+  feature reports its state with `Common::ConfigReport::Feature` (the log's `CONFIG` block).
 - **Build modes.** Both sides of an A/B use the same `KYTY_BUILD_MODE` and, in `pgo` mode, the
   same profile file: pin it once with `export KYTY_PGO_PROFILE=$(readlink -e
   ~/.cache/kyty-pgo/current.profdata)` before `refbuild.sh` and `build.sh` (protocol below).

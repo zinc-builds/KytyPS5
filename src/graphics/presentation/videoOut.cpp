@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "common/configReport.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -1135,6 +1136,7 @@ bool FlipQueue::Flip() {
 			m_presenter.Present(std::span(layers.data(), layer_count));
 		}
 		if (requests[0].cfg->bus == 0) {
+			Common::ConfigReport::OnFlip();
 			Graphics::PerformanceOverlayRecordFlip(m_width, m_height);
 		}
 	}

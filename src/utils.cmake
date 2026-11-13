@@ -116,6 +116,21 @@ elseif(NOT kyty_pgo STREQUAL "off")
 	message(FATAL_ERROR "KYTY_PGO must be OFF, generate or use, not '${KYTY_PGO}'")
 endif()
 
+# One line for the startup report (kytyBuildMode.h).
+set(KYTY_BUILD_MODE_DESC "")
+if(kyty_lto STREQUAL "thin")
+	string(APPEND KYTY_BUILD_MODE_DESC " lto=thin")
+endif()
+if(kyty_pgo STREQUAL "generate")
+	string(APPEND KYTY_BUILD_MODE_DESC " pgo=generate")
+elseif(kyty_pgo STREQUAL "use")
+	string(APPEND KYTY_BUILD_MODE_DESC " pgo=use profile=${KYTY_PGO_PROFILE_HASH}")
+endif()
+string(STRIP "${KYTY_BUILD_MODE_DESC}" KYTY_BUILD_MODE_DESC)
+if(KYTY_BUILD_MODE_DESC STREQUAL "")
+	set(KYTY_BUILD_MODE_DESC "plain")
+endif()
+
 string(APPEND KYTY_CPP_FLAGS "${kyty_lto_pgo_flags}")
 string(APPEND KYTY_C_FLAGS "${kyty_lto_pgo_flags}")
 

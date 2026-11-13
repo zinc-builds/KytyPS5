@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include "graphics/presentation/performanceOverlay.h"
+#include "common/envSwitch.h"
 
 #include "common/benchMetrics.h"
 #include "common/debugCounters.h"
@@ -861,7 +862,7 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 		}
 		Refresh(shown, graphics, now, generation);
 		// Local benchmarking aid: one line per refresh on stdout when KYTY_PERF_LOG is set.
-		static const bool perf_log = std::getenv("KYTY_PERF_LOG") != nullptr;
+		static const bool perf_log = Common::EnvFlag("KYTY_PERF_LOG");
 		if (perf_log && shown.frame_count > 0) {
 			const double fps   = std::max(shown.fps, 1.0);
 			std::string  thrds;

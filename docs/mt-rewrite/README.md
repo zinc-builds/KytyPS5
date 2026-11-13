@@ -88,3 +88,44 @@ tools/fast.sh run ~/Games/PS5/PPSA21567.zar --fullscreen --frame-skip auto
   saw rarely, so they may gain less (FINDINGS, "Build modes", for the levels measured).
 - `tools/astro-bench/build.sh` builds the same thing for `kyty_emulator` alone in a bench checkout
   (`KYTY_BUILD_MODE=pgo`).
+
+### What the emulator actually ran with
+
+The log starts with a `CONFIG` block, and after the game's 120th flip repeats it with every
+feature's state as `CONFIG summary begin` … `end` (the bench saves that block with each run as
+`/tmp/garden-<label>.config` and in the run's JSON):
+
+- `CONFIG build` — the build mode and PGO profile hash (`plain`, `lto=thin pgo=use profile=…`).
+- `CONFIG switch KYTY_X=v (kind, default d, now on|off)` — every `KYTY_*` variable set, with its
+  kind and default from `SWITCHES.md`; `CONFIG warning:` for a name this build does not read (a
+  typo), a verify mode whose feature is turned off, pins ignored under `KYTY_NO_PIN`, and
+  `KYTY_STALL_DIAG` during a bench run.
+- `CONFIG feature …` — what was chosen and what fell back, and why: `amd-cpu` (mode, the CPUID bits
+  missing, per-module found/native/trapped/skipped), `write tracking` (asynchronous userfaultfd or
+  the mprotect fallback), `core placement` and `core <thread>` (the CPUs of the GPU command thread,
+  each prepare worker, the recorder, the decode thread and each game-thread group, or "FAILED" when
+  pinning was refused), `transfer uploads`, `recorder thread`, `submit thread`, `decode thread`,
+  `resident textures`, `frame skip`.
+
+`SWITCHES.md` lists every `KYTY_*` switch: kind, default, values, where it is read. It is generated
+by `tools/switches.py` (`--check` fails when it is stale). On/off switches read through
+`Common::EnvFlag` treat `0`, `false`, `off` and `no` as off.
+
+### Machines this is tuned for, and what others would need (not built)
+
+Everything here is measured on one machine: an Intel i5-14600K (a hybrid CPU) and an RTX 4080
+Super, Linux. What depends on that, and what the `CONFIG` block shows on another machine:
+
+- **Core placement** needs an Intel hybrid CPU under Linux (`/sys/devices/cpu_core` and
+  `cpu_atom`). Elsewhere it is off and every thread runs where the scheduler puts it; the reserved
+  cores, the prepare workers' own cores and the game threads on efficiency cores were each worth
+  several percent here. A plan for a non-hybrid CPU (reserve the last cores by count) is not built.
+- **Write tracking** wants userfaultfd with shared-memory write protection, and
+  `UFFD_FEATURE_WP_ASYNC` plus `PAGEMAP_SCAN` (Linux 6.7+) for the asynchronous mode; without them
+  it falls back (mprotect: every guest write fault is a signal).
+- **`--amd-cpu`** matters on hosts without SSE4a (every Intel CPU); auto handles it.
+- **GPU:** other GPUs and weaker cards are out of scope for now (the user's decision). The shader
+  code generation was tuned against NVIDIA's compiler (EXEC selects, indexed-register switches),
+  the copy-engine upload path needs a transfer-only queue family, and resident textures need
+  update-after-bind descriptor limits (`CONFIG feature resident textures` says which is missing).
+  An upstream report of driver timeouts in Astro Bot on an AMD RX 6700 XT has not been looked at.

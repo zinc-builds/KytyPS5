@@ -1,4 +1,6 @@
 #include "kernel/memory.h"
+#include "common/configReport.h"
+#include "common/envSwitch.h"
 
 #include "common/assert.h"
 #include "common/kernelStats.h"

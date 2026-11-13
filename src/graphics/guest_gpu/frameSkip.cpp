@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/frameSkip.h"
+#include "common/configReport.h"
 
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -414,6 +415,11 @@ void Init() {
 	if (enabled) {
 		std::printf("Frame skip: %s\n", s.mode == Mode::Auto ? "auto" : "every n-th frame (test)");
 	}
+	Common::ConfigReport::Feature(
+	    "frame skip", s.mode == Mode::Off    ? "off (every frame drawn; below 60 FPS the game slows)"
+	                  : s.mode == Mode::Auto ? "auto, at most " + std::to_string(s.max_consecutive) +
+	                                               " in a row"
+	                                         : "every n-th frame (test mode)");
 	s.report_start = Clock::now();
 }
 

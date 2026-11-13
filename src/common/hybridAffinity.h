@@ -7,6 +7,9 @@
 // command thread's core both slowed the critical path. KYTY_NO_PIN=1 disables it.
 
 #if defined(__linux__)
+#include "common/configReport.h"
+#include "common/envSwitch.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -17,6 +20,7 @@
 #include <sched.h>
 #include <set>
 #include <sstream>
+#include <cerrno>
 #include <string>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -64,7 +68,33 @@ struct Plan {
 	std::vector<int> prepare_cpus;
 	// The overflow prepare worker's CPU (see PrepareOverflowCpu), or -1.
 	int overflow_cpu = -1;
+	// Why the plan is off (startup report).
+	std::string off_reason;
 };
+
+// "0,2-5" for a CPU set (startup report).
+inline std::string CpuListText(const cpu_set_t& set) {
+	std::string text;
+	for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+		if (!CPU_ISSET(cpu, &set)) continue;
+		int last = cpu;
+		while (last + 1 < CPU_SETSIZE && CPU_ISSET(last + 1, &set)) last++;
+		text += (text.empty() ? "" : ",") + std::to_string(cpu) +
+		        (last > cpu ? "-" + std::to_string(last) : "");
+		cpu = last;
+	}
+	return text.empty() ? "none" : text;
+}
+
+// Pins the calling thread and reports where `role` runs, or that pinning failed (once per state).
+inline void PinCurrentThread(const char* role, const cpu_set_t& set) {
+	const int error = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	Common::ConfigReport::Feature(
+	    std::string("core ") + role,
+	    error == 0 ? "CPUs " + CpuListText(set)
+	               : "pinning to CPUs " + CpuListText(set) + " FAILED (error " +
+	                     std::to_string(error) + "); runs where the scheduler puts it");
+}
 
 inline int EnvCpu(const char* name) {
 	const char* value = std::getenv(name);
@@ -87,17 +117,22 @@ inline uint32_t PrepareWorkerCount() {
 inline Plan& GetPlan() {
 	static Plan plan = [] {
 		Plan result;
-		if (std::getenv("KYTY_NO_PIN") != nullptr) {
+		if (Common::EnvFlag("KYTY_NO_PIN")) {
+			result.off_reason = "KYTY_NO_PIN";
 			return result;
 		}
 		const auto performance = ReadCpuList("/sys/devices/cpu_core/cpus");
 		const auto efficiency  = ReadCpuList("/sys/devices/cpu_atom/cpus");
 		if (performance.size() < 4 || efficiency.empty()) {
-			return result; // not a hybrid CPU, or too few performance cores to spare one
+			// not a hybrid CPU, or too few performance cores to spare one
+			result.off_reason = "not an Intel hybrid CPU with >= 4 performance threads "
+			                    "(/sys/devices/cpu_core, cpu_atom)";
+			return result;
 		}
 		cpu_set_t allowed;
 		CPU_ZERO(&allowed);
 		if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+			result.off_reason = "sched_getaffinity failed";
 			return result;
 		}
 		// The last performance core (with its SMT siblings) is reserved for the GPU thread.
@@ -179,6 +214,10 @@ inline Plan& GetPlan() {
 			}
 		}
 		result.active = CPU_COUNT(&result.process) >= 2 && CPU_ISSET(result.gpu_cpu, &allowed);
+		if (!result.active) {
+			result.off_reason = "too few allowed CPUs left for the emulator, or the GPU thread's "
+			                    "CPU is not allowed";
+		}
 		return result;
 	}();
 	return plan;
@@ -201,7 +240,20 @@ inline void ApplyPipelinePriority() {
 // Call early in main(), before threads start: later threads inherit the mask.
 inline void ApplyToProcess() {
 	auto& plan = GetPlan();
-	if (plan.active && sched_setaffinity(0, sizeof(plan.process), &plan.process) == 0) {
+	if (!plan.active) {
+		Common::ConfigReport::Feature("core placement", "off (" + plan.off_reason +
+		                                                    "): every thread where the scheduler puts it");
+		return;
+	}
+	if (sched_setaffinity(0, sizeof(plan.process), &plan.process) != 0) {
+		Common::ConfigReport::Feature("core placement",
+		                              "process mask " + CpuListText(plan.process) +
+		                                  " FAILED (errno " + std::to_string(errno) + ")");
+		return;
+	}
+	Common::ConfigReport::Feature("core placement", "hybrid layout; emulator threads on CPUs " +
+	                                                    CpuListText(plan.process));
+	{
 		std::string prepare;
 		for (const int cpu: plan.prepare_cpus) {
 			prepare += (prepare.empty() ? "" : ",") + std::to_string(cpu);
@@ -223,7 +275,7 @@ inline void ApplyToGpuThread() {
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	CPU_SET(plan.gpu_cpu, &set);
-	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	PinCurrentThread("GPU command thread", set);
 }
 
 // The CPU of the overflow prepare worker (see DrawPrepare::Pool), or -1 for none: by default the
@@ -253,13 +305,17 @@ inline void ApplyToPrepareThread(uint32_t worker) {
 	} else if (worker == 0) {
 		cpu = EnvCpu("KYTY_PREPARE_CPU");
 	}
+	const std::string role = worker >= PrepareWorkerCount()
+	                             ? std::string("prepare overflow worker")
+	                             : "prepare worker " + std::to_string(worker);
 	if (cpu < 0) {
+		Common::ConfigReport::Feature("core " + role, "unpinned");
 		return;
 	}
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	CPU_SET(cpu, &set);
-	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	PinCurrentThread(role.c_str(), set);
 }
 
 // Call from the decode thread (KYTY_DECODE_THREAD): KYTY_DECODE_CPU=<n>, else the emulator's
@@ -275,7 +331,7 @@ inline void ApplyToDecodeThread() {
 	} else {
 		return;
 	}
-	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	PinCurrentThread("decode thread", set);
 }
 
 // The CPUs for the game's threads: the efficiency cores but the recording thread's. Leaving the
@@ -377,6 +433,8 @@ inline void NoteGraphicsSubmitter(int priority) {
 		std::printf("Hybrid CPU: game threads at guest priority %d or above (a graphics "
 		            "submitter's) on the performance cores\n",
 		            priority);
+		Common::ConfigReport::Feature("core game-thread priority bar",
+		                              std::to_string(priority) + " (raised by a graphics submitter)");
 	}
 }
 
@@ -401,8 +459,8 @@ inline void ApplyToGuestThread(const std::string& name, int priority) {
 	}();
 	if (KeepGuestOnPerformanceCores(name, priority,
 	                                GuestPriorityBar().load(std::memory_order_relaxed), names)) {
-		const auto& process = GetPlan().process;
-		(void)pthread_setaffinity_np(pthread_self(), sizeof(process), &process);
+		PinCurrentThread("game threads kept with the emulator (DrawThread*, priority bar)",
+		                 GetPlan().process);
 		return;
 	}
 	cpu_set_t set;
@@ -410,7 +468,7 @@ inline void ApplyToGuestThread(const std::string& name, int priority) {
 	for (const int cpu: cpus) {
 		CPU_SET(cpu, &set);
 	}
-	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	PinCurrentThread("game threads (others)", set);
 }
 
 // Call from the GPU recording thread: an efficiency core of its own, which the emulator leaves
@@ -432,7 +490,7 @@ inline void ApplyToRecorderThread() {
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	CPU_SET(cpu, &set);
-	(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	PinCurrentThread("recorder thread", set);
 }
 
 } // namespace Common::HybridAffinity

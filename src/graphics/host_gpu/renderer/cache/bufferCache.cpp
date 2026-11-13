@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/envSwitch.h"
 #include "common/frameDiag.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
@@ -60,7 +61,7 @@ std::unordered_map<uint64_t, WrittenRange> g_written_pages; // 4 KiB page -> las
 std::vector<WrittenRange>                  g_written_big;   // binds over 4 MiB, latest first
 std::mutex                                 g_written_mutex;
 bool FaultDiag() {
-	static const bool on = std::getenv("KYTY_FAULT_DIAG") != nullptr;
+	static const bool on = Common::EnvFlag("KYTY_FAULT_DIAG");
 	return on;
 }
 uint64_t CallerOffset(void* ra) {
@@ -281,13 +282,13 @@ size_t StreamCopySlot(uint64_t vaddr, uint64_t size) {
 }
 
 bool AsyncUploadVerifyEnabled() {
-	static const bool on = std::getenv("KYTY_ASYNC_UPLOAD_VERIFY") != nullptr;
+	static const bool on = Common::EnvFlag("KYTY_ASYNC_UPLOAD_VERIFY");
 	return on;
 }
 
 // KYTY_STREAM_VERIFY=1: compare every reused stream copy against the guest bytes.
 bool StreamVerifyEnabled() {
-	static const bool on = std::getenv("KYTY_STREAM_VERIFY") != nullptr;
+	static const bool on = Common::EnvFlag("KYTY_STREAM_VERIFY");
 	return on;
 }
 
@@ -623,7 +624,7 @@ bool SyncReadback() {
 }
 
 bool ReadbackVerify() {
-	static const bool verify = std::getenv("KYTY_READBACK_VERIFY") != nullptr;
+	static const bool verify = Common::EnvFlag("KYTY_READBACK_VERIFY");
 	return verify;
 }
 
@@ -1676,7 +1677,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			                                          : StreamOutcome::DirectListed,
 			                 0, m_worker_stream_rings);
 		}
-		static const bool reuse_disabled = std::getenv("KYTY_NO_STREAM_REUSE") != nullptr;
+		static const bool reuse_disabled = Common::EnvFlag("KYTY_NO_STREAM_REUSE");
 		const auto        epoch          = GuestSyncEpoch::Current();
 		const auto        tick           = m_scheduler.CurrentTick();
 		auto&             copy           = (*m_stream_copies)[StreamCopySlot(vaddr, size)];

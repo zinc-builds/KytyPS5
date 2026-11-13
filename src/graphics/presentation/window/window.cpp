@@ -1,6 +1,7 @@
 ﻿#include "graphics/presentation/window.h"
 
 #include "common/assert.h"
+#include "common/envSwitch.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -823,7 +824,7 @@ static void WindowCreate(WindowContext& context) {
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
 	// borderless window skips that machinery entirely.
-	if (std::getenv("KYTY_BORDERLESS") != nullptr) {
+	if (Common::EnvFlag("KYTY_BORDERLESS")) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif

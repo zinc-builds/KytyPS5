@@ -1,4 +1,5 @@
 #include "kernel/timeDiag.h"
+#include "common/envSwitch.h"
 
 #include "common/singleton.h"
 #include "loader/runtimeLinker.h"
@@ -252,7 +253,7 @@ void ReporterThread() {
 }
 
 bool StartIfEnabled() {
-	if (std::getenv("KYTY_TIME_DIAG") == nullptr) {
+	if (!Common::EnvFlag("KYTY_TIME_DIAG")) {
 		return false;
 	}
 	std::thread(ReporterThread).detach();

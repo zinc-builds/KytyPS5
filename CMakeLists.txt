@@ -188,6 +188,7 @@ endif()
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
+configure_file(${KYTY_SOURCE_DIR}/kytyBuildMode.h.in ${PROJECT_BINARY_DIR}/kytyBuildMode.h)
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
@@ -470,6 +471,9 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(env_switch_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EnvSwitchTests.cpp")
+target_include_directories(env_switch_tests PRIVATE ${inc_headers})
+
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
@@ -718,6 +722,7 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME env_switch COMMAND $<TARGET_FILE:env_switch_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)

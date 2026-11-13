@@ -76,6 +76,9 @@ public:
 		    syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
 		if (fd < 0) {
 			LOGF("\t guest write tracking: mprotect (userfaultfd unavailable: %d)\n", errno);
+			Common::ConfigReport::Feature("write tracking",
+			                              "mprotect fallback (userfaultfd unavailable, errno " +
+			                                  std::to_string(errno) + "): every guest write fault is a signal");
 			return;
 		}
 		uffdio_api api {};
@@ -86,6 +89,9 @@ public:
 		    (api.ioctls & (uint64_t {1} << _UFFDIO_REGISTER)) == 0) {
 			LOGF("\t guest write tracking: mprotect (no shared-memory write protection: %d)\n",
 			     errno);
+			Common::ConfigReport::Feature(
+			    "write tracking", "mprotect fallback (userfaultfd lacks shared-memory write "
+			                      "protection): every guest write fault is a signal");
 			close(fd);
 			return;
 		}
@@ -94,7 +100,9 @@ public:
 #if defined(UFFD_FEATURE_WP_ASYNC) && defined(PAGEMAP_SCAN)
 		// Hot ranges move to a second context whose write faults the kernel resolves itself
 		// (no signal); their written pages are collected with PAGEMAP_SCAN instead.
-		if (std::getenv("KYTY_NO_ASYNC_WP") != nullptr) {
+		if (Common::EnvFlag("KYTY_NO_ASYNC_WP")) {
+			Common::ConfigReport::Feature("write tracking",
+			                              "userfaultfd write protection, async off (KYTY_NO_ASYNC_WP)");
 			return;
 		}
 		const int async_fd = static_cast<int>(
@@ -109,7 +117,13 @@ public:
 			m_async_fd = async_fd;
 			m_pagemap  = pagemap;
 			LOGF("\t guest write tracking: asynchronous write protection for hot ranges\n");
+			Common::ConfigReport::Feature("write tracking",
+			                              "userfaultfd write protection; hot ranges asynchronous "
+			                              "(UFFD_FEATURE_WP_ASYNC + PAGEMAP_SCAN)");
 		} else {
+			Common::ConfigReport::Feature(
+			    "write tracking", "userfaultfd write protection; no asynchronous mode (kernel lacks "
+			                      "UFFD_FEATURE_WP_ASYNC or /proc/self/pagemap): hot ranges fault");
 			if (async_fd >= 0) {
 				close(async_fd);
 			}
@@ -272,7 +286,7 @@ private:
 
 // KYTY_ASYNC_WP_VERIFY: stores through the backing alias change guest bytes without a write
 // fault in any mode; the verifier skips them.
-static bool                                       g_log_alias_writes = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+static bool                                       g_log_alias_writes = Common::EnvFlag("KYTY_ASYNC_WP_VERIFY");
 static std::mutex                                 g_alias_write_mutex;
 static std::vector<std::pair<uint64_t, uint64_t>> g_alias_writes;
 // KYTY_ASYNC_WP_VERIFY: kept writes the GPU thread's last collection took; each must be among
@@ -878,7 +892,7 @@ public:
 		bool       moved = false;
 		// KYTY_ASYNC_WP_DRYRUN: track the chunk as if asynchronous but keep its views synchronous
 		// (to check KYTY_ASYNC_WP_VERIFY itself against the faulting path).
-		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		static const bool dry_run = Common::EnvFlag("KYTY_ASYNC_WP_DRYRUN");
 		ForEachSparseRange(
 		    m_maps, begin, ASYNC_CHUNK_SIZE,
 		    [&](const MapEntry& entry, uint64_t start, uint64_t bytes) {
@@ -902,7 +916,7 @@ public:
 	// Whether one page lies in a write-protected view of an asynchronous chunk (so its guest
 	// stores leave a mark PAGEMAP_SCAN reports).
 	[[nodiscard]] bool AsyncPageTrackedUnlocked(uint64_t page) const {
-		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		static const bool dry_run = Common::EnvFlag("KYTY_ASYNC_WP_DRYRUN");
 		if (dry_run || !IsAsync(page, 0x1000)) {
 			return false;
 		}
@@ -1091,7 +1105,7 @@ public:
 	// the bytes marks no page table of this one). Returns the remap generation the arm is valid
 	// for: remaps, aliases, unmaps and zeroing move it (g_remap_generation).
 	std::optional<uint64_t> ArmStaged(uint64_t vaddr, uint64_t size) {
-		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		static const bool dry_run = Common::EnvFlag("KYTY_ASYNC_WP_DRYRUN");
 		const auto begin = vaddr & ~uint64_t {0xfff};
 		const auto end   = (vaddr + size + 0xfff) & ~uint64_t {0xfff};
 		if (size == 0 || end <= begin || dry_run || !m_write_protection.AsyncEnabled()) {
@@ -1377,7 +1391,7 @@ private:
 
 	// uffd write protection of a registered view range, split by context.
 	bool ProtectWritesUnlocked(uint64_t vaddr, uint64_t size, bool write_protect) const {
-		static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+		static const bool dry_run = Common::EnvFlag("KYTY_ASYNC_WP_DRYRUN");
 		if (m_async_list.empty() || dry_run) {
 			return m_write_protection.Protect(vaddr, size, write_protect);
 		}
@@ -1552,7 +1566,7 @@ private:
 #if !defined(__APPLE__)
 		*write_protected = m_write_protection.Enabled() && m_write_protection.Register(vaddr, size);
 		if (*write_protected) {
-			static const bool dry_run = std::getenv("KYTY_ASYNC_WP_DRYRUN") != nullptr;
+			static const bool dry_run = Common::EnvFlag("KYTY_ASYNC_WP_DRYRUN");
 			ForEachAsyncChunk(vaddr, size, [&](uint64_t start, uint64_t bytes) {
 				// MakeAsync succeeds or stops the emulator: a failed move would lose protection.
 				if (!dry_run) {
