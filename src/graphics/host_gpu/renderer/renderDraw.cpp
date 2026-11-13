@@ -37,6 +37,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <cinttypes>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1919,6 +1920,7 @@ RenderExecutor::QueuedDraw* RenderExecutor::NextQueuedDraw(const LiveRegisters& 
 		// The ring holds one more slot than the queue, so the next one is free.
 		EXIT_IF(posted - m_queued_taken >= size);
 	}
+	DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::SlotReuse);
 	return m_queued_draws[posted % size].get();
 }
 
@@ -1954,23 +1956,17 @@ HW::Context* RenderExecutor::RegisterSnapshotFor(const HW::Context& live, uint64
 	// Queued draws not yet committed: sequences from `oldest` on.
 	// (Committed means finished with: the GPU thread may still read a taken draw's snapshot.)
 	const auto oldest = m_queued_released.load(std::memory_order_acquire) + 1;
-	if (m_register_snapshots.empty()) {
-		m_register_snapshots.push_back(std::make_unique<RegisterSnapshot>());
-	}
-	auto& candidate = m_register_snapshots[m_register_snapshot_next];
-	if (candidate.get() == current || candidate->last_sequence >= oldest) {
-		// Still in use: one more snapshot (they are taken in order, so the next one is the
-		// oldest).
-		m_register_snapshots.insert(m_register_snapshots.begin() +
-		                                static_cast<ptrdiff_t>(m_register_snapshot_next),
-		                            std::make_unique<RegisterSnapshot>());
-	}
-	auto* snapshot = m_register_snapshots[m_register_snapshot_next].get();
-	m_register_snapshot_next = (m_register_snapshot_next + 1) % m_register_snapshots.size();
-	if (mode == 2) {
+	DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::SnapshotRetire);
+	auto* snapshot = m_register_snapshots.Take(current, oldest);
+	if (mode == 2 || DrawPrepare::Chaos::Enabled()) {
+		// No draw still queued (not yet released) reads the snapshot about to be rewritten.
 		for (const auto& slot: m_queued_draws) {
-			EXIT_IF(slot->registers == &snapshot->registers && slot->sequence >= oldest &&
-			        slot->sequence <= m_queued_posted.load(std::memory_order_relaxed));
+			if (slot->registers == &snapshot->registers && slot->sequence >= oldest &&
+			    slot->sequence <= m_queued_posted.load(std::memory_order_relaxed)) {
+				EXIT("prepare invariant: register snapshot of queued draw %" PRIu64
+				     " reused (oldest unreleased %" PRIu64 ")\n",
+				     slot->sequence, oldest);
+			}
 		}
 	}
 	snapshot->registers = live;
@@ -2014,7 +2010,7 @@ void RenderExecutor::PostQueuedDraw(const LiveRegisters& live, QueuedDraw& queue
 	auto* const handoff       = m_decode_handoff;
 	// Posts come from the decode thread, or from the GPU thread while the decode thread waits
 	// at a sync.
-	EXIT_IF(handoff != nullptr && handoff->verify && !g_on_decode_thread &&
+	EXIT_IF(handoff != nullptr && handoff->asserts && !g_on_decode_thread &&
 	        !GuestGpu::IsGpuThread());
 	if (handoff != nullptr) {
 		// Not while the GPU thread waits for the workers to be idle (WaitPrepareIdle).
@@ -2033,6 +2029,9 @@ void RenderExecutor::PostQueuedDraw(const LiveRegisters& live, QueuedDraw& queue
 	EXIT_IF(m_queued_draws[(sequence - 1) % m_queued_draws.size()].get() != &queued ||
 	        (m_prepare_pool ? m_prepare_pool->Post() != sequence
 	                        : PrepareWorker(sequence).Post() != PrepareJob(sequence)));
+	if (handoff != nullptr) {
+		DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::DecodePost);
+	}
 	m_queued_posted.store(sequence, std::memory_order_release);
 	if (handoff != nullptr) {
 		handoff->posting.store(false, std::memory_order_release);
@@ -2135,6 +2134,12 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	const auto sequence =
 	    self.m_prepare_pool ? job : (job - 1) * self.m_prepare_lanes.size() + lane.index + 1;
 	auto& queued = *self.m_queued_draws[(sequence - 1) % self.m_queued_draws.size()];
+	const bool chaos = DrawPrepare::Chaos::Enabled();
+	if (chaos && queued.sequence != sequence) {
+		EXIT("prepare invariant: worker handed draw %" PRIu64 " found slot holding %" PRIu64 "\n",
+		     sequence, queued.sequence);
+	}
+	const auto chaos_sum = chaos ? ChaosDigest(queued) : 0;
 	queued.log.Reset();
 	DrawPrepare::SetLog(&queued.log);
 	std::destroy_at(&queued.state);
@@ -2146,6 +2151,24 @@ void RenderExecutor::PrepareQueuedDraw(void* prepare_lane, uint64_t job) {
 	self.SpeculateTextures(queued, lane.textures);
 	self.SpeculateTargets(queued, lane.targets);
 	self.ProposePipelineKey(queued);
+	if (chaos) {
+		// What the command thread checks at adoption (published by the pool's done store).
+		queued.chaos_sum = chaos_sum;
+		queued.chaos_ran = sequence;
+	}
+}
+
+// KYTY_PREPARE_CHAOS: a digest of a queued draw's inputs (its register snapshot, user config,
+// shader registers and draw arguments), taken by the worker before it reads them and again by
+// the command thread at adoption.
+uint64_t RenderExecutor::ChaosDigest(const QueuedDraw& queued) {
+	using DrawPrepare::Chaos::Digest;
+	auto hash = Digest(queued.registers, HW::Context::RegisterBytes());
+	hash      = Digest(&queued.user_config, sizeof(queued.user_config), hash);
+	hash      = Digest(&queued.shaders, sizeof(queued.shaders), hash);
+	hash      = queued.indexed ? Digest(&queued.index_args, sizeof(queued.index_args), hash)
+	                           : Digest(&queued.auto_args, sizeof(queued.auto_args), hash);
+	return Digest(&queued.sequence, sizeof(queued.sequence), hash);
 }
 
 // Prepare worker: the pipeline key GetGraphicsPipeline would build for the queued draw if the
@@ -2304,7 +2327,7 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring
 
 void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(m_decode_handoff != nullptr && m_decode_handoff->verify &&
+	EXIT_IF(m_decode_handoff != nullptr && m_decode_handoff->asserts &&
 	        (g_on_decode_thread || !GuestGpu::IsGpuThread()));
 	const auto sequence = m_queued_taken + 1;
 	auto&      queued   = *m_queued_draws[(sequence - 1) % m_queued_draws.size()];
@@ -2316,12 +2339,14 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 		RenderExecutor& executor;
 		uint64_t        sequence;
 		~Release() {
+			DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::Release);
 			executor.m_queued_released.store(sequence, std::memory_order_release);
 			if (executor.m_decode_handoff != nullptr) {
 				executor.m_decode_handoff->to_decode.Notify();
 			}
 		}
 	} release {*this, sequence};
+	DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::CommitWait);
 	if (const auto waited = m_prepare_pool ? m_prepare_pool->Wait(sequence)
 	                                       : PrepareWorker(sequence).Wait(PrepareJob(sequence));
 	    waited != 0) {
@@ -2346,6 +2371,18 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	}
 	if (m_drain_stats) {
 		PrintDrainStats();
+	}
+	if (DrawPrepare::Chaos::Enabled()) {
+		DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::Adopt);
+		// Non-draining invariants: the worker ran this draw (not an older or newer one in the
+		// slot), and what it read is still what the draw was posted with.
+		if (queued.chaos_ran != sequence || ChaosDigest(queued) != queued.chaos_sum) {
+			EXIT("prepare invariant: draw %" PRIu64 " adopted with the worker's stamp %" PRIu64
+			     " (digest %s)\n",
+			     sequence, queued.chaos_ran,
+			     ChaosDigest(queued) == queued.chaos_sum ? "same" : "changed");
+		}
+		DrawPrepare::Chaos::Checked();
 	}
 	// The draw reads the registers it was queued with.
 	auto& registers   = *buffer.m_registers;

@@ -478,6 +478,10 @@ private:
 		uint64_t                         sync_epoch         = 0;
 		uint64_t                         stored_sequence    = 0;
 		uint64_t                         gpu_write_sequence = 0;
+		// KYTY_PREPARE_CHAOS: the sequence the worker last ran in this slot, and the digest of
+		// the inputs it read (ChaosDigest).
+		uint64_t chaos_ran = 0;
+		uint64_t chaos_sum = 0;
 		WorkerBuffers                    buffers;
 		WorkerTextures                   textures;
 		// Resolves the command thread made for this draw, for the worker's memo (see
@@ -496,6 +500,7 @@ private:
 	const WorkerPipelineKey* m_adopted_pipeline_key = nullptr;
 	// Prepare worker, after SpeculateTargets: builds the queued draw's pipeline key.
 	void ProposePipelineKey(QueuedDraw& queued);
+	[[nodiscard]] static uint64_t ChaosDigest(const QueuedDraw& queued);
 	// The worker's color targets for the queued draw being committed, while they may be used.
 	const WorkerTargets* m_adopted_targets = nullptr;
 	// Color target resolves made for the queued draw being committed, handed to its slot after.
@@ -818,8 +823,7 @@ private:
 		HW::Context registers;
 		uint64_t    last_sequence = 0;
 	};
-	std::vector<std::unique_ptr<RegisterSnapshot>> m_register_snapshots;
-	size_t                                         m_register_snapshot_next = 0;
+	DrawPrepare::SnapshotRing<RegisterSnapshot>    m_register_snapshots;
 	RegisterSnapshot*                              m_register_snapshot      = nullptr;
 	const HW::Context*                             m_register_snapshot_source = nullptr;
 	// Lines of the context registers that differ from the previous queued draw's (all with a new

@@ -90,8 +90,11 @@ struct DecodeHandoff {
 	alignas(64) std::atomic<bool> posting {false};
 	alignas(64) std::atomic<bool> pause {false};
 	uint64_t spin_ns = 20'000;
-	// KYTY_DECODE_THREAD=verify: ownership asserts on the posting and committing paths.
+	// KYTY_DECODE_THREAD=verify: the shadow decode and its checks.
 	bool verify = false;
+	// Ownership asserts on the posting, committing and sync paths: in verify mode and under
+	// KYTY_PREPARE_CHAOS.
+	bool asserts = false;
 };
 
 } // namespace Libs::Graphics

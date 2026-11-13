@@ -24,6 +24,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrepare.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1673,6 +1674,7 @@ public:
 		m_stats_enabled = std::getenv("KYTY_DECODE_STATS") != nullptr;
 		verify          = DecodeThreadMode() == 2;
 		handoff.verify  = verify;
+		handoff.asserts = verify || DrawPrepare::Chaos::Enabled();
 		if (verify) {
 			shadow.reset(new CommandProcessor(cp.m_renderer, cp.m_interrupt_event_id));
 			shadow->m_shadow = true;
@@ -1874,7 +1876,7 @@ void DecodeThread::VerifyReplay(uint64_t through, const VerifyEntry** sync) {
 }
 
 void DecodeThread::ExecuteSync() {
-	EXIT_IF(verify && (g_on_decode_thread || !GuestGpu::IsGpuThread()));
+	EXIT_IF(handoff.asserts && (g_on_decode_thread || !GuestGpu::IsGpuThread()));
 	const auto start = m_stats_enabled ? DecodeNowNs() : 0;
 	if (m_stats_enabled && requested_ns != 0 && start > requested_ns) {
 		stats.seen_ns += start - requested_ns;
@@ -2001,6 +2003,7 @@ void DecodeThread::Run(Pm4Execution& exec, GuestGpu* gpu_state) {
 			if (executor.QueuedCount() != 0) {
 				continue; // posted before the request
 			}
+			DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::DecodeSync);
 			if (verify) {
 				// Every draw before the request is verified and committed; the next log entry is
 				// this sync, and the shadow decode reached the same state.
@@ -2025,6 +2028,7 @@ void DecodeThread::Run(Pm4Execution& exec, GuestGpu* gpu_state) {
 				VerifySeed(); // the sync ran on the GPU thread: from its state on
 				verified = executor.QueuedPosted();
 			}
+			DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::DecodeSync);
 			state.store(State::SyncDone, std::memory_order_release);
 			handoff.to_decode.Notify();
 			after_sync = true;
@@ -2187,6 +2191,7 @@ bool CommandProcessor::DecodeSync(const PacketView* view) {
 	if (d.verify) {
 		d.LogVerify({view != nullptr ? view->packet : nullptr, 0, 0, 0, 0, true});
 	}
+	DrawPrepare::Chaos::Point(DrawPrepare::Chaos::Site::DecodeSync);
 	d.state.store(DecodeThread::State::Sync, std::memory_order_release);
 	d.handoff.to_commit.Notify();
 	d.handoff.to_decode.Wait(

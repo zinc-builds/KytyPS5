@@ -7,12 +7,72 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace Libs::Graphics::DrawPrepare {
+
+// KYTY_PREPARE_CHAOS=<seed> (non-zero): random short delays at the hand-off points of the prepare
+// pipeline (a worker's claim and publication, the command thread's wait and adoption, a slot's
+// release and reuse, a register snapshot's retirement, the decode thread's posts and syncs), with
+// verify off, to shake out orderings that verify mode's draining hides. Also turns on the
+// ownership asserts and the non-draining invariants (Chaos::Stamp/Check on each queued draw).
+namespace Chaos {
+enum class Site : uint32_t {
+	WorkerClaim,    // a worker took a draw, before it runs it
+	WorkerPublish,  // a worker finished a draw, before it says so
+	CommitWait,     // the command thread, before it waits for the draw it commits next
+	Adopt,          // the command thread, the draw done, before it reads the result
+	Release,        // the command thread, before it releases a committed draw's slot
+	SlotReuse,      // the poster, a slot free, before it fills it
+	SnapshotRetire, // the poster, before it decides which register snapshot to reuse
+	DecodePost,     // the decode thread, a draw posted, before it publishes the count
+	DecodeSync,     // either side of a decode-thread sync hand-off
+	Count,
+};
+inline std::atomic<uint64_t> g_seed {[] {
+	const char* value = std::getenv("KYTY_PREPARE_CHAOS");
+	return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+}()};
+[[nodiscard]] inline bool Enabled() noexcept {
+	return g_seed.load(std::memory_order_relaxed) != 0;
+}
+void Delay(Site site) noexcept;
+inline void Point(Site site) noexcept {
+	if (Enabled()) [[unlikely]] {
+		Delay(site);
+	}
+}
+// Tests: 0 turns it off.
+inline void SetSeed(uint64_t seed) noexcept {
+	g_seed.store(seed, std::memory_order_relaxed);
+}
+// Delays taken at `site` so far (all threads).
+[[nodiscard]] uint64_t Delays(Site site) noexcept;
+// The command thread checked one adopted draw's invariants; at most every five seconds, prints
+// the delays per site and the draws checked (PREPARE_CHAOS line).
+void Checked() noexcept;
+// A digest of `size` bytes for the invariants (8 bytes a step; not cryptographic).
+[[nodiscard]] inline uint64_t Digest(const void* data, size_t size,
+                                     uint64_t hash = 0xcbf29ce484222325ull) noexcept {
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	size_t      i     = 0;
+	for (; i + 8 <= size; i += 8) {
+		uint64_t word = 0;
+		std::memcpy(&word, bytes + i, 8);
+		hash = (hash ^ word) * 0x100000001b3ull;
+		hash ^= hash >> 29u;
+	}
+	for (; i < size; i++) {
+		hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+	}
+	return hash;
+}
+} // namespace Chaos
 
 // Threaded draw preparation: a worker looks up a draw's shader programs (SRT walk, resource
 // materialization, module selection) from a copy of the registers while the GPU command thread
@@ -111,6 +171,35 @@ private:
 	uint64_t m_open = 0;
 	bool     m_outer;
 	bool     m_ranged;
+};
+
+// Snapshots taken in post order and reused once no queued draw uses them (the command thread's
+// register snapshots, #104). `Entry` has a `last_sequence`: the last draw posted with it. Only
+// the poster calls Take; a draw reads its snapshot from its post until its release.
+template <typename Entry>
+class SnapshotRing {
+public:
+	// The entry the next snapshot goes into: the next one in order, unless it is `current` (the
+	// newest snapshot) or a draw from `oldest` on (posted, not yet released) uses it; then a new
+	// entry inserted there (snapshots are taken in order, so the next one is the oldest).
+	Entry* Take(const Entry* current, uint64_t oldest) {
+		if (m_entries.empty()) {
+			m_entries.push_back(std::make_unique<Entry>());
+		}
+		auto& candidate = m_entries[m_next];
+		if (candidate.get() == current || candidate->last_sequence >= oldest) {
+			m_entries.insert(m_entries.begin() + static_cast<ptrdiff_t>(m_next),
+			                 std::make_unique<Entry>());
+		}
+		auto* entry = m_entries[m_next].get();
+		m_next      = (m_next + 1) % m_entries.size();
+		return entry;
+	}
+	[[nodiscard]] size_t Size() const { return m_entries.size(); }
+
+private:
+	std::vector<std::unique_ptr<Entry>> m_entries;
+	size_t                              m_next = 0;
 };
 
 class Worker;
