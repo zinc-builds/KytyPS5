@@ -51,7 +51,10 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
 - `benchlock.sh` — host-wide lock so agents sharing the machine never overlap. `garden.sh`,
   `run.sh` and `batch.sh` take it exclusively (the emulator inherits it, so `KEEP_RUNNING=1` holds
   it until the emulator exits); wrap other emulator launches in `benchlock.sh run …` and builds or
-  unit tests in `benchlock.sh build …` (shared). `benchlock.sh status` shows the holder.
+  unit tests in `benchlock.sh build …` (shared). Waiters queue in order of
+  `KYTY_BENCH_PRIO` (1 critical path, 5 default, 9 background), then arrival; shared tickets at the
+  head go together, an exclusive one holds back the shared ones behind it. `benchlock.sh status`
+  shows the holder and the queue; `test-benchlock.sh` tests the queue on a private lock file.
 - `batch.sh` — runs `<label> [ENV=VAL…] -- [flags…]` lines back to back, after a short unreported
   warm-up run of the first line (the first run of a batch reads slow; `BATCH_WARMUP=0` skips it).
 - `refbuild.sh <commit>` — prints the install dir of a Release build of that commit, building it
