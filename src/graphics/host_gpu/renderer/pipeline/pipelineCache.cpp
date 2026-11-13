@@ -493,9 +493,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		uint64_t    hash     = 0;
 		const char* stage    = nullptr;
 		bool        injected = false;
-		~PlaytestMiss() { Common::Playtest::EndShaderMiss(start, hash, stage, injected); }
-	} playtest_miss {.hash = params.hash, .stage = ShaderRecompiler::StageName(options.stage),
-	                 .injected = m_injected_miss};
+		bool*       clear    = nullptr; // an injected miss ends here even if nothing compiled
+		~PlaytestMiss() {
+			Common::Playtest::EndShaderMiss(start, hash, stage, injected);
+			*clear = false;
+		}
+	} playtest_miss {.hash     = params.hash,
+	                 .stage    = ShaderRecompiler::StageName(options.stage),
+	                 .injected = m_injected_miss,
+	                 .clear    = &m_injected_miss};
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
