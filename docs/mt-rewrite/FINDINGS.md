@@ -2204,6 +2204,95 @@ efficiency cores changes the game's pace from batch to batch, so only arms of on
 - **The 2 s spike frames** (the host's fan-control daemon on the command thread's SMT sibling) are
   included in the numbers of record; the bracketed share leaves them out.
 
+### Outside load: what it costs and what doesn't recover it (Track R, 2026-11-13)
+
+**Question.** Ten agent sessions share this machine. Is a slow heavy-level run the game or the
+neighbours, and can the emulator tolerate ordinary background load?
+
+**Setup.** Sky Aztec, PGO (`dev` 6e90b1d3 with default-off switches), frames 1000–3000,
+`KYTY_FRAME_DIAG=1`, every log checked for `StartLevel sky_aztec`. This was before the VRSQRTPS fix
+(#139). Synthetic load ran as unpinned processes in their own user scope:
+- light: 4 tasks at 10% duty, ~0.5 CPU;
+- heavy: 8 tasks at 60% duty, ~4.8 CPUs.
+
+| arm × load | runs | FPS | cmd CPU ms/frame | cmd run queue ms | no guest work ms/frame | presented 2+ refreshes |
+|---|---|---|---|---|---|---|
+| default × none | 5 | 59.0–59.5 | 14.4–14.8 | 0.01–0.03 | 1.25–1.99 | 1.2–2.5% |
+| default × light | 1 | 59.2 | 14.79 | 0.02 | 1.76 | 1.9% |
+| default × heavy (2 of them with the emulator's scope at `CPUWeight=1000`) | 4 | 51.8–52.6 | 18.6–18.9 | 0.11–0.15 | 0.06–0.17 | 14.1–15.7% |
+| command, prepare and recorder threads at `SCHED_RR` 1 × none | 1 | 59.1 | 14.25 | 0.00 | 2.58 | 1.8% |
+| the same × heavy | 1 | 51.2 | 18.15 | 0.03 | 1.13 | 17.3% |
+| recorder on CPU 11 (`KYTY_RECORDER_CPU=11`) × none | 1 | 60.0 | 15.94 | 0.00 | 0.02 | 0.1% |
+| the same × heavy | 1 | 51.9 | 18.39 | 0.26 | 0.50 | 15.6% |
+| core-scheduling cookie (`PR_SCHED_CORE`) × heavy | 1 | 33.6 | 22.50 | 5.15 | 0.06 | 66% |
+
+**Light load costs nothing measurable.** Every column is inside the quiet runs' spread.
+
+**Heavy load costs through SMT throughput, not scheduling.**
+- The game's threads already fill the efficiency cores, so the load lands on the performance
+  cores' idle SMT siblings. CPU 11, the command thread's sibling, goes from 5% to 60% busy, and
+  CPU 9 likewise.
+- The command thread then needs +25% CPU for the same frame (14.4 → 18.6 ms), and the prepare and
+  recorder waits double.
+- Guest-late time disappears because the emulator, not the game, becomes the late side.
+
+**Nothing available without root recovers it:**
+- **`CPUWeight`:** changes nothing. The cgroup `cpu` controller is enabled down to every agent's
+  scope, so autogroup nice is not in play either.
+- **`SCHED_RR` on the emulator's three thread kinds:** removes the scheduling part (run queue back
+  to 0.03 ms, prepare and recorder waits back to quiet levels) but not the throughput loss.
+  - It is safe here: the threads spin 50 µs, then sleep. Real-time throttling is off on this
+    machine (`sched_rt_runtime_us` = period) and nothing stalled.
+  - It buys nothing, so don't retry it.
+- **Core scheduling:** makes it far worse. A process can create a cookie unprivileged
+  (`CONFIG_SCHED_CORE=y`). Only tasks with the same cookie then share a physical core, but
+  force-idle is symmetric: when the foreign task wins the core-wide pick, our thread on the
+  sibling is forced idle. The prepare waits went from 1.2 to 9.2 ms/frame.
+- **Occupying a sibling ourselves:** moves the load to the next idle CPU (9, 0–5).
+- The robust answer is headroom: less command-thread CPU per frame. No mitigation code was merged.
+
+**Recorder on CPU 11 with no load.** This was the one gain. With the recorder off efficiency core
+19, the game gets 8 efficiency cores instead of 7: the `tbb` pool's runnable wait drops from 389%
+to 321% of a CPU. It costs +9% command-thread CPU (shared core). The rsqrt fix (#139) attacks the
+same shortage, so it is not a default.
+
+**Measuring under load:**
+- **PSI is no contamination signal.** `/proc/pressure/cpu` "some" is ~31% on a quiet Sky Aztec
+  run, because the game's 11 `tbb` workers oversubscribe 7 efficiency cores, and ~29% under the
+  heavy load.
+- **The signal is the busy share of the CPUs the layout leaves idle** (here 9 and 11):
+
+  | load | CPUs 9 and 11 busy |
+  |---|---|
+  | quiet | 5.5% |
+  | light | 16% |
+  | heavy | 60–63% |
+
+  `garden.sh` voids a run over 30% mean or 50% in any 5 s, and flags it over 20% (#140).
+
+**After the VRSQRTPS fix (#139): placement needs no change.** PGO `dev` 9026f389, Sky Aztec, frames
+1000–3000, quiet machine except the light-load run:
+
+| run | FPS | no guest work ms/frame | presented 2+ refreshes | cmd CPU ms/frame |
+|---|---|---|---|---|
+| default | 60.0 | 0.00 | 0.8% | 14.45 |
+| default | 60.0 | 0.00 | 0.5% | 14.30 |
+| default × light load | 60.0 | 0.00 | 0.2% | 14.42 |
+
+- **Efficiency cores:** 12–18 run 54–55% busy, about 3.2 CPUs of slack out of 7 (85% busy before
+  the fix). The `tbb` pool runs 3.4 CPUs, down from 5.5.
+- **Performance cores:** the process set 0–5 runs 24–26% busy.
+- **The game is no longer late.** The remaining two-refresh frames are command-thread CPU spikes
+  (~25 ms busy), on the emulator side.
+- **Light load is still free.**
+- **One reading to avoid:** the `tbb` threads' schedstat run-queue time stays ~2.4 CPUs even with
+  the cores half idle. That is their `usleep(0)`/yield loops passing through the run queue, not a
+  CPU shortage.
+
+**`KYTY_AMD_SKIP_RSQRT=1` is not a usable arm on Sky Aztec.** The host's VRSQRTPS precision crashes
+the game on this AMD host, with a null read from guest code at frame ~400, 2 of 2 runs. The traps'
+cost came from Track S's exact fast path instead (#139).
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
