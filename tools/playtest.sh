@@ -170,6 +170,7 @@ unset KYTY_SHADER_STORE_DIR
 } > "$dir/launch.txt"
 echo "playtest: session $dir"
 echo "playtest: marker = F9, or the PS / microphone button; F2 shows the performance overlay"
+echo "playtest: to finish, close the game window (or press Ctrl+C here); the report follows"
 start=$(date +%s)
 (
 	cd "$install" || exit 1
@@ -185,8 +186,16 @@ if [ -d "/proc/$emu" ]; then
 	nice -n 19 python3 -I "$here/playtest-sample.py" "$emu" "$dir/system.jsonl" 2 9>&- 8>&- &
 	sampler=$!
 fi
-wait "$emu"
-status=$?
+# Ctrl+C (or a hangup) in this terminal quits the game the way closing its window does: the
+# emulator runs in the background, where SIGINT is ignored, so pass it on as SIGTERM (SDL turns
+# that into a quit, and the recorder flushes the session).
+trap 'kill -TERM "$emu" 2>/dev/null' INT TERM HUP
+while :; do
+	wait "$emu"
+	status=$?
+	[ -d "/proc/$emu" ] || break
+done
+trap - INT TERM HUP
 echo "exit_status: $status" >> "$dir/launch.txt"
 echo "ended: $(date -Iseconds) ($(( $(date +%s) - start )) s)" >> "$dir/launch.txt"
 [ -n "$sampler" ] && kill "$sampler" 2>/dev/null
