@@ -376,10 +376,13 @@ The rule, in any build mode:
   (~4 min): 2 per-draw runs into the result store and one hitch run with the screenshot, stored as
   the commit's hitch baseline. Gates then read `dev` instead of re-running it.
 - **Void runs.** `garden.sh` samples the CPUs the core layout leaves idle (the SMT siblings of the
-  command thread's and prepare workers' cores) over the measured window: a mean over 15% busy or
-  any 5 s over 40% (Track R's provisional thresholds; ~5.5% quiet, ~60% under a 4.8-CPU outside
-  load) marks the run `VOID (outside load)`, keeps it out of the store, and `batch.sh` runs it once
-  more. `idle_busy=mean/max5s%` is on every summary line.
+  command thread's and prepare workers' cores, minus any CPU the run itself uses) over the measured
+  window: a mean over 30% busy or any 5 s over 50% marks the run `VOID (outside load)`, keeps it
+  out of the store, and `batch.sh` runs it once more; a mean over 20% only adds `SUSPECT (some
+  outside load; kept)`. Track R's provisional thresholds: quiet runs read ~5.5%; a harmless
+  ~0.5-CPU load 16% (worst 5 s 19%, no measurable cost); a 4.8-CPU load 60-63% (cmd_ns +28%);
+  nothing measured in between. `GARDEN_VOID_MEAN`, `GARDEN_VOID_MAX5`, `GARDEN_FLAG_MEAN` override
+  them. `idle_busy=mean/max5s%` is on every summary line.
 
 **Where the command thread's cycles go (2026-11-12, `KYTY_BENCH_PMU=1`).** That diagnostic mode adds
 user-mode PMU events for the command thread and the prepare workers, multiplexed by the kernel, plus

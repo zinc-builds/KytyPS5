@@ -170,7 +170,7 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 		inwin { print }
 		fr >= f1 { printf "FRAMEFPS %.4f\n", (fr - a) / (t - ta); exit }' > "/tmp/garden-$label.window"
 	fw=$(grep -m1 '^FRAMEFPS' "/tmp/garden-$label.window" | cut -d' ' -f2)
-	idle_note= void=
+	idle_note= void= suspect=
 	# A hybrid layout that leaves no CPU to watch says so, rather than passing unchecked.
 	[ -n "$hy" ] && [ -z "$mon_cpus" ] && idle_note=" idle_busy=unchecked(no idle CPUs)"
 	if [ -n "$mon_pid" ]; then
@@ -178,9 +178,13 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 		read -r imean imax < <(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["mean"], d["max5s"])' "$mon_out" 2>/dev/null)
 		if [ -n "$imean" ] && [ "$imean" != None ]; then
 			idle_note=" idle_busy=$imean/$imax%(cpus $mon_cpus)"
-			# Provisional thresholds (Track R): mean over 15%, or any 5 s over 40%.
-			awk -v m="$imean" -v x="$imax" -v tm="${GARDEN_VOID_MEAN:-15}" -v tx="${GARDEN_VOID_MAX5:-40}" \
+			# Thresholds (Track R, provisional): void over a 30% mean or any 5 s over 50% (a 4.8-CPU
+			# load reads 60-63% and costs cmd_ns +28%); a mean over 20% is flagged but kept (a
+			# harmless ~0.5-CPU load read 16%, worst 5 s 19%; quiet runs ~5.5%; nothing measured
+			# between 19% and 60%).
+			awk -v m="$imean" -v x="$imax" -v tm="${GARDEN_VOID_MEAN:-30}" -v tx="${GARDEN_VOID_MAX5:-50}" \
 				'BEGIN { exit !(m > tm || x > tx) }' && void=1
+			[ -z "$void" ] && awk -v m="$imean" -v tf="${GARDEN_FLAG_MEAN:-20}" 'BEGIN { exit !(m > tf) }' && suspect=1
 		fi
 	fi
 	# Per-draw costs over the same window (metrics.py; needs a binary with METRICS lines), as
@@ -198,8 +202,8 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 		time="$(date -Iseconds)" exe="$exe" build_mode="${mode:-plain}" profile="$profile" level="$level")
 	rm -f "/tmp/garden-$label.void.json"
 	if [ -f "/tmp/garden-$label.json" ] && [ -s "$mon_out" ]; then
-		python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["idle_busy"]=json.load(open(sys.argv[2])); d["void"]=sys.argv[3]=="1"; json.dump(d,open(p,"w"),indent=1,sort_keys=True)' \
-			"/tmp/garden-$label.json" "$mon_out" "${void:-0}"
+		python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["idle_busy"]=json.load(open(sys.argv[2])); d["void"]=sys.argv[3]=="1"; d["suspect"]=sys.argv[4]=="1"; json.dump(d,open(p,"w"),indent=1,sort_keys=True)' \
+			"/tmp/garden-$label.json" "$mon_out" "${void:-0}" "${suspect:-0}"
 		# A void run is not a result: its JSON is kept apart, so nothing reads it as one.
 		[ -n "$void" ] && mv -f "/tmp/garden-$label.json" "/tmp/garden-$label.void.json"
 	fi
@@ -207,7 +211,7 @@ if [ -n "$base" ] && [ -z "$GARDEN_WINDOW" ] && [ "$window" != time ]; then
 	# A void run (outside load) is not data: it stays out of the store.
 	case "$label" in *-warmup) ;; *) [ -z "$void" ] && [ "$level" = aerial_garden ] && [ -f "/tmp/garden-$label.json" ] && python3 -I "$(dirname "$0")/results.py" add "/tmp/garden-$label.json" ;; esac
 	grep '^PERF' "/tmp/garden-$label.window" | fields |
-		awk -v l="$label" -v fw="$fw" -v note=" frames=$window$extra$idle_note${void:+ VOID (outside load)}" "$summary"
+		awk -v l="$label" -v fw="$fw" -v note=" frames=$window$extra$idle_note${void:+ VOID (outside load)}${suspect:+ SUSPECT (some outside load; kept)}" "$summary"
 else
 	wait_s "${GARDEN_SETTLE:-25}"       # opening flight / shader warm-up
 	from=$(wc -l < "$log")
