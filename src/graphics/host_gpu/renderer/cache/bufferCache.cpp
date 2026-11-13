@@ -332,9 +332,44 @@ namespace {
 bool Enabled() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_COLLIDE_DIAG");
-		return v != nullptr && v[0] != '0';
+		return v != nullptr && v[0] != '0' && std::strcmp(v, "count") != 0;
 	}();
 	return on;
+}
+// KYTY_COLLIDE_DIAG=count: no hashing; once per second a COLLIDECOUNT line with the written syncs
+// (SynchronizeBuffer with is_written), those that newly take GPU ownership of at least one page,
+// the pages they take, and the collisions (GPU-thread synchronous merges).
+bool CountOnly() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_COLLIDE_DIAG");
+		return v != nullptr && std::strcmp(v, "count") == 0;
+	}();
+	return on;
+}
+struct Counts {
+	uint64_t written_syncs = 0, taking_syncs = 0, taken_pages = 0, collisions = 0, last = 0;
+};
+Counts& GetCounts() {
+	static Counts c;
+	return c;
+}
+void PrintCounts() {
+	auto&      c   = GetCounts();
+	const auto now = Common::GpuWaitDiag::NowNs();
+	if (c.last == 0) {
+		c.last = now;
+		return;
+	}
+	if (now - c.last < 1'000'000'000ull) {
+		return;
+	}
+	const double secs = static_cast<double>(now - c.last) / 1e9;
+	std::printf("COLLIDECOUNT written_syncs_s=%.0f taking_syncs_s=%.0f taken_pages_s=%.0f collisions_s=%.1f\n",
+	            static_cast<double>(c.written_syncs) / secs, static_cast<double>(c.taking_syncs) / secs,
+	            static_cast<double>(c.taken_pages) / secs, static_cast<double>(c.collisions) / secs);
+	std::fflush(stdout);
+	c      = {};
+	c.last = now;
 }
 struct PageRec {
 	uint64_t                 up_seq = 0, acq_seq = 0, up_sync = 0, acq_sync = 0;
@@ -868,6 +903,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 			if (IsRegionGpuModified(vaddr, size)) {
+				if (is_write && CollideDiag::CountOnly()) {
+					CollideDiag::GetCounts().collisions++;
+				}
 				if (is_write && CollideDiag::Enabled()) {
 					CollideDiag::NoteCollision(vaddr, size, m_gpu_modified_ranges, [this](uint64_t page) {
 						return IsRegionGpuModified(page, 4096);
@@ -1217,6 +1255,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	vk::Buffer                  source;
 	if (CollideDiag::Enabled()) {
 		CollideDiag::BeginSync(is_written);
+	}
+	if (is_written && CollideDiag::CountOnly()) {
+		auto&    c     = CollideDiag::GetCounts();
+		uint64_t taken = 0;
+		for (uint64_t page = vaddr & ~4095ull; page < vaddr + size; page += 4096) {
+			taken += IsRegionGpuModified(page, 4096) ? 0 : 1;
+		}
+		c.written_syncs++;
+		c.taking_syncs += taken != 0 ? 1 : 0;
+		c.taken_pages += taken;
+		CollideDiag::PrintCounts();
 	}
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
