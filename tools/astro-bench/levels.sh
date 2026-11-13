@@ -10,6 +10,7 @@
 #   -e "K=V ..." extra env for every run (e.g. KYTY_INSTALL=<pgo install> KYTY_FRAME_DIAG=1)
 #   -t TAG      label prefix (default lv): runs are <TAG>-<mode>-<level>
 #   -l FILE     read the levels from FILE (one per line, # comments) as well
+#   -F "FLAGS"  emulator flags (default --amd-cpu; "" for the default --amd-cpu auto mode)
 # A level that does not reach "StartLevel <name>" within GARDEN_BOOT_TIMEOUT (default here 150 s)
 # is reported as not booting. A run that dies is reported with the cause garden.sh printed and the
 # last log lines; a verifier's exit shows up there as its EXIT message.
@@ -21,7 +22,7 @@ here=$(dirname "$0")
 # instead of exiting: KYTY_ASYNC_WP_VERIFY, whose ASYNCWPVERIFY lines the table reads (lost>0
 # fails the level). KYTY_DECODE_THREAD=verify also turns on the (default-off) decode thread.
 VERIFY_ENV="KYTY_PREPARE_VERIFY=1 KYTY_BINDING_REUSE_VERIFY=1 KYTY_WORKER_TARGETS_VERIFY=1 KYTY_WORKER_PIPELINE_KEY_VERIFY=1 KYTY_WORKER_BUFFERS=verify KYTY_COLOR_CLEAR_MEMO=verify KYTY_STENCIL_TARGET_FAST=verify KYTY_DECODE_THREAD=verify KYTY_DTC_VERIFY=1 KYTY_WORKER_TEXTURES_VERIFY=1 KYTY_WORKER_STREAM=verify KYTY_ASYNC_WP_VERIFY=1 KYTY_FAST_GUEST_READ=verify KYTY_REGISTER_SNAPSHOT=verify"
-mode=verify window= shot= extra= tag=lv levels=()
+mode=verify window= shot= extra= tag=lv levels=() flags=--amd-cpu
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-m) mode=$2; shift ;;
@@ -29,6 +30,7 @@ while [ $# -gt 0 ]; do
 	-s) shot=$2; shift ;;
 	-e) extra=$2; shift ;;
 	-t) tag=$2; shift ;;
+	-F) flags=$2; shift ;;
 	-l) while read -r l _ || [ -n "$l" ]; do [[ -n "$l" && "$l" != \#* ]] && levels+=("$l"); done < "$2"; shift ;;
 	-*) echo "levels.sh: unknown option $1" >&2; exit 1 ;;
 	*) levels+=("$1") ;;
@@ -58,8 +60,8 @@ for l in "${levels[@]}"; do
 	rm -f "/tmp/garden-$tag-$mode-$l.out" "/tmp/bench-$tag-$mode-$l.log" "/tmp/garden-$tag-$mode-$l-shot.png"
 done
 for l in "${levels[@]}"; do
-	printf '%s GARDEN_LEVEL=%s GARDEN_FRAMES=%s GARDEN_BOOT_TIMEOUT=%s %s %s %s -- --amd-cpu\n' \
-		"$tag-$mode-$l" "$l" "$window" "${GARDEN_BOOT_TIMEOUT:-150}" "${shot:+GARDEN_SHOT=$shot}" "$env" "$extra"
+	printf '%s GARDEN_LEVEL=%s GARDEN_FRAMES=%s GARDEN_BOOT_TIMEOUT=%s %s %s %s -- %s\n' \
+		"$tag-$mode-$l" "$l" "$window" "${GARDEN_BOOT_TIMEOUT:-150}" "${shot:+GARDEN_SHOT=$shot}" "$env" "$extra" "$flags"
 done | BATCH_WARMUP=0 "$here/batch.sh" > /dev/null
 batch_status=${PIPESTATUS[1]}
 [ "$batch_status" = 0 ] || echo "levels.sh: batch.sh failed ($batch_status): levels without output did not run" >&2
