@@ -1261,6 +1261,47 @@ bool ProtectAsyncGuestPage(uint64_t page, uint64_t& token) {
 #endif
 }
 
+bool ProtectAsyncGuestPage(uint64_t page, uint64_t& token, LabelMemo* memo) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->Backing().ProtectAsyncPage(page, token, memo);
+#else
+	(void)page;
+	(void)token;
+	(void)memo;
+	return false;
+#endif
+}
+
+bool TryStoreLabelsMemo(const LabelMemo& memo, uint64_t vaddr, const void* values, uint32_t elem,
+                        uint32_t count, uint32_t stride, uint64_t& token) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space == nullptr) {
+		return false;
+	}
+	return g_guest_address_space->Backing().StoreLabelsMemo(memo, vaddr, values, elem, count, stride, token, [] {
+		if (Graphics::GuestSyncEpoch::g_stores_ranged) {
+			Graphics::GuestSyncEpoch::AdvanceRanged();
+		} else {
+			Graphics::GuestSyncEpoch::Advance();
+		}
+	});
+#else
+	(void)memo;
+	(void)vaddr;
+	(void)values;
+	(void)elem;
+	(void)count;
+	(void)stride;
+	(void)token;
+	return false;
+#endif
+}
+
+bool CanStoreLabelsBacking(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->CanStoreLabelsBacking(vaddr, size);
+}
+
 uint64_t GuestRemapGeneration() noexcept {
 	return g_remap_generation.load(std::memory_order_relaxed);
 }

@@ -38,6 +38,7 @@ enum class Counter {
 	WriteDataDwords,
 	LabelStale,   // IsCpLabel: the label matched but its token was voided (the wait collects)
 	LabelWritten, // IsCpLabel: the label matched but the guest stored to its page
+	WriteDataMemoHits, // StoreCpLabels through the page's memo (KYTY_WRITE_DATA_MEMO)
 	Count
 };
 

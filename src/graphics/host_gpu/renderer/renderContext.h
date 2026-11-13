@@ -187,6 +187,12 @@ public:
 	// KYTY_WRITE_DATA_LABELS=all fills them for every packet.
 	static constexpr uint32_t kWriteDataLabelMaxDwords = 16;
 	[[nodiscard]] static bool FillsLabelSlots(uint32_t source) noexcept;
+	// KYTY_WRITE_DATA_MEMO (default on; =0 off, =verify checks each memo store against the full
+	// path): StoreCpLabels to the page of the previous one stores through LibKernel::Memory::
+	// LabelMemo while its snapshots hold, without the protection call and the backing lookups.
+	enum class MemoMode { Off, On, Verify };
+	[[nodiscard]] static MemoMode GetMemoMode() noexcept;
+	void                          VerifyLabelMemo(uint64_t vaddr, uint64_t size, uint64_t token);
 	// KYTY_LABEL_HIT_STATS=1 (off by default): per second, label checks (IsCpLabel) by outcome and
 	// by the size of the WRITE_DATA packet that wrote the slot, and slots written by size.
 	enum class LabelCheck { OtherAddress, Mismatch, Hit, Stale, Written };
@@ -280,6 +286,7 @@ private:
 		uint64_t token      = 0; // LibKernel::Memory::ProtectAsyncGuestPage
 	};
 	std::array<CpLabel, 1024> m_cp_labels {};
+	LibKernel::Memory::LabelMemo m_label_memo; // GPU thread only (StoreCpLabels)
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

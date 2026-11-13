@@ -982,6 +982,65 @@ WriteDataVerify g_wd_verify;
 
 } // namespace
 
+RenderContext::MemoMode RenderContext::GetMemoMode() noexcept {
+	static const MemoMode mode = [] {
+		// KYTY_LABEL_SCAN_SKIP=0 rescans at every protection by design: no memo then.
+		const char* skip = std::getenv("KYTY_LABEL_SCAN_SKIP");
+		if (skip != nullptr && skip[0] == '0') {
+			return MemoMode::Off;
+		}
+		const char* value = std::getenv("KYTY_WRITE_DATA_MEMO");
+		if (value == nullptr) {
+			return MemoMode::On;
+		}
+		if (std::strcmp(value, "verify") == 0) {
+			return MemoMode::Verify;
+		}
+		return value[0] == '0' ? MemoMode::Off : MemoMode::On;
+	}();
+	return mode;
+}
+
+// KYTY_WRITE_DATA_MEMO=verify, after a store through the memo: the full path's checks, without
+// storing. ProtectAsyncGuestPage must give the memo's token and backing address, and the address
+// space must allow the store (TryStoreLabelsBacking's checks), unless the tracker's token counter,
+// the translation sequence or the remap generation moved since the memo's store (counted as
+// raced). The address-space check runs first: a change that slipped past the snapshots shows
+// there, and one that did not moves a snapshot before the protection reads it.
+void RenderContext::VerifyLabelMemo(uint64_t vaddr, uint64_t size, uint64_t token) {
+	static uint64_t fast = 0, checked = 0, raced = 0, last_report = 0;
+	fast++;
+	const auto memo = m_label_memo;
+	const bool can  = LibKernel::Memory::CanStoreLabelsBacking(vaddr, size);
+	LibKernel::Memory::LabelMemo fresh;
+	uint64_t                     fresh_token = 0;
+	const bool protect = LibKernel::Memory::ProtectAsyncGuestPage(memo.page, fresh_token, &fresh);
+	const bool same_state = protect && fresh.seq_at_entry == memo.seq && fresh.translation == memo.translation &&
+	                        fresh.remap == memo.remap;
+	if (!same_state) {
+		raced++;
+	} else {
+		checked++;
+		if (!can || fresh_token != token || fresh.host != memo.host) {
+			EXIT("MEMOVERIFY FAIL: 0x%016" PRIx64 "+%" PRIu64 " stored through the memo (token %" PRIu64
+			     ", host %p); the full path gives token %" PRIu64 ", host %p, address-space check %d\n",
+			     vaddr, size, token, static_cast<void*>(memo.host), fresh_token, static_cast<void*>(fresh.host),
+			     can ? 1 : 0);
+		}
+	}
+	if (protect) {
+		m_label_memo = fresh;
+	} else {
+		m_label_memo.host = nullptr;
+	}
+	const auto now = Common::FrameDiag::NowNs();
+	if (now - last_report >= 1'000'000'000ull) {
+		std::printf("MEMOVERIFY fast=%" PRIu64 " checked=%" PRIu64 " raced=%" PRIu64 " fail=0\n", fast, checked, raced);
+		std::fflush(stdout);
+		last_report = now;
+	}
+}
+
 bool RenderContext::FillsLabelSlots(uint32_t source) noexcept {
 	static const bool all = [] {
 		const char* value = std::getenv("KYTY_WRITE_DATA_LABELS");
@@ -1009,13 +1068,27 @@ bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t e
 	// Read first: a remap after this read voids the labels.
 	const auto generation = LibKernel::Memory::GuestRemapGeneration();
 	uint64_t   token      = 0;
-	if (!LibKernel::Memory::ProtectAsyncGuestPage(page, token)) {
-		LibKernel::Memory::RequestAsyncWriteTracking(vaddr);
-		return false;
-	}
-	// All or nothing: it fails before storing anything.
-	if (!LibKernel::Memory::TryStoreLabelsBacking(vaddr, values, elem, count, stride)) {
-		return false;
+	const auto memo_mode  = GetMemoMode();
+	// The page's previous store left a memo whose snapshots still hold: the same token, the same
+	// backing address, no protection or lookups (LibKernel::Memory::LabelMemo).
+	if (memo_mode != MemoMode::Off &&
+	    LibKernel::Memory::TryStoreLabelsMemo(m_label_memo, vaddr, values, elem, count, stride, token)) {
+		Common::FrameDiag::Add(Common::FrameDiag::Counter::WriteDataMemoHits);
+		if (memo_mode == MemoMode::Verify) {
+			VerifyLabelMemo(vaddr, span, token);
+		}
+	} else {
+		auto* memo = memo_mode != MemoMode::Off ? &m_label_memo : nullptr;
+		if (!LibKernel::Memory::ProtectAsyncGuestPage(page, token, memo)) {
+			m_label_memo.host = nullptr;
+			LibKernel::Memory::RequestAsyncWriteTracking(vaddr);
+			return false;
+		}
+		// All or nothing: it fails before storing anything.
+		if (!LibKernel::Memory::TryStoreLabelsBacking(vaddr, values, elem, count, stride)) {
+			m_label_memo.host = nullptr;
+			return false;
+		}
 	}
 	uint64_t invalidated = 0;
 	if (invalidate) {
