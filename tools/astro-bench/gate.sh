@@ -3,8 +3,8 @@
 # hold, a block to paste into the PR body. The class is declared, printed with its reason, and
 # decides what runs (bench procedure, "fewer runs"):
 #   diag    diagnostic-only code, off by default: a screening A/B of the new build (diagnostic off)
-#           against stored references of the merge-base, and one run with it on (--diag-env) plus
-#           the verify modes and the screenshot. No hitch run.
+#           against stored references of the merge-base (up to 2 pairs), and one run with it on
+#           (--diag-env), the verify modes and the screenshot together. No hitch run.
 #   switch  a behaviour change behind a kill switch: the same binary with the switch's off value
 #           (--switch "KYTY_X=0") as the reference arm and the default as the new arm, a verify
 #           run, and one hitch run (with the screenshot) on the new arm against the stored dev
@@ -101,7 +101,7 @@ while [ $# -gt 0 ]; do
 done
 case "$class" in
 diag) [ -n "$diag_env" ] || { echo "gate.sh: --class diag needs --diag-env \"KYTY_X=1\" (the diagnostic on)" >&2; exit 2; }
-	hitch=0 ;;
+	hitch=0 ;; # the verify modes run in the diagnostic's run
 switch) [[ "$switch" == KYTY_*=* ]] || { echo "gate.sh: --class switch needs --switch \"KYTY_X=0\" (the env that turns the change off)" >&2; exit 2; } ;;
 full) ;;
 *) echo "gate.sh: --class diag|switch|full is required (and --why \"<reason>\"); see the header" >&2; exit 2 ;;
@@ -124,8 +124,8 @@ if [ "$hitch" = 1 ]; then
 	base_sha=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["rev"])' "$base_json" 2>/dev/null)
 fi
 extra=()
-[ "$verify" = 1 ] && extra+=(--extra "$label-verify KYTY_INSTALL=$new_install GARDEN_FRAMES=0-$vframes $env $new_env $VERIFY_ENV $verify_env -- $flags")
-[ "$class" = diag ] && extra+=(--extra "$label-diag KYTY_INSTALL=$new_install GARDEN_FRAMES=0-$((shot + 100)) GARDEN_SHOT=$shot $env $new_env $diag_env -- $flags")
+[ "$verify" = 1 ] && [ "$class" != diag ] && extra+=(--extra "$label-verify KYTY_INSTALL=$new_install GARDEN_FRAMES=0-$vframes $env $new_env $VERIFY_ENV $verify_env -- $flags")
+[ "$class" = diag ] && extra+=(--extra "$label-diag KYTY_INSTALL=$new_install GARDEN_FRAMES=0-$((shot + 100)) GARDEN_SHOT=$shot $env $new_env $diag_env $([ "$verify" = 1 ] && echo "$VERIFY_ENV $verify_env") -- $flags")
 if [ "$hitch" = 1 ]; then
 	extra+=(--hitch "$hframes" --hitch-shot "$shot")
 	[ -n "$base_sha" ] && extra+=(--hitch-new-only)
@@ -167,9 +167,9 @@ elif ! grep -q '^AB ' <<<"$verdict"; then
 else
 	echo "**Perf direction:** PASS (no decision metric worse by >= 3 sd)"
 fi
-for run in $([ "$verify" = 1 ] && echo verify) $([ "$class" = diag ] && echo diag); do
+for run in $([ "$verify" = 1 ] && [ "$class" != diag ] && echo verify) $([ "$class" = diag ] && echo diag); do
 	v=$(head -1 "/tmp/garden-$label-$run.out" 2>/dev/null)
-	what=$([ "$run" = verify ] && echo "$VERIFY_ENV${verify_env:+ $verify_env}" || echo "$diag_env")
+	what=$([ "$run" = verify ] && echo "$VERIFY_ENV${verify_env:+ $verify_env}" || echo "$diag_env$([ "$verify" = 1 ] && echo " $VERIFY_ENV${verify_env:+ $verify_env}")")
 	if [[ "$v" == "$label-$run: fps="* ]]; then
 		echo "**${run^}:** PASS, frames 0-$([ "$run" = verify ] && echo "$vframes" || echo $((shot + 100))) clean with $what"
 	else

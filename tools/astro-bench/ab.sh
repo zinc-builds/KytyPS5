@@ -152,7 +152,7 @@ while [ "$done_pairs" -lt "$n" ]; do
 	for i in $(seq $((done_pairs + 1)) "$upto"); do mapfile -t -O "${#lines[@]}" lines < <(pair_lines "$i"); done
 	# batch.sh warms up its first line's install only; a cold shader store (a new binary)
 	# compiles during the first frames, so the other install gets its own short warm-up.
-	if [ "$done_pairs" = 0 ] && [ "$reuse" = 0 ]; then
+	if [ "$done_pairs" = 0 ] && [ "$reuse" = 0 ] && [ "$ref_install" != "$new_install" ]; then
 		lines=("${lines[0]}" "$label-new-warmup KYTY_INSTALL=$new_install GARDEN_FRAMES=0-150 $env $new_env -- $flags" "${lines[@]:1}")
 	fi
 	echo "ab.sh: pairs $((done_pairs + 1))-$upto: ${#lines[@]} runs (window $window, reference ${ref_sha:0:12}$([ "$reuse" = 1 ] && echo ": stored runs reused"))" >&2
