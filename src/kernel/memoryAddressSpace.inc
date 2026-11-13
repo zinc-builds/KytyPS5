@@ -1776,6 +1776,15 @@ public:
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
+	// Whether TryStoreLabelBacking can store anywhere in [vaddr, vaddr + size).
+	bool BackingStorable(uint64_t vaddr, uint64_t size) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->Contains(vaddr, size);
+	}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	[[nodiscard]] GuestBackingStore& Backing() { return *m_backing; }
 #endif

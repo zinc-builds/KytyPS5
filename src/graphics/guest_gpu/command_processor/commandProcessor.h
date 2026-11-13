@@ -149,6 +149,9 @@ private:
 	// The per-packet work before the handler: drains, collection, dispatch chain, epoch, atomic
 	// batch, early submit.
 	void RunPrologue(const PacketView& view, bool& first_packet);
+	// An EVENT_WRITE that is an always-visible occlusion-counter dump able to keep the queued
+	// draws (RenderExecutor::CanKeepOcclusionDump).
+	[[nodiscard]] bool KeepsOcclusionDump(const PacketView& view);
 	// The handler, then the cursor (chains, calls). False if the packet suspended the execution.
 	bool RunHandler(Pm4Execution& execution, const PacketView& view);
 	// KYTY_DECODE_THREAD: the packet loop on the decode thread, the GPU thread committing.

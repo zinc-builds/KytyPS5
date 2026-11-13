@@ -920,6 +920,10 @@ bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 	return written;
 }
 
+bool CanStoreThroughBacking(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->BackingStorable(vaddr, size);
+}
+
 bool TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value) {
 	Graphics::GuestSyncEpoch::Advance();
 	const bool written = g_guest_address_space->TryFillBacking(vaddr, size, value);

@@ -38,6 +38,8 @@ public:
 	// KYTY_EARLY_SUBMIT_US µs (default 300), it is submitted now rather than when the guest's
 	// command buffer ends. Returns whether it submitted.
 	bool           SubmitIfGpuIdle();
+	// Whether SubmitIfGpuIdle would submit now (the same test, without submitting).
+	[[nodiscard]] bool EarlySubmitDue();
 	// Sets the early-submission age in µs (< 0: off), for tests.
 	void           SetEarlySubmitUs(int64_t age_us) noexcept {
 		m_early_submit_age =

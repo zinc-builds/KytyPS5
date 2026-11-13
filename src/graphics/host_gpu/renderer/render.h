@@ -401,6 +401,8 @@ public:
 		DrainAsyncCollect  = 258, // async writes collected before a kept packet
 		DrainNumInstances  = 259, // a draw reads NUM_INSTANCES from guest memory
 		DrainDirectDraw    = 260, // a draw that cannot be queued
+		DrainAfterCommitRead = 261, // a decode-time guest read while after-commit stores wait
+		DrainEarlySubmit   = 262, // an occlusion dump at an early-submit checkpoint
 		DrainReasons       = 768,
 	};
 	void FinishQueuedDraws(CommandBuffer& buffer, uint32_t reason = DrainDirectDraw) {
@@ -414,6 +416,8 @@ public:
 		while (QueuedCount() != 0) {
 			FinishQueuedDraw(buffer);
 		}
+		// Every after-commit store follows a queued draw, so none outlives a drain.
+		EXIT_IF(m_after_commit_pending != 0);
 		m_draining = false;
 		m_post_after_drain = m_decode_handoff == nullptr;
 		// The draws posted next refill the queue: their waits are this drain's refill cost.
@@ -427,6 +431,20 @@ public:
 		return m_queued_posted.load(std::memory_order_acquire) - m_queued_taken;
 	}
 	[[nodiscard]] bool HasQueuedDraw() const { return QueuedCount() != 0; }
+
+	// KYTY_OCCLUSION_DUMP_KEEP: 1 (default) an always-visible occlusion-counter dump keeps the
+	// queued draws and its result is stored after the last draw posted before it commits; 0 the
+	// dump drains them, as before; verify also checks every deferred store (GPU thread).
+	[[nodiscard]] static int OcclusionDumpKeepMode();
+	// Whether a dump to `address` may keep the queued draws now: draws are queued, the result
+	// bytes can be stored through the backing and no cache holds them, and it is not an
+	// early-submit checkpoint (then the dump drains and submits, as before).
+	[[nodiscard]] bool CanKeepOcclusionDump(uint64_t address);
+	// Attaches the dump's store to the last posted draw.
+	void AttachOcclusionStore(uint64_t address, uint64_t value);
+	// After-commit stores not yet made: decode-time guest reads must drain first.
+	[[nodiscard]] bool HasAfterCommitStores() const { return m_after_commit_pending != 0; }
+	static constexpr uint64_t OcclusionResultBytes = 16u * 2u * sizeof(uint64_t);
 
 private:
 	[[nodiscard]] static bool ChainsDispatch(const ShaderComputeInputInfo& input_info,
@@ -458,6 +476,13 @@ private:
 	};
 
 	// A queued draw: what it was given, its registers when queued, and the worker's lookup.
+	// An always-visible occlusion-counter dump (EVENT_WRITE 0x39) that keeps the queued draws:
+	// its synthetic result, stored once the last draw posted before it is committed.
+	struct OcclusionStore {
+		uint64_t                 address = 0;
+		uint64_t                 value   = 0;
+		std::array<uint64_t, 16> before {}; // the words it overwrites, read at the dump
+	};
 	struct QueuedDraw {
 		// The draw's context registers: a command-thread-owned snapshot shared by consecutive
 		// draws while the registers do not change (RegisterSnapshot).
@@ -478,6 +503,9 @@ private:
 		uint64_t                         sync_epoch         = 0;
 		uint64_t                         stored_sequence    = 0;
 		uint64_t                         gpu_write_sequence = 0;
+		// Occlusion-counter dumps that follow this draw (KYTY_OCCLUSION_DUMP_KEEP): stored once
+		// it is committed, in order.
+		std::vector<OcclusionStore> after_commit;
 		WorkerBuffers                    buffers;
 		WorkerTextures                   textures;
 		// Resolves the command thread made for this draw, for the worker's memo (see
@@ -831,6 +859,13 @@ private:
 	// free again).
 	alignas(64) std::atomic<uint64_t> m_queued_posted {0};
 	alignas(64) uint64_t              m_queued_taken = 0;
+	// KYTY_OCCLUSION_DUMP_KEEP: stores attached to queued draws, not yet made; and counts for
+	// KYTY_PREPARE_STATS (kept dumps, dumps a guest store overtook, late cache registrations).
+	uint64_t m_after_commit_pending = 0;
+	uint64_t m_dumps_kept           = 0;
+	uint64_t m_dumps_overtaken      = 0;
+	uint64_t m_dumps_late_cached    = 0;
+	void     RunAfterCommit(QueuedDraw& queued);
 	alignas(64) std::atomic<uint64_t> m_queued_released {0};
 	DecodeHandoff*                    m_decode_handoff = nullptr;
 	// Register snapshots taken (the poster writes, the GPU thread reports).

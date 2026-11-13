@@ -139,6 +139,8 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, bool ranged = false);
 // One aligned 4- or 8-byte store through the backing (a label: never written twice).
 bool                   TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size);
+// Whether TryStoreLabelBacking can store anywhere in [vaddr, vaddr + size).
+[[nodiscard]] bool     CanStoreThroughBacking(uint64_t vaddr, uint64_t size);
 // Fills dword-aligned [vaddr, vaddr + size) with value through the backing alias: no write
 // faults, so the caller invalidates the range. False (nothing written) if it is not all backed.
 bool                   TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value);

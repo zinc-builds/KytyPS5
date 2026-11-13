@@ -118,6 +118,15 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 }
 
 bool CommandScheduler::SubmitIfGpuIdle() {
+	if (!EarlySubmitDue()) {
+		return false;
+	}
+	Common::GpuWaitDiag::NoteEarlySubmit();
+	Flush();
+	return true;
+}
+
+bool CommandScheduler::EarlySubmitDue() {
 	// Flush (BeginNext) needs bound registers: unit tests may record without them.
 	if (m_early_submit_age < 0 || m_command.IsInvalid() || !Active()) {
 		return false;
@@ -139,13 +148,8 @@ bool CommandScheduler::SubmitIfGpuIdle() {
 			return false;
 		}
 	}
-	if (std::chrono::steady_clock::now().time_since_epoch().count() - m_command_begin <
-	    m_early_submit_age) {
-		return false;
-	}
-	Common::GpuWaitDiag::NoteEarlySubmit();
-	Flush();
-	return true;
+	return std::chrono::steady_clock::now().time_since_epoch().count() - m_command_begin >=
+	       m_early_submit_age;
 }
 
 CommandScheduler::~CommandScheduler() {

@@ -2302,6 +2302,101 @@ void RenderExecutor::SpeculateBuffers(QueuedDraw& queued, WorkerStreamRing* ring
 	buffers.ready = true;
 }
 
+int RenderExecutor::OcclusionDumpKeepMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_OCCLUSION_DUMP_KEEP");
+		if (value == nullptr) return 1;
+		return std::string_view(value) == "0" ? 0 : std::string_view(value) == "verify" ? 2 : 1;
+	}();
+	return mode;
+}
+
+bool RenderExecutor::CanKeepOcclusionDump(uint64_t address) {
+	if (OcclusionDumpKeepMode() == 0 || !HasQueuedDraw() ||
+	    !LibKernel::Memory::CanStoreThroughBacking(address, OcclusionResultBytes) ||
+	    m_context.GetBufferCache().IsRegionRegistered(address, OcclusionResultBytes) ||
+	    m_context.GetTextureCache().IsRegionRegistered(address, OcclusionResultBytes)) {
+		return false;
+	}
+	// An early-submit checkpoint (#108): drain and submit there, as before.
+	return !m_context.GetCommandScheduler().EarlySubmitDue();
+}
+
+void RenderExecutor::AttachOcclusionStore(uint64_t address, uint64_t value) {
+	const auto posted = m_queued_posted.load(std::memory_order_relaxed);
+	EXIT_IF(posted == m_queued_taken);
+	auto&          queued = *m_queued_draws[(posted - 1) % m_queued_draws.size()];
+	OcclusionStore store {address, value, {}};
+	for (uint32_t db = 0; db < 16u; db++) {
+		if (!LibKernel::Memory::TryReadBacking(address + db * 16u, &store.before[db], sizeof(uint64_t))) {
+			store.before[db] = *reinterpret_cast<volatile const uint64_t*>(address + db * 16u);
+		}
+	}
+	queued.after_commit.push_back(store);
+	m_after_commit_pending++;
+	m_dumps_kept++;
+}
+
+// The dumps attached to a draw just committed, in order. The result words are stored through the
+// backing as a ranged emulator store (queued draws posted after the dump that read them are
+// rejected at adoption), unless the guest stored to them since the dump: then its store came
+// after the dump's, as it would have without the deferral, and is kept.
+void RenderExecutor::RunAfterCommit(QueuedDraw& queued) {
+	const bool verify = OcclusionDumpKeepMode() == 2;
+	for (const auto& store: queued.after_commit) {
+		bool overtaken = false;
+		for (uint32_t db = 0; db < 16u && !overtaken; db++) {
+			uint64_t now = 0;
+			if (!LibKernel::Memory::TryReadBacking(store.address + db * 16u, &now, sizeof(now))) {
+				now = *reinterpret_cast<volatile const uint64_t*>(store.address + db * 16u);
+			}
+			overtaken = now != store.before[db];
+		}
+		if (overtaken) {
+			m_dumps_overtaken++;
+			if (verify) {
+				EXIT("KYTY_OCCLUSION_DUMP_KEEP=verify: the guest stored to occlusion results at "
+				     "0x%016" PRIx64 " between the dump and its deferred store\n",
+				     store.address);
+			}
+			continue;
+		}
+		const bool cached =
+		    m_context.GetBufferCache().IsRegionRegistered(store.address, OcclusionResultBytes) ||
+		    m_context.GetTextureCache().IsRegionRegistered(store.address, OcclusionResultBytes);
+		if (cached && verify) {
+			EXIT("KYTY_OCCLUSION_DUMP_KEEP=verify: occlusion results at 0x%016" PRIx64
+			     " became cached between the dump and its deferred store\n",
+			     store.address);
+		}
+		{
+			DrawPrepare::RangedStore ranged(store.address, OcclusionResultBytes);
+			for (uint32_t db = 0; db < 16u; db++) {
+				if (!LibKernel::Memory::TryStoreLabelBacking(store.address + db * 16u, store.value,
+				                                             sizeof(uint64_t))) {
+					EXIT("occlusion result at 0x%016" PRIx64 " no longer stores through the backing\n",
+					     store.address);
+				}
+			}
+		}
+		if (cached) {
+			// An earlier draw's commit cached the bytes: as the immediate store does.
+			m_dumps_late_cached++;
+			m_context.NoteGpuWrite(store.address, OcclusionResultBytes);
+		} else {
+			RenderContext::VerifyNoteGpuWrite(store.address, OcclusionResultBytes);
+		}
+		if (verify) {
+			for (uint32_t db = 0; db < 16u; db++) {
+				EXIT_IF(*reinterpret_cast<volatile const uint64_t*>(store.address + db * 16u) !=
+				        store.value);
+			}
+		}
+	}
+	m_after_commit_pending -= queued.after_commit.size();
+	queued.after_commit.clear();
+}
+
 void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_decode_handoff != nullptr && m_decode_handoff->verify &&
@@ -2381,6 +2476,9 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 	if (auto* ring = queued.buffers.speculation.ring; ring != nullptr) {
 		ring->Retire(sequence, m_context.GetCommandScheduler().CurrentTick());
 	}
+	if (!queued.after_commit.empty()) {
+		RunAfterCommit(queued);
+	}
 
 	if (m_prepare_stats) {
 		auto&      stat = m_prepare_stat;
@@ -2427,6 +2525,11 @@ void RenderExecutor::FinishQueuedDraw(CommandBuffer& buffer) {
 			            stat.page_buckets[3], stat.page_buckets[4], stat.page_buckets[5],
 			            stat.page_buckets[6], stat.page_buckets[7],
 			            100.0 * static_cast<double>(stat.register_snapshots) / draws);
+			if (m_dumps_kept != 0 || m_dumps_overtaken != 0 || m_dumps_late_cached != 0) {
+				std::printf("OCCLUSION_DUMP kept=%" PRIu64 " overtaken=%" PRIu64 " late_cached=%" PRIu64
+				            "\n",
+				            m_dumps_kept, m_dumps_overtaken, m_dumps_late_cached);
+			}
 			stat                 = {};
 			stat.start_ns        = now;
 			stat.worker_busy_ns  = busy;

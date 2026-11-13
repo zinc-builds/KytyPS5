@@ -776,6 +776,19 @@ static bool KeepsQueuedDraw(uint32_t packet_header) {
 	}
 }
 
+// Kept packets that read guest memory while they are decoded: they must see emulator stores still
+// attached to the queue (KYTY_OCCLUSION_DUMP_KEEP), so those packets drain first. (Draws that
+// read NUM_INSTANCES from memory drain anyway.)
+static bool ReadsGuestAtDecode(uint32_t packet_header) {
+	switch ((packet_header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_INDIRECT_BUFFER: return true;
+		default: return false;
+	}
+}
+
 // Packets that neither wait nor touch memory, so consecutive dispatches around them may overlap
 // on the guest: register writes, markers and the dispatches themselves. Any other packet may be
 // the guest's synchronization between two dispatches (a partial flush, a cache operation, a label
@@ -855,17 +868,42 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	}
 }
 
+bool CommandProcessor::KeepsOcclusionDump(const PacketView& view) {
+	if (KYTY_PM4_LEN(view.header) != 4u) {
+		return false;
+	}
+	const uint32_t* body  = view.packet + 1;
+	const auto      type  = body[0] & 0x3fu;
+	const auto      index = (body[0] >> 8u) & 0x7u;
+	const auto      address = body[1] | (static_cast<uint64_t>(body[2]) << 32u);
+	if (type != 0x39u || index != 1u || address == 0 || (address & 0x7u) != 0) {
+		return false;
+	}
+	// With host queries (--occlusion-queries) the dump still drains: Dump() reads the queries
+	// begun so far, which only the committed draws have begun. (It could become an after-commit
+	// item too; not measured.)
+	return !m_renderer.GetOcclusionQueries().Enabled() &&
+	       m_renderer.GetRenderExecutor().CanKeepOcclusionDump(address);
+}
+
 // Inlined into the packet loops: these run for every packet.
 [[gnu::always_inline]] void CommandProcessor::RunPrologue(const PacketView& view, bool& first_packet) {
 	auto&      executor      = m_renderer.GetRenderExecutor();
 	const auto packet_header = view.header;
 	const auto opcode        = view.opcode;
+	// An always-visible occlusion-counter dump keeps the queued draws: its result is stored after
+	// the last of them commits (KYTY_OCCLUSION_DUMP_KEEP). It touches nothing else.
+	const bool kept_dump = opcode == Pm4::IT_EVENT_WRITE && executor.HasQueuedDraw() &&
+	                       KeepsOcclusionDump(view);
+	const bool keeps     = kept_dump || KeepsQueuedDraw(packet_header);
 	if (executor.HasQueuedDraw() &&
-	    (!KeepsQueuedDraw(packet_header) ||
-	     (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
+	    (!keeps || (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()) ||
+	     (executor.HasAfterCommitStores() && ReadsGuestAtDecode(packet_header)))) {
 		uint32_t reason = RenderExecutor::DrainAsyncCollect;
-		if (!KeepsQueuedDraw(packet_header)) {
+		if (!keeps) {
 			reason = opcode == Pm4::IT_NOP ? 512u + (KYTY_PM4_R(packet_header) & 0xffu) : opcode;
+		} else if (executor.HasAfterCommitStores() && ReadsGuestAtDecode(packet_header)) {
+			reason = RenderExecutor::DrainAfterCommitRead;
 		}
 		executor.FinishQueuedDraws(CurrentBuffer(), reason);
 	}
@@ -876,7 +914,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		executor.EndDispatchChain(CurrentBuffer());
 		first_packet = false;
 	}
-	if (!KeepsAtomicWrites(packet_header)) {
+	if (!KeepsAtomicWrites(packet_header) && !kept_dump) {
 		// The same packets may signal the guest or store into its memory.
 		GuestSyncEpoch::Advance();
 		if (executor.HasAtomicWrites()) {
@@ -1419,13 +1457,19 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			// contains one interleaved begin/end pair per DB, and bit 63 marks a result ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
+			// The counter advances in dump order either way, so the stored values are the same.
+			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			if (auto& executor = m_renderer.GetRenderExecutor(); executor.HasQueuedDraw()) {
+				// The prologue kept the queued draws (KeepsOcclusionDump): store after them.
+				executor.AttachOcclusionStore(event_address, value);
+				break;
+			}
+			auto* results = reinterpret_cast<volatile uint64_t*>(event_address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
 			m_renderer.NoteGpuWrite(event_address, 16u * 2u * sizeof(uint64_t));
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
 		default:
