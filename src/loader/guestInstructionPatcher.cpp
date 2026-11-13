@@ -10,6 +10,7 @@
 
 #include <Zydis/Zydis.h>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <bitset>
 #include <climits>
@@ -113,6 +114,9 @@ struct DecodedCodeInstruction {
 };
 
 struct DecodedFunction {
+	uintptr_t                                   start {};
+	uintptr_t                                   end {};
+	std::vector<uintptr_t>                      unresolved_indirect_branches;
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
 	std::set<uintptr_t>                         branch_targets;
 	bool                                        uses_red_zone {};
@@ -168,6 +172,32 @@ bool IsControlFlowTerminator(const ZydisDecodedInstruction& instruction) {
 	       instruction.meta.category == ZYDIS_CATEGORY_INTERRUPT ||
 	       instruction.meta.category == ZYDIS_CATEGORY_SYSRET ||
 	       instruction.mnemonic == ZYDIS_MNEMONIC_UD2;
+}
+
+// An instruction a preceding-jump span (RelocateGuestInstructions) may copy: it falls through,
+// does not call or trap, and does not read its own address except as a RIP-relative operand,
+// which relocation rewrites.
+bool IsStraightLineInstruction(const ZydisDecodedInstruction& instruction) {
+	switch (instruction.meta.category) {
+		case ZYDIS_CATEGORY_COND_BR:
+		case ZYDIS_CATEGORY_UNCOND_BR:
+		case ZYDIS_CATEGORY_CALL:
+		case ZYDIS_CATEGORY_RET:
+		case ZYDIS_CATEGORY_SYSCALL:
+		case ZYDIS_CATEGORY_SYSRET:
+		case ZYDIS_CATEGORY_SYSTEM:
+		case ZYDIS_CATEGORY_INTERRUPT: return false;
+		default: return instruction.mnemonic != ZYDIS_MNEMONIC_UD2;
+	}
+}
+
+// KYTY_RSQRT_PRECEDING_JUMP=0 turns preceding-jump spans off (A/B and fallback).
+bool PrecedingJumpEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_RSQRT_PRECEDING_JUMP");
+		return env == nullptr || *env != '0';
+	}();
+	return enabled;
 }
 
 uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
@@ -579,6 +609,13 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		}
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+	function.start               = function_start;
+	function.end                 = function_end;
+	for (const uintptr_t branch: indirect_branches) {
+		if (!resolved_indirect_branches.contains(branch)) {
+			function.unresolved_indirect_branches.push_back(branch);
+		}
+	}
 	return function;
 }
 
@@ -1021,6 +1058,8 @@ bool NeedsTrapRedZoneProtection(const DecodedCodeInstruction& decoded) {
 #endif
 }
 
+std::atomic<TrappedSiteObserver> g_trapped_site_observer {nullptr};
+
 void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunction& function,
                                  const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                  GuestInstructionPatchResult&                   result) {
@@ -1044,6 +1083,16 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 		MarkInstructionTrap(reinterpret_cast<u8*>(address), decoded.instruction,
 		                    rewrite.replacement);
 		++ReplacementCounts(result, rewrite.replacement).trapped;
+		if (const auto observer = g_trapped_site_observer.load(std::memory_order_relaxed);
+		    observer != nullptr) {
+			observer({.site                         = address,
+			          .function_start               = function.start,
+			          .function_end                 = function.end,
+			          .indirect_function            = function.has_indirect_branch,
+			          .reciprocal_sqrt              = rewrite.replacement ==
+			                                            InstructionReplacement::ReciprocalSquareRoot,
+			          .unresolved_indirect_branches = function.unresolved_indirect_branches});
+		}
 	}
 }
 
@@ -1223,8 +1272,54 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 			return span;
 		};
 
+		// A 4-byte VRSQRTPS in a function with unresolved indirect branches: its neighbours cannot
+		// be moved, since an unknown jump could land inside the moved bytes. Instead, the near
+		// jump goes over the first five bytes of the nearest preceding instruction of five bytes
+		// or more, in straight-line code decoded from the function's entry. The trampoline runs
+		// copies of that instruction through the site (the site natively) and returns after the
+		// site. Everything after the overwritten instruction stays in place, the site in its trap
+		// form, so a jump to any of those instructions still runs correctly (the site traps).
+		// No instruction starts inside the five jump bytes: the overwritten instruction is that
+		// long, and its start remains a valid entry.
+		const auto collect_preceding_span = [&]() -> std::optional<RelocationSpan> {
+			const auto site_instruction = function.instructions.find(site);
+			ASSERT(site_instruction != function.instructions.end());
+			if (site_it->second.replacement != InstructionReplacement::ReciprocalSquareRoot) {
+				return std::nullopt;
+			}
+			RelocationSpan span {
+			    .instructions = {&site_instruction->second},
+			    .patch_start  = site,
+			    .continuation = site + site_instruction->second.instruction.length,
+			    .patch_size   = site_instruction->second.instruction.length,
+			};
+			for (auto current = site_instruction; current != function.instructions.begin();) {
+				const auto  previous = std::prev(current);
+				const auto& decoded  = previous->second;
+				// Decoded from the function's entry and contiguous with the next instruction: its
+				// boundaries are those control flow reaches, not a linear sweep's guess.
+				if (previous->first + decoded.instruction.length != current->first ||
+				    previous->first < covered_until ||
+				    module->patched.contains(reinterpret_cast<u8*>(previous->first)) ||
+				    !IsStraightLineInstruction(decoded.instruction) ||
+				    rewrite_sites.contains(previous->first) ||
+				    span.instructions.size() >= 16) {
+					return std::nullopt;
+				}
+				span.instructions.insert(span.instructions.begin(), &decoded);
+				span.patch_start = previous->first;
+				span.patch_size += decoded.instruction.length;
+				if (decoded.instruction.length >= NearJumpSize) {
+					return span;
+				}
+				current = previous;
+			}
+			return std::nullopt;
+		};
+
 		std::optional<RelocationSpan> selected_span;
 		std::optional<size_t>         trampoline_offset;
+		bool                          preceding_jump = false;
 		const auto&                   site_instruction       = function.instructions.at(site);
 		const bool                    can_relocate_neighbors = !function.has_indirect_branch;
 		if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
@@ -1244,6 +1339,16 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				}
 			}
 		}
+		if (!selected_span && !can_relocate_neighbors &&
+		    site_instruction.instruction.length < NearJumpSize && PrecedingJumpEnabled()) {
+			if (auto preceding_span = collect_preceding_span()) {
+				trampoline_offset = emit_span(*preceding_span);
+				if (trampoline_offset) {
+					selected_span  = std::move(preceding_span);
+					preceding_jump = true;
+				}
+			}
+		}
 		if (!selected_span) {
 			unresolved_sites.push_back(site);
 			continue;
@@ -1251,20 +1356,35 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		const auto& span       = *selected_span;
 		const auto* trampoline = module->trampoline_gen.getCode() + *trampoline_offset;
+		// A preceding-jump span overwrites only its first instruction.
+		const size_t overwrite =
+		    preceding_jump ? span.instructions.front()->instruction.length : span.patch_size;
 
 		auto& patch_gen = module->patch_gen;
 		patch_gen.reset();
 		patch_gen.setSize(span.patch_start - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
 		patch_gen.jmp(trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
-		patch_gen.nop(span.patch_size - NearJumpSize);
+		patch_gen.nop(overwrite - NearJumpSize);
 		EXIT_IF(Xbyak::GetError() != 0);
 
 		record_rewrites(span);
+		if (preceding_jump) {
+			// The site stays in place for jumps past the overwritten instruction: trap form, as
+			// TrapUnrelocatedInstructions would leave it (unchanged where trapping is unsafe).
+			const auto& decoded = *span.instructions.back();
+			if (!NeedsTrapRedZoneProtection(decoded)) {
+				MarkInstructionTrap(reinterpret_cast<u8*>(decoded.address), decoded.instruction,
+				                    InstructionReplacement::ReciprocalSquareRoot);
+			}
+			if (!span.trap_replacements) {
+				++result.reciprocal_sqrt_preceding_jump;
+			}
+		}
 		patched_spans.emplace_back(span.patch_start, span.continuation);
-		if (span.patch_size >= NearJumpSize * 2) {
+		if (overwrite >= NearJumpSize * 2) {
 			relay_slots.push_back(span.patch_start + NearJumpSize);
 		}
-		if (span.patch_size >= NearJumpSize + ShortJumpSize) {
+		if (overwrite >= NearJumpSize + ShortJumpSize) {
 			short_relay_slots.push_back(span.patch_start + NearJumpSize);
 		}
 		covered_until = span.continuation;
@@ -1535,6 +1655,10 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 		                                     cpu.has(Xbyak::util::Cpu::tCLWB)};
 	}();
 	return features;
+}
+
+void SetTrappedSiteObserver(TrappedSiteObserver observer) {
+	g_trapped_site_observer.store(observer, std::memory_order_relaxed);
 }
 
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
