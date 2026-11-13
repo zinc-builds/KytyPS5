@@ -1816,11 +1816,11 @@ void RenderExecutor::PrintProxyStats() {
 	}
 	m_proxy_stat_ns = now;
 	const auto& s   = m_proxy_stat;
-	std::printf("PROXY_SKIP boxes=%" PRIu64 " skipped=%" PRIu64 " refused_registers=%" PRIu64
-	            " refused_unknown=%" PRIu64 " refused_writes=%" PRIu64 " verified=%" PRIu64
-	            " combos=%zu\n",
-	            s.boxes, s.skipped, s.refused_registers, s.refused_unknown, s.refused_writes,
-	            s.verified, m_proxy_shaders.size());
+	std::printf("PROXY_SKIP in_query=%" PRIu64 " renders=%" PRIu64 " proxies=%" PRIu64
+	            " skipped=%" PRIu64 " refused_unknown=%" PRIu64 " refused_writes=%" PRIu64
+	            " verified=%" PRIu64 " combos=%zu\n",
+	            s.in_query, s.renders, s.skipped + s.refused_unknown + s.refused_writes, s.skipped,
+	            s.refused_unknown, s.refused_writes, s.verified, m_proxy_shaders.size());
 	std::fflush(stdout);
 }
 

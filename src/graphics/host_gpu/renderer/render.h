@@ -444,9 +444,12 @@ public:
 		return it == m_proxy_shaders.end() ? ProxyShaders::Unknown
 		                                   : it->second ? ProxyShaders::Clean : ProxyShaders::Writes;
 	}
+	// Draws inside an open synthetic query: those that render (they write a target), and those
+	// shaped like a proxy (only the count changes), skipped or refused (shaders not yet seen, or
+	// seen to write memory).
 	struct ProxyStats {
-		uint64_t boxes = 0, skipped = 0, refused_registers = 0, refused_unknown = 0,
-		         refused_writes = 0, verified = 0;
+		uint64_t in_query = 0, renders = 0, skipped = 0, refused_unknown = 0, refused_writes = 0,
+		         verified = 0;
 	};
 	ProxyStats m_proxy_stat; // GPU thread
 	void       PrintProxyStats();

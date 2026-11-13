@@ -1029,9 +1029,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 bool CommandProcessor::SkipOcclusionProxy() {
 	auto& executor = m_renderer.GetRenderExecutor();
 	auto& stat     = executor.m_proxy_stat;
-	stat.boxes++;
+	stat.in_query++;
 	if (!RenderExecutor::ProxyRegisters(m_ctx)) {
-		stat.refused_registers++;
+		stat.renders++;
 		return false;
 	}
 	switch (executor.ProxyShaderClass(RenderExecutor::ProxyShaderKey(m_ctx, m_sh_ctx))) {
@@ -1479,7 +1479,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
-	if (m_renderer.GetRenderExecutor().m_proxy_stat.boxes != 0) {
+	if (m_renderer.GetRenderExecutor().m_proxy_stat.in_query != 0) {
 		m_renderer.GetRenderExecutor().PrintProxyStats();
 	}
 	m_renderer.GetOcclusionQueries().Publish();
