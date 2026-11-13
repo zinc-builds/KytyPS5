@@ -932,15 +932,18 @@ bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 
 bool TryStoreLabelsBacking(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
                            uint32_t stride) {
-	const auto advance = [] {
-		if (Graphics::GuestSyncEpoch::g_stores_ranged) {
+	const bool ranged  = Graphics::GuestSyncEpoch::g_stores_ranged;
+	const auto advance = [ranged] {
+		if (ranged) {
 			Graphics::GuestSyncEpoch::AdvanceRanged();
 		} else {
 			Graphics::GuestSyncEpoch::Advance();
 		}
 	};
 	advance();
-	const bool written = g_guest_address_space->TryStoreLabelsBacking(vaddr, values, elem, count, stride);
+	// A ranged run into an aliased range also advances the unranged epoch, under the lock.
+	const bool written = g_guest_address_space->TryStoreLabelsBacking(vaddr, values, elem, count,
+	                                                                  stride, ranged && AnyGuestAliases());
 	advance();
 	return written;
 }

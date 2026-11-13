@@ -2783,6 +2783,23 @@ void TestAliasedViewsInHazardChecks() {
 		Check(test, *reinterpret_cast<volatile uint64_t*>(va_b + 0x10) == 0x5ca1ab1e0a11a5edull,
 		      "B does not show the bytes stored through A");
 	}
+	// A ranged run of label stores (TryStoreLabelsBacking, WRITE_DATA) through A, prepared from
+	// B: rejected too (the fallback is decided under the backing store's lock).
+	{
+		DP::Log log;
+		log.reads                = {{va_b + 0x300, 8}};
+		const auto     posted    = stamps();
+		const uint64_t words[2]  = {0x1111222233334444ull, 0x5555666677778888ull};
+		const auto     open      = DP::OpenStoredRange(va_a + 0x300, 24);
+		Epoch::g_stores_ranged   = true;
+		const bool     stored    = TryStoreLabelsBacking(va_a + 0x300, words, 8, 2, 16);
+		Epoch::g_stores_ranged   = false;
+		DP::CloseStoredRange(open);
+		Check(test, stored && DP::Adoption(posted, log, clean) == DP::Verdict::Epoch,
+		      "a draw prepared from B was adopted after a ranged label run through A");
+		Check(test, *reinterpret_cast<volatile uint64_t*>(va_b + 0x310) == words[1],
+		      "B does not show the label run stored through A");
+	}
 	// A RangedStore scope over an aliased range is not ranged.
 	{
 		DP::RangedStore store(va_a + 0x20, 4);

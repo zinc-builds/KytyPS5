@@ -480,15 +480,16 @@ public:
 	// one at a time in address order through the backing alias, each as StoreLabel would store
 	// it; one mapping lookup for the run. False (nothing stored) when the run leaves one mapping.
 	bool StoreLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
-	                 uint32_t stride) {
+	                 uint32_t stride, bool ranged = false) {
 		if (count == 0 || (elem != 4 && elem != 8) || stride < elem || (stride % elem) != 0 ||
 		    (vaddr & (elem - 1)) != 0) {
 			return false;
 		}
 		const uint64_t size = uint64_t {count - 1} * stride + elem;
 		LogAliasWrite(vaddr, size);
-		std::shared_lock lock(m_mutex);
-		auto             it = m_maps.upper_bound(vaddr);
+		std::shared_lock   lock(m_mutex);
+		const AliasedStore aliased(*this, ranged, vaddr, size);
+		auto               it = m_maps.upper_bound(vaddr);
 		if (it == m_maps.begin()) {
 			return false;
 		}
@@ -1972,7 +1973,7 @@ public:
 	}
 
 	bool TryStoreLabelsBacking(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
-	                           uint32_t stride) {
+	                           uint32_t stride, bool ranged) {
 		if (count == 0 || stride < elem) {
 			return false;
 		}
@@ -1982,7 +1983,7 @@ public:
 		}
 		std::shared_lock lock(m_mutex);
 		return !OverlapsPrivateUnlocked(vaddr, size) &&
-		       m_backing->StoreLabels(vaddr, values, elem, count, stride);
+		       m_backing->StoreLabels(vaddr, values, elem, count, stride, ranged);
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
