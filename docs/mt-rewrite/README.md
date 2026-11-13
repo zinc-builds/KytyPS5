@@ -75,7 +75,8 @@ tools/fast.sh run ~/Games/PS5/PPSA21567.zar --fullscreen --frame-skip auto
     rounded to float (within about half a float ulp, where the hardware instruction only promises
     1.5·2⁻¹² and AMD and Intel each return their own approximation). It is not AMD's table, but it
     is what every number of record used. Unrelocatable sites trap (~266k/s in Sky Garden, about 3%
-    FPS). Unlike auto, it aborts on a site it cannot patch safely (Windows red zone).
+    FPS). Unlike auto, it aborts on an SSE4a/RDPID/CLWB site it cannot patch safely (Windows red zone);
+    such a VRSQRTPS site is left native in both.
   - **`--no-amd-cpu`:** rewrites nothing.
   - **`KYTY_AMD_SKIP_RSQRT=1`** (experiments only) leaves `VRSQRTPS` at the host's precision: no
     traps, about 3% faster in Sky Garden, but on Intel Sky Aztec crashes near level frame 400 (a

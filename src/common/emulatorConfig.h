@@ -34,7 +34,8 @@ enum class FrameSkipMode { Off, Auto };
 // Auto rewrites the AMD-only instructions CPUID says the host lacks (SSE4a EXTRQ/INSERTQ, RDPID,
 // CLWB) at load, and on a host that is not AMD also VRSQRTPS (its approximation differs from AMD's
 // and game code depends on it); an AMD host that has them all is not patched. On (--amd-cpu)
-// always rewrites VRSQRTPS too, and aborts on a site it cannot patch safely; Off (--no-amd-cpu)
+// always rewrites VRSQRTPS too, and aborts on an SSE4a/RDPID/CLWB site it cannot patch safely
+// (a VRSQRTPS site like that stays native in every mode); Off (--no-amd-cpu)
 // rewrites nothing, and the host traps and emulates each missing instruction.
 enum class AmdCpuMode { Auto, Off, On };
 
