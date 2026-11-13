@@ -264,7 +264,7 @@ def main():
     # Incidents by cause.
     def frame_excess(rec):
         # Every long frame of the incident (a merged stretch has many), else its worst one.
-        if rec.get('lost_ms') is not None:
+        if rec.get('lost_ms'):  # 0 (no frame over 33.4 ms): fall back to the worst frame
             return max(0.0, rec['lost_ms'])
         longs = rec.get('long_frames') or []
         if longs:
