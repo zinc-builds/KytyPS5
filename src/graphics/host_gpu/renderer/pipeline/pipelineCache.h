@@ -170,6 +170,9 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	// A program with GPU-selected calls loaded from the shader store: the serialized resource
+	// plan it was compiled with (the plan depends on the callee code in function_code).
+	std::vector<uint8_t>                         stored_call_plan;
 };
 
 // N trivially copyable elements, left unconstructed until Construct: value-initializing a draw
@@ -335,6 +338,9 @@ private:
 		// A deque, so a module stays where it is while the program compiles more.
 		std::deque<ShaderModule>                        modules;
 		bool                                            skip_dispatch = false;
+		// Loaded from the shader store with GPU-selected calls: call_source is rebuilt from the
+		// guest code at the first lookup on the command thread, before any module is used.
+		bool                                            stored_calls  = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
@@ -456,6 +462,8 @@ private:
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();
+// `base` with a suffix for the device and code-changing switches: one store per combination.
+std::filesystem::path VariantStorePath(const GraphicContext& graphics, const std::filesystem::path& base);
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 

@@ -43,7 +43,7 @@ struct Frame {
 };
 
 // Bump to discard every existing store by hand (a change the source hash cannot see).
-constexpr uint32_t kShaderStoreFormat = 1;
+constexpr uint32_t kShaderStoreFormat = 2; // 2: module records carry their callee code
 
 // KYTY_SHADER_CACHE_STAMP=N (N > 0) replaces the source hash with N: a manual key, to keep a store
 // across a source change known not to alter what it records, or to discard one by changing N.
@@ -73,6 +73,22 @@ uint64_t ManualStamp() {
 //    memory limit, the host subgroup sizes, the buffer cache's page table geometry and the DMA
 //    address translation constants, masked selects
 //    and KYTY_BDA_STATS=access (instrumented DMA shaders).
+// The part of the header a player can change without rebuilding: the device and the switches
+// that change generated code. Each combination gets its own store file (VariantStorePath), so
+// turning KYTY_RESIDENT_TEXTURES (in the SPIR-V profile) or another switch on and off keeps a
+// warm store for each instead of discarding one store every time.
+std::vector<uint8_t> VariantKey(const GraphicContext& graphics) {
+	Writer         key;
+	const auto&    properties     = graphics.GetPhysicalDeviceProperties();
+	const uint32_t bda_access     = MemDiag::BdaStatsMode() == 2 ? 1u : 0u;
+	const uint32_t masked_selects = ShaderRecompiler::MaskedSelectsEnabled() ? 1u : 0u;
+	const uint32_t wave64         = graphics.SupportsComputeWave64() ? 1u : 0u;
+	IoAll(key, properties.vendorID, properties.deviceID, SpirvProfile(graphics),
+	      properties.limits.maxComputeSharedMemorySize, graphics.subgroup_size, wave64,
+	      masked_selects, bda_access);
+	return std::move(key.bytes);
+}
+
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	Writer      header;
 	const auto& properties = graphics.GetPhysicalDeviceProperties();
@@ -101,13 +117,23 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 }
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
-	// The handle comes from the SPIR-V; stored programs have no function code.
+	// The handle comes from the SPIR-V. function_code is the callee code a program with
+	// GPU-selected calls was linked against (empty without calls).
 	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
+	       mesh_task, stored_call_plan] = stage;
+	IoAll(io, id, info, specialization, function_code, vertex_formats, rect_parameters, mesh_task);
 }
 
 } // namespace
+
+std::filesystem::path VariantStorePath(const GraphicContext& graphics,
+                                       const std::filesystem::path& base) {
+	const auto key = VariantKey(graphics);
+	auto       name = base.stem();
+	name += fmt::format(".{:016x}", XXH3_64bits(key.data(), key.size()));
+	name += base.extension();
+	return base.parent_path() / name;
+}
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
                              uint64_t kept) {
@@ -255,11 +281,21 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			if (!complete()) {
 				return false;
 			}
+			const bool calls = !module.function_code.empty();
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
 			if (inserted &&
 			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
 				m_program_cache.erase(program);
 				return false;
+			}
+			if (calls != program->second.stored_calls && !inserted) {
+				return false; // one program's records disagree on whether it has calls
+			}
+			if (calls) {
+				// Its plan follows the callee code: PipelineCache::GetProgram picks the record that
+				// matches the callees' current code after relinking.
+				program->second.stored_calls = true;
+				module.stored_call_plan      = std::move(plan);
 			}
 			VulkanDiagnostics::DumpSpirv(ShaderRecompiler::StageName(program->first.stage),
 			                             program->first.hash, module.id, spirv);

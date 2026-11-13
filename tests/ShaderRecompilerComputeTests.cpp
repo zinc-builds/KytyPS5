@@ -50375,6 +50375,101 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// A program with a GPU-selected call is stored with the callee code it was linked against: a
+// restart reuses it while the callee is unchanged and compiles again when the callee differs.
+void CheckShaderStoreCalls(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderStoreCalls";
+  constexpr uintptr_t base = 0x0000000205800000ull;
+  constexpr uint64_t size = 0x10000;
+  constexpr auto table = base + 0x100;
+  constexpr auto leaf_address = base + 0x1000;
+  constexpr auto output = base + 0x4000;
+  // As ScalarLeafCall: load the function pointer at table + 0x20, call it, store s20.
+  static const std::vector<u32> code = [] {
+    std::vector<u32> words{
+        EncodeSMovB32(20, InlineU32(0)),
+        0xbeea03ffu, static_cast<u32>(base), 0xbeeb03ffu, static_cast<u32>(base >> 32u),
+        0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u,
+        0xbf8cc07fu, 0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u,
+        0xbf8cc07fu, 0xbe8e210eu, EncodeVop1(0x01, 1, 20),
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&words);
+    return words;
+  }();
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  int64_t physical = -1;
+  Require(name, "allocate",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+          "call fixture allocation failed");
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "map",
+          LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, physical, size) == 0 &&
+              mapped == reinterpret_cast<void *>(base),
+          "call fixture mapping failed");
+  const auto store = std::filesystem::temp_directory_path() /
+                     fmt::format("kyty_shader_store_calls_{}",
+                                 std::chrono::steady_clock::now().time_since_epoch().count()) /
+                     "TEST00001.shaders";
+  // One run: the leaf returns `value` in s20; reports the result and the compute compiles.
+  const auto run = [&](u32 value) {
+    std::memset(mapped, 0, size);
+    const ShaderBufferResource table_desc{{static_cast<u32>(table),
+        static_cast<u32>(table >> 32u) | (16u << 16u), 8, 0x5204u}};
+    LibKernel::Memory::WriteBacking(base, table_desc.fields, sizeof(table_desc.fields));
+    const uint64_t target = leaf_address | 3u;
+    LibKernel::Memory::WriteBacking(table + 0x20, &target, sizeof(target));
+    const std::array leaf{EncodeSMovB32(20, 255), value, EncodeSop1(0x21, 125, 14)};
+    LibKernel::Memory::WriteBacking(leaf_address, leaf.data(), sizeof(leaf));
+    RenderContext context(vulkan.RuntimeContext(), store);
+    u32 actual = 0;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] = DstSel(4, 5, 6, 7) |
+                      (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(i, out.fields[i]);
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      context.GetBufferCache().ReadMemory(output, sizeof(u32));
+      (void)LibKernel::Memory::TryReadBacking(output, &actual, sizeof(actual));
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    const auto compiled =
+        PipelineCacheTestAccess::Compiled(context.GetPipelineCache())[static_cast<size_t>(ShaderType::Compute)];
+    return std::pair{actual, compiled};
+  };
+  Require(name, "cold", run(41) == std::pair<u32, uint32_t>{41, 1},
+          "the first run did not compile and run the call program");
+  Require(name, "warm restart", run(41) == std::pair<u32, uint32_t>{41, 0},
+          "a restart with the same callee compiled the call program again");
+  Require(name, "changed callee", run(73) == std::pair<u32, uint32_t>{73, 1},
+          "a restart with different callee code reused a module linked against the old code");
+  Require(name, "both callees stored", run(41) == std::pair<u32, uint32_t>{41, 0} &&
+                                           run(73) == std::pair<u32, uint32_t>{73, 0},
+          "a stored module for either callee was not reused");
+  std::filesystem::remove_all(store.parent_path());
+  Require(name, "release",
+          LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+              LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+          "call fixture release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -56555,6 +56650,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
     VulkanHarness vulkan;
     CheckShaderStore(vulkan);
+    CheckShaderStoreCalls(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
@@ -57852,6 +57948,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
+  CheckShaderStoreCalls(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();
