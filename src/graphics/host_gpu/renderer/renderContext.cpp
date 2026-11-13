@@ -800,6 +800,7 @@ bool RenderContext::TakeAsyncWrites(uint64_t begin, uint64_t end) {
 		m_page_manager.AppendWriteWatched(run_begin, run_end, watched);
 	}
 	const bool observe = ObserveCollectEnabled() && AsyncCollectRequested();
+	const BufferCache::CollectionScope collection; // KYTY_OWNERSHIP_TAKE=verify judges these merges
 	for (const auto& [run_begin, run_end]: watched) {
 		// As CollectAsyncWrites: the same work as a write fault on each page.
 		MemDiag::Add(MemDiag::AsyncInvalidatedPages, (run_end - run_begin) / TRACKER_PAGE_SIZE);
@@ -949,6 +950,7 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool r
 		std::sort(drop.begin(), drop.end());
 		g_observe.dropped += drop.size();
 	}
+	const BufferCache::CollectionScope collection; // KYTY_OWNERSHIP_TAKE=verify judges these merges
 	for (const auto& [begin, end]: watched) {
 		// The same work as a write fault on each page (HandleFault).
 		MemDiag::Add(MemDiag::AsyncInvalidatedPages, (end - begin) / TRACKER_PAGE_SIZE);

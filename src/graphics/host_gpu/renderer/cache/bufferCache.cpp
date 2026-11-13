@@ -934,7 +934,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				}
 				if (is_write && GuestGpu::IsGpuThread()) {
 					Common::FrameDiag::Add(Common::FrameDiag::Counter::CollisionReadbacks);
-					if (OwnershipTakeVerify()) {
+					if (OwnershipTakeVerify() && t_in_collection) {
 						VerifyMergeIsNoOp(buffer, vaddr, size);
 					}
 				}
