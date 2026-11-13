@@ -470,6 +470,43 @@ public:
 		return true;
 	}
 
+	// count values of elem bytes (4 or 8, naturally aligned) at vaddr, vaddr + stride, ..., stored
+	// one at a time in address order through the backing alias, each as StoreLabel would store
+	// it; one mapping lookup for the run. False (nothing stored) when the run leaves one mapping.
+	bool StoreLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
+	                 uint32_t stride) {
+		if (count == 0 || (elem != 4 && elem != 8) || stride < elem || (stride % elem) != 0 ||
+		    (vaddr & (elem - 1)) != 0) {
+			return false;
+		}
+		const uint64_t size = uint64_t {count - 1} * stride + elem;
+		LogAliasWrite(vaddr, size);
+		std::shared_lock lock(m_mutex);
+		auto             it = m_maps.upper_bound(vaddr);
+		if (it == m_maps.begin()) {
+			return false;
+		}
+		--it;
+		const auto& entry = it->second;
+		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) {
+			return false;
+		}
+		auto* target = m_backing_base + (entry.backing_offset + vaddr - entry.vaddr);
+		const auto* src = static_cast<const uint8_t*>(values);
+		for (uint32_t i = 0; i < count; i++, target += stride, src += elem) {
+			if (elem == 4) {
+				uint32_t v = 0;
+				std::memcpy(&v, src, 4);
+				*reinterpret_cast<volatile uint32_t*>(target) = v;
+			} else {
+				uint64_t v = 0;
+				std::memcpy(&v, src, 8);
+				*reinterpret_cast<volatile uint64_t*>(target) = v;
+			}
+		}
+		return true;
+	}
+
 	// Fills [vaddr, vaddr + size) with a 32-bit value through the backing alias (as the guest
 	// mapping's std::fill did).
 	// False (nothing written) unless backing mappings hold all of it.
@@ -954,7 +991,9 @@ public:
 	}
 
 	// Whether no guest view has stored to the page since ProtectAsyncPage gave the token.
-	[[nodiscard]] bool AsyncPageUntouched(uint64_t page, uint64_t token) {
+	// stale (optional): set when the answer is no because the token is no longer the page's
+	// current one (another page took its slot, or the floor rose), not because of a store.
+	[[nodiscard]] bool AsyncPageUntouched(uint64_t page, uint64_t token, bool* stale = nullptr) {
 		std::unique_lock<std::mutex> serial;
 		if (SerialSubmitScans()) {
 			serial = std::unique_lock(m_submit_scan_mutex);
@@ -967,6 +1006,9 @@ public:
 		std::lock_guard kept_lock(m_kept_mutex);
 		const auto&     slot = m_page_seq[(page >> 12u) % m_page_seq.size()];
 		if (slot.page != page || slot.seq != token || token <= m_seq_floor) {
+			if (stale != nullptr) {
+				*stale = true;
+			}
 			return false;
 		}
 		bool written = false;
@@ -1713,6 +1755,20 @@ public:
 		}
 		std::shared_lock lock(m_mutex);
 		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->StoreLabel(vaddr, value, size);
+	}
+
+	bool TryStoreLabelsBacking(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
+	                           uint32_t stride) {
+		if (count == 0 || stride < elem) {
+			return false;
+		}
+		const uint64_t size = uint64_t {count - 1} * stride + elem;
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) &&
+		       m_backing->StoreLabels(vaddr, values, elem, count, stride);
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)

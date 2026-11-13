@@ -920,6 +920,21 @@ bool TryStoreLabelBacking(uint64_t vaddr, uint64_t value, uint64_t size) {
 	return written;
 }
 
+bool TryStoreLabelsBacking(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
+                           uint32_t stride) {
+	const auto advance = [] {
+		if (Graphics::GuestSyncEpoch::g_stores_ranged) {
+			Graphics::GuestSyncEpoch::AdvanceRanged();
+		} else {
+			Graphics::GuestSyncEpoch::Advance();
+		}
+	};
+	advance();
+	const bool written = g_guest_address_space->TryStoreLabelsBacking(vaddr, values, elem, count, stride);
+	advance();
+	return written;
+}
+
 bool TryFillBacking(uint64_t vaddr, uint64_t size, uint32_t value) {
 	Graphics::GuestSyncEpoch::Advance();
 	const bool written = g_guest_address_space->TryFillBacking(vaddr, size, value);
@@ -1250,13 +1265,14 @@ uint64_t GuestRemapGeneration() noexcept {
 	return g_remap_generation.load(std::memory_order_relaxed);
 }
 
-bool AsyncGuestPageUntouched(uint64_t page, uint64_t token) {
+bool AsyncGuestPageUntouched(uint64_t page, uint64_t token, bool* stale) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->Backing().AsyncPageUntouched(page, token);
+	       g_guest_address_space->Backing().AsyncPageUntouched(page, token, stale);
 #else
 	(void)page;
 	(void)token;
+	(void)stale;
 	return false;
 #endif
 }

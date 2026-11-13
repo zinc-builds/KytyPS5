@@ -939,6 +939,173 @@ bool RenderContext::StoreCpLabel(uint64_t vaddr, const void* value, uint64_t siz
 	return true;
 }
 
+namespace {
+
+enum class WriteDataMode { PerDword, Ranged, Verify };
+
+WriteDataMode ReadWriteDataMode() {
+	const char* value = std::getenv("KYTY_WRITE_DATA_RANGED");
+	if (value == nullptr) {
+		return WriteDataMode::Ranged;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return WriteDataMode::Verify;
+	}
+	return value[0] == '0' ? WriteDataMode::PerDword : WriteDataMode::Ranged;
+}
+
+WriteDataMode GetWriteDataMode() {
+	static const WriteDataMode mode = ReadWriteDataMode();
+	return mode;
+}
+
+// KYTY_WRITE_DATA_RANGED=verify: what the comparisons found (GPU thread only).
+struct WriteDataVerify {
+	uint64_t runs        = 0;
+	uint64_t elems       = 0;
+	uint64_t raced       = 0; // the guest stored to the page meanwhile, or it was remapped
+	uint64_t voided      = 0; // the per-dword store got a newer token: the ranged one was voided
+	                          // meanwhile (another page took its token slot, or a collection
+	                          // raised the floor); a voided token only fails IsCpLabel
+	uint64_t ranged_inv  = 0; // bytes the ranged store invalidated
+	uint64_t dword_inv   = 0; // bytes the per-element stores invalidate
+	uint64_t last_report = 0;
+};
+WriteDataVerify g_wd_verify;
+
+} // namespace
+
+bool RenderContext::WriteDataRanged() noexcept {
+	return GetWriteDataMode() != WriteDataMode::PerDword;
+}
+
+bool RenderContext::StoreCpLabels(uint64_t vaddr, const void* values, uint32_t elem, uint32_t count,
+                                  uint32_t stride, bool invalidate) {
+	EXIT_IF(g_on_decode_thread); // GPU thread only (sync packets)
+	if (count == 0 || (elem != 4 && elem != 8) || stride < elem) {
+		return false;
+	}
+	const auto     page = vaddr & ~uint64_t {0xfff};
+	const uint64_t span = uint64_t {count - 1} * stride + elem;
+	if (((vaddr + span - 1) & ~uint64_t {0xfff}) != page) {
+		return false;
+	}
+	Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::LabelStore);
+	// Read first: a remap after this read voids the labels.
+	const auto generation = LibKernel::Memory::GuestRemapGeneration();
+	uint64_t   token      = 0;
+	if (!LibKernel::Memory::ProtectAsyncGuestPage(page, token)) {
+		LibKernel::Memory::RequestAsyncWriteTracking(vaddr);
+		return false;
+	}
+	// All or nothing: it fails before storing anything.
+	if (!LibKernel::Memory::TryStoreLabelsBacking(vaddr, values, elem, count, stride)) {
+		return false;
+	}
+	uint64_t invalidated = 0;
+	if (invalidate) {
+		if (stride == elem) {
+			(void)InvalidateMemory(vaddr, span);
+			invalidated = span;
+		} else {
+			for (uint32_t i = 0; i < count; i++) {
+				(void)InvalidateMemory(vaddr + uint64_t {i} * stride, elem);
+				invalidated += elem;
+			}
+		}
+	}
+	const auto* bytes = static_cast<const uint8_t*>(values);
+	for (uint32_t i = 0; i < count; i++) {
+		const uint64_t at     = vaddr + uint64_t {i} * stride;
+		uint64_t       stored = 0;
+		std::memcpy(&stored, bytes + uint64_t {i} * elem, elem);
+		m_cp_labels[(at >> 2u) % m_cp_labels.size()] = {at, stored, elem, generation, token};
+		if (elem == sizeof(uint64_t)) {
+			m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()] = {at + 4, stored >> 32u, 4,
+			                                                       generation, token};
+		}
+	}
+	if (GetWriteDataMode() == WriteDataMode::Verify) {
+		VerifyCpLabels(vaddr, values, elem, count, stride, invalidate, token, invalidated);
+	}
+	return true;
+}
+
+// KYTY_WRITE_DATA_RANGED=verify, after StoreCpLabels stored [vaddr, ...): runs StoreCpLabel for
+// each value as the per-dword path would have, then checks that it left the label slots as the
+// ranged store did (address, value, size, remap generation, token), that the guest reads the
+// values back, and that both invalidated the same bytes. When the guest stored to the page
+// meanwhile, or remapped, (a race the guest owns) nothing is compared or stored again (so as not
+// to overwrite the guest's store): counted apart, not a failure.
+void RenderContext::VerifyCpLabels(uint64_t vaddr, const void* values, uint32_t elem,
+                                   uint32_t count, uint32_t stride, bool invalidate,
+                                   uint64_t token, uint64_t invalidated) {
+	static const bool scan_skip = [] {
+		const char* value = std::getenv("KYTY_LABEL_SCAN_SKIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	const auto page      = vaddr & ~uint64_t {0xfff};
+	const auto  generation = m_cp_labels[(vaddr >> 2u) % m_cp_labels.size()].generation;
+	const bool  untouched  = LibKernel::Memory::AsyncGuestPageUntouched(page, token) &&
+	                       LibKernel::Memory::GuestRemapGeneration() == generation;
+	const auto* bytes      = static_cast<const uint8_t*>(values);
+	auto&       v          = g_wd_verify;
+	v.runs++;
+	v.elems += count;
+	v.raced += untouched ? 0 : 1;
+	for (uint32_t i = 0; untouched && i < count; i++) {
+		const uint64_t at       = vaddr + uint64_t {i} * stride;
+		const auto     ranged   = m_cp_labels[(at >> 2u) % m_cp_labels.size()];
+		const auto     ranged_hi = m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()];
+		uint64_t       expected = 0;
+		std::memcpy(&expected, bytes + uint64_t {i} * elem, elem);
+		uint64_t seen = 0;
+		std::memcpy(&seen, reinterpret_cast<const void*>(at), elem);
+		if (!StoreCpLabel(at, bytes + uint64_t {i} * elem, elem, invalidate)) {
+			EXIT("WDVERIFY FAIL: the per-dword store of 0x%016" PRIx64 " failed after the ranged one\n", at);
+		}
+		v.dword_inv += invalidate ? elem : 0;
+		const auto dword    = m_cp_labels[(at >> 2u) % m_cp_labels.size()];
+		const auto dword_hi = m_cp_labels[((at + 4) >> 2u) % m_cp_labels.size()];
+		// Tokens: equal, or the per-dword one newer (the ranged token voided since, which only
+		// makes waiters on it collect). KYTY_LABEL_SCAN_SKIP=0 makes a new token per protection.
+		const auto same = [&](const CpLabel& a, const CpLabel& b) {
+			if (a.vaddr != b.vaddr || a.value != b.value || a.size != b.size || a.generation != b.generation) {
+				return false;
+			}
+			if (a.token != b.token && scan_skip) {
+				v.voided += b.token > a.token ? 1 : 0;
+				return b.token > a.token;
+			}
+			return true;
+		};
+		if (seen != expected || !same(ranged, dword) || (elem == 8 && !same(ranged_hi, dword_hi))) {
+			EXIT("WDVERIFY FAIL: 0x%016" PRIx64 " guest reads 0x%" PRIx64 " (stored 0x%" PRIx64
+			     "), ranged label {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64 " gen %" PRIu64 " token %" PRIu64
+			     "}, per-dword {0x%" PRIx64 " 0x%" PRIx64 " %" PRIu64 " gen %" PRIu64 " token %" PRIu64
+			     "}, page untouched %d\n",
+			     at, seen, expected, ranged.vaddr, ranged.value, ranged.size, ranged.generation,
+			     ranged.token, dword.vaddr, dword.value, dword.size, dword.generation, dword.token,
+			     untouched ? 1 : 0);
+		}
+	}
+	if (untouched) {
+		v.ranged_inv += invalidated;
+	}
+	if (v.ranged_inv != v.dword_inv) {
+		EXIT("WDVERIFY FAIL: the ranged stores invalidated %" PRIu64 " bytes, per-dword %" PRIu64 "\n",
+		     v.ranged_inv, v.dword_inv);
+	}
+	const auto now = Common::FrameDiag::NowNs();
+	if (now - v.last_report >= 1'000'000'000ull) {
+		std::printf("WDVERIFY runs=%" PRIu64 " elems=%" PRIu64 " raced=%" PRIu64 " voided=%" PRIu64
+		            " inv_b=%" PRIu64 " fail=0\n",
+		            v.runs, v.elems, v.raced, v.voided, v.ranged_inv);
+		std::fflush(stdout);
+		v.last_report = now;
+	}
+}
+
 void RenderContext::PrepareBda() {
 	KYTY_PROFILER_FUNCTION();
 	std::shared_lock lock(m_mapped_ranges_mutex);

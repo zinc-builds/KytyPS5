@@ -33,6 +33,11 @@ enum class Counter {
 	CmdIdleNs,
 	CmdBlocks,    // the command thread waited with only blocked submissions queued
 	CmdBlockedNs,
+	WriteDatas,   // CommandProcessor::WriteData packets
+	WriteDataNs,
+	WriteDataDwords,
+	LabelStale,   // IsCpLabel: the label matched but its token was voided (the wait collects)
+	LabelWritten, // IsCpLabel: the label matched but the guest stored to its page
 	Count
 };
 
