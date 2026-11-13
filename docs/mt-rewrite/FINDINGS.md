@@ -1954,8 +1954,9 @@ Those frames also take ~450–640 command-thread minor faults against ~15 in oth
 **Question.** Do the 50–700 ms frames left after the GC revert (#128) come from VRAM pressure, meaning the texture collector evicting images and then re-uploading them? Would a bigger or smaller budget help?
 
 **Answer.** Evictions and re-creations of evicted images don't explain most of the measured hitches.
-- The slow frames that aren't occlusion-burst frames carry large texture uploads (50–2,088 MiB in one frame).
-- Only a few of them fall near an eviction or a re-creation. The exceptions are listed below.
+- Some of the slow frames that aren't occlusion-burst frames carry large texture uploads (50–2,088 MiB in one frame), including the largest ones measured.
+- Others are unattributed, among them 49 of final_stage's 76 slow frames, which uploaded under 40 MiB.
+- Only a few slow frames fall near an eviction or a re-creation. The exceptions are listed below.
 - In single runs, a ±1,600 MiB budget shift gave no consistent hitch improvement.
 - The lever to look at is the upload path: copy cost and lead time. These uploads count every image refreshed in the frame (`tex_up_b`), not only first uploads. Which are first uploads is measured separately (TEXIMG, see the upload plan).
 
@@ -1969,6 +1970,7 @@ Those frames also take ~450–640 command-thread minor faults against ~15 in oth
   - A line is printed at the start of a tick, before that tick's collection.
   - `KYTY_VRAM_BUDGET_DELTA_MB` shifts the budget the thresholds come from (MiB).
 - **Runs.** levels.sh frames 0-3000 with `KYTY_FRAME_DIAG=1`, one run per level and setting. Outside load was checked and no run was void.
+- **Analysed interval.** The analysis covers the whole log after the level start, which runs a few frames past 3000 because the run ends after the window. Cutting at frame 3000 gives slightly lower counts: final_stage 70 slow frames instead of 76, Ninja Castle 26 instead of 27.
 - **Matching.** Frames over 50 ms (level-load frames excluded, as hitches.py does) are matched to the VRAM lines from the frame's start to 50 ms after its end. That window is approximate: a line's counters cover the interval since the previous line. "Near" below means inside that window.
 
 **Budget and thresholds.**
@@ -1988,9 +1990,9 @@ Those frames also take ~450–640 command-thread minor faults against ~15 in oth
 - above pressure, up to 20 candidates aged 80 ticks or more;
 - below pressure, up to 10 candidates aged 16 ticks or more.
 
-If usage is still critical, an aggressive pass follows: up to 40 candidates aged 160 ticks or more. Skipped candidates count against those limits: resident heap references, depth images, GPU-modified images that are safe to keep.
+If usage is still critical, an aggressive pass follows: up to 40 candidates aged 160 ticks or more. Skipped candidates count against those limits: images with resident heap references, stencil associations attached to depth owners (freed with their owner), and GPU-modified images that are safe to keep.
 
-**Reading.** On the four levels other than final_stage, usage sits above "critical" ~90–96% of the time, yet few images are evicted. A likely reason is that most of that usage isn't eligible images: buffers, rings, the resident heap, render targets, recently used images. That is a hypothesis; these runs don't break usage down by resource. It would also explain the "set point" seen across runs (9.7–12.2 GB peaks, nearly regardless of level).
+**Reading.** On the four levels other than final_stage, usage is above "critical" at ~90–96% of sampled GC ticks, yet few images are evicted. A likely reason is that most of that usage isn't eligible images: buffers, rings, the resident heap, render targets, recently used images. That is a hypothesis; these runs don't break usage down by resource. It would also explain why peak usage across runs looks like a set point, nearly regardless of level.
 
 **Evictions, re-creations, and slow frames.**
 
@@ -2002,11 +2004,11 @@ If usage is still critical, an aggressive pass follows: up to 40 candidates aged
 | Clock Tower | 0 / 1 / 83 (1.48/s, 324) | 2, 0 MiB (2 / 0 / 0) | 18 (5) | 13 / 2 / 1 |
 | final_stage | 0 / 465 / 0 (7.98/s, 1,412) | 107, 272 MiB (23 / 60 / 24) | 76 (7) | 27 / 4 / 5 |
 
-- **Worst frames.** All are large uploads:
+- **Worst frames.** The largest measured frames coincide with large uploads; these counters alone don't establish the cause:
   - 302 ms for ~2.0 GiB (Pirate Island, level frame 300);
   - 262 ms for ~1.7 GiB (Sky Garden, frame 192);
   - 708 ms for ~2.0 GiB (final_stage, frame 1334).
-- **Slow frames without an upload.** On Ninja Castle and Pirate Island these are the occlusion-query burst frames. final_stage's are not attributed.
+- **Slow frames without a large upload.** On Ninja Castle and Pirate Island these are the occlusion-query burst frames. final_stage's 49 are not attributed: for example, frame 439 took 62 ms with 2 KiB uploaded and 697 draws.
 - **Exceptions.**
   - Eviction near a slow frame: Sky Garden 1, Ninja Castle 1, Clock Tower 2, final_stage 4.
   - Re-creation near a slow frame: Clock Tower 1, final_stage 5. final_stage's worst is frame 1531: 42 images, 120 MiB, in a 58 ms frame.
@@ -2024,12 +2026,12 @@ If usage is still critical, an aggressive pass follows: up to 40 candidates aged
 
 - Raising the budget almost stopped Sky Garden's evictions (0.53 → 0.03/s) without fewer slow frames there.
 - It cut Ninja Castle's slow frames from 27 to 19 (over 100 ms: 3 / 3 / 3). That needs repeats before it means anything.
-- Lowering the budget changed neither level's slow-frame counts or eviction rate.
+- Lowering the budget: Sky Garden's slow frames went 6 → 7 and its evictions 0.53 → 0.54/s; Ninja Castle's slow frames stayed at 27 and its evictions went 0.23 → 0.27/s.
 - Re-creations stayed at 0–2 everywhere.
 
 **What follows.**
 1. **The collector's pressure measure.** It reads "critical" most of the time on four levels while finding little to evict. Before changing it, measure what the device-local usage is made of: image bytes against the rest. Candidates are judging pressure on evictable image bytes, or on usage minus a non-evictable floor. final_stage's re-creations call for a ghost list of recently evicted keys. Both changes go behind a switch (Track K).
-2. **The large texture uploads** are the largest hitch a player feels. They belong to the upload path (copy cost, lead time), measured separately.
+2. **The large texture uploads** coincide with the largest measured frames. They are examined on the upload path (copy cost, lead time), measured separately.
 3. **The ~636 burst-frame minor faults per frame on Ninja Castle** are not glibc heap trimming. With `GLIBC_TUNABLES` trim and mmap thresholds of 1 GiB and top_pad of 256 MiB, they went 635 → 636 per burst frame; the emulator uses glibc malloc. Fault addresses are next.
 
 ### Commit-side prefetch: early hand-off lines don't buy cycles (Track R, 2026-11-12)
