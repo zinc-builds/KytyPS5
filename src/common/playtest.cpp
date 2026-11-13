@@ -1324,12 +1324,17 @@ private:
 			std::string others;
 			int         listed = 0;
 			uint64_t    prev   = 0;
+			double      lost   = 0; // every long frame's time over one refresh (the list is capped)
 			out += ",\"long_frames\":[";
 			for (const auto* f: window) {
 				const auto from = prev;
 				prev            = f->d.t_ns;
 				if (f->ms <= 33.4 || f->d.t_ns < open_ns - std::min<uint64_t>(open_ns, 1'000'000'000ull) ||
-				    f->d.t_ns > last_ns + 100'000'000ull || listed == 30) {
+				    f->d.t_ns > last_ns + 100'000'000ull) {
+					continue;
+				}
+				lost += f->ms - 1000.0 / 60.0;
+				if (listed == 30) {
 					continue;
 				}
 				const auto fc  = Attribute(window, *f, from);
@@ -1341,7 +1346,7 @@ private:
 				}
 				listed++;
 			}
-			out += "]";
+			out += fmt::format("],\"lost_ms\":{:.2f}", lost);
 			if (!others.empty()) {
 				summary += "; other long frames: " + others;
 			}

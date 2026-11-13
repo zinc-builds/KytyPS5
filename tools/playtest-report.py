@@ -176,10 +176,8 @@ def main():
     if frames:
         first, last = int(frames[0]['t']), int(frames[-1]['t'])
         next_load = {}
-        nxt = None
-        for f in reversed(frames):
-            nxt = f.get('load', 0)
-            next_load.setdefault(int(f['t']), nxt)
+        for f in frames:  # an occupied second takes its first frame's phase
+            next_load.setdefault(int(f['t']), f.get('load', 0))
         carry = 0
         for sec in range(last, first - 1, -1):
             carry = next_load.get(sec, carry)
@@ -266,6 +264,8 @@ def main():
     # Incidents by cause.
     def frame_excess(rec):
         # Every long frame of the incident (a merged stretch has many), else its worst one.
+        if rec.get('lost_ms') is not None:
+            return max(0.0, rec['lost_ms'])
         longs = rec.get('long_frames') or []
         if longs:
             return sum(max(0.0, f['ms'] - REFRESH_MS) for f in longs)
