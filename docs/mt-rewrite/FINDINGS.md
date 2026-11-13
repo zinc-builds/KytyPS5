@@ -2204,6 +2204,127 @@ efficiency cores changes the game's pace from batch to batch, so only arms of on
 - **The 2 s spike frames** (the host's fan-control daemon on the command thread's SMT sibling) are
   included in the numbers of record; the bracketed share leaves them out.
 
+### Outside load: what it costs and what doesn't recover it (Track R, 2026-11-13)
+
+**Question.** Ten agent sessions share this machine (Intel i5-14600K: CPUs 0–11 are six
+performance cores with two SMT threads each, 12–19 are efficiency cores). Is a slow heavy-level
+run the game or the neighbours, and can the emulator tolerate ordinary background load?
+
+**Setup.**
+- Sky Aztec, PGO build of `dev` 6e90b1d3 plus two env switches that are off unless set
+  (`KYTY_USLEEP0`, `KYTY_RECORDER_SPIN_US`; neither was set). This was before the VRSQRTPS fix
+  (#139).
+- Frames 1000–3000, `KYTY_FRAME_DIAG=1`, every log checked for `StartLevel sky_aztec`.
+- Synthetic load ran as unpinned processes in their own user scope (cgroup):
+  - light: 4 tasks at 10% duty, ~0.5 CPU;
+  - heavy: 8 tasks at 60% duty, ~4.8 CPUs.
+
+**Terms.**
+- SMT: the two hardware threads of one performance core, which share its execution units.
+- `tbb`: the game's 11-thread job pool (`tbb_thead`).
+- "CPUs" as a unit means CPU-equivalents (100% of one logical CPU = 1).
+- cmd CPU and cmd run queue: the command thread's CPU time and its run-queue delay, both in
+  ms per guest frame.
+
+| arm × load | runs | FPS | cmd CPU | cmd run queue | prepare / recorder wait ms/frame | no guest work ms/frame | presented 2+ refreshes |
+|---|---|---|---|---|---|---|---|
+| default × none | 5 | 59.0–59.5 | 14.4–14.8 | 0.01–0.03 | 0.74–1.11 / 0.11–0.15 | 1.25–1.99 | 1.2–2.5% |
+| default × light | 1 | 59.2 | 14.79 | 0.02 | 0.66 / 0.14 | 1.76 | 1.9% |
+| default × heavy | 2 | 51.9–52.6 | 18.56–18.77 | 0.12–0.15 | 1.18–1.21 / 0.67 | 0.08–0.17 | 14.1–15.7% |
+| default, emulator scope at `CPUWeight=1000` × heavy | 2 | 51.8–51.9 | 18.85–18.86 | 0.11–0.15 | 1.16 / 0.62–0.68 | 0.06–0.07 | 15.3–15.7% |
+| command, prepare and recorder threads at `SCHED_RR` 1 × none | 1 | 59.1 | 14.25 | 0.00 | 0.67 / 0.11 | 2.58 | 1.8% |
+| the same × heavy | 1 | 51.2 | 18.15 | 0.03 | 0.68 / 0.12 | 1.13 | 17.3% |
+| recorder on CPU 11 (`KYTY_RECORDER_CPU=11`) × none | 1 | 60.0 | 15.94 | 0.00 | 0.45 / 0.14 | 0.02 | 0.1% |
+| the same × heavy | 1 | 51.9 | 18.39 | 0.26 | 1.48 / 0.21 | 0.50 | 15.6% |
+| core-scheduling cookie (`PR_SCHED_CORE`) × heavy | 1 | 33.6 | 22.50 | 5.15 | 9.22 / 1.53 | 0.06 | 66% |
+
+**Light load.** The single light-load run showed no observed degradation: the prepare wait was
+below the quiet-run range, and the other metrics were within it.
+
+**Heavy load.** The dominant measured cost is increased command-thread CPU time, consistent with
+SMT contention.
+- The game's threads already filled the efficiency cores, so the load landed on the performance
+  cores, including the idle SMT siblings of our pinned threads. CPU 11, the command thread's
+  sibling, went from 5% to 60% busy, and CPU 9, the sibling of prepare worker 8, likewise.
+- The command thread then needed +26–31% CPU for the same frame (14.4–14.8 → 18.6–18.9 ms). The
+  recorder wait rose about 5× (0.11–0.15 → 0.62–0.68 ms) and the prepare wait about +10–60%.
+- The run-queue delay also rose (0.01–0.03 → 0.11–0.15 ms) but is small next to the CPU-time
+  increase.
+- No-guest-work time fell because the emulator, not the game, became the late side.
+
+**None of the tested mitigations restored quiet-run performance under this heavy load** (n=1–2
+per arm):
+- **`CPUWeight=1000` on the emulator's scope:** no observed benefit (n=2 each, rows above). The
+  cgroup `cpu` controller is enabled down to every agent's scope, so autogroup nice does not apply
+  either.
+- **`SCHED_RR` 1 on the command, prepare and recorder threads:** removed the run-queue part (back
+  to 0.03 ms) and brought the prepare and recorder waits back to quiet levels, but not the CPU-time
+  increase. Two-refresh frames stayed at 17.3%.
+  - This was unprivileged only because this machine's `RLIMIT_RTPRIO` is 99. Real-time throttling
+    is off here (`sched_rt_runtime_us` equals the period).
+  - No stalls were observed in these two runs. That is an observation, not a safety bound: the
+    50 µs spin-then-sleep bounds idle spinning, not continuous work.
+  - In this setup it bought nothing.
+- **Core scheduling:** the regression is consistent with force-idle.
+  - A process can create a cookie unprivileged (`CONFIG_SCHED_CORE=y`). The cookie was set on the
+    launcher, so every emulator thread, game and emulator alike, shared it; the load tasks had
+    none.
+  - Cookies govern simultaneous execution on one core: the core-wide pick runs the
+    highest-priority task, and its sibling may only run a task with the same cookie, else it is
+    forced idle
+    ([kernel docs](https://docs.kernel.org/admin-guide/hw-vuln/core-scheduling.html#design-implementation)).
+    So when a load task wins the pick, our thread on the sibling waits.
+  - Force-idle time was not measured; the run-queue delay (5.15 ms/frame) and prepare wait
+    (9.22 ms) fit it. n=1.
+- **Occupying one sibling ourselves** (recorder on CPU 11): the load moved to the next idle CPUs
+  (9, 0–5).
+- What would help is headroom, less command-thread CPU per frame. No mitigation code was merged.
+
+**Recorder on CPU 11 with no load** (n=1). This was the one gain.
+- With the recorder off efficiency core 19, the game gets 8 efficiency cores instead of 7. The
+  `tbb` pool's run-queue time dropped from ~3.9 to ~3.2 CPUs.
+- It cost +1.5 ms/frame of command-thread CPU (+10%; shared core).
+- The VRSQRTPS fix (#139) attacks the same shortage, so it is not a default.
+
+**Measuring under load.**
+- **PSI is no contamination signal.** `/proc/pressure/cpu` "some" was ~31% on quiet Sky Aztec runs
+  (the `tbb` pool oversubscribes the efficiency cores) and ~29% under the heavy load.
+- **The busy share of the CPUs the layout leaves idle** (here 9 and 11, window mean) separated
+  them:
+
+  | runs | CPUs 9 and 11 busy |
+  |---|---|
+  | quiet | 5.5% |
+  | the light-load run | 16% (worst 5 s: 19%) |
+  | heavy | 60–63% |
+
+  `garden.sh` (#140) voids a run over a 30% window mean or 50% in any 5 s, and flags one over a
+  20% window mean. These are provisional defaults: nothing was measured between ~19% and ~60%.
+
+**After the VRSQRTPS fix (#139).** PGO `dev` 9026f389, Sky Aztec, frames 1000–3000:
+
+| run | FPS | no guest work ms/frame | presented 2+ refreshes | cmd CPU ms/frame | efficiency cores 12–18 busy |
+|---|---|---|---|---|---|
+| quiet, default placement, run 1 | 60.0 | 0.00 | 0.8% | 14.45 | 55% |
+| quiet, default placement, run 2 | 60.0 | 0.00 | 0.5% | 14.30 | 55% |
+| light load, default placement | 60.0 | 0.00 | 0.2% | 14.42 | 54% |
+
+- **The existing default (priority-based) placement sufficed in these runs.** About 3.2 of the 7
+  efficiency cores' worth was idle (85% busy before the fix). The `tbb` pool ran 3.4 CPUs, down
+  from 5.5, and the performance-core process set 0–5 was 24–26% busy.
+- No heavy-load or alternative-placement comparison was run after the fix.
+- The remaining two-refresh frames had high command-thread CPU (~25 ms), not missing guest work.
+- **The `tbb` threads' run-queue time** stayed ~2.4 CPUs with the cores half idle. Their
+  `sceKernelUsleep(0)` returns without a syscall, but `scePthreadYield` is a host `sched_yield()`
+  (94–221 ns per call). Yield loops requeueing are the likely source; this was not measured
+  directly.
+
+**`KYTY_AMD_SKIP_RSQRT=1` is not a usable arm on Sky Aztec.** It leaves the trapped VRSQRTPS
+sites on this Intel host's native precision, and the game crashed in both runs at frame ~400,
+before the measured window. Track S's section above identifies the two faults: a null dereference
+of a tagged handle (`eboot+0x39cca5`) and a store through a null array (`+0x7d1239`). The traps'
+cost was measured instead with #139's bit-identical native path.
+
 ## Critical path after B4 (2026-11-07)
 
 `KYTY_STALL_DIAG=1` (dev abc268e0, ~35 FPS). Shares of wall time, steady over each second:
