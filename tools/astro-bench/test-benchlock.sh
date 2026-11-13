@@ -3,7 +3,7 @@
 # the real one): FIFO order, shared tickets going together, an exclusive ticket holding back later
 # shared ones, priorities, a killed waiter, a timeout, nested holds, and mutual exclusion against
 # old-style (flock-only) competitors, a zombie waiter, a late higher-priority ticket, ageing.
-# Takes about a minute. Exit status 0 when every case passes.
+# Takes about 90 s. Exit status 0 when every case passes.
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d) || exit 1
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$tmp"' EXIT
@@ -129,6 +129,20 @@ unset KYTY_BENCH_AGE
 # arrived first), 3 to 5 for i >= 5 (behind P9). Without ageing P9 would go last.
 check '[ "$(t $log P9 start)" -lt "$(t $log P5_5 start)" ] && [ "$(t $log P9 start)" -lt "$(t $log P5_7 start)" ]' "P9 before the priority-5 tickets that arrived 5+ s after it"
 check '[ "$(t $log P5_1 start)" -lt "$(t $log P9 start)" ]' "P5_1 (arrived 1 s after P9) still before it"
+check drained "queue empty"
+
+echo "4e. no starvation: a priority-9 ticket gets the lock within its timeout under a steady stream of priority-1 arrivals (scaled: KYTY_BENCH_AGE=1, timeout 10 s = 8 steps + 2 s)"
+log=$tmp/4e.log
+export KYTY_BENCH_AGE=1
+acq "$log" H x 0.5; sleep 0.2
+acq "$log" P9 x 0.2 KYTY_BENCH_PRIO=9 KYTY_BENCH_LOCK_TIMEOUT=10
+# 10 s of P1s, one every 0.25 s, each held 0.4 s: more work than time, so the queue never drains
+# and without ageing P9 would wait ~16 s.
+for i in $(seq 40); do sleep 0.25; acq "$log" "P1_$i" x 0.4 KYTY_BENCH_PRIO=1; done
+wait
+unset KYTY_BENCH_AGE
+check '[ -n "$(t $log P9 start)" ] && [ -z "$(t $log P9 failed)" ]' "P9 got the lock (did not time out)"
+check '[ -n "$(t $log P1_40 start)" ] && [ "$(t $log P9 start)" -lt "$(t $log P1_40 start)" ]' "P9 before the last priority-1 arrivals"
 check drained "queue empty"
 
 echo "5. a timeout removes the ticket"

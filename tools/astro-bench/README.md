@@ -55,7 +55,7 @@ copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures th
   `KYTY_BENCH_PRIO` (1 critical path, 5 default, 9 background), aged one step per 20 min of waiting
   (`KYTY_BENCH_AGE`, floor 1, so no class starves), then arrival; shared tickets at the head go
   together, an exclusive one holds back the shared ones behind it. A wait over
-  `KYTY_BENCH_LOCK_TIMEOUT` (90 min) prints "timed out waiting for the bench lock" and the script
+  `KYTY_BENCH_LOCK_TIMEOUT` (4 h, longer than a priority-9 ticket takes to age to 1) prints "timed out waiting for the bench lock" and the script
   exits 75. `benchlock.sh status` shows the holder and the queue with aged priorities;
   `test-benchlock.sh` tests the queue on a private lock file.
 - `batch.sh` — runs `<label> [ENV=VAL…] -- [flags…]` lines back to back, after a short unreported

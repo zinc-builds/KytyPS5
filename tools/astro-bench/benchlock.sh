@@ -13,7 +13,9 @@
 # Order: effective priority, then arrival. The effective priority starts at KYTY_BENCH_PRIO (1 =
 # critical path, 5 = default, 9 = background) and improves by one step for every KYTY_BENCH_AGE
 # seconds waited (default 1200, 20 min; floor 1), so no class starves: a priority-9 ticket is
-# ahead of priority-5 tickets that arrive 4 steps (80 min) after it, and reaches 1 in 160 min.
+# ahead of priority-5 tickets that arrive 4 steps (80 min) after it, and reaches 1 in 160 min,
+# well inside the default timeout (4 h): at 1 it is ahead of every later arrival, whatever its
+# priority, so no ticket times out behind a steady stream of more urgent work.
 # KYTY_BENCH_AGE must be the same for every waiter on the host (each one orders the queue). Shared
 # tickets right behind each other at the head go together; an exclusive ticket at the head holds
 # back every shared ticket behind it, so neither side can starve the other. A ticket is removed as
@@ -24,7 +26,8 @@
 # The exclusive lock lives on an inherited file descriptor (9), so an emulator left running
 # (KEEP_RUNNING=1) keeps holding it until it exits: kill your emulator when you are done.
 # KYTY_BENCH_LOCKED (set while held) makes nested calls no-ops.
-# KYTY_BENCH_LOCK_TIMEOUT: seconds to wait in all (default 5400); on a timeout benchlock_acquire
+# KYTY_BENCH_LOCK_TIMEOUT: seconds to wait in all (default 14400, 4 h: longer than 8 ageing steps,
+# so keep it above 8 * KYTY_BENCH_AGE when changing either); on a timeout benchlock_acquire
 # prints "timed out waiting for the bench lock" and returns 75, and the scripts exit with it.
 # KYTY_BENCH_LOCK: lock file path.
 #
@@ -103,7 +106,7 @@ benchlock_acquire() {
 	s) echo "benchlock: inside a shared (build) hold; cannot take the exclusive lock" >&2; return 1 ;;
 	esac
 	exec 9>>"$KYTY_BENCH_LOCK" || return 1
-	local timeout=${KYTY_BENCH_LOCK_TIMEOUT:-5400} prio=${KYTY_BENCH_PRIO:-5}
+	local timeout=${KYTY_BENCH_LOCK_TIMEOUT:-14400} prio=${KYTY_BENCH_PRIO:-5}
 	[[ "$prio" =~ ^[1-9]$ ]] || { echo "benchlock: KYTY_BENCH_PRIO must be 1-9" >&2; exec 9>&-; return 1; }
 	# The ticket names this process: BASHPID, not $$, which a subshell shares with its parent.
 	local dir ticket name me=$BASHPID start deadline=$((SECONDS + timeout)) said= ahead eff
