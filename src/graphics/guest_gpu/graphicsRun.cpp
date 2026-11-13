@@ -902,15 +902,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	if (PassDiag::Enabled()) {
 		PassDiag::OnPacket(opcode);
 	}
-	// A multi-draw indirect keeps the queue too while it is queued itself (KYTY_INDIRECT_QUEUE);
-	// one drawn at once drains in DrawIndirectMulti.
-	// So does PFP_SYNC_ME (a no-op here: the queue keeps guest order, and CP stores run at
-	// decode), which the guest puts between its indirect draws (one each in burst frames) so
-	// the prefetcher sees the micro-engine's stores to their records.
+	// An indirect draw keeps the queue too while it is queued itself (KYTY_INDIRECT_QUEUE); one
+	// drawn at once drains in DrawIndirectMulti. So does PFP_SYNC_ME (a no-op here: the queue
+	// keeps guest order, and CP stores run at decode), which the guest puts before its indirect
+	// draws (SET_BASE, PFP_SYNC_ME, DRAW_INDEX_INDIRECT per object in the occlusion-culling
+	// prepass) so the prefetcher sees the micro-engine's stores to their records.
 	const bool queue_indirect = executor.IndirectQueueMode() != 0;
 	const bool pfp_sync       = opcode == Pm4::IT_PFP_SYNC_ME && queue_indirect;
 	const bool keeps          = KeepsQueuedDraw(packet_header) || pfp_sync ||
-	                   ((opcode == Pm4::IT_DRAW_INDIRECT_MULTI ||
+	                   ((opcode == Pm4::IT_DRAW_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_INDIRECT ||
+	                     opcode == Pm4::IT_DRAW_INDIRECT_MULTI ||
 	                     opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI) &&
 	                    queue_indirect);
 	if (executor.HasQueuedDraw() &&
