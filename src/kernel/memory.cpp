@@ -1261,13 +1261,14 @@ bool AsyncGuestPageUntouched(uint64_t page, uint64_t token) {
 #endif
 }
 
-void PeekAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
+void PeekAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written, bool wp_only) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	if (g_guest_address_space != nullptr) {
-		g_guest_address_space->Backing().PeekAsyncWrites(written);
+		g_guest_address_space->Backing().PeekAsyncWrites(written, wp_only);
 	}
 #else
 	(void)written;
+	(void)wp_only;
 #endif
 }
 

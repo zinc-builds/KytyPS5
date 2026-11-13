@@ -187,7 +187,8 @@ void TakeKeptAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& writte
 void TakeVerifyKeptWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 // KYTY_ASYNC_WP_VERIFY: appends the asynchronous pages written since the last collection, and
 // the writes kept for the next one (after any submit scan in flight).
-void PeekAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written);
+// wp_only: only pages a collection's protecting scan can report (in write-protected views).
+void PeekAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written, bool wp_only = false);
 // Whether part of the range is under asynchronous write protection, where a store raises no
 // fault: emulator stores there must invalidate the caches themselves (GPU thread).
 [[nodiscard]] bool IsAsyncWriteTracked(uint64_t vaddr, uint64_t size) noexcept;

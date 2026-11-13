@@ -645,7 +645,9 @@ bool RenderContext::ObserveCollectEnabled() noexcept {
 // kept writes, read without consuming them.
 static void ObservePeek(const PageManager& pages, std::vector<std::pair<uint64_t, uint64_t>>& out) {
 	std::vector<std::pair<uint64_t, uint64_t>> written;
-	LibKernel::Memory::PeekAsyncGuestWrites(written);
+	// Only pages in write-protected views: a populated page elsewhere reads as written, but no
+	// collection's protecting scan reports it (nor needs to: its watch is mprotect-based).
+	LibKernel::Memory::PeekAsyncGuestWrites(written, true);
 	for (const auto& [begin, end]: written) {
 		pages.AppendWriteWatched(begin, end, out);
 	}

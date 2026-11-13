@@ -122,8 +122,9 @@ public:
 	// deferred there (slow: a peek at each of thousands of skips a second). KYTY_OBSERVE_DROP=<n> (test only)
 	// makes production skip the invalidation of every n-th such page, which observe must catch.
 	// Unlike KYTY_SUBMIT_SCAN=verify and KYTY_RESUME_SCAN=verify, which handle what the
-	// skipped scan would have found (nothing is lost for good), this proves timely visibility:
-	// nothing a publication makes visible is read stale after it.
+	// skipped scan would have found (nothing is lost for good), this checks that the collection
+	// a publication forces covers every write pending at it. It assumes publications are
+	// classified correctly and that no guest-reading packet runs before that collection.
 	[[nodiscard]] static bool ObserveCollectEnabled() noexcept;
 	enum class ObserveSkipKind { Submit, Resume, CpLabel };
 	void ObservePublication();
