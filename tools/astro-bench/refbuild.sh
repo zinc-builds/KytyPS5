@@ -25,7 +25,7 @@ done_marker=$dst/.complete
 [ -f "$done_marker" ] && { echo "$dst/install"; exit 0; }
 # Building inside an exclusive hold would disturb that benchmark, and could deadlock with a caller
 # waiting on this commit's lock while it waits for the benchmark.
-[ "$KYTY_BENCH_LOCKED" = x ] && { echo "refbuild: $key is not built yet; call refbuild.sh before batch.sh" >&2; exit 1; }
+[ "$KYTY_BENCH_LOCKED" = x ] && { echo "refbuild: $key is not built yet; call refbuild.sh before taking the exclusive hold (batch.sh, benchlock.sh run)" >&2; exit 1; }
 
 mkdir -p "$root"
 exec 7>"$root/$key.lock"
