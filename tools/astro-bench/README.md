@@ -9,11 +9,18 @@ galaxy map before the Gorilla Nebula (copy one with `setup-install.sh`).
 
 ```bash
 [ -p /tmp/vpad.fifo ] || python3 -I tools/astro-bench/vpad.py &  # menu route only: virtual pad (shared)
-tools/astro-bench/setup-install.sh              # once per build dir: save data + warm shader cache
+tools/astro-bench/setup-install.sh              # once per build dir: save data (shader stores: below)
 tools/astro-bench/garden.sh mylabel --amd-cpu   # one run → "mylabel: fps=… draws/frame=… …"
 printf '%s\n' "a1 -- --amd-cpu" "b1 KYTY_NO_PIN=1 -- --amd-cpu" | tools/astro-bench/batch.sh
 cat /tmp/bench-batch.txt                        # batch results (logs: /tmp/bench-<label>.log)
 ```
+
+Shader stores live outside the install: run.sh points every bench run at
+`~/.cache/kyty-shaders-bench` (one file per codegen hash, device and switches, shared by all tracks
+and installs), and plain launches and `tools/playtest.sh` use the user's `~/.cache/kyty-shaders`.
+A same-binary switch pair shares a store; two binaries with different codegen get different files.
+Isolate a run with `KYTY_SHADER_STORE_DIR=<dir>` (e.g. `$KYTY_INSTALL/_PipelineCache`), or start
+one cold with `KYTY_SHADER_CACHE_STAMP=N`.
 
 The pad is shared by every agent on the machine: don't send it `quit`. Always pass `--amd-cpu`;
 without it ~1.7M SIGILL/s drop Sky Garden to ~10 FPS. `run.sh` starts

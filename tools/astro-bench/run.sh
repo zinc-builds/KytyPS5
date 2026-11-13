@@ -22,6 +22,11 @@ if [ -z "$KYTY_INSTALL" ] && [ "$built" -gt "$installed" ]; then
 	exit 1
 fi
 cd "${KYTY_INSTALL:-$repo/_Build/linux/install}" || exit 1
+# The bench's shader store: one directory shared by every bench run (all tracks and installs, one
+# store file per codegen hash, device and switches), apart from the store the user plays from
+# (~/.cache/kyty-shaders, written only by builds they ran). Set KYTY_SHADER_STORE_DIR to isolate a
+# run, e.g. KYTY_SHADER_STORE_DIR=$KYTY_INSTALL/_PipelineCache for a per-install store.
+export KYTY_SHADER_STORE_DIR=${KYTY_SHADER_STORE_DIR:-$HOME/.cache/kyty-shaders-bench}
 export KYTY_PERF_LOG=1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
 export SDL_GAMECONTROLLER_IGNORE_DEVICES=0x054c/0x0ce6
 export SDL_AUDIO_DRIVER=dummy

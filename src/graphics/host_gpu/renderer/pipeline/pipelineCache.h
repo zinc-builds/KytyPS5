@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <initializer_list>
@@ -170,6 +171,9 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	// A program with GPU-selected calls loaded from the shader store: the serialized resource
+	// plan it was compiled with (the plan depends on the callee code in function_code).
+	std::vector<uint8_t>                         stored_call_plan;
 };
 
 // N trivially copyable elements, left unconstructed until Construct: value-initializing a draw
@@ -229,6 +233,26 @@ struct DrawRenderState {
 };
 
 // Writes the shader store on its own thread, running jobs in the order they were posted.
+// An exclusive lock on <path>.lock (flock, or LockFileEx on Windows), tried once without waiting
+// and held until destruction: one emulator writes a store or driver cache at a time, and pruning
+// removes only files nobody holds. The lock file itself is never removed.
+class StoreLock {
+public:
+	StoreLock() = default;
+	explicit StoreLock(const std::filesystem::path& path);
+	StoreLock(StoreLock&& other) noexcept: m_handle(other.m_handle) { other.m_handle = kNone; }
+	StoreLock& operator=(StoreLock&& other) noexcept;
+	StoreLock(const StoreLock&)            = delete;
+	StoreLock& operator=(const StoreLock&) = delete;
+	~StoreLock() { Release(); }
+	[[nodiscard]] bool Held() const { return m_handle != kNone; }
+
+private:
+	static constexpr intptr_t kNone = -1; // also INVALID_HANDLE_VALUE
+	void                      Release();
+	intptr_t                  m_handle = kNone;
+};
+
 class ShaderStoreWriter {
 public:
 	ShaderStoreWriter();
@@ -236,6 +260,11 @@ public:
 	void Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
 	// Whether the store is open.
 	explicit operator bool() const { return !m_file.IsInvalid(); }
+	// Takes the store's writer lock (<path>.lock, held until destruction): one emulator appends
+	// to a store at a time. False when another process holds it, or on failure; such a store is
+	// still read, just not written. Call before reading the store, so no other writer can append
+	// between the read and Open.
+	bool Lock(const std::filesystem::path& path);
 	// Compresses `record` and appends it on the store thread, in call order.
 	void Append(std::vector<uint8_t>&& record);
 	void Post(Common::UniqueFunction<void>&& job);
@@ -245,6 +274,7 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
+	StoreLock                                m_lock;
 	Common::File                             m_file;
 	std::mutex                               m_mutex;
 	std::condition_variable_any              m_ready;
@@ -335,6 +365,9 @@ private:
 		// A deque, so a module stays where it is while the program compiles more.
 		std::deque<ShaderModule>                        modules;
 		bool                                            skip_dispatch = false;
+		// Loaded from the shader store with GPU-selected calls: call_source is rebuilt from the
+		// guest code at the first lookup on the command thread, before any module is used.
+		bool                                            stored_calls  = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
@@ -395,6 +428,9 @@ private:
 	StageResources                         m_compute_resources;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	// Held while this emulator may write the driver cache; taken again at a save if another
+	// emulator held it at start.
+	mutable StoreLock             m_driver_lock;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash,
@@ -440,7 +476,9 @@ private:
 	void WriteDriverCache() const;
 
 	// pipelineSerialization.cpp
-	void WarmUp(const std::filesystem::path& path);
+	// Loads the store at `path`; when it does not exist yet, first adopts the first of `adopt`
+	// whose header matches (a store an install kept in its own directory).
+	void WarmUp(const std::filesystem::path& path, std::span<const std::filesystem::path> adopt = {});
 	bool LoadRecord(std::span<const uint8_t>& records);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);
@@ -453,9 +491,35 @@ private:
 	                            const ModuleMap& modules);
 };
 
-// The shader store of the running title; empty unless --shader-cache is on in a Release build
-// without debug dumps, which change the SPIR-V.
+// Where the shader stores and the driver's pipeline cache live, shared by every build and install:
+// KYTY_SHADER_STORE_DIR if set, else the user's cache directory (Linux: $XDG_CACHE_HOME or
+// ~/.cache, then kyty-shaders; macOS: ~/Library/Caches/kyty-shaders; Windows:
+// %LOCALAPPDATA%\kyty-shaders), else the install's own _PipelineCache.
+std::filesystem::path ShaderStoreDir();
+// The install-local directory stores lived in before ShaderStoreDir, adopted from on first use.
+inline const std::filesystem::path& InstallStoreDir() {
+	static const std::filesystem::path dir("_PipelineCache");
+	return dir;
+}
+// The shader store of the running title (<dir>/<title>.shaders, before KeyedStorePath); empty
+// unless --shader-cache is on in a Release build without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();
+// `base` with a suffix for everything the store's header holds (the codegen source hash, the
+// device and the code-changing switches): <stem>.<16 hex digits><ext>. Builds and switch
+// combinations that would record different modules use different files, so none truncates
+// another's, and a rebuild that keeps the header finds its store warm.
+std::filesystem::path KeyedStorePath(const GraphicContext& graphics, const std::filesystem::path& base);
+// `path` with a suffix unique to this process and call, for a file written and then renamed.
+std::filesystem::path TempPathFor(const std::filesystem::path& path);
+// Copies the first of `candidates` whose first bytes equal `header` to `store` (through a temporary
+// file and a rename), unless `store` exists. Returns the adopted path, or empty. The caller holds
+// the store's StoreLock, so no other emulator creates `store` meanwhile.
+std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<const uint8_t> header,
+                                 std::span<const std::filesystem::path> candidates);
+// Removes stores of the same title (<title>.*<ext> beside `current`) not written for `max_age`,
+// and all but the `keep` most recently written, never `current` nor a store whose StoreLock
+// another emulator holds. Returns how many it removed.
+size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chrono::hours max_age);
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 

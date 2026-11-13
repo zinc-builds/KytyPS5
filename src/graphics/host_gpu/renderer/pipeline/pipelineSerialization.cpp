@@ -14,6 +14,14 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
 #include <algorithm>
+#if defined(_WIN32)
+#include <windows.h> // IWYU pragma: keep
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -43,7 +51,7 @@ struct Frame {
 };
 
 // Bump to discard every existing store by hand (a change the source hash cannot see).
-constexpr uint32_t kShaderStoreFormat = 1;
+constexpr uint32_t kShaderStoreFormat = 2; // 2: module records carry their callee code
 
 // KYTY_SHADER_CACHE_STAMP=N (N > 0) replaces the source hash with N: a manual key, to keep a store
 // across a source change known not to alter what it records, or to discard one by changing N.
@@ -73,6 +81,10 @@ uint64_t ManualStamp() {
 //    memory limit, the host subgroup sizes, the buffer cache's page table geometry and the DMA
 //    address translation constants, masked selects
 //    and KYTY_BDA_STATS=access (instrumented DMA shaders).
+// The store's file name carries a hash of all of it (KeyedStorePath), so every build and switch
+// combination that would record different modules has its own file in the shared directory:
+// turning KYTY_RESIDENT_TEXTURES on and off, or alternating two builds, keeps a warm store for
+// each instead of one truncating the other's.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	Writer      header;
 	const auto& properties = graphics.GetPhysicalDeviceProperties();
@@ -101,13 +113,205 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 }
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
-	// The handle comes from the SPIR-V; stored programs have no function code.
+	// The handle comes from the SPIR-V. function_code is the callee code a program with
+	// GPU-selected calls was linked against (empty without calls).
 	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
+	       mesh_task, stored_call_plan] = stage;
+	IoAll(io, id, info, specialization, function_code, vertex_formats, rect_parameters, mesh_task);
 }
 
 } // namespace
+
+std::filesystem::path ShaderStoreDir() {
+	const auto env = [](const char* name) -> const char* {
+		const char* value = std::getenv(name);
+		return value != nullptr && value[0] != '\0' ? value : nullptr;
+	};
+	if (const char* dir = env("KYTY_SHADER_STORE_DIR")) {
+		return dir;
+	}
+#if defined(_WIN32)
+	if (const char* local = env("LOCALAPPDATA")) {
+		return std::filesystem::path(local) / "kyty-shaders";
+	}
+#elif defined(__APPLE__)
+	if (const char* home = env("HOME")) {
+		return std::filesystem::path(home) / "Library" / "Caches" / "kyty-shaders";
+	}
+#else
+	if (const char* xdg = env("XDG_CACHE_HOME"); xdg != nullptr && xdg[0] == '/') {
+		return std::filesystem::path(xdg) / "kyty-shaders";
+	}
+	if (const char* home = env("HOME")) {
+		return std::filesystem::path(home) / ".cache" / "kyty-shaders";
+	}
+#endif
+	return InstallStoreDir();
+}
+
+std::filesystem::path KeyedStorePath(const GraphicContext& graphics, const std::filesystem::path& base) {
+	const auto header = StoreHeader(graphics);
+	auto       name   = base.stem();
+	name += fmt::format(".{:016x}", XXH3_64bits(header.data(), header.size()));
+	name += base.extension();
+	return base.parent_path() / name;
+}
+
+std::filesystem::path TempPathFor(const std::filesystem::path& path) {
+	static std::atomic<uint32_t> counter {0};
+#if defined(_WIN32)
+	const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
+#else
+	const auto pid = static_cast<uint64_t>(::getpid());
+#endif
+	auto temp = path;
+	temp += fmt::format(".{}.{}.tmp", pid, counter.fetch_add(1, std::memory_order_relaxed));
+	return temp;
+}
+
+std::filesystem::path AdoptStore(const std::filesystem::path& store, std::span<const uint8_t> header,
+                                 std::span<const std::filesystem::path> candidates) {
+	std::error_code error;
+	if (std::filesystem::exists(store, error) || error) {
+		return {};
+	}
+	for (const auto& candidate: candidates) {
+		if (candidate.empty() || candidate == store) {
+			continue;
+		}
+		std::vector<uint8_t> head(header.size());
+		uint32_t             read = 0;
+		if (Common::File file;
+		    Common::File::IsFileExisting(candidate) && file.Open(candidate, Common::File::Mode::Read)) {
+			file.Read(head.data(), static_cast<uint32_t>(head.size()), &read);
+		}
+		if (read != header.size() || !std::ranges::equal(head, header)) {
+			continue;
+		}
+		// A copy under a name of this process's, then a rename: a store appears whole or not.
+		const auto temp = TempPathFor(store);
+		Common::File::CreateDirectories(store.parent_path());
+		std::filesystem::copy_file(candidate, temp, std::filesystem::copy_options::overwrite_existing,
+		                           error);
+		if (!error) {
+			std::filesystem::rename(temp, store, error);
+		}
+		if (error) {
+			std::filesystem::remove(temp, error);
+			continue;
+		}
+		return candidate;
+	}
+	return {};
+}
+
+StoreLock::StoreLock(const std::filesystem::path& path) {
+	auto lock_path = path;
+	lock_path += ".lock";
+	Common::File::CreateDirectories(path.parent_path());
+#if defined(_WIN32)
+	HANDLE handle = ::CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+	                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+	                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	OVERLAPPED overlapped {};
+	if (::LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0,
+	                 &overlapped) == 0) {
+		::CloseHandle(handle);
+		return;
+	}
+	m_handle = reinterpret_cast<intptr_t>(handle);
+#else
+	const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		return;
+	}
+	if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+		::close(fd);
+		return;
+	}
+	m_handle = fd;
+#endif
+}
+
+void StoreLock::Release() {
+	if (m_handle == kNone) {
+		return;
+	}
+	// Closing releases the lock. The lock file stays: unlinking it would let a process that opened
+	// it before the unlink and one that creates it again afterwards both hold "the" lock.
+#if defined(_WIN32)
+	::CloseHandle(reinterpret_cast<HANDLE>(m_handle));
+#else
+	::close(static_cast<int>(m_handle));
+#endif
+	m_handle = kNone;
+}
+
+StoreLock& StoreLock::operator=(StoreLock&& other) noexcept {
+	if (this != &other) {
+		Release();
+		m_handle       = other.m_handle;
+		other.m_handle = kNone;
+	}
+	return *this;
+}
+
+size_t PruneStores(const std::filesystem::path& current, size_t keep, std::chrono::hours max_age) {
+	const auto dir    = current.parent_path().empty() ? std::filesystem::path(".") : current.parent_path();
+	const auto name   = current.filename().string();
+	const auto prefix = name.substr(0, name.find('.') + 1); // "<title>."
+	const auto ext    = current.extension().string();
+	if (prefix.size() < 2 || ext.empty()) {
+		return 0;
+	}
+	std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> stores;
+	std::error_code                       error;
+	std::filesystem::directory_iterator it(dir, error);
+	for (const std::filesystem::directory_iterator end; !error && it != end; it.increment(error)) {
+		const auto&     entry = *it;
+		const auto      file  = entry.path().filename().string();
+		std::error_code entry_error;
+		if (!file.starts_with(prefix) || !file.ends_with(ext) || file == name ||
+		    !entry.is_regular_file(entry_error) || entry_error) {
+			continue;
+		}
+		const auto time = entry.last_write_time(entry_error);
+		if (!entry_error) {
+			stores.emplace_back(time, entry.path());
+		}
+	}
+	std::ranges::sort(stores, std::greater {});
+	const auto now     = std::filesystem::file_time_type::clock::now();
+	size_t     removed = 0;
+	// `current` counts against `keep`.
+	for (size_t i = 0; i < stores.size(); i++) {
+		const auto& [time, path] = stores[i];
+		if (i + 1 < keep && now - time < max_age) {
+			continue;
+		}
+		// Only a store no emulator is writing, locked until it is gone: no emulator opens it in
+		// between. Its lock file stays (StoreLock::Release).
+		const StoreLock lock(path);
+		if (!lock.Held()) {
+			continue;
+		}
+		std::error_code remove_error;
+		if (std::filesystem::remove(path, remove_error)) {
+			removed++;
+		}
+	}
+	return removed;
+}
+
+bool ShaderStoreWriter::Lock(const std::filesystem::path& path) {
+	if (!m_lock.Held()) {
+		m_lock = StoreLock(path);
+	}
+	return m_lock.Held();
+}
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
                              uint64_t kept) {
@@ -159,12 +363,26 @@ void ShaderStoreWriter::Post(Common::UniqueFunction<void>&& job) {
 	m_ready.notify_one();
 }
 
-void PipelineCache::WarmUp(const std::filesystem::path& path) {
+void PipelineCache::WarmUp(const std::filesystem::path& path,
+                           std::span<const std::filesystem::path> adopt) {
 	if (path.empty()) {
 		return;
 	}
 	const auto header = StoreHeader(m_graphics);
 	const auto           start = std::chrono::steady_clock::now();
+	// Before reading: no other emulator appends between the read and Open's truncation.
+	const bool writer = m_store.Lock(path);
+	if (writer) {
+		if (const auto adopted = AdoptStore(path, header, adopt); !adopted.empty()) {
+			Log::WriteToConsoleAndLog(fmt::format("Shader cache: adopted {} as {}\n",
+			                                      Common::PathToString(adopted),
+			                                      Common::PathToString(path)));
+		}
+	} else {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader cache: {} is in use by another emulator; reading it, not adding to it\n",
+		    Common::PathToString(path)));
+	}
 	std::vector<uint8_t> bytes;
 	if (Common::File file;
 	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
@@ -186,7 +404,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		}
 	}
 	// A damaged record ends the store; the records before it stay.
-	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
+	if (writer) {
+		m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
+	}
 
 	const auto modules = MapModules();
 	std::vector<Common::UniqueFunction<void>> jobs;
@@ -255,11 +475,21 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			if (!complete()) {
 				return false;
 			}
+			const bool calls = !module.function_code.empty();
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
 			if (inserted &&
 			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
 				m_program_cache.erase(program);
 				return false;
+			}
+			if (calls != program->second.stored_calls && !inserted) {
+				return false; // one program's records disagree on whether it has calls
+			}
+			if (calls) {
+				// Its plan follows the callee code: PipelineCache::GetProgram picks the record that
+				// matches the callees' current code after relinking.
+				program->second.stored_calls = true;
+				module.stored_call_plan      = std::move(plan);
 			}
 			VulkanDiagnostics::DumpSpirv(ShaderRecompiler::StageName(program->first.stage),
 			                             program->first.hash, module.id, spirv);

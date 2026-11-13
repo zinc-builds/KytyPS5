@@ -53,6 +53,10 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
+// Stores (and driver caches) of one title kept in the shared directory: the most recently written
+// ones, from the builds and switch combinations in use; others go after a month unused.
+constexpr size_t kKeptStores  = 8;
+constexpr auto   kStoreMaxAge = std::chrono::hours {24 * 30};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -283,7 +287,7 @@ std::filesystem::path ShaderStorePath() {
 	if (title_id.empty()) {
 		return {};
 	}
-	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+	return ShaderStoreDir() / (title_id + ".shaders");
 }
 
 bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
@@ -394,9 +398,9 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
 	}
-	// Programs with GPU-selected calls depend on their callees' current code. An injected miss
-	// (playtest) compiles a module the store already has.
-	if (program.call_source == nullptr && !m_injected_miss) {
+	// A program with GPU-selected calls is stored with the callee code it was linked against. An
+	// injected miss (playtest) compiles a module the store already has.
+	if (!m_injected_miss) {
 		StoreModule(key, program, module, result.spirv);
 	}
 	m_injected_miss = false;
@@ -451,7 +455,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	bool source_changed = false;
 	if (worker) {
 		// Only finds: a miss, a compile or a call-target refresh is the command thread's.
-		if (entry == m_program_cache.end() || entry->second.call_source) {
+		if (entry == m_program_cache.end() || entry->second.call_source ||
+		    entry->second.stored_calls) {
 			DrawPrepare::Fail();
 			return nullptr;
 		}
@@ -466,7 +471,42 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 		return bind(*module);
 	}
-	if (entry != m_program_cache.end()) {
+	if (entry != m_program_cache.end() && entry->second.stored_calls) {
+		// A stored program with GPU-selected calls: relink it against the callees' current code,
+		// then use a stored module only if it was compiled for that same code.
+		auto& cached        = entry->second;
+		cached.stored_calls = false;
+		options.shader_hash = params.hash;
+		options.user_data   = user_data;
+		options.back_code   = params.back_code;
+		auto relinked = std::make_unique<ShaderRecompiler::ShaderSource>(
+		    ShaderRecompiler::PrepareShaderSource(params.code, options));
+		EXIT_IF(relinked->calls.empty() || relinked->unsupported_call_pc != UINT32_MAX);
+		ShaderRecompiler::RefreshShaderSource(*relinked, runtime);
+		cached.call_source = std::move(relinked);
+		const auto function_code = cached.FunctionCode();
+		bool       planned       = false;
+		for (auto& stored: cached.modules) {
+			if (!planned && std::ranges::equal(stored.function_code, function_code)) {
+				// LoadResourcePlan appends: load into a fresh plan, not over the first record's.
+				ShaderRecompiler::IR::ResourcePlan plan;
+				if (ShaderRecompiler::IR::LoadResourcePlan(stored.stored_call_plan, plan)) {
+					cached.resource_plan              = std::move(plan);
+					cached.resource_plan.source_reads = cached.call_source->reads;
+					planned                           = true;
+				}
+			}
+			stored.stored_call_plan = {};
+		}
+		if (planned) {
+			if (auto* module = cached.FindModule<true>(runtime, push_data_cursor, resources)) {
+				return bind(*module);
+			}
+		} else {
+			// No stored module matches the callees: translate and plan again below.
+			source_changed = true;
+		}
+	} else if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
@@ -562,7 +602,22 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	WarmUp(shader_store);
+	// The title's own store is keyed by its header (KeyedStorePath) in the shared directory, and
+	// adopts a matching store an install kept locally; a path given explicitly (tests) is used as is.
+	const bool title_store = !shader_store.empty() && shader_store == ShaderStorePath();
+	if (!title_store) {
+		WarmUp(shader_store);
+		return;
+	}
+	const auto store = KeyedStorePath(m_graphics, shader_store);
+	const auto local = InstallStoreDir() / shader_store.filename();
+	const std::array<std::filesystem::path, 2> adopt {KeyedStorePath(m_graphics, local), local};
+	WarmUp(store, adopt);
+	// Stores of other builds and switch combinations: the most recent few stay.
+	if (const auto removed = PruneStores(store, kKeptStores, kStoreMaxAge); removed != 0) {
+		PipelineCacheLog("Shader cache: removed {} unused stores beside {}", removed,
+		                 Common::PathToString(store));
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -593,7 +648,22 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	// In the shared directory, keyed by the driver signature it is validated against; adopts the
+	// install's own <title>.bin the first time.
+	const auto signature_key = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	m_driver_cache_path = ShaderStoreDir() / fmt::format("{}.{:016x}.bin", title_id,
+	                                                     XXH3_64bits(signature_key.data(), signature_key.size()));
+	m_driver_lock = StoreLock(m_driver_cache_path);
+	if (const auto local = InstallStoreDir() / (title_id + ".bin");
+	    m_driver_lock.Held() && local != m_driver_cache_path) {
+		const std::array<std::filesystem::path, 1> adopt {local};
+		const auto signature_bytes = std::span(reinterpret_cast<const uint8_t*>(signature_key.data()),
+		                                       signature_key.size());
+		if (const auto adopted = AdoptStore(m_driver_cache_path, signature_bytes, adopt); !adopted.empty()) {
+			PipelineCacheLog("Vulkan pipeline cache: adopted {}", Common::PathToString(adopted));
+		}
+	}
+	PruneStores(m_driver_cache_path, kKeptStores, kStoreMaxAge);
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -711,8 +781,16 @@ void PipelineCache::WriteDriverCache() const {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return;
 	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
+	// One emulator writes a driver cache at a time; another keeps what it loaded.
+	if (!m_driver_lock.Held()) {
+		m_driver_lock = StoreLock(m_driver_cache_path);
+		if (!m_driver_lock.Held()) {
+			PipelineCacheLog("Vulkan pipeline cache: {} is in use by another emulator; not saved",
+			                 Common::PathToString(m_driver_cache_path));
+			return;
+		}
+	}
+	const auto temp_path = TempPathFor(m_driver_cache_path);
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;
@@ -728,6 +806,9 @@ void PipelineCache::WriteDriverCache() const {
 		std::filesystem::rename(temp_path, m_driver_cache_path, error);
 	}
 	if (!written || error) {
+		// The temporary name is unique per save: never leave one behind.
+		std::error_code remove_error;
+		std::filesystem::remove(temp_path, remove_error);
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;
