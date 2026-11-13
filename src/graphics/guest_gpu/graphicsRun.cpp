@@ -904,10 +904,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	}
 	// A multi-draw indirect keeps the queue too while it is queued itself (KYTY_INDIRECT_QUEUE);
 	// one drawn at once drains in DrawIndirectMulti.
-	const bool keeps = KeepsQueuedDraw(packet_header) ||
+	// So does PFP_SYNC_ME (a no-op here: the queue keeps guest order, and CP stores run at
+	// decode), which the guest puts between its indirect draws (one each in burst frames) so
+	// the prefetcher sees the micro-engine's stores to their records.
+	const bool queue_indirect = executor.IndirectQueueMode() != 0;
+	const bool pfp_sync       = opcode == Pm4::IT_PFP_SYNC_ME && queue_indirect;
+	const bool keeps          = KeepsQueuedDraw(packet_header) || pfp_sync ||
 	                   ((opcode == Pm4::IT_DRAW_INDIRECT_MULTI ||
 	                     opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI) &&
-	                    executor.IndirectQueueMode() != 0);
+	                    queue_indirect);
 	if (executor.HasQueuedDraw() &&
 	    (!keeps || (!DefersAsyncCollect(packet_header) && m_renderer.AsyncCollectRequested()))) {
 		uint32_t reason = RenderExecutor::DrainAsyncCollect;
@@ -923,7 +928,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		executor.EndDispatchChain(CurrentBuffer());
 		first_packet = false;
 	}
-	if (!KeepsAtomicWrites(packet_header)) {
+	// PFP_SYNC_ME (kept above) neither signals the guest nor stores: an epoch advance would only
+	// void the queued draws' preparations.
+	if (!KeepsAtomicWrites(packet_header) && !pfp_sync) {
 		// The same packets may signal the guest or store into its memory.
 		GuestSyncEpoch::Advance();
 		if (executor.HasAtomicWrites()) {
