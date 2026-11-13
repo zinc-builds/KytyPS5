@@ -6,8 +6,8 @@
 # The first measured run of a batch tends to be slow (cold file cache and clocks), so the batch
 # starts with a short, unreported warm-up run of its first line. BATCH_WARMUP=0 skips it.
 # A run that garden.sh marks VOID (outside load on the CPUs the layout leaves idle) is repeated
-# once; the void one is kept as /tmp/garden-<label>.void.out (and .void.json). A second VOID
-# leaves no /tmp/garden-<label>.json: callers treat it as a failed run.
+# once; the void one's summary is kept as /tmp/garden-<label>.void.out. A second VOID leaves no
+# /tmp/garden-<label>.json (only .void.json): callers treat it as a failed run.
 . "$(dirname "$0")/benchlock.sh"
 benchlock_acquire x "batch.sh" || exit 1
 run_line() { # run_line <line> [extra env]: runs one configuration, prints garden.sh's summary line
