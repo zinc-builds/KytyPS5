@@ -928,8 +928,9 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
-		// Local knob: KYTY_AMD_SKIP_RSQRT=1 keeps VRSQRTPS on the host's precision, so --amd-cpu only
-		// removes the SSE4a/RDPID/CLWB traps (about 2-3% faster in Astro Bot's Sky Garden).
+		// Experiment knob: KYTY_AMD_SKIP_RSQRT=1 keeps VRSQRTPS on the host's precision (no traps,
+		// about 3% faster in Sky Garden), but on Intel it crashes Astro Bot's Sky Aztec (a null read
+		// in game code near level frame 400, 2 of 2 runs): not for play.
 		static const bool skip_rsqrt = Common::EnvFlag("KYTY_AMD_SKIP_RSQRT");
 		if (rsqrt && !skip_rsqrt && instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
 		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
@@ -1529,13 +1530,15 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 		const Xbyak::util::Cpu cpu;
 		uint32_t               leaf[4] {};
 		Xbyak::util::Cpu::getCpuid(0, leaf);
-		bool rdpid = false;
+		// Vendor string: EBX, EDX, ECX.
+		const bool amd = leaf[1] == 0x68747541u && leaf[3] == 0x69746e65u && leaf[2] == 0x444d4163u;
+		bool       rdpid = false;
 		if (leaf[0] >= 7) {
 			Xbyak::util::Cpu::getCpuidEx(7, 0, leaf);
 			rdpid = (leaf[2] & (1u << 22)) != 0;
 		}
 		return GuestInstructionHostFeatures {cpu.has(Xbyak::util::Cpu::tSSE4a), rdpid,
-		                                     cpu.has(Xbyak::util::Cpu::tCLWB)};
+		                                     cpu.has(Xbyak::util::Cpu::tCLWB), amd};
 	}();
 	return features;
 }

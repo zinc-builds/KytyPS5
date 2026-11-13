@@ -32,9 +32,10 @@ enum class FrameSkipMode { Off, Auto };
 
 // Guest instructions the host CPU lacks (docs/mt-rewrite/README.md, "Playing with the fast build"):
 // Auto rewrites the AMD-only instructions CPUID says the host lacks (SSE4a EXTRQ/INSERTQ, RDPID,
-// CLWB) at load and nothing on a host that has them all; On (--amd-cpu) also rewrites VRSQRTPS to
-// a deterministic reciprocal square root; Off (--no-amd-cpu) rewrites nothing, and the host traps
-// and emulates each missing instruction.
+// CLWB) at load, and on a host that is not AMD also VRSQRTPS (its approximation differs from AMD's
+// and game code depends on it); an AMD host that has them all is not patched. On (--amd-cpu)
+// always rewrites VRSQRTPS too, and aborts on a site it cannot patch safely; Off (--no-amd-cpu)
+// rewrites nothing, and the host traps and emulates each missing instruction.
 enum class AmdCpuMode { Auto, Off, On };
 
 using Keymap = std::vector<std::string>;

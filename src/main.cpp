@@ -62,8 +62,8 @@ static void PrintUsage() {
 	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
 	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --amd-cpu                            Rewrite every AMD-only instruction the host lacks,\n"
-	         "                                       and VRSQRTPS. Default: auto (only what the host\n"
-	         "                                       lacks, no VRSQRTPS); KYTY_AMD_CPU=auto|0|1.\n");
+	         "                                       and VRSQRTPS. Default: auto (the same on a non-AMD\n"
+	         "                                       host; on AMD only what it lacks); KYTY_AMD_CPU=auto|0|1.\n");
 	::printf("  --no-amd-cpu                         Rewrite nothing; the host traps missing instructions.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");

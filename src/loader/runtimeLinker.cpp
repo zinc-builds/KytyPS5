@@ -1720,10 +1720,20 @@ const AmdPatchPlan& GetAmdPatchPlan() {
 				                        : "; the host lacks " + missing + ", which trap and are emulated");
 				break;
 			case Config::AmdCpuMode::Auto:
-				result = {!missing.empty(), false, false};
-				text   = missing.empty() ? "auto: rewrites nothing; " + has_all
-				                         : "auto: rewrites what the host lacks (" + missing +
-				                             "); VRSQRTPS stays native";
+				// VRSQRTPS is an approximation each vendor rounds its own way, and game code
+				// depends on AMD's: on Intel, host precision crashes Astro Bot's Sky Aztec. So
+				// only an AMD host leaves it native; elsewhere auto rewrites it as --amd-cpu does
+				// (without --amd-cpu's abort on an unpatchable site).
+				if (host.amd) {
+					result = {!missing.empty(), false, false};
+					text   = missing.empty() ? "auto (AMD host): rewrites nothing; " + has_all
+					                         : "auto (AMD host): rewrites what the host lacks (" +
+					                             missing + "); VRSQRTPS stays native";
+				} else {
+					result = {true, true, false};
+					text   = "auto (non-AMD host): rewrites VRSQRTPS (the host's differs from AMD's)" +
+					       (missing.empty() ? "; " + has_all : " and what the host lacks (" + missing + ")");
+				}
 				break;
 		}
 		Log::WriteToConsoleAndLog(fmt::format("AMD CPU compatibility: mode {}\n", text));

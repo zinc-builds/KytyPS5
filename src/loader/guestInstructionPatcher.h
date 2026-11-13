@@ -15,6 +15,7 @@ struct GuestInstructionHostFeatures {
 	bool sse4a = false;
 	bool rdpid = false;
 	bool clwb  = false;
+	bool amd   = false; // CPUID vendor AuthenticAMD: the host's VRSQRTPS is AMD's own
 };
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures();

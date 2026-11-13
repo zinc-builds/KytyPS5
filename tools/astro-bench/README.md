@@ -17,8 +17,8 @@ cat /tmp/bench-batch.txt                        # batch results (logs: /tmp/benc
 
 The pad is shared by every agent on the machine: don't send it `quit`. Always pass `--amd-cpu`:
 every number of record uses it. Without any patching (`--no-amd-cpu`) ~1.7M SIGILL/s drop Sky
-Garden to ~10 FPS; the default (auto) rewrites what this Intel host lacks but not VRSQRTPS, which
-changes float results and draws per frame against the numbers of record. `run.sh` starts
+Garden to ~10 FPS; the default (auto) is the same as `--amd-cpu` on this Intel host, but the flag
+also fixes the mode on any host. `run.sh` starts
 `_Build/linux/install/kyty_emulator`, not the freshly linked one: after each build, install or
 copy `_Build/linux/kyty_emulator` (and its `.map`) there, or the run measures the old binary.
 

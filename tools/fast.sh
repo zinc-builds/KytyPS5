@@ -23,15 +23,15 @@ inst=$bdir/install
 # The settings of the benchmark (tools/astro-bench/run.sh) that matter for speed, minus its
 # bench-only parts (muted audio, a fixed 1920x1080 window, the perf log):
 #   --amd-cpu        rewrite the AMD-only instructions the host lacks (SSE4a EXTRQ/INSERTQ and
-#                    friends) to native code at load, and VRSQRTPS as the bench does. Without it,
-#                    an Intel host emulates every EXTRQ in a SIGILL handler (~1.7M/s in Sky Garden,
-#                    ~10 FPS instead of ~50).
+#                    friends) to native code at load, and VRSQRTPS as the bench does. Without any
+#                    patching (--no-amd-cpu), an Intel host emulates every EXTRQ in a SIGILL handler
+#                    (~1.7M/s in Sky Garden, ~10 FPS instead of ~50).
 #   --shader-cache   keep compiled shaders and pipelines between boots (no compile stutter after
 #                    the first run of a level).
 #   --present-mode Mailbox --vblank-frequency 60
 #                    what the numbers are measured with (Mailbox is also the default).
 # The patcher mode, in one place: --amd-cpu (what every number of record uses), or "" for the
-# default auto (no VRSQRTPS rewrite, no traps; a behaviour check decides whether to move to it).
+# default auto, which is the same on a non-AMD host and patches nothing an AMD host has.
 FAST_AMD_CPU=--amd-cpu
 FAST_FLAGS=($FAST_AMD_CPU --shader-cache --present-mode Mailbox --vblank-frequency 60)
 

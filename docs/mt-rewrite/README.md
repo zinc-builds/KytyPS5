@@ -66,14 +66,20 @@ tools/fast.sh run ~/Games/PS5/PPSA21567.zar --fullscreen --frame-skip auto
   Intel CPU; Rosetta) traps on each one and emulates it in a signal handler, ~1.7M times a second
   in Sky Garden, which drops it to ~10 FPS. The emulator can rewrite those instructions to native
   code when it loads the game (~7 s more boot for Astro Bot's 312k functions). Three modes:
-  - **auto (the default since #PR):** rewrites only what CPUID says the host lacks; on a host
-    that has SSE4a, RDPID and CLWB (current AMD CPUs) it rewrites nothing and costs no boot time.
-  - **`--amd-cpu`:** also rewrites every `VRSQRTPS` to a 1/√x computed in double precision and
+  - **auto (the default since #PR):** rewrites what CPUID says the host lacks and, on a host that
+    is not AMD, every `VRSQRTPS` as `--amd-cpu` does; so on Intel auto is `--amd-cpu`. An AMD host
+    that has SSE4a, RDPID and CLWB is not patched at all and pays no boot time. (Upstream's #1439
+    leaves `VRSQRTPS` opt-in; here it is not, because the host's own `VRSQRTPS` crashes Sky Aztec
+    on Intel: `KYTY_AMD_SKIP_RSQRT` below.)
+  - **`--amd-cpu`:** always rewrites every `VRSQRTPS` to a 1/√x computed in double precision and
     rounded to float (within about half a float ulp, where the hardware instruction only promises
     1.5·2⁻¹² and AMD and Intel each return their own approximation). It is not AMD's table, but it
-    is what every number of record used, so the preset keeps it. Unrelocatable sites trap (~236k/s
-    in Sky Garden, ≤ ~2% FPS).
+    is what every number of record used. Unrelocatable sites trap (~266k/s in Sky Garden, about 3%
+    FPS). Unlike auto, it aborts on a site it cannot patch safely (Windows red zone).
   - **`--no-amd-cpu`:** rewrites nothing.
+  - **`KYTY_AMD_SKIP_RSQRT=1`** (experiments only) leaves `VRSQRTPS` at the host's precision: no
+    traps, about 3% faster in Sky Garden, but on Intel Sky Aztec crashes near level frame 400 (a
+    null read in game code, 2 of 2 runs).
   `KYTY_AMD_CPU=auto|1|0` sets the mode when neither flag is given; any other value is an error.
   The log's `AMD CPU compatibility: mode …` line says what was chosen and why, and each module's
   line gives found/native/trapped/skipped counts per instruction and its load time.

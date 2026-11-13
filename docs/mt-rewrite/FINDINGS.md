@@ -494,7 +494,8 @@ After C2 the SIGILL traps (~123k/s) are the main signal source on guest threads.
 - **Ceiling:** `KYTY_AMD_SKIP_RSQRT=1` (host-precision VRSQRTPS, no traps) against the default on
   `dev` 74b1d351: 26.48 / 26.25 vs 25.79 / 26.05 FPS, at most **+1.7%**. Draws per frame also
   change (5,400 vs 5,490): the precision changes game state, so the rewrite stays under
-  `--amd-cpu`. (The rewrite is not AMD's approximation either. It computes 1/√x in double
+  `--amd-cpu`, and host precision crashes Sky Aztec ("`--amd-cpu` modes" below). (The rewrite is
+  not AMD's approximation either. It computes 1/√x in double
   precision and rounds to float, so it is within about half a float ulp of the exact value
   (~2⁻²⁴ relative), where the instruction only promises 1.5·2⁻¹² and AMD and Intel hardware each
   return their own table's approximation. Corrected 2026-11-12; earlier notes called it
@@ -1822,13 +1823,19 @@ One PGO + ThinLTO binary (dev 2a926892 + the auto mode), frames 200–500, 2 run
 | Mode | SIGILL/s | cmd ns/draw | FPS | eboot load |
 |---|---|---|---|---|
 | `--amd-cpu` (rewrites EXTRQ and VRSQRTPS; 1,088 VRSQRTPS sites trap) | 266k / 268k | 3011 / 2884 | 54.6 / 55.2 | 6.0 s |
-| auto (rewrites EXTRQ only) | 0 / 0 | 2877 / 2932 | 57.4 / 56.0 | 6.3 s |
+| EXTRQ only (`KYTY_AMD_SKIP_RSQRT=1`; auto as first proposed) | 0 / 0 | 2877 / 2932 | 57.4 / 56.0 | 6.3 s |
 | `--no-amd-cpu` (EXTRQ traps) | 1.34M / 1.35M | 2791 / 2837 | 7.5 / 7.6 | 0.3 s |
 
-EXTRQ: native=97 in both auto and on. The command thread's cost per draw does not change, so the
-VRSQRTPS traps cost about 3% FPS on the game's side (low n). Auto changes float results (host
-VRSQRTPS precision) and draws per frame against the numbers of record, so the bench and
-`tools/fast.sh` keep `--amd-cpu` until a behaviour check (Track S) says otherwise.
+EXTRQ: native=97 in both. The command thread's cost per draw does not change, so the VRSQRTPS
+traps cost about 3% FPS on the game's side (low n).
+
+Leaving VRSQRTPS at the host's precision is not an option: on this Intel host Sky Aztec crashed
+near level frame 400 with it (Track R, `KYTY_AMD_SKIP_RSQRT=1`, an unhandled null read in game
+code, 2 of 2 runs; the baseline runs in the same hold were normal). Sky Garden frames 200–500
+happen to survive. So auto keeps the VRSQRTPS rewrite on every host that is not AMD (on Intel,
+auto is `--amd-cpu`), unlike upstream's #1439, which makes it opt-in. The 3% has to come back
+by making the trapped sites native (relocating the 1,088 `vrsqrtps xmm, xmm` sites; Track S),
+not by dropping the rewrite.
 
 PGO training on several levels was ruled out the same day: on Sky Garden, profiles trained on Sky
 Garden, Pirate Island, or the three heavy levels merged were within ±2% per draw; on Pirate Island
