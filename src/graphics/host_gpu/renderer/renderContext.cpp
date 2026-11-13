@@ -752,6 +752,73 @@ static void ObserveReport() {
 	o.last_ns = now;
 }
 
+namespace {
+// TakeAsyncWrites since the last collection (GPU thread): the runs taken, for
+// KYTY_ASYNC_WP_VERIFY, and the pages invalidated while a publication was pending, for
+// KYTY_COLLECT_OBSERVE (a take after a publication invalidates what that publication needs).
+std::vector<std::pair<uint64_t, uint64_t>> g_taken_runs;
+std::vector<uint64_t>                      g_taken_observed;
+
+// What KYTY_ASYNC_WP_VERIFY counts as collected: this collection's runs and the takes' since the
+// last one.
+const std::vector<std::pair<uint64_t, uint64_t>>& VerifyRuns(const std::vector<std::pair<uint64_t, uint64_t>>& written) {
+	if (g_taken_runs.empty()) {
+		return written;
+	}
+	static std::vector<std::pair<uint64_t, uint64_t>> runs;
+	runs.assign(g_taken_runs.begin(), g_taken_runs.end());
+	runs.insert(runs.end(), written.begin(), written.end());
+	return runs;
+}
+} // namespace
+
+bool RenderContext::TakeAsyncWrites(uint64_t begin, uint64_t end) {
+	EXIT_IF(g_on_decode_thread); // GPU thread only
+	begin = begin & ~uint64_t {TRACKER_PAGE_SIZE - 1};
+	end   = (end + TRACKER_PAGE_SIZE - 1) & ~uint64_t {TRACKER_PAGE_SIZE - 1};
+	if (end <= begin) {
+		return true;
+	}
+	static std::vector<std::pair<uint64_t, uint64_t>> written;
+	static std::vector<std::pair<uint64_t, uint64_t>> watched;
+	written.clear();
+	watched.clear();
+	{
+		Common::KernelStats::SiteScope kernel(Common::KernelStats::Site::CollectScan);
+		if (!LibKernel::Memory::CollectAsyncGuestWritesIn(begin, end, written)) {
+			return false;
+		}
+	}
+	if (written.empty()) {
+		return true;
+	}
+	static const bool verify = std::getenv("KYTY_ASYNC_WP_VERIFY") != nullptr;
+	if (verify) {
+		g_taken_runs.insert(g_taken_runs.end(), written.begin(), written.end());
+	}
+	for (const auto& [run_begin, run_end]: written) {
+		m_page_manager.AppendWriteWatched(run_begin, run_end, watched);
+	}
+	const bool observe = ObserveCollectEnabled() && AsyncCollectRequested();
+	for (const auto& [run_begin, run_end]: watched) {
+		// As CollectAsyncWrites: the same work as a write fault on each page.
+		MemDiag::Add(MemDiag::AsyncInvalidatedPages, (run_end - run_begin) / TRACKER_PAGE_SIZE);
+		if (observe) {
+			for (auto page = run_begin; page < run_end; page += TRACKER_PAGE_SIZE) {
+				g_taken_observed.push_back(page);
+			}
+		}
+		if (IsMapped(run_begin, run_end - run_begin)) {
+			(void)InvalidateMemory(run_begin, run_end - run_begin);
+			continue;
+		}
+		for (auto page = run_begin; page < run_end; page += TRACKER_PAGE_SIZE) {
+			(void)InvalidateMemory(page, TRACKER_PAGE_SIZE);
+		}
+	}
+	return true;
+}
+
 void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool resume) {
 	EXIT_IF(g_on_decode_thread); // GPU thread only (Process start, sync prologues)
 	ReportPrestage();
@@ -772,6 +839,11 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool r
 	// Pages the observer requires this collection to invalidate (a publication forced it).
 	static std::vector<uint64_t> observed;
 	observed.clear();
+	if (observe && requested) {
+		// Pages TakeAsyncWrites invalidated after the publication.
+		observed.insert(observed.end(), g_taken_observed.begin(), g_taken_observed.end());
+	}
+	g_taken_observed.clear();
 	static std::vector<std::pair<uint64_t, uint64_t>> written;
 	static std::vector<std::pair<uint64_t, uint64_t>> watched;
 	written.clear();
@@ -838,8 +910,9 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool r
 		}
 	}
 	if (written.empty()) {
-		VerifyAsyncWrites(written, true);
-		VerifyAsyncWrites(written, false);
+		VerifyAsyncWrites(VerifyRuns(written), true);
+		VerifyAsyncWrites(VerifyRuns(written), false);
+		g_taken_runs.clear();
 		if (observe && requested) {
 			ObserveCheck(m_page_manager, observed);
 		}
@@ -858,7 +931,7 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool r
 		}
 		return pages;
 	}());
-	VerifyAsyncWrites(written, true);
+	VerifyAsyncWrites(VerifyRuns(written), true);
 	// KYTY_OBSERVE_DROP=<n> (test only, with KYTY_COLLECT_OBSERVE): this collection leaves every
 	// n-th page a publication made visible stale, as a production bug would; observe must fail.
 	static const uint64_t drop_every = [] {
@@ -903,7 +976,8 @@ void RenderContext::CollectAsyncWrites(bool kept_only, KeptVerify verify, bool r
 			(void)InvalidateMemory(page, TRACKER_PAGE_SIZE);
 		}
 	}
-	VerifyAsyncWrites(written, false);
+	VerifyAsyncWrites(VerifyRuns(written), false);
+	g_taken_runs.clear();
 	if (observe && requested) {
 		ObserveCheck(m_page_manager, observed);
 	}

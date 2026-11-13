@@ -1200,6 +1200,25 @@ void TakeVerifyKeptWrites(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
 #endif
 }
 
+bool CollectAsyncGuestWritesIn(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>& written) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (g_guest_address_space == nullptr) {
+		return false;
+	}
+	auto& backing = g_guest_address_space->Backing();
+	if (!backing.AsyncWriteProtection()) {
+		return false;
+	}
+	backing.ScanAsyncWritesIn(begin, end, written);
+	return true;
+#else
+	(void)begin;
+	(void)end;
+	(void)written;
+	return false;
+#endif
+}
+
 void TakeKeptAsyncGuestWrites(std::vector<std::pair<uint64_t, uint64_t>>& written) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	if (g_guest_address_space == nullptr) {

@@ -127,6 +127,15 @@ public:
 	// a publication forces covers every write pending at it. It assumes publications are
 	// classified correctly and that no guest-reading packet runs before that collection.
 	[[nodiscard]] static bool ObserveCollectEnabled() noexcept;
+	// A collection limited to the page-aligned [begin, end) (GPU thread, no tracker lock held):
+	// the guest writes pending there (page-table marks, re-protecting the pages, and kept writes)
+	// are taken and their write-watched pages invalidated, exactly as CollectAsyncWrites handles
+	// them; writes elsewhere stay for the next collection. For a buffer sync about to take GPU
+	// ownership of the range (Track W): a store before the take is invalidated (CPU-dirty, so the
+	// sync uploads it); one after leaves a new mark for the next collection. False when nothing
+	// was done (asynchronous protection off): the caller keeps its fallback.
+	// KYTY_ASYNC_WP_VERIFY and KYTY_COLLECT_OBSERVE see the takes at the next collection.
+	bool TakeAsyncWrites(uint64_t begin, uint64_t end);
 	enum class ObserveSkipKind { Submit, Resume, CpLabel };
 	void ObservePublication();
 	void ObserveSkip(ObserveSkipKind kind);
