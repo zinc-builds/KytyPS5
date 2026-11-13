@@ -102,7 +102,7 @@ void MasterSemaphore::Wait(uint64_t tick, const std::source_location& site) {
 	const bool diag  = m_wait_diag && Common::StallDiag::OnCommandThread();
 	const auto known = diag ? KnownGpuTick() : 0;
 	const auto start = diag ? Common::GpuWaitDiag::NowNs() : 0;
-	const auto frame_start = Common::FrameDiag::Enabled() && Common::StallDiag::OnCommandThread()
+	const auto frame_start = Common::FrameDiag::Counting() && Common::StallDiag::OnCommandThread()
 	                             ? Common::FrameDiag::NowNs()
 	                             : 0;
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);

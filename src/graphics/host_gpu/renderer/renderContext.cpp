@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "common/frameDiag.h"
+#include "common/playtest.h"
 #include "graphics/guest_gpu/frameSkip.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
@@ -165,7 +166,7 @@ void RenderContextMutex::Lock() {
 		}
 		m_owner_active.store(false, std::memory_order_release);
 	}
-	if (Common::FrameDiag::Enabled()) {
+	if (Common::FrameDiag::Counting()) {
 		if (!m_mutex.try_lock()) {
 			const auto start = Common::FrameDiag::NowNs();
 			m_mutex.lock();
@@ -1284,6 +1285,18 @@ void RenderContext::PrepareBda() {
 void RenderContext::RunGarbageCollector() {
 	const Common::FrameDiag::Scope frame_diag(Common::FrameDiag::Counter::GcRuns,
 	                                          Common::FrameDiag::Counter::GcNs);
+	// A slow collection (0.5 ms or more) is a playtest event.
+	struct PlaytestGc {
+		uint64_t start = Common::Playtest::Enabled() ? Common::FrameDiag::NowNs() : 0;
+		~PlaytestGc() {
+			if (start != 0) {
+				const auto ns = Common::FrameDiag::NowNs() - start;
+				if (ns >= 500'000) {
+					Common::Playtest::Event(Common::Playtest::Kind::GarbageCollect, ns);
+				}
+			}
+		}
+	} playtest_gc;
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

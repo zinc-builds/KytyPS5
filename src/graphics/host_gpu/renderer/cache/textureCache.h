@@ -88,6 +88,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// Playtest fault injection (KYTY_PLAYTEST_INJECT=upload:...): treat the largest recently used
+	// sampled textures, `bytes` in all, as written by the CPU, so they upload again from guest
+	// memory (unchanged bytes: the image stays the same). GPU thread.
+	void               InjectReupload(uint64_t bytes);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 

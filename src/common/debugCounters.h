@@ -60,6 +60,7 @@ enum class Peak { ShaderCompileNs, PipelineCreateNs, Count };
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+inline std::atomic<bool>     g_visible {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
@@ -70,6 +71,15 @@ inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 
 inline void SetEnabled(bool enabled) noexcept {
 	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+// Whether the performance overlay is shown. Counting can run without it (the playtest recorder,
+// KYTY_PLAYTEST, counts with the overlay hidden).
+[[nodiscard]] inline bool Visible() noexcept {
+	return Detail::g_visible.load(std::memory_order_relaxed);
+}
+inline void SetVisible(bool visible) noexcept {
+	Detail::g_visible.store(visible, std::memory_order_relaxed);
 }
 
 namespace Detail {

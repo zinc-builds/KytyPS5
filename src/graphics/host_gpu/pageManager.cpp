@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/kernelStats.h"
+#include "common/playtest.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memDiag.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -64,8 +65,11 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 	std::fputs("PageManager fatal: ", stderr);
 	va_list args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	char message[512];
+	std::vsnprintf(message, sizeof(message), format, args);
 	va_end(args);
+	std::fputs(message, stderr);
+	Common::Playtest::OnFatal("PageManager fatal", message);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
 	std::_Exit(322);

@@ -2618,6 +2618,34 @@ cost was measured instead with #139's bit-identical native path.
 3. **Guest write faults (~130k/s)** — no longer on the critical path after pinning (`tbb_thead`
    ~17% each), but they will be once the GPU thread gets faster.
 
+## Playtest flight recorder (Track L, 2026-11-13)
+
+`KYTY_PLAYTEST=1` (off by default; `tools/playtest.sh`, `tools/playtest-report.py`,
+docs/playtest.md) records hand-played sessions: per guest frame the command thread's CPU, kernel
+time, waits by kind, uploads, compiles, GC and collection time; rare events (program-cache misses
+with translation + compile time, pipeline creations, uploads of 1 MiB+, slow GCs, first calls of
+unresolved imports, level starts, markers); pad input at the HLE read. Incidents (a frame over
+33 ms, two over 25 ms in a second, under 57 frames in a second, no flip for 2 s, a new stub, a
+fatal error, the user's marker) get the window around them, a screenshot and causes ranked by how
+much each exceeds the window's usual frame.
+
+- **Cost:** same PGO binary, frames 1000-1600, on vs off: instructions/draw -0.15% ±0.21 (noise),
+  cmd_ns -2.50% ±0.52 in the recorder's favour (the off run had more outside load), so no
+  measurable cost against the 0.5% budget. Nothing runs per draw: the command thread reads its
+  counters once per guest flip (two system calls), events are rare, one helper thread at nice 10
+  on the efficiency cores writes every file.
+- **Attribution, by injected faults** (`KYTY_PLAYTEST_INJECT`, Sky Garden, PGO): a 120 ms sleep
+  on the command thread reads "+120 ms command thread off-CPU (3 voluntary switches)"; 20 forced
+  program-cache misses "+118 ms shader compiles (20 misses, of which driver compile 24 ms)"; a
+  512 MiB re-upload of sampled textures "+175 ms texture uploads (1559 MB), +88 ms GPU wait". An
+  injected `EXIT` and an unhandled SIGSEGV each left a complete session (crash.json with the last
+  ~10 s of frames and 15 s of events, the open incident closed as `fatal`, every file flushed).
+- **First observations (no injection):** a program-cache miss in play cost 97 ms of which the
+  driver compile was 5.7 ms: translation, not the driver, dominates misses, so a miss after a
+  rebuild (cold store) is a visible hitch. Sky Garden's level load is one ~5 s frame (335 misses,
+  3.9 s of translation and compile, 4 GB of texture uploads) followed by ~10 s of frames waiting
+  0.5-1.5 s each on the GPU.
+
 ## Instrumentation already in the tree
 
 - `KYTY_PERF_LOG=1` (needs `--perf-overlay`): one `PERF fps=… draws_frame=… wt_faults_s=…
@@ -2630,6 +2658,8 @@ cost was measured instead with #139's bit-identical native path.
   (`~/AI/emu/tracy-build` has binaries); export with `tracy-csvexport`. Tracy renames the main
   thread, so match the process by command line (`^\./kyty_emulator --game`), never by name.
 - Thread name `KytyGpuCmd` for the GPU thread (top/perf/taskset).
+- `KYTY_PLAYTEST=1`: the playtest flight recorder (docs/playtest.md); `KYTY_PLAYTEST_INJECT` for
+  fault injection.
 - `KYTY_FRAME_DIAG=1`: `GFRAME` lines per guest flip, `FRAME` lines per presented flip, `GIDLE`
   lines per wait of the command thread for guest work of 1 ms or more (FINDINGS, "Frame pacing");
   `tools/astro-bench/framediag.py` and `framemodel.py` read them. `KYTY_OFFCPU_THREAD=<name>`

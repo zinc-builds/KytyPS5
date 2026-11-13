@@ -1,5 +1,6 @@
 #include "common/assert.h"
 
+#include "common/playtest.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
@@ -13,6 +14,7 @@ namespace Common {
                                    int line) {
 	Log::WriteToConsoleAndLog(fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n", KYTY_BUILD_LABEL,
 	                                      title, text, file, line));
+	Playtest::OnFatal(title, fmt::format("{} in {}:{}", text, file, line).c_str());
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 	std::_Exit(321);

@@ -12,6 +12,7 @@
 #include "common/debugCounters.h"
 #include "common/gpuWaitDiag.h"
 #include "common/frameDiag.h"
+#include "common/playtest.h"
 #include "common/benchMetrics.h"
 #include "common/kernelStats.h"
 #include "common/stallDiag.h"
@@ -506,7 +507,7 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
-				if (idle_start == 0 && Common::FrameDiag::Enabled()) {
+				if (idle_start == 0 && Common::FrameDiag::Counting()) {
 					Common::FrameDiag::OnCmdIdleBegin();
 					idle_start = Common::FrameDiag::NowNs();
 				}
@@ -1649,6 +1650,12 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	}
 	if (PassDiag::Enabled()) {
 		PassDiag::OnGuestFlip(PerformanceOverlayFlipCount());
+	}
+	if (Common::Playtest::Enabled()) {
+		// A non-zero result is an injected upload fault (KYTY_PLAYTEST_INJECT=upload:...).
+		if (const auto bytes = Common::Playtest::OnGuestFlip(PerformanceOverlayFlipCount()); bytes != 0) {
+			m_renderer.GetTextureCache().InjectReupload(bytes);
+		}
 	}
 }
 

@@ -2,6 +2,8 @@
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/assert.h"
+#include "common/frameDiag.h"
+#include "common/playtest.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -392,10 +394,12 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
 	}
-	// Programs with GPU-selected calls depend on their callees' current code.
-	if (program.call_source == nullptr) {
+	// Programs with GPU-selected calls depend on their callees' current code. An injected miss
+	// (playtest) compiles a module the store already has.
+	if (program.call_source == nullptr && !m_injected_miss) {
 		StoreModule(key, program, module, result.spirv);
 	}
+	m_injected_miss = false;
 	return module;
 }
 
@@ -454,7 +458,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
 		auto* module = cached.FindModule<false>(runtime, push_data_cursor, resources);
-		if (module == nullptr) {
+		// Playtest fault injection: hand graphics draws to the command thread, which misses.
+		if (module == nullptr || (!std::is_same_v<InputInfo, ShaderComputeInputInfo> &&
+		                          Common::Playtest::Enabled() && Common::Playtest::InjectedMissPending())) {
 			DrawPrepare::Fail();
 			return nullptr;
 		}
@@ -469,10 +475,33 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, resources);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor, resources);
+			// Playtest fault injection (KYTY_PLAYTEST_INJECT=miss:...): compile this graphics shader
+			// again.
+			if (!std::is_same_v<InputInfo, ShaderComputeInputInfo> && module != nullptr &&
+			    Common::Playtest::Enabled() && Common::Playtest::TakeInjectedMiss()) {
+				module          = nullptr;
+				m_injected_miss = true;
+			}
 		}
 		if (module != nullptr) return bind(*module);
 	}
 
+	// A program-cache miss (the shader store warms the cache at start, so this compiles in play):
+	// translation and compilation together, timed for the playtest recorder.
+	struct PlaytestMiss {
+		uint64_t    start    = Common::Playtest::BeginShaderMiss(); // 0 when off
+		uint64_t    hash     = 0;
+		const char* stage    = nullptr;
+		bool        injected = false;
+		bool*       clear    = nullptr; // an injected miss ends here even if nothing compiled
+		~PlaytestMiss() {
+			Common::Playtest::EndShaderMiss(start, hash, stage, injected);
+			*clear = false;
+		}
+	} playtest_miss {.hash     = params.hash,
+	                 .stage    = ShaderRecompiler::StageName(options.stage),
+	                 .injected = m_injected_miss,
+	                 .clear    = &m_injected_miss};
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
@@ -1458,7 +1487,12 @@ PipelineCache::Pipeline& PipelineCache::FindGraphicsPipeline(const GraphicsPipel
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const uint64_t playtest_start = Common::Playtest::Enabled() ? Common::FrameDiag::NowNs() : 0;
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+		if (playtest_start != 0) {
+			Common::Playtest::Event(Common::Playtest::Kind::PipelineCreate,
+			                        Common::FrameDiag::NowNs() - playtest_start, 0);
+		}
 	}
 	StorePipeline(key);
 	CheckpointDriverCache();
@@ -1485,7 +1519,12 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const uint64_t playtest_start = Common::Playtest::Enabled() ? Common::FrameDiag::NowNs() : 0;
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		if (playtest_start != 0) {
+			Common::Playtest::Event(Common::Playtest::Kind::PipelineCreate,
+			                        Common::FrameDiag::NowNs() - playtest_start, 1);
+		}
 	}
 	CheckpointDriverCache();
 

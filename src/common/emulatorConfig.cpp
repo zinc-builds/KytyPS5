@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/playtest.h"
 
 #include <algorithm>
 #include <memory>
@@ -18,6 +19,7 @@ void Initialize() {
 
 void Shutdown() {
 	Common::DebugCounters::SetEnabled(false);
+	Common::DebugCounters::SetVisible(false);
 	g_config.reset();
 }
 
@@ -29,7 +31,8 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
-	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	Common::DebugCounters::SetVisible(cfg.perf_overlay_enabled);
+	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled || Common::Playtest::Enabled());
 }
 
 uint32_t GetScreenWidth() {

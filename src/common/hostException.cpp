@@ -1,4 +1,5 @@
 #include "common/hostException.h"
+#include "common/playtest.h"
 #include "common/kernelStats.h"
 
 #include <atomic>
@@ -228,6 +229,15 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return;
+	}
+	// Unhandled: the process dies on the re-executed fault. The playtest recorder writes its
+	// crash record first.
+	if (Playtest::Enabled()) {
+		char detail[160];
+		std::snprintf(detail, sizeof(detail), "signal %d at rip 0x%llx, address 0x%llx", signal_number,
+		              static_cast<unsigned long long>(info.exception_address),
+		              static_cast<unsigned long long>(info.access_violation_vaddr));
+		Playtest::OnFatal(signal_number == SIGILL ? "SIGILL" : signal_number == SIGBUS ? "SIGBUS" : "SIGSEGV", detail);
 	}
 
 	struct sigaction restore {};

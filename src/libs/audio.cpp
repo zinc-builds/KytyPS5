@@ -1,6 +1,7 @@
 #include "libs/audio.h"
 
 #include "common/assert.h"
+#include "common/playtest.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -406,6 +407,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		if (queued < static_cast<int>(prepared_size)) {
 			if (port->queue_primed) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
+				Common::Playtest::Event(Common::Playtest::Kind::AudioUnderrun);
 			}
 			port->queue_primed = false;
 		}

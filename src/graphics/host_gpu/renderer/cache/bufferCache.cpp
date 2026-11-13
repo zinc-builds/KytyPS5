@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "common/frameDiag.h"
+#include "common/playtest.h"
 #include "graphics/host_gpu/renderer/drawPrepare.h"
 
 #include "common/alignment.h"
@@ -1394,6 +1395,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+	// Large uploads are playtest events, with the time of the staging copy.
+	const uint64_t playtest_start =
+	    Common::Playtest::Enabled() && total_size >= Common::Playtest::BufferUploadEventBytes
+	        ? Common::FrameDiag::NowNs()
+	        : 0;
 
 	// Fills the staging bytes; copy source offsets are still relative to their start.
 	const auto write = [&](uint8_t* mapped) {
@@ -1437,6 +1443,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 	for (auto& copy: copies) {
 		copy.srcOffset += base_offset;
+	}
+	if (playtest_start != 0) {
+		Common::Playtest::Event(Common::Playtest::Kind::BufferUpload, total_size,
+		                        Common::FrameDiag::NowNs() - playtest_start, 0, nullptr,
+		                        Common::Playtest::InTextureUpload() ? 1 : 0);
 	}
 	return source;
 }

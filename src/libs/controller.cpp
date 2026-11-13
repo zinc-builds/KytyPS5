@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/playtest.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -1415,6 +1416,11 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PlayerForHandle(handle)->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
+	if (Common::Playtest::Enabled()) {
+		PadData seen = *data;
+		seen.timestamp = 0;
+		Common::Playtest::OnPadRead(handle, &seen, sizeof(seen), 1);
+	}
 
 	return OK;
 }
@@ -1448,6 +1454,13 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
+	}
+	if (Common::Playtest::Enabled()) {
+		for (int i = 0; i < ret_num; i++) { // every state the game received, in order
+			PadData seen   = data[i];
+			seen.timestamp = 0;
+			Common::Playtest::OnPadRead(handle, &seen, sizeof(seen), ret_num);
+		}
 	}
 
 	return ret_num;

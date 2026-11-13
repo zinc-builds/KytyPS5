@@ -4,6 +4,7 @@
 #include "common/benchMetrics.h"
 #include "common/debugCounters.h"
 #include "common/frameDiag.h"
+#include "common/playtest.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
 #include "graphics/guest_gpu/frameSkip.h"
@@ -170,7 +171,8 @@ void SetOverlayEnabled(bool enabled) {
 			g_frames = {};
 			g_generation.fetch_add(1, std::memory_order_release);
 		}
-		Common::DebugCounters::SetEnabled(enabled);
+		Common::DebugCounters::SetVisible(enabled);
+		Common::DebugCounters::SetEnabled(enabled || Common::Playtest::Enabled());
 	}
 	g_sampler_wait.notify_all();
 }
@@ -188,7 +190,7 @@ void SamplerThread(const std::stop_token& stop) {
 	uint64_t                                sampled_generation = 0;
 	std::unique_lock                        lock(g_host_mutex);
 	while (!stop.stop_requested()) {
-		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Enabled(); });
+		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Visible(); });
 		if (stop.stop_requested()) {
 			break;
 		}
@@ -202,11 +204,11 @@ void SamplerThread(const std::stop_token& stop) {
 		lock.lock();
 		g_host_stats      = std::move(stats);
 		g_host_generation = generation;
-		if (Common::DebugCounters::Enabled() && GuestStalled(Clock::now())) {
+		if (Common::DebugCounters::Visible() && GuestStalled(Clock::now())) {
 			g_revision.fetch_add(1, std::memory_order_acq_rel);
 		}
 		g_sampler_wait.wait_for(lock, stop, REFRESH_INTERVAL, [generation] {
-			return !Common::DebugCounters::Enabled() ||
+			return !Common::DebugCounters::Visible() ||
 			       generation != g_generation.load(std::memory_order_acquire);
 		});
 	}
@@ -769,6 +771,7 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 		g_flip_count.store(frame, std::memory_order_relaxed);
 		g_frames.guest_width  = guest_width;
 		g_frames.guest_height = guest_height;
+		Common::Playtest::OnPresent(frame, interval_ms); // one writer: under g_frame_mutex
 	}
 	Common::FrameDiag::OnFlip(frame, interval_ms);
 }
@@ -778,16 +781,16 @@ uint64_t PerformanceOverlayFlipCount() noexcept {
 }
 
 bool PerformanceOverlayEnabled() noexcept {
-	return Common::DebugCounters::Enabled();
+	return Common::DebugCounters::Visible();
 }
 
 void TogglePerformanceOverlay() noexcept {
-	SetOverlayEnabled(!Common::DebugCounters::Enabled());
+	SetOverlayEnabled(!Common::DebugCounters::Visible());
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void TogglePerformanceOverlayDetails() noexcept {
-	if (Common::DebugCounters::Enabled()) {
+	if (Common::DebugCounters::Visible()) {
 		g_details.store(!g_details.load(std::memory_order_acquire), std::memory_order_release);
 	} else {
 		g_details.store(true, std::memory_order_release);
