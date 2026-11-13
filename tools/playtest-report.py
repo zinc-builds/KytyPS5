@@ -335,7 +335,9 @@ def main():
     for rec in incidents:
         cause = rec.get('primary_cause', 'none')
         trig = rec.get('triggers', {})
-        if 'freeze>2s' in trig:
+        if rec.get('outside_load'):
+            cause = 'outside load (host task on a reserved core)'
+        elif 'freeze>2s' in trig:
             cause = 'freeze (no flips for 2 s or more): ' + cause
         elif 'new-stub' in trig and len(trig) == 1:
             cause = 'new unresolved import'
@@ -354,7 +356,29 @@ def main():
             'ids': [r.get('id') for r in recs],
             'next_run': next_run(cause, worst.get('level')),
         })
-    by_cause.sort(key=lambda g: (g['phase'] != 'play', -g['lost_ms'], -g['count']))
+    by_cause.sort(key=lambda g: (g['phase'] != 'play', g['cause'].startswith('outside load'), -g['lost_ms'], -g['count']))
+    # Outside load: how many, how many at the ~2 s period of a polling host daemon, and which host
+    # processes the system sampler saw on the emulator's cores around them.
+    outside = [r for r in incidents if r.get('outside_load') or r.get('outside_frames')]
+    # The tagged frames themselves (a merged incident holds many), else the incident's time.
+    tagged = sorted({t for r in outside for t in (r.get('outside_frames') or [r.get('t') or 0])})
+    periodic = 0
+    for a, b in zip(tagged, tagged[1:]):
+        gap = b - a
+        k = round(gap / 2.0)
+        if 1 <= k <= 3 and abs(gap - 2.0 * k) <= 0.3:
+            periodic += 1
+    near = defaultdict(float)
+    for t in tagged:
+        for x in system:
+            if 'start_mono_s' in start and abs((x['t'] - start['start_mono_s']) - t) <= 2.0:
+                for i in x.get('intruders', []):
+                    near[i['comm']] += i['pct']
+    outside_info = {
+        'incidents': len(outside), 'frames': len(tagged), 'periodic_2s': periodic,
+        'reserved_cpus': outside[0].get('reserved_cpus') if outside else None,
+        'host_processes_near': [k for k, _ in sorted(near.items(), key=lambda kv: -kv[1])[:5]],
+    }
     marker_list = []
     for m in markers:
         marker_list.append({
@@ -370,14 +394,17 @@ def main():
         top.append(f"CRASH: {crash.get('reason')} ({crash.get('detail')}) at {fmt_t(crash.get('t', 0))}, "
                    f"level {crash.get('level') or '?'}: crash.json")
     for g in by_cause:
-        if g['phase'] != 'play' or len(top) >= 3:
+        if g['phase'] != 'play' or len(top) >= 3 or g['cause'].startswith('outside load'):
             continue
         w = g['worst']
         top.append(f"{g['cause']}: {g['count']} incident(s), {g['lost_ms']:.0f} ms lost; worst {w['worst_ms']} ms "
                    f"at {fmt_t(w['t'] or 0)} ({w['file']}): {w['summary']}")
-    # Throttling keeps a top-three slot (after up to two others) when the clocks dropped with it.
     # Outside causes the player can act on keep their top-three slots (after the others).
     outside_top = []
+    if outside_info['incidents']:
+        outside_top.append(f"not the emulator: {outside_info['frames']} slow frame(s) were outside load on the reserved "
+                           f"CPUs ({outside_info['reserved_cpus']}), {outside_info['periodic_2s']} at a ~2 s period; host "
+                           f"processes seen: {', '.join(outside_info['host_processes_near']) or 'see system.jsonl'}")
     if thermal and thermal['core_mhz_at_limit'] and thermal['core_mhz_otherwise'] and \
             thermal['core_mhz_at_limit'] < 0.97 * thermal['core_mhz_otherwise']:
         outside_top.append(f"not the emulator: the CPU package reached its thermal limit ({thermal['limit_c']:.0f} °C) in "
@@ -417,7 +444,7 @@ def main():
         'incidents': {'total': len(incidents), 'by_phase': {p: sum(1 for r in incidents if r.get('phase') == p)
                                                              for p in ('play', 'load', 'boot')},
                       'unwritten': (end or {}).get('incidents_unwritten', 0), 'by_cause': by_cause},
-        'markers': marker_list, 'stubs': stubs, 'system': sys_info, 'top3': top[:3],
+        'markers': marker_list, 'stubs': stubs, 'system': sys_info, 'top3': top[:3], 'outside_load': outside_info,
         'dropped': {'events': (end or {}).get('events_dropped'), 'frames': (end or {}).get('frames_dropped')},
     }
     with open(os.path.join(session, 'report.json'), 'w') as f:
@@ -476,6 +503,11 @@ def main():
             p(f"      next run: {g['next_run']}")
         if show_all and len(g['ids']) > 1:
             p(f"      all: {g['ids']}")
+    if outside_info['incidents']:
+        p(f"outside load: {outside_info['frames']} slow frame(s) in {outside_info['incidents']} incident(s) coincided with "
+          f"host work on the reserved-idle CPUs ({outside_info['reserved_cpus']}), {outside_info['periodic_2s']} of them "
+          f"2, 4 or 6 s (±0.3) after the previous one; "
+          f"host processes seen near them: {', '.join(outside_info['host_processes_near']) or 'none sampled'}")
     for mk in marker_list:
         p(f"  marker {mk['number']} @{fmt_t(mk['t'] or 0)} ({mk['wall']}) level {mk['level']}/{mk['sublevel']}: "
           f"{mk['screenshot'] or 'no screenshot (' + str(mk['screenshot_status']) + ')'}")

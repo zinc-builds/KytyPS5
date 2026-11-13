@@ -58,6 +58,15 @@ size, format and mips; buffer uploads of 4 MiB or more with the staging-copy tim
 0.5 ms or more; the first call of each unresolved import; audio underruns; level starts (the
 game's `StartLevel <name>` and `Level has started: <name>` lines); markers; injected faults.
 
+Outside load, every 100 ms, in the emulator (`reserved_cpus.csv`): the busy % of the CPUs the
+layout leaves idle on purpose (the SMT siblings of the command thread's and prepare workers' CPUs,
+and `KYTY_RESERVE_CPUS`, that no pinned emulator thread runs on: CPUs 9 and 11 here). A slow frame during which one of them
+was 25% busy or more, and whose emulator-side top cause is only what sibling contention looks like
+from inside (slower command-thread CPU work, off-CPU time, waits on the workers or the recorder,
+or nothing), is tagged `outside_load` and its cause is "outside load (host task on a
+reserved core)"; a compile, upload, GC, GPU wait, collection or mutex wait still names itself: host work there (a fan daemon's 47 ms poll every 2 s, app bursts) slows the
+command thread and workers without being the emulator's doing (FINDINGS, "outside load").
+
 System, every 2 s, read-only (`tools/playtest-sample.py`, nice 19): per-core busy % and MHz,
 temperatures, the emulator's RSS and named threads with their CPUs, other processes that ran on
 those CPUs or their SMT siblings, and VRAM, GPU load, temperature and clock (`nvidia-smi`). The
@@ -113,6 +122,7 @@ to close the open incident as `fatal` and flush its files.
 | `incidents/` | `incident-NNNN.json`, `marker-NNN.json` |
 | `shots/` | `incident-NNNN.png`, `marker-NNN.png` |
 | `system.jsonl` | the 2 s system samples |
+| `reserved_cpus.csv` | the reserved-idle CPUs' busy %, every 100 ms |
 | `crash.json` | only after a fatal error |
 | `session_end.json` | end time, counts, unresolved imports with their call counts |
 | `report.json` | `playtest-report.py`'s data |
@@ -126,7 +136,9 @@ tools/playtest-report.py <session dir> [--json] [--all]
 One page: length and how it ended, FPS per second of play (load seconds apart), presented frames
 at two and three refreshes, long frames, memory growth (MB/min), incidents grouped by primary cause
 with count, time lost and the worst one, markers with screenshots and the last 10 s, unresolved
-imports, other processes on the emulator's cores, and the top three things to fix. Each cause
+imports, other processes on the emulator's cores, outside-load incidents apart from the emulator's
+(with how many fall on a ~2 s period and the host processes seen near them), and the top three
+things to fix. Each cause
 group names the targeted diagnostic run that explains it further (e.g. `KYTY_GPU_WAIT_DIAG=1` for
 GPU waits, `KYTY_FRAME_DIAG=1` for a late game, `KYTY_OFFCPU_SAMPLE=1` for off-CPU time), as a
 `levels.sh` command for the incident's level, so a follow-up never needs the user.
